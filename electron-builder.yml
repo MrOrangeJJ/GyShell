@@ -21,7 +21,7 @@ mac:
         - arm64
   category: public.app-category.developer-tools
 win:
-  icon: icon.icns
+  icon: icon.ico
   target:
     - target: nsis
       arch:
