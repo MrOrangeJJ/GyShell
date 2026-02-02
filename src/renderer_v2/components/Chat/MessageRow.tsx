@@ -1,0 +1,132 @@
+import React from 'react'
+import { observer } from 'mobx-react-lite'
+import { CornerUpLeft } from 'lucide-react'
+import ReactMarkdown from 'react-markdown'
+import type { AppStore } from '../../stores/AppStore'
+import type { ChatMessage } from '../../stores/ChatStore'
+import { CommandBanner, ToolCallBanner, FileEditBanner, SubToolBanner, AskBanner, AlertBanner } from './ChatBanner'
+
+interface MessageRowProps {
+  store: AppStore
+  sessionId: string
+  messageId: string
+  onAskDecision: (msg: ChatMessage, decision: 'allow' | 'deny') => void
+  onRollback: (msg: ChatMessage) => void
+  askLabels: { allow: string; deny: string; allowed: string; denied: string }
+  isThinking: boolean
+}
+
+export const MessageRow: React.FC<MessageRowProps> = observer(({ 
+  store,
+  sessionId, 
+  messageId, 
+  onAskDecision, 
+  onRollback,
+  askLabels,
+  isThinking 
+}) => {
+  const session = store.chat.sessions.find(s => s.id === sessionId)
+  if (!session) return null
+  
+  const msg = session.messagesById.get(messageId)
+  if (!msg) return null
+  const renderModeClass = msg.renderMode === 'sub' ? 'render-mode-sub' : ''
+
+  // Handle special message types
+  if (msg.type === 'tokens_count') {
+    return null
+  }
+  if (msg.type === 'command') {
+    return (
+      <div className={renderModeClass}>
+        <CommandBanner msg={msg} />
+      </div>
+    )
+  }
+  if (msg.type === 'tool_call') {
+    return (
+      <div className={renderModeClass}>
+        <ToolCallBanner msg={msg} />
+      </div>
+    )
+  }
+  if (msg.type === 'file_edit') {
+    return (
+      <div className={renderModeClass}>
+        <FileEditBanner msg={msg} />
+      </div>
+    )
+  }
+  if (msg.type === 'sub_tool') {
+    return (
+      <div className={renderModeClass}>
+        <SubToolBanner msg={msg} />
+      </div>
+    )
+  }
+  if (msg.type === 'ask') {
+    return (
+      <div className={renderModeClass}>
+        <AskBanner 
+          msg={msg} 
+          onDecision={(decision) => onAskDecision(msg, decision)} 
+          labels={askLabels} 
+        />
+      </div>
+    )
+  }
+  if (msg.type === 'alert' || msg.type === 'error') {
+    return (
+      <div className={renderModeClass}>
+        <AlertBanner msg={msg} />
+      </div>
+    )
+  }
+
+  // Regular text messages
+  const isUser = msg.role === 'user'
+  const canRollback = isUser && !!msg.backendMessageId && !msg.streaming && !isThinking
+
+  if (isUser) {
+    return (
+      <div className={`message-user-row ${renderModeClass}`}>
+        <button
+          className="message-rollback-btn"
+          title="Rollback and re-edit"
+          onClick={() => onRollback(msg)}
+          disabled={!canRollback}
+        >
+          <CornerUpLeft size={14} />
+        </button>
+        <div className={`message-text ${msg.role} ${renderModeClass}`}>
+          <div className="plain-text">
+            {msg.content}
+            {msg.streaming && <span className="cursor-blink" />}
+          </div>
+        </div>
+      </div>
+    )
+  }
+
+  return (
+    <div className={`message-text ${msg.role} ${renderModeClass}`}>
+      {msg.role === 'assistant' && <div className="message-role-icon"><div className="avatar-ai" /></div>}
+      <div className={msg.role === 'assistant' ? "markdown-body" : "plain-text"}>
+        {msg.role === 'assistant' ? (
+          <ReactMarkdown
+            components={{
+              a: ({ node, ...props }) => (
+                <a {...props} target="_blank" rel="noopener noreferrer" />
+              )
+            }}
+          >
+            {msg.content}
+          </ReactMarkdown>
+        ) : (
+          msg.content
+        )}
+        {msg.streaming && <span className="cursor-blink" />}
+      </div>
+    </div>
+  )
+})

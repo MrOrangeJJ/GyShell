@@ -1,0 +1,107 @@
+.platform-windows {
+  // 1. Adjust Custom Banner Position
+  // On Windows, we use titleBarOverlay, so the traffic lights are handled by the system (Electron).
+  // We don't need to push content to the right to avoid Mac's traffic lights.
+  .panel-header-minimal {
+    // Keep padding small for Windows as traffic lights are on the right
+    padding-left: 12px !important;
+    -webkit-app-region: drag; // Ensure the header area is draggable
+
+    // Make interactive elements non-draggable so they can be clicked
+    .chat-tab-add,
+    .chat-tab-history,
+    .chat-tabs {
+      -webkit-app-region: no-drag;
+    }
+  }
+
+  // TopBar Layout Adjustments
+  .topbar {
+    // Make TopBar visually identical to the native titleBarOverlay background
+    background: var(--app-bg) !important;
+    backdrop-filter: none !important;
+
+    // Reduce padding as no left traffic lights
+    padding-left: 12px !important;
+
+    // Keep space on right for Windows controls (Min/Max/Close) ~140px
+    padding-right: 140px !important;
+
+    position: relative;
+
+    .topbar-left {
+      padding-left: 0 !important; // Reset Mac's indentation
+    }
+
+    // Pin buttons so they never "disappear" behind the system window controls
+    .topbar-right {
+      -webkit-app-region: no-drag;
+      position: absolute;
+      right: 140px;
+      top: 0;
+      height: 38px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    // Windows-only: make the two right-side icon buttons look like pure icons
+    // (transparent background, no border), and enlarge the icon by 20%.
+    .icon-btn {
+      background: transparent !important;
+      border: none !important;
+    }
+
+    .icon-btn:hover,
+    .icon-btn:active {
+      background: transparent !important;
+      border: none !important;
+    }
+
+    .icon-btn svg {
+      transform: scale(1.1);
+      transform-origin: center;
+    }
+  }
+
+  // 2. Beautiful Scrollbars (Webkit)
+  // ... (keep existing scrollbar styles)
+  ::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+  }
+
+  ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+
+  ::-webkit-scrollbar-thumb {
+    background: color-mix(in srgb, var(--fg) 12%, transparent);
+    border-radius: 5px;
+    border: 2px solid var(--app-bg); // Creates a padding effect
+    background-clip: content-box;
+
+    &:hover {
+      background: color-mix(in srgb, var(--fg) 22%, transparent);
+      border: 2px solid var(--app-bg);
+      background-clip: content-box;
+    }
+  }
+
+  ::-webkit-scrollbar-corner {
+    background: transparent;
+  }
+
+  // 4. Terminal Specific Scrollbar Adjustments
+  // Ensure the terminal's viewport scrollbar matches the app theme
+  .xterm-viewport::-webkit-scrollbar-thumb {
+    background: color-mix(in srgb, var(--fg) 16%, transparent) !important;
+    border: none; // xterm scrollbar often looks better without the border padding trick
+    border-radius: 4px;
+  }
+  
+  // Specific fix for the top-bar title region if it exists
+  .top-bar {
+    padding-left: 12px !important;
+  }
+}

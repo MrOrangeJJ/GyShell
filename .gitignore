@@ -1,0 +1,14 @@
+
+dist
+out
+*.log
+.DS_Store
+.electron-vite
+reference code/
+step_plan/
+scripts/
+node_modules/
+about_mcp.md
+mcp.json
+.cursorignore
+demo.md

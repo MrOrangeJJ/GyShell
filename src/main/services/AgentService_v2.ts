@@ -1,0 +1,1437 @@
+import { ChatOpenAI } from '@langchain/openai'
+import { HumanMessage, AIMessage, ToolMessage, type BaseMessage } from '@langchain/core/messages'
+import { mapChatMessagesToStoredMessages, mapStoredMessagesToChatMessages } from '@langchain/core/messages'
+import { StateGraph, START, END, Annotation, MemorySaver } from '@langchain/langgraph'
+import { RunnableLambda } from '@langchain/core/runnables'
+import type { ChatSession, AppSettings } from '../types'
+import { TerminalService } from './TerminalService'
+import { ChatHistoryService } from './ChatHistoryService'
+import type { CommandPolicyService } from './CommandPolicy/CommandPolicyService'
+import type { McpToolService } from './McpToolService'
+import type { SkillService } from './SkillService'
+import type { UIHistoryService } from './UIHistoryService'
+import { v4 as uuidv4 } from 'uuid'
+import type { z } from 'zod'
+import {
+  TOOLS_FOR_MODEL,
+  buildToolsForModel,
+  execCommandSchema,
+  readTerminalTabSchema,
+  readFileSchema,
+  sendCharSchema,
+  writeAndEditSchema,
+  waitSchema,
+  buildToolsForThinkingModel,
+
+  getThinkingModeAllowedToolNames,
+  toolImplementations
+} from './AgentHelper/tools'
+import type { ToolExecutionContext } from './AgentHelper/types'
+import { AgentHelpers } from './AgentHelper/helpers'
+import {
+  USER_INPUT_TAG,
+  USEFUL_SKILL_TAG,
+  USER_HIGHLIGHT_CONTENT,
+  TAB_CONTEXT_MARKER,
+  SYS_INFO_MARKER,
+  createBaseSystemPrompt,
+  createSystemInfoPrompt,
+  createTabContextPrompt,
+  createUserHighlightPrompt,
+  COMMAND_POLICY_DECISION_SCHEMA,
+  createCommandPolicyUserPrompt,
+  createThinkingModePrompt,
+} from './AgentHelper/prompts'
+import { runSkillTool } from './AgentHelper/skill_tools'
+import { TokenManager } from './AgentHelper/TokenManager'
+
+const Ann: any = Annotation
+
+const StateAnnotation = Ann.Root({
+  // Runtime Context - used for LLM inference, will be pruned
+  messages: Ann({
+    reducer: (x: BaseMessage[], y?: BaseMessage | BaseMessage[]) => {
+      if (!y) return x
+
+      // If a full list is provided (by token_manager), replace the entire messages state.
+      if (Array.isArray(y)) {
+        return y
+      }
+      // Otherwise, append a single message.
+      return [...x, y]
+    },
+    default: () => []
+  }),
+  // Full Persistence - always append, never prune, used for saving session
+  full_messages: Ann({
+    reducer: (x: BaseMessage[], y?: BaseMessage | BaseMessage[]) => {
+      if (!y) return x
+      if (Array.isArray(y)) {
+        return y
+      }
+      return [...x, y]
+    },
+    default: () => []
+  }),
+  // Token State - tracked separately
+  token_state: Ann({
+    reducer: (current: { current_tokens: number, max_tokens: number }, update?: Partial<{ current_tokens: number, max_tokens: number }>) => {
+      if (!update) return current
+      return { ...current, ...update }
+    },
+    default: () => ({ current_tokens: 0, max_tokens: 0 })
+  }),
+  // Add sessionId to the state to track which session this execution belongs to
+  sessionId: Ann({
+    reducer: (x: string, y?: string) => y ?? x,
+    default: () => ""
+  }),
+  pendingToolCalls: Ann({
+    reducer: (x: any[], y?: any[] | any) => {
+      if (!y) return x
+      if (Array.isArray(y)) return y
+      return x
+    },
+    default: () => []
+  }),
+  mode: Ann({
+    reducer: (x: 'normal' | 'thinking', y?: 'normal' | 'thinking') => y ?? x,
+    default: () => 'normal'
+  })
+})
+
+export class AgentService_v2 {
+  private terminalService: TerminalService
+  private chatHistoryService: ChatHistoryService
+  private commandPolicyService: CommandPolicyService
+  private mcpToolService: McpToolService
+  private skillService: SkillService
+  private uiHistoryService: UIHistoryService
+  private model: ChatOpenAI | null = null
+  private actionModel: ChatOpenAI | null = null
+  private thinkingModel: ChatOpenAI | null = null
+  private settings: AppSettings | null = null
+  private graph: any = null
+  private helpers: AgentHelpers
+  private checkpointer: MemorySaver
+  private toolsForModel = TOOLS_FOR_MODEL
+  private builtInToolEnabled: Record<string, boolean> = {}
+  private readFileSupport = { image: false }
+
+  constructor(
+    terminalService: TerminalService,
+    commandPolicyService: CommandPolicyService,
+    mcpToolService: McpToolService,
+    skillService: SkillService,
+    uiHistoryService: UIHistoryService
+  ) {
+    this.terminalService = terminalService
+    this.chatHistoryService = new ChatHistoryService()
+    this.commandPolicyService = commandPolicyService
+    this.mcpToolService = mcpToolService
+    this.skillService = skillService
+    this.uiHistoryService = uiHistoryService
+    this.helpers = new AgentHelpers()
+    this.checkpointer = new MemorySaver()
+    this.initializeGraph()
+  }
+
+  updateSettings(settings: AppSettings): void {
+    this.settings = settings
+    this.builtInToolEnabled = settings.tools?.builtIn ?? {}
+    
+    const activeProfileId = settings.models.activeProfileId
+    
+    if (!activeProfileId) {
+      this.resetModels()
+      return
+    }
+
+    const activeProfile = settings.models.profiles.find((p) => p.id === activeProfileId)
+    if (!activeProfile) {
+      this.resetModels()
+      return
+    }
+
+    const globalModelId = activeProfile.globalModelId
+    const modelItem = settings.models.items.find((m) => m.id === globalModelId)
+    
+    if (!modelItem) {
+      if (globalModelId) {
+        console.warn('[AgentService_v2] Active profile references a missing model item:', {
+          activeProfileId,
+          globalModelId
+        })
+      }
+      this.resetModels()
+      return
+    }
+
+    if (!modelItem.apiKey) {
+      console.error('[AgentService_v2] Model item referenced but has no API Key.')
+      this.resetModels()
+      return
+    }
+
+    const globalModel = this.helpers.createChatModel(modelItem, 0.7)
+    this.model = globalModel
+
+    const actionModelItem = activeProfile.actionModelId
+      ? settings.models.items.find((m) => m.id === activeProfile.actionModelId)
+      : undefined
+    this.actionModel = actionModelItem?.apiKey ? this.helpers.createChatModel(actionModelItem, 0.1) : globalModel
+
+    const thinkingModelItem = activeProfile.thinkingModelId
+      ? settings.models.items.find((m) => m.id === activeProfile.thinkingModelId)
+      : undefined
+    this.thinkingModel = thinkingModelItem?.apiKey ? this.helpers.createChatModel(thinkingModelItem, 0.2) : globalModel
+
+    this.readFileSupport = this.helpers.computeReadFileSupport(modelItem.profile, thinkingModelItem?.profile ?? modelItem.profile)
+    this.toolsForModel = buildToolsForModel(this.readFileSupport)
+    this.initializeGraph()
+  }
+
+  private resetModels() {
+    this.model = null
+    this.actionModel = null
+    this.thinkingModel = null
+    this.toolsForModel = TOOLS_FOR_MODEL
+    this.readFileSupport = { image: false }
+    this.initializeGraph()
+  }
+
+  private initializeGraph(): void {
+    if (!this.model) {
+      this.graph = null
+      return
+    }
+
+    const workflow = new StateGraph(StateAnnotation) as any
+
+    workflow.addNode('context_manager', this.createContextManagerNode())
+    // Add token_manager nodes for double interception
+    workflow.addNode('token_pruner_initial', this.createTokenManagerNode())
+    workflow.addNode('token_pruner_runtime', this.createTokenManagerNode())
+    
+    workflow.addNode('model_request', this.createModelRequestNode())
+    workflow.addNode('thinking_request', this.createThinkingRequestNode())
+    workflow.addNode('thinking_model_request', this.createThinkingModelRequestNode())
+    workflow.addNode('thinking_finalize', this.createThinkingFinalizeNode())
+    workflow.addNode('firewall', this.createFirewallNode())
+    workflow.addNode('batch_toolcall_executor', this.createBatchToolcallExecutorNode())
+    workflow.addNode('tools', this.createToolsNode())
+    workflow.addNode('command_tools', this.createCommandToolsNode())
+    workflow.addNode('file_tools', this.createFileToolsNode())
+    workflow.addNode('read_file', this.createReadFileNode())
+    workflow.addNode('mcp_tools', this.createMcpToolsNode())
+    workflow.addNode('final_output', this.createFinalOutputNode())
+
+    workflow.addEdge(START, 'context_manager')
+    workflow.addEdge('context_manager', 'token_pruner_initial')
+    workflow.addEdge('token_pruner_initial', 'token_pruner_runtime')
+    
+    workflow.addConditionalEdges(
+      'token_pruner_runtime',
+      (state: any) => state.mode === 'thinking' ? 'thinking_model_request' : 'model_request',
+      ['thinking_model_request', 'model_request']
+    )
+    
+    workflow.addEdge('model_request', 'firewall')
+    workflow.addEdge('thinking_model_request', 'firewall')
+    workflow.addConditionalEdges(
+      'firewall',
+      this.routeFirewallOutput,
+      ['batch_toolcall_executor', 'token_pruner_runtime']
+    )
+    workflow.addConditionalEdges(
+      'batch_toolcall_executor',
+      this.routeModelOutput,
+      ['thinking_request', 'thinking_finalize', 'tools', 'command_tools', 'file_tools', 'read_file', 'mcp_tools', 'final_output']
+    )
+
+    workflow.addEdge('thinking_request', 'token_pruner_runtime')
+    
+    // Tools route back to runtime pruner before model request
+    workflow.addConditionalEdges(
+      'tools',
+      this.routeAfterToolCall,
+      ['tools', 'command_tools', 'file_tools', 'read_file', 'mcp_tools', 'token_pruner_runtime']
+    )
+    workflow.addConditionalEdges(
+      'command_tools',
+      this.routeAfterToolCall,
+      ['tools', 'command_tools', 'file_tools', 'read_file', 'mcp_tools', 'token_pruner_runtime']
+    )
+    workflow.addConditionalEdges(
+      'file_tools',
+      this.routeAfterToolCall,
+      ['tools', 'command_tools', 'file_tools', 'read_file', 'mcp_tools', 'token_pruner_runtime']
+    )
+    workflow.addConditionalEdges(
+      'read_file',
+      this.routeAfterToolCall,
+      ['tools', 'command_tools', 'file_tools', 'read_file', 'mcp_tools', 'token_pruner_runtime']
+    )
+    workflow.addConditionalEdges(
+      'mcp_tools',
+      this.routeAfterToolCall,
+      ['tools', 'command_tools', 'file_tools', 'read_file', 'mcp_tools', 'token_pruner_runtime']
+    )
+    
+    workflow.addEdge('final_output', END)
+    workflow.addEdge('thinking_finalize', 'token_pruner_runtime')
+
+    this.graph = workflow.compile({ checkpointer: this.checkpointer })
+  }
+
+  // --- Graph Nodes ---
+  
+  private createTokenManagerNode() {
+    return RunnableLambda.from(async (state: any) => {
+      const { messages, token_state } = state
+      
+      // Perform pruning if needed
+      if (TokenManager.isOverflow(token_state.current_tokens, token_state.max_tokens)) {
+        const pruned = TokenManager.prune(messages)
+        // If pruned length differs or content changed (simplified check by length or reference)
+        // TokenManager.prune always returns a new array if changes were made.
+        if (pruned !== messages) {
+            // Debug: log when pruning actually happens
+            console.log(`[TokenManager] Pruned ${messages.length - pruned.length} messages (sessionId=${state.sessionId || 'unknown'})`)
+            // ONLY return messages update to trigger replacement in state.
+            // DO NOT return full_messages here.
+            return { messages: pruned }
+        }
+      }
+      return {} // No op
+    })
+  }
+
+  private createContextManagerNode() {
+    return RunnableLambda.from(async (state: any) => {
+      const sessionId = state.sessionId;
+      if (!sessionId) return state;
+
+      const messages: BaseMessage[] = [...state.messages]
+      const fullMessages: BaseMessage[] = [...state.full_messages]
+      if (messages.length === 0 || fullMessages.length === 0) return state
+
+      const lastMsg = messages[messages.length - 1]
+      const otherMsgs = messages.slice(0, -1)
+
+      const tabs = this.terminalService.getAllTerminals()
+      
+      const sysInfoMsg = this.helpers.markEphemeral(createSystemInfoPrompt(tabs))
+      const baseSystemMsg = createBaseSystemPrompt()
+
+      // Check if base system prompt already exists in history
+      const hasBaseSystem = otherMsgs.some(m => m.type === 'system' && typeof m.content === 'string')
+
+      // boundTerminalId will be passed from Gateway via metadata or state
+      const currentTabId = state.boundTerminalId
+      const currentTab = currentTabId ? this.terminalService.getAllTerminals().find(t => t.id === currentTabId) : undefined
+      const recent = currentTabId ? this.terminalService.getRecentOutput(currentTabId, 100) : ''
+      
+      const contextMsg = this.helpers.markEphemeral(createTabContextPrompt(currentTab, recent))
+
+      const selectionText = currentTabId ? this.terminalService.getSelection(currentTabId) : ''
+      const trimmedSelection = selectionText.trim()
+      const lastHighlight = [...messages]
+        .reverse()
+        .find((m) => typeof m.content === 'string' && m.content.includes(USER_HIGHLIGHT_CONTENT))
+      const lastHighlightText =
+        typeof lastHighlight?.content === 'string'
+          ? lastHighlight.content.split(`${USER_HIGHLIGHT_CONTENT}\n`)[1] ?? ''
+          : ''
+      const shouldInjectHighlight =
+        trimmedSelection.length > 0 && trimmedSelection !== lastHighlightText.trim()
+      const highlightMsg = shouldInjectHighlight ? createUserHighlightPrompt(selectionText) : null
+
+      const prefix = hasBaseSystem ? [] : [baseSystemMsg]
+      const newMessages = highlightMsg
+        ? [...prefix, ...otherMsgs, sysInfoMsg, contextMsg, highlightMsg, lastMsg]
+        : [...prefix, ...otherMsgs, sysInfoMsg, contextMsg, lastMsg]
+
+      const fullLastMsg = fullMessages[fullMessages.length - 1]
+      const fullOtherMsgs = fullMessages.slice(0, -1)
+      const fullLastHighlight = [...fullMessages]
+        .reverse()
+        .find((m) => typeof m.content === 'string' && m.content.includes(USER_HIGHLIGHT_CONTENT))
+      const fullLastHighlightText =
+        typeof fullLastHighlight?.content === 'string'
+          ? fullLastHighlight.content.split(`${USER_HIGHLIGHT_CONTENT}\n`)[1] ?? ''
+          : ''
+      const fullShouldInjectHighlight =
+        trimmedSelection.length > 0 && trimmedSelection !== fullLastHighlightText.trim()
+      const fullHighlightMsg = fullShouldInjectHighlight ? createUserHighlightPrompt(selectionText) : null
+      
+      const fullHasBaseSystem = fullOtherMsgs.some(m => m.type === 'system' && typeof m.content === 'string' && m.content.includes('# Role: GyShell Assistant'))
+      const fullPrefix = fullHasBaseSystem ? [] : [baseSystemMsg]
+
+      const newFullMessages = fullHighlightMsg
+        ? [...fullPrefix, ...fullOtherMsgs, sysInfoMsg, contextMsg, fullHighlightMsg, fullLastMsg]
+        : [...fullPrefix, ...fullOtherMsgs, sysInfoMsg, contextMsg, fullLastMsg]
+      
+      // Initialize Token State
+      let globalMax = 200000
+      let thinkingMax = 200000
+      if (this.settings?.models) {
+        const activeProfile = this.settings.models.profiles.find(
+          (p) => p.id === this.settings?.models.activeProfileId
+        )
+        const globalModelId = activeProfile?.globalModelId
+        const thinkingModelId = activeProfile?.thinkingModelId ?? activeProfile?.globalModelId
+        const globalItem = globalModelId
+          ? this.settings.models.items.find((m) => m.id === globalModelId)
+          : undefined
+        const thinkingItem = thinkingModelId
+          ? this.settings.models.items.find((m) => m.id === thinkingModelId)
+          : undefined
+        if (typeof globalItem?.maxTokens === 'number') globalMax = globalItem.maxTokens
+        if (typeof thinkingItem?.maxTokens === 'number') thinkingMax = thinkingItem.maxTokens
+      }
+      const maxTokens = Math.min(globalMax, thinkingMax)
+      
+      let currentTokens = 0
+      const historyToCheck = state.full_messages?.length > 0 ? state.full_messages : state.messages
+      for (let i = historyToCheck.length - 1; i >= 0; i--) {
+        const m = historyToCheck[i]
+        const usage = (m as any).usage_metadata || (m as any).additional_kwargs?.usage
+        if (usage?.total_tokens) {
+            currentTokens = usage.total_tokens
+            break
+        }
+      }
+
+      return { 
+          messages: newMessages,
+          full_messages: newFullMessages, 
+          token_state: {
+              max_tokens: maxTokens,
+              current_tokens: currentTokens
+          }
+      }
+    })
+  }
+
+  private createModelRequestNode() {
+    return RunnableLambda.from(async (state: any, config: any) => {
+      if (!this.model) throw new Error('Model not initialized')
+      const sessionId = state.sessionId;
+      if (!sessionId) throw new Error('No session ID in state');
+
+      this.helpers.sendEvent(sessionId, {
+        type: 'render_mode',
+        renderMode: 'normal'
+      })
+
+      const builtInTools = this.helpers.getEnabledBuiltInTools(this.toolsForModel, this.builtInToolEnabled)
+      const mcpTools = this.mcpToolService.getActiveTools()
+      const modelWithTools = this.model.bindTools([...builtInTools, ...mcpTools])
+
+      const messageId = uuidv4()
+      const stream = await modelWithTools.stream(state.messages, {
+        signal: config?.signal
+      })
+
+      let fullResponse: any = null
+
+      for await (const chunk of stream) {
+        fullResponse = fullResponse ? fullResponse.concat(chunk) : chunk
+        const delta = this.helpers.extractText(chunk.content)
+        if (delta) {
+          this.helpers.sendEvent(sessionId, {
+            messageId,
+            type: 'say',
+            content: delta
+          })
+        }
+      }
+
+      // NOTE: We do NOT enforce single-tool here anymore.
+      // Tool-call cleanup and batch/single selection is handled in batch_toolcall_executor.
+
+      fullResponse.additional_kwargs = {
+        ...(fullResponse.additional_kwargs || {}),
+        _gyshellMessageId: messageId
+      }
+
+      // Extract usage metadata if available
+      const usage = (fullResponse as any).usage_metadata || (fullResponse as any).additional_kwargs?.usage
+      let currentTokens = state.token_state.current_tokens
+      
+      if (usage) {
+        currentTokens = usage.total_tokens || usage.totalTokens || 0
+        const modelName = (fullResponse as any).response_metadata?.model_name || (this.model as any)?.modelName || 'unknown'
+        this.helpers.sendEvent(sessionId, {
+          type: 'tokens_count',
+          modelName,
+          totalTokens: currentTokens,
+          maxTokens: state.token_state.max_tokens // Use static max from state
+        })
+      }
+
+      // Always reset pendingToolCalls here to avoid stale queue influencing routing.
+      const fullHistory: BaseMessage[] = state.full_messages
+      return { 
+          messages: [...state.messages, fullResponse],
+          full_messages: [...fullHistory, fullResponse],
+          token_state: { current_tokens: currentTokens },
+          sessionId, 
+          pendingToolCalls: [] 
+      }
+    })
+  }
+
+  private createThinkingRequestNode() {
+    return RunnableLambda.from(async (state: any) => {
+      const sessionId = state.sessionId
+      if (!sessionId) throw new Error('No session ID in state')
+
+      const queue: any[] = Array.isArray(state.pendingToolCalls) ? state.pendingToolCalls : []
+      const toolCall = queue[0]
+      if (!toolCall || toolCall.name !== 'think') return state
+
+      const thinkingModePrompt = createThinkingModePrompt()
+      const toolMessage = this.createToolMessage(toolCall)
+      toolMessage.content = thinkingModePrompt.content as string
+
+      // Keep strict: clean up other possible tool_calls except for think
+      const messages: BaseMessage[] = [...state.messages]
+      const fullMessages: BaseMessage[] = [...state.full_messages]
+      const lastMsg = messages[messages.length - 1]
+      const fullLastMsg = fullMessages[fullMessages.length - 1]
+
+      if (AIMessage.isInstance(lastMsg)) {
+        this.cleanupModelToolCallMetadata(lastMsg, [toolCall])
+      }
+      if (AIMessage.isInstance(fullLastMsg)) {
+        this.cleanupModelToolCallMetadata(fullLastMsg, [toolCall])
+      }
+
+      return {
+        messages: [...messages, toolMessage],
+        full_messages: [...fullMessages, toolMessage],
+        sessionId,
+        pendingToolCalls: queue.slice(1),
+        mode: 'thinking'
+      }
+    })
+  }
+
+  private createThinkingModelRequestNode() {
+    return RunnableLambda.from(async (state: any, config: any) => {
+      if (!this.thinkingModel) throw new Error('Thinking model not initialized')
+      const sessionId = state.sessionId
+      if (!sessionId) throw new Error('No session ID in state')
+
+      this.helpers.sendEvent(sessionId, {
+        type: 'render_mode',
+        renderMode: 'sub'
+      })
+
+      const skills = await this.skillService.getAll().catch(() => [])
+      const thinkingTools = buildToolsForThinkingModel(skills)
+      const modelWithTools = this.thinkingModel.bindTools(thinkingTools)
+      // const modelWithTools = this.thinkingModel
+
+      const messageId = uuidv4()
+
+      const stream = await modelWithTools.stream(state.messages, {
+        signal: config?.signal
+      })
+
+      let fullResponse: any = null
+      for await (const chunk of stream) {
+        fullResponse = fullResponse ? fullResponse.concat(chunk) : chunk
+        const delta = this.helpers.extractText(chunk.content)
+        if (delta) {
+          this.helpers.sendEvent(sessionId, {
+            messageId,
+            type: 'say',
+            content: delta
+          })
+        }
+      }
+
+      const usage = (fullResponse as any)?.usage_metadata || (fullResponse as any)?.additional_kwargs?.usage
+      let currentTokens = state.token_state.current_tokens
+
+      if (usage) {
+        currentTokens = usage.total_tokens || usage.totalTokens || 0
+        const modelName = (fullResponse as any)?.response_metadata?.model_name || (this.thinkingModel as any)?.modelName || 'unknown'
+        this.helpers.sendEvent(sessionId, {
+          type: 'tokens_count',
+          modelName,
+          totalTokens: currentTokens,
+          maxTokens: state.token_state.max_tokens
+        })
+      }
+
+      if (fullResponse) {
+        fullResponse.additional_kwargs = {
+          ...(fullResponse.additional_kwargs || {}),
+          _gyshellMessageId: messageId
+        }
+
+      }
+
+      const fullHistory: BaseMessage[] = state.full_messages
+      return {
+        messages: fullResponse ? [...state.messages, fullResponse] : [...state.messages],
+        full_messages: fullResponse ? [...fullHistory, fullResponse] : [...fullHistory],
+        token_state: { current_tokens: currentTokens },
+        sessionId,
+        pendingToolCalls: []
+      }
+    })
+  }
+
+  private createThinkingFinalizeNode() {
+    return RunnableLambda.from(async (state: any) => {
+      const sessionId = state.sessionId
+      if (!sessionId) return state
+
+      const messages: BaseMessage[] = [...state.messages]
+      const fullMessages: BaseMessage[] = [...state.full_messages]
+
+      const lastMessage = messages[messages.length - 1]
+      const fullLastMessage = fullMessages[fullMessages.length - 1]
+
+      if (AIMessage.isInstance(lastMessage)) {
+        const toolCalls: any[] = Array.isArray((lastMessage as any).tool_calls) ? (lastMessage as any).tool_calls : []
+        let thinkingEndCall = toolCalls.find(tc => tc.name === 'thinking_end')
+        
+        // Case 1: LLM has actively called thinking_end
+        if (thinkingEndCall) {
+          const toolMessage = this.createToolMessage(thinkingEndCall)
+          toolMessage.content = `You have exited thinking mode. You can now start executing tasks.`
+
+          this.cleanupModelToolCallMetadata(lastMessage, [thinkingEndCall])
+          this.cleanupModelToolCallMetadata(fullLastMessage, [thinkingEndCall])
+
+          return {
+            messages: [...messages, toolMessage],
+            full_messages: [...fullMessages, toolMessage],
+            sessionId,
+            mode: 'normal'
+          }
+        }
+
+        // Case 2: LLM did not call any tools (or only output text), auto-end
+        // We need to manually construct a thinking_end tool_call and insert it into the last message
+        const syntheticId = `call_${uuidv4().replace(/-/g, '')}`
+        const syntheticCall = {
+          id: syntheticId,
+          name: 'thinking_end',
+          args: {}
+        }
+
+        // Modify the last AI message, inject this constructed tool_call
+        if (AIMessage.isInstance(lastMessage)) {
+          lastMessage.tool_calls = [syntheticCall]
+          // Also need to clean up possible metadata like chunks to ensure correct format
+          this.cleanupModelToolCallMetadata(lastMessage, [syntheticCall])
+        }
+        if (AIMessage.isInstance(fullLastMessage)) {
+          fullLastMessage.tool_calls = [syntheticCall]
+          this.cleanupModelToolCallMetadata(fullLastMessage, [syntheticCall])
+        }
+
+        // Create corresponding ToolMessage response
+        const toolMessage = this.createToolMessage(syntheticCall)
+        toolMessage.content = `You have exited thinking mode. You can now start executing tasks.`
+
+        return {
+          messages: [...messages, toolMessage],
+          full_messages: [...fullMessages, toolMessage],
+          sessionId,
+          mode: 'normal'
+        }
+      }
+
+      return {
+        sessionId,
+        mode: 'normal'
+      }
+    })
+  }
+
+  private createFirewallNode() {
+    return RunnableLambda.from(async (state: any) => {
+      const messages: BaseMessage[] = [...state.messages]
+      const lastMessage = messages[messages.length - 1]
+
+      if (!AIMessage.isInstance(lastMessage)) {
+        return {}
+      }
+
+      const toolCalls: any[] = Array.isArray((lastMessage as any).tool_calls) ? (lastMessage as any).tool_calls : []
+      if (toolCalls.length === 0) return {}
+
+      const allowedTools =
+        state.mode === 'thinking'
+          ? getThinkingModeAllowedToolNames()
+          : this.getAllowedNormalToolNames()
+
+      const illegalCall = toolCalls.find((tc: any) => !allowedTools.includes(tc.name))
+      if (!illegalCall) return {}
+
+      this.cleanupModelToolCallMetadata(lastMessage, [illegalCall])
+
+      const toolMessage = this.createToolMessage(illegalCall)
+      toolMessage.content =
+        state.mode === 'thinking'
+          ? `Error: You are currently in THINKING mode. In this mode, you can ONLY call the following tools: ${allowedTools.join(', ')}. ` +
+            'Your PRIMARY task is to reason, analyze and plan, not to execute actions. Please use the allowed tools if needed, ' +
+            'or provide your final reasoning/plan to exit thinking mode.' + 
+            'Please use the thinking_end tool to exit thinking mode if you are done thinking. Before exit thinking mode, you cannot execute any tasks.'
+          : `Error: Tool "${illegalCall.name}" is not allowed or not enabled in the current mode. ` +
+            `Allowed tools: ${allowedTools.join(', ') || 'None'}.`
+
+      const fullHistory: BaseMessage[] = state.full_messages
+      return {
+        messages: [...messages, toolMessage],
+        full_messages: [...fullHistory, toolMessage],
+        pendingToolCalls: []
+      }
+    })
+  }
+
+  private createBatchToolcallExecutorNode() {
+    return RunnableLambda.from(async (state: any) => {
+      const sessionId = state.sessionId
+      if (!sessionId) throw new Error('No session ID in state')
+
+      const messages: BaseMessage[] = [...state.messages]
+      const fullMessages: BaseMessage[] = [...state.full_messages]
+      const lastMessage = messages[messages.length - 1]
+      const fullLastMessage = fullMessages[fullMessages.length - 1]
+
+      let pendingToolCalls: any[] = []
+
+      if (!AIMessage.isInstance(lastMessage)) {
+        return { messages, full_messages: fullMessages, sessionId, pendingToolCalls }
+      }
+
+      const toolCalls: any[] = Array.isArray((lastMessage as any).tool_calls) ? (lastMessage as any).tool_calls : []
+
+      // Always clean tool-call chunk/invalid metadata to prevent context bloat,
+      // and then decide how many tool calls we keep/enqueue.
+      if (!toolCalls || toolCalls.length === 0) {
+        this.cleanupModelToolCallMetadata(lastMessage, [])
+        this.cleanupModelToolCallMetadata(fullLastMessage, [])
+        return { messages, full_messages: fullMessages, sessionId, pendingToolCalls }
+      }
+
+      // If only one tool call, just enqueue it and continue (no extra checks needed).
+      if (toolCalls.length === 1) {
+        pendingToolCalls = toolCalls.slice(0, 1)
+        this.cleanupModelToolCallMetadata(lastMessage, pendingToolCalls)
+        this.cleanupModelToolCallMetadata(fullLastMessage, pendingToolCalls)
+        return { messages, full_messages: fullMessages, sessionId, pendingToolCalls }
+      }
+
+      const thinkCall = toolCalls.find((tc) => tc?.name === 'think')
+      if (thinkCall) {
+        pendingToolCalls = [thinkCall]
+        this.cleanupModelToolCallMetadata(lastMessage, pendingToolCalls)
+        this.cleanupModelToolCallMetadata(fullLastMessage, pendingToolCalls)
+        return { messages, full_messages: fullMessages, sessionId, pendingToolCalls }
+      }
+
+      // If ANY exec_command is present, force single-tool: keep only the first tool call.
+      const hasExecCommand = toolCalls.some((tc) => tc?.name === 'exec_command')
+      if (hasExecCommand) {
+        pendingToolCalls = toolCalls.slice(0, 1)
+        this.cleanupModelToolCallMetadata(lastMessage, pendingToolCalls)
+        this.cleanupModelToolCallMetadata(fullLastMessage, pendingToolCalls)
+        return { messages, full_messages: fullMessages, sessionId, pendingToolCalls }
+      }
+
+      const skillCall = toolCalls.find((tc) => tc?.name === 'skill')
+      if (skillCall) {
+        pendingToolCalls = [skillCall]
+        this.cleanupModelToolCallMetadata(lastMessage, pendingToolCalls)
+        this.cleanupModelToolCallMetadata(fullLastMessage, pendingToolCalls)
+        return { messages, full_messages: fullMessages, sessionId, pendingToolCalls }
+      }
+
+      // Otherwise (no exec_command), allow executing ALL tool calls sequentially.
+      pendingToolCalls = toolCalls.slice()
+      this.cleanupModelToolCallMetadata(lastMessage, pendingToolCalls)
+      this.cleanupModelToolCallMetadata(fullLastMessage, pendingToolCalls)
+
+      return { messages, full_messages: fullMessages, sessionId, pendingToolCalls }
+    })
+  }
+
+  private createToolsNode() {
+    return RunnableLambda.from(async (state: any, config: any) => {
+      const sessionId = state.sessionId;
+      if (!sessionId) throw new Error('No session ID in state')
+
+      const queue: any[] = Array.isArray(state.pendingToolCalls) ? state.pendingToolCalls : []
+      const toolCall = queue[0]
+      if (!toolCall) return state
+
+      const toolMessage = this.createToolMessage(toolCall)
+      const executionContext = this.createExecutionContext(
+        sessionId,
+        toolMessage.additional_kwargs._gyshellMessageId as string,
+        config
+      )
+      const fullHistory: BaseMessage[] = state.full_messages
+      let result = ''
+      switch (toolCall.name) {
+        case 'skill': {
+          let args: any = toolCall.args || {}
+          if (typeof args === 'string') {
+            try {
+              args = this.helpers.parseStrictJsonObject(args)
+            } catch {
+              args = {}
+            }
+          }
+          const messageId = toolMessage.additional_kwargs._gyshellMessageId as string
+          this.helpers.sendEvent(sessionId, {
+            messageId,
+            type: 'sub_tool_started',
+            title: 'Skill',
+            hint: `${args.name || 'unknown'}...`,
+            input: JSON.stringify(args)
+          })
+          const outcome = await runSkillTool(args, this.skillService)
+          result = outcome.message
+          const skillContent = result.split(USEFUL_SKILL_TAG)[1].trim()
+
+          this.helpers.sendEvent(sessionId, {
+            messageId,
+            type: 'sub_tool_delta',
+            outputDelta: skillContent
+          })
+
+          this.helpers.sendEvent(sessionId, {
+            messageId,
+            type: 'sub_tool_finished'
+          })
+          break
+        }
+        case 'read_terminal_tab': {
+          try {
+            const validatedArgs = readTerminalTabSchema.parse(toolCall.args || {})
+            result = await toolImplementations.readTerminalTab(validatedArgs, executionContext)
+          } catch (err) {
+            result = `Parameter validation error for read_terminal_tab: ${(err as Error).message}`
+          }
+          break
+        }
+        case 'send_char': {
+          try {
+            const validatedArgs = sendCharSchema.parse(toolCall.args || {})
+            result = await toolImplementations.sendChar(validatedArgs, executionContext)
+          } catch (err) {
+            result = `Parameter validation error for send_char: ${(err as Error).message}`
+          }
+          break
+        }
+        case 'wait': {
+          try {
+            const validatedArgs = waitSchema.parse(toolCall.args || {})
+            const messageId = toolMessage.additional_kwargs._gyshellMessageId as string
+            this.helpers.sendEvent(sessionId, {
+              messageId,
+              type: 'sub_tool_started',
+              title: 'Wait',
+              hint: `Waiting for ${validatedArgs.seconds}s...`,
+              input: JSON.stringify(validatedArgs)
+            })
+            await new Promise((resolve) => setTimeout(resolve, validatedArgs.seconds * 1000))
+            result = `Waited for ${validatedArgs.seconds} seconds.`
+            this.helpers.sendEvent(sessionId, {
+              messageId,
+              type: 'sub_tool_finished',
+              output: result
+            })
+          } catch (err) {
+            result = `Parameter validation error for wait: ${(err as Error).message}`
+          }
+          break
+        }
+        default:
+          result = `Tool "${toolCall.name}" is not supported.`
+      }
+
+      toolMessage.content = result
+      return {
+        messages: [...state.messages, toolMessage],
+        full_messages: [...fullHistory, toolMessage],
+        sessionId,
+        pendingToolCalls: queue.slice(1)
+      }
+    })
+  }
+
+  private createCommandToolsNode() {
+    return RunnableLambda.from(async (state: any, config: any) => {
+      const sessionId = state.sessionId
+      if (!sessionId) throw new Error('No session ID in state')
+
+      const queue: any[] = Array.isArray(state.pendingToolCalls) ? state.pendingToolCalls : []
+      const toolCall = queue[0]
+      if (!toolCall || toolCall.name !== 'exec_command') return state
+
+      const toolMessage = this.createToolMessage(toolCall)
+      const executionContext = this.createExecutionContext(sessionId, toolMessage.additional_kwargs._gyshellMessageId as string, config)
+      const fullHistory: BaseMessage[] = state.full_messages
+
+      let validated: z.infer<typeof execCommandSchema>
+      try {
+        validated = execCommandSchema.parse(toolCall.args || {})
+      } catch (err) {
+        toolMessage.content = `Parameter validation error for exec_command: ${(err as Error).message}`
+        return { 
+            messages: [...state.messages, toolMessage], 
+            full_messages: [...fullHistory, toolMessage],
+            sessionId, 
+            pendingToolCalls: queue.slice(1) 
+        }
+      }
+
+      const { found, bestMatch } = this.terminalService.resolveTerminal(validated.tabIdOrName)
+      if (!bestMatch) {
+        toolMessage.content = found.length > 1
+            ? `Error: Multiple terminal tabs found with name "${validated.tabIdOrName}".`
+            : `Error: Terminal tab "${validated.tabIdOrName}" not found.`
+        return { 
+            messages: [...state.messages, toolMessage], 
+            full_messages: [...fullHistory, toolMessage],
+            sessionId, 
+            pendingToolCalls: queue.slice(1) 
+        }
+      }
+
+      const recent = this.terminalService.getRecentOutput(bestMatch.id, 50) || ''
+
+      if (!this.actionModel) {
+        toolMessage.content = 'Action model not initialized.'
+        return { 
+            messages: [...state.messages, toolMessage], 
+            full_messages: [...fullHistory, toolMessage],
+            sessionId, 
+            pendingToolCalls: queue.slice(1) 
+        }
+      }
+
+      // Build context for Action Model
+      const allMessages = state.full_messages as BaseMessage[]
+      
+      // 1. Find the last 3 special marker messages (only from HumanMessages)
+      const specialTags = [USER_INPUT_TAG, TAB_CONTEXT_MARKER, SYS_INFO_MARKER]
+      const last3Special: BaseMessage[] = []
+      for (let i = allMessages.length - 1; i >= 0 && last3Special.length < 3; i--) {
+        const msg = allMessages[i]
+        const content = msg.content
+        if (msg.type === 'human' && typeof content === 'string' && specialTags.some(tag => content.includes(tag))) {
+          last3Special.unshift(msg)
+        }
+      }
+
+      // 2. Locate the very last USER_INPUT_TAG message to define the execution detail range
+      let lastUserInputIndex = -1
+      for (let i = allMessages.length - 1; i >= 0; i--) {
+        const m = allMessages[i]
+        const content = m.content
+        if (m.type === 'human' && typeof content === 'string' && content.includes(USER_INPUT_TAG)) {
+          lastUserInputIndex = i
+          break
+        }
+      }
+      
+      // 3. Get execution details: messages strictly AFTER the last USER_INPUT_TAG
+      const executionDetails = lastUserInputIndex !== -1 
+        ? allMessages.slice(lastUserInputIndex + 1) 
+        : []
+
+      const recentExecutionMsgs: BaseMessage[] = []
+      if (executionDetails.length > 10) {
+        recentExecutionMsgs.push(new HumanMessage({ content: '... (some execution details omitted) ...' }))
+        recentExecutionMsgs.push(...executionDetails.slice(-10))
+      } else {
+        recentExecutionMsgs.push(...executionDetails)
+      }
+
+      // 4. Construct final message list for Action Model
+      // Structure: [Last 3 Special Tags] + [Recent Execution Details] + [System/User Prompts]
+      const finalActionMessages: BaseMessage[] = [
+        ...last3Special,
+        ...recentExecutionMsgs
+      ]
+
+      const user = createCommandPolicyUserPrompt({
+        tabTitle: bestMatch.title,
+        tabId: bestMatch.id,
+        tabType: bestMatch.type,
+        command: validated.command,
+        recentOutput: recent
+      })
+
+      const finalMessagesForActionModel = [...finalActionMessages, user]
+      console.log('[AgentService_v2] Action Model Context:', JSON.stringify(finalMessagesForActionModel.map(m => ({
+        type: m.type,
+        content: typeof m.content === 'string' ? m.content.slice(0, 200) + (m.content.length > 200 ? '...' : '') : '[Complex Content]'
+      })), null, 2))
+
+      let decision: z.infer<typeof COMMAND_POLICY_DECISION_SCHEMA>
+      try {
+        const resp = await this.actionModel.invoke(finalMessagesForActionModel, { signal: config?.signal })
+        const raw = this.helpers.extractText((resp as any).content)
+        const parsed = this.helpers.parseStrictJsonObject(String(raw))
+        decision = COMMAND_POLICY_DECISION_SCHEMA.parse(parsed)
+      } catch (err: any) {
+        toolMessage.content = `Action model decision failed: ${err?.message || String(err)}`
+        return { 
+            messages: [...state.messages, toolMessage], 
+            full_messages: [...fullHistory, toolMessage],
+            sessionId, 
+            pendingToolCalls: queue.slice(1) 
+        }
+      }
+
+      let resultText = ''
+      if (decision.decision === 'wait') {
+        resultText = await toolImplementations.runCommand(validated, executionContext)
+      } else if (decision.decision === 'nowait') {
+        const res = await toolImplementations.runCommandNowait(validated, executionContext)
+        resultText = res + "\nThis command may hang, so it is run asynchronously. Please use read_terminal_tab to check the result/status!"
+      }
+
+      toolMessage.content = resultText
+      return { 
+          messages: [...state.messages, toolMessage], 
+          full_messages: [...fullHistory, toolMessage],
+          sessionId, 
+          pendingToolCalls: queue.slice(1) 
+      }
+    })
+  }
+
+  private createFileToolsNode() {
+    return RunnableLambda.from(async (state: any, config: any) => {
+      const sessionId = state.sessionId
+      if (!sessionId) throw new Error('No session ID in state')
+
+      const queue: any[] = Array.isArray(state.pendingToolCalls) ? state.pendingToolCalls : []
+      const toolCall = queue[0]
+      if (!toolCall || toolCall.name !== 'create_or_edit') return state
+
+      const toolMessage = this.createToolMessage(toolCall)
+      const executionContext = this.createExecutionContext(sessionId, toolMessage.additional_kwargs._gyshellMessageId as string, config)
+      const fullHistory: BaseMessage[] = state.full_messages
+
+      let result: string
+      try {
+        const validatedArgs = writeAndEditSchema.parse(toolCall.args || {})
+        result = await toolImplementations.writeAndEdit(validatedArgs, executionContext)
+      } catch (err) {
+        result = `Parameter validation or execution error for create_or_edit: ${(err as Error).message}`
+      }
+
+      toolMessage.content = result
+      return { 
+          messages: [...state.messages, toolMessage], 
+          full_messages: [...fullHistory, toolMessage],
+          sessionId, 
+          pendingToolCalls: queue.slice(1) 
+      }
+    })
+  }
+
+  private createReadFileNode() {
+    return RunnableLambda.from(async (state: any, config: any) => {
+      const sessionId = state.sessionId
+      if (!sessionId) throw new Error('No session ID in state')
+
+      const queue: any[] = Array.isArray(state.pendingToolCalls) ? state.pendingToolCalls : []
+      const toolCall = queue[0]
+      if (!toolCall || toolCall.name !== 'read_file') return state
+
+      const toolMessage = this.createToolMessage(toolCall)
+      const messageId = toolMessage.additional_kwargs._gyshellMessageId as string
+      const executionContext = this.createExecutionContext(sessionId, messageId, config)
+      const fullHistory: BaseMessage[] = state.full_messages
+
+      let resultText: string
+      let imageMessage: HumanMessage | null = null
+      let meaningLessAIMessage: AIMessage | null = null
+
+      try {
+        const validatedArgs = readFileSchema.parse(toolCall.args || {})
+        const result = await toolImplementations.runReadFile(validatedArgs, executionContext, this.readFileSupport)
+        resultText = result.resultText
+        imageMessage = result.imageMessage ?? null
+        meaningLessAIMessage = result.meaningLessAIMessage ?? null
+      } catch (err) {
+        resultText = err instanceof Error ? err.message : String(err)
+        // Ensure frontend gets a banner even on validation errors / unexpected failures.
+        this.helpers.sendEvent(sessionId, {
+          messageId,
+          type: 'file_read',
+          level: 'warning',
+          filePath: String((toolCall.args as any)?.filePath || 'unknown file'),
+          input: JSON.stringify(toolCall.args || {}),
+          output: resultText
+        })
+      }
+
+      toolMessage.content = resultText
+
+      const updates = imageMessage
+        ? [toolMessage, meaningLessAIMessage, imageMessage]
+        : [toolMessage]
+
+      return {
+        messages: [...state.messages, ...updates],
+        full_messages: [...fullHistory, ...(updates as BaseMessage[])],
+        sessionId,
+        pendingToolCalls: queue.slice(1)
+      }
+    })
+  }
+
+  private createMcpToolsNode() {
+    return RunnableLambda.from(async (state: any, config: any) => {
+      const sessionId = state.sessionId
+      if (!sessionId) throw new Error('No session ID in state')
+
+      const queue: any[] = Array.isArray(state.pendingToolCalls) ? state.pendingToolCalls : []
+      const toolCall = queue[0]
+      if (!toolCall || !this.mcpToolService.isMcpToolName(toolCall.name)) return state
+
+      const toolMessage = this.createToolMessage(toolCall)
+      const messageId = toolMessage.additional_kwargs._gyshellMessageId as string
+      const fullHistory: BaseMessage[] = state.full_messages
+
+      let args: any = toolCall.args || {}
+      if (typeof args === 'string') {
+        try {
+          args = this.helpers.parseStrictJsonObject(args)
+        } catch {}
+      }
+
+      const signal = config?.signal
+      let resultText: string
+      try {
+        const result = await this.mcpToolService.invokeTool(toolCall.name, args, signal)
+        resultText = typeof result === 'string' ? result : JSON.stringify(result, null, 2)
+      } catch (err) {
+        if (this.helpers.isAbortError(err)) throw err
+        resultText = err instanceof Error ? err.message : String(err)
+      }
+
+      this.helpers.sendEvent(sessionId, {
+        messageId,
+        type: 'tool_call',
+        toolName: toolCall.name,
+        input: JSON.stringify(args ?? {}),
+        output: resultText
+      })
+
+      toolMessage.content = resultText
+      return { 
+          messages: [...state.messages, toolMessage], 
+          full_messages: [...fullHistory, toolMessage],
+          sessionId, 
+          pendingToolCalls: queue.slice(1) 
+      }
+    })
+  }
+
+
+  private createFinalOutputNode() {
+    return RunnableLambda.from(async (state: any) => {
+      const sessionId = state.sessionId;
+      if (!sessionId) return state;
+
+      // Persist UI history at task boundary (avoid sync disk writes during streaming).
+      try {
+        this.uiHistoryService.flush(sessionId)
+      } catch (e) {
+        console.warn('[AgentService_v2] Failed to flush UI history on done:', e)
+      }
+
+      this.helpers.sendEvent(sessionId, { 
+        type: 'debug_history', 
+        history: JSON.parse(JSON.stringify(state.messages)) 
+      })
+      this.helpers.sendEvent(sessionId, { type: 'done' })
+      return state
+    })
+  }
+
+  // --- Helpers ---
+
+  private createToolMessage(toolCall: any): ToolMessage {
+    const toolMessage = new ToolMessage({
+      content: '',
+      tool_call_id: toolCall.id || '',
+      name: toolCall.name
+    })
+    const messageId = uuidv4()
+    ;(toolMessage as any).additional_kwargs = { _gyshellMessageId: messageId }
+    return toolMessage
+  }
+
+  private createExecutionContext(sessionId: string, messageId: string, config: any): ToolExecutionContext {
+    return {
+      sessionId,
+      messageId,
+      terminalService: this.terminalService,
+      sendEvent: this.helpers.sendEvent.bind(this.helpers),
+      commandPolicyService: this.commandPolicyService,
+      commandPolicyMode: this.settings?.commandPolicyMode || 'standard',
+      signal: config?.signal
+    }
+  }
+
+  private getAllowedNormalToolNames(): string[] {
+    const builtIn = this.helpers.getEnabledBuiltInTools(this.toolsForModel, this.builtInToolEnabled)
+    const builtInNames = builtIn
+      .map((tool: any) => tool?.function?.name ?? tool?.name)
+      .filter((name: any): name is string => typeof name === 'string')
+    const mcpNames = this.mcpToolService.getActiveTools().map((tool) => tool.name)
+    return Array.from(new Set([...builtInNames, ...mcpNames]))
+  }
+
+  private routeFirewallOutput = (state: any): string => {
+    const lastMsg = state.messages[state.messages.length - 1]
+    if (lastMsg instanceof ToolMessage && String((lastMsg as any).content || '').startsWith('Error:')) {
+      return 'token_pruner_runtime'
+    }
+    return 'batch_toolcall_executor'
+  }
+
+  private routeModelOutput = (state: any): string => {
+    const queue: any[] = Array.isArray(state.pendingToolCalls) ? state.pendingToolCalls : []
+    const first = queue[0]
+    // console.log(first);
+    if (first?.name) {
+      if (first.name === 'think') return 'thinking_request'
+      if (first.name === 'thinking_end') return 'thinking_finalize'
+      if (first.name === 'skill') return 'tools'
+      if (this.mcpToolService.isMcpToolName(first.name)) return 'mcp_tools'
+      if (first.name === 'exec_command') return 'command_tools'
+      if (first.name === 'create_or_edit') return 'file_tools'
+      if (first.name === 'read_file') return 'read_file'
+      return 'tools'
+    }
+
+    if (state.mode === 'thinking') return 'thinking_finalize'
+    return 'final_output'
+  }
+
+  private routeAfterToolCall = (state: any): string => {
+    const queue: any[] = Array.isArray(state.pendingToolCalls) ? state.pendingToolCalls : []
+    const first = queue[0]
+    if (!first) {
+      // Both normal and thinking modes should go through token pruning before the next model request
+      return 'token_pruner_runtime'
+    }
+    if (first?.name) {
+      if (first.name === 'think') return 'thinking_request'
+      if (this.mcpToolService.isMcpToolName(first.name)) return 'mcp_tools'
+      if (first.name === 'exec_command') return 'command_tools'
+      if (first.name === 'create_or_edit') return 'file_tools'
+      if (first.name === 'read_file') return 'read_file'
+      return 'tools'
+    }
+    return 'token_pruner_runtime'
+  }
+
+  private cleanupModelToolCallMetadata(msg: any, keepToolCalls: any[]): void {
+    // Keep only chosen tool calls (0/1/many) while removing tool-call chunk/invalid artifacts.
+    if (Array.isArray(msg?.tool_calls)) {
+      msg.tool_calls = Array.isArray(keepToolCalls) ? keepToolCalls : []
+    }
+    if (Array.isArray(msg?.invalid_tool_calls)) {
+      msg.invalid_tool_calls = []
+    }
+    if (Array.isArray(msg?.tool_call_chunks)) {
+      msg.tool_call_chunks = []
+    }
+    if (msg?.additional_kwargs?.tool_calls) {
+      delete msg.additional_kwargs.tool_calls
+    }
+  }
+
+  // --- Execution Core ---
+
+  async run(context: any, input: string, signal: AbortSignal): Promise<void> {
+    if (!this.graph) throw new Error('Graph not initialized')
+
+    const { sessionId, boundTerminalId } = context
+    const loadedSession = this.chatHistoryService.loadSession(sessionId)
+    const baseMessages = loadedSession ? mapStoredMessagesToChatMessages(Array.from(loadedSession.messages.values())) : []
+
+    const userMessageId = uuidv4()
+    const humanMessage = new HumanMessage(`${USER_INPUT_TAG}${input}`)
+    ;(humanMessage as any).additional_kwargs = { _gyshellMessageId: userMessageId }
+
+    // Use the new emit-based event system (via helpers)
+    this.helpers.sendEvent(sessionId, {
+      messageId: userMessageId,
+      type: 'user_input',
+      content: input
+    })
+
+    const initialState = {
+      messages: [...baseMessages, humanMessage],
+      full_messages: [...baseMessages, humanMessage],
+      sessionId: sessionId,
+      boundTerminalId: boundTerminalId // Pass terminal context into graph
+    }
+
+    try {
+      const result = await this.graph.invoke(initialState, {
+        recursionLimit: 200,
+        signal,
+        configurable: { thread_id: sessionId }
+      })
+
+      // Persistence
+      if (result && (result.full_messages || result.messages)) {
+        const finalMessages = result.full_messages || result.messages
+        const sessionToSave = loadedSession || {
+          id: sessionId,
+          title: 'New Session',
+          boundTerminalTabId: boundTerminalId,
+          messages: new Map(),
+          lastCheckpointOffset: 0
+        }
+        this.updateSessionFromMessages(sessionToSave, finalMessages as BaseMessage[])
+        this.chatHistoryService.saveSession(sessionToSave)
+      }
+    } catch (err) {
+      console.error(`[AgentService_v2] Run task failed (sessionId=${sessionId}):`, err)
+      // For any error (Abort or internal Error), try to save all history in the current Checkpoint
+      await this.trySaveSessionFromCheckpoint(sessionId, boundTerminalId)
+      
+      if (this.helpers.isAbortError(err)) {
+        return
+      }
+      throw err // Throw to Gateway for UI notification
+    } finally {
+      await this.clearCheckpoint(sessionId)
+    }
+  }
+
+  private async clearCheckpoint(sessionId: string): Promise<void> {
+    try {
+      // Clear MemorySaver state for this thread after task completion/error.
+      await this.checkpointer.deleteThread(sessionId)
+    } catch {
+      // best-effort cleanup
+    }
+  }
+
+  private async trySaveSessionFromCheckpoint(sessionId: string, boundTerminalId: string): Promise<void> {
+    if (!this.graph) return
+    try {
+      const snapshot = await this.graph.getState({ configurable: { thread_id: sessionId } })
+      const messages = ((snapshot as any)?.values?.full_messages || (snapshot as any)?.values?.messages) as BaseMessage[] | undefined
+      if (!messages || messages.length === 0) return
+      
+      const session = this.chatHistoryService.loadSession(sessionId) || {
+        id: sessionId,
+        title: 'New Session',
+        boundTerminalTabId: boundTerminalId,
+        messages: new Map(),
+        lastCheckpointOffset: 0
+      }
+      this.updateSessionFromMessages(session, messages)
+      this.chatHistoryService.saveSession(session)
+    } catch (error) {
+      console.warn('[AgentService_v2] Failed to save session from checkpoint:', error)
+    }
+  }
+
+  // --- Session Management (Legacy / Internal) ---
+
+  private updateSessionFromMessages(session: ChatSession, messages: BaseMessage[]): void {
+    let persisted = messages.filter((m) => !this.helpers.isEphemeral(m))
+
+    // Check if the last message is an empty AI message and remove it if so
+    // if (persisted.length > 0) {
+    //   const lastMsg = persisted[persisted.length - 1]
+    //   if (AIMessage.isInstance(lastMsg)) {
+    //     const content = this.helpers.extractText(lastMsg.content).trim()
+    //     const hasToolCalls = (lastMsg as AIMessage).tool_calls && (lastMsg as AIMessage).tool_calls!.length > 0
+    //     if (!content && !hasToolCalls) {
+    //       persisted = persisted.slice(0, -1)
+    //     }
+    //   }
+    // }
+
+    const storedMessages = mapChatMessagesToStoredMessages(persisted)
+    const newMessagesMap = new Map<string, typeof storedMessages[0]>()
+
+    for (const msg of storedMessages) {
+      const msgId =
+        (msg as any)?.data?.additional_kwargs?._gyshellMessageId ||
+        (msg as any)?.additional_kwargs?._gyshellMessageId ||
+        uuidv4()
+      newMessagesMap.set(msgId, msg)
+    }
+
+    session.messages = newMessagesMap
+  }
+
+  loadChatSession(sessionId: string): ChatSession | null {
+    return this.chatHistoryService.loadSession(sessionId)
+  }
+
+  deleteChatSession(sessionId: string): void {
+    this.chatHistoryService.deleteSession(sessionId)
+  }
+
+  exportChatSession(sessionId: string): any | null {
+    return this.chatHistoryService.exportSession(sessionId)
+  }
+
+  rollbackToMessage(sessionId: string, messageId: string): { ok: boolean; removedCount: number } {
+    const session = this.chatHistoryService.loadSession(sessionId)
+    if (!session) {
+      return { ok: false, removedCount: 0 }
+    }
+
+    const entries = Array.from(session.messages.entries())
+    const idx = entries.findIndex(([id, msg]) => {
+      if (id === messageId) return true
+      const storedId = (msg as any)?.data?.additional_kwargs?._gyshellMessageId
+      return storedId === messageId
+    })
+    if (idx === -1) {
+      return { ok: false, removedCount: 0 }
+    }
+
+    const kept = entries.slice(0, idx)
+    session.messages = new Map(kept)
+    this.chatHistoryService.saveSession(session)
+
+    return { ok: true, removedCount: entries.length - idx }
+  }
+
+  getAllChatHistory() {
+    const backendSessions = this.chatHistoryService.getAllSessions()
+    const uiSessions = this.uiHistoryService.getAllSessions()
+
+    return backendSessions.map((backend) => {
+      const ui = uiSessions.find((u) => u.id === backend.id)
+      return {
+        ...backend,
+        title: ui?.title || backend.title,
+        messagesCount: ui?.messages.length || 0
+      }
+    })
+  }
+}

@@ -1,0 +1,106 @@
+.gy-confirm-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.5);
+  backdrop-filter: blur(4px);
+  /* Must be above other overlays (e.g. chat history z-index: 1000, tooltips ~10000). */
+  z-index: 20000;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+}
+
+.gy-confirm-card {
+  width: 100%;
+  max-width: 420px;
+  background: var(--panel-bg);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  box-shadow: 0 18px 40px rgba(0, 0, 0, 0.35);
+  overflow: hidden;
+}
+
+.gy-confirm-header {
+  height: 44px;
+  padding: 0 14px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  border-bottom: 1px solid var(--border);
+
+  .icon-btn-sm {
+    color: var(--fg-muted);
+    
+    &:hover {
+      background: var(--control-bg-hover);
+      color: var(--fg);
+    }
+
+    svg {
+      stroke-width: 2.5px;
+    }
+  }
+}
+
+.gy-confirm-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--fg);
+}
+
+.gy-confirm-body {
+  padding: 14px 14px;
+}
+
+.gy-confirm-message {
+  font-size: 13px;
+  line-height: 1.45;
+  color: var(--fg-muted);
+  text-align: center;
+}
+
+.gy-confirm-footer {
+  padding: 12px 14px;
+  border-top: 1px solid var(--border);
+  display: flex;
+  justify-content: flex-end;
+  gap: 12px;
+  background: color-mix(in srgb, var(--app-bg) 85%, transparent);
+}
+
+.gy-btn {
+  height: 32px;
+  padding: 0 14px;
+  border-radius: 9px;
+  border: 1px solid transparent;
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.gy-btn-secondary {
+  background: transparent;
+  border-color: var(--border);
+  color: var(--fg);
+}
+.gy-btn-secondary:hover {
+  background: var(--control-bg-hover);
+}
+
+.gy-btn-primary {
+  background: var(--accent);
+  color: var(--bg);
+}
+.gy-btn-primary:hover {
+  filter: brightness(1.06);
+}
+
+.gy-btn-danger {
+  background: var(--danger);
+  color: white;
+}
+.gy-btn-danger:hover {
+  filter: brightness(1.06);
+}
+
+

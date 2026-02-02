@@ -1,0 +1,382 @@
+import Store from 'electron-store'
+import { v4 as uuidv4 } from 'uuid'
+import type { AgentEvent, AgentEventType } from '../types'
+import type { ChatMessage, UIChatSession, UIUpdateAction } from '../types/ui-chat'
+
+interface StoredUIHistory {
+  sessions: Record<string, UIChatSession>
+}
+
+export class UIHistoryService {
+  private store: Store<StoredUIHistory>
+  // Keep UI history hot in memory to avoid sync electron-store overhead on every stream chunk.
+  private sessionsCache: Record<string, UIChatSession>
+  private dirtySessions: Set<string> = new Set()
+  private renderModeBySession: Map<string, 'normal' | 'sub'> = new Map()
+
+  constructor() {
+    this.store = new Store<StoredUIHistory>({
+      name: 'gyshell-ui-history',
+      defaults: { sessions: {} }
+    })
+    this.sessionsCache = this.store.get('sessions') || {}
+  }
+
+  private saveSessions(sessions: Record<string, UIChatSession>): void {
+    this.store.set('sessions', sessions)
+  }
+
+  recordEvent(sessionId: string, event: AgentEvent): UIUpdateAction[] {
+    if (!this.sessionsCache[sessionId]) {
+      this.sessionsCache[sessionId] = {
+        id: sessionId,
+        title: 'New Chat',
+        messages: [],
+        updatedAt: Date.now()
+      }
+    }
+    if (!this.renderModeBySession.has(sessionId)) {
+      this.renderModeBySession.set(sessionId, 'normal')
+    }
+
+    const session = this.sessionsCache[sessionId]
+    session.updatedAt = Date.now()
+
+    const actions = this.processEvent(session, event, sessionId)
+    // Mark dirty but do not persist immediately (critical for smooth streaming UX).
+    this.dirtySessions.add(sessionId)
+    return actions
+  }
+
+  /**
+   * Flush UI history to disk. By design we persist at low frequency
+   * (e.g. on task completion / error / delete / rollback), not on every event.
+   */
+  flush(sessionId?: string): void {
+    if (sessionId) {
+      // Only flush if this session has changes; still writes full sessions map
+      // because electron-store persists the underlying JSON file as a whole.
+      if (!this.dirtySessions.has(sessionId)) return
+    } else if (this.dirtySessions.size === 0) {
+      return
+    }
+
+    this.saveSessions(this.sessionsCache)
+    if (sessionId) this.dirtySessions.delete(sessionId)
+    else this.dirtySessions.clear()
+  }
+
+  private processEvent(session: UIChatSession, event: AgentEvent, sessionId: string): UIUpdateAction[] {
+    const type = event.type as AgentEventType
+    const actions: UIUpdateAction[] = []
+
+    if (type === 'render_mode') {
+      const nextMode = event.renderMode === 'sub' ? 'sub' : 'normal'
+      this.renderModeBySession.set(sessionId, nextMode)
+      return actions
+    }
+
+    if (type === 'user_input') {
+      const message = this.createMessage({
+        role: 'user',
+        type: 'text',
+        content: event.content || '',
+        backendMessageId: event.messageId
+      }, sessionId)
+      session.messages.push(message)
+      this.checkAutoTitle(session, 'user', event.content || '')
+      actions.push({ type: 'ADD_MESSAGE', sessionId, message })
+    } else if (type === 'say') {
+      const lastMsg = session.messages[session.messages.length - 1]
+      const delta = event.content || event.outputDelta || ''
+      if (lastMsg && lastMsg.role === 'assistant' && lastMsg.type === 'text' && lastMsg.streaming) {
+        lastMsg.content += delta
+        actions.push({ type: 'APPEND_CONTENT', sessionId, messageId: lastMsg.id, content: delta })
+      } else {
+        const stopAction = this.stopLatestStreaming(session, sessionId)
+        if (stopAction) actions.push(stopAction)
+
+        const message = this.createMessage({
+          role: 'assistant',
+          type: 'text',
+          content: delta,
+          streaming: true,
+          backendMessageId: event.messageId
+        }, sessionId)
+        session.messages.push(message)
+        actions.push({ type: 'ADD_MESSAGE', sessionId, message })
+      }
+    } else if (type === 'command_started') {
+      const stopAction = this.stopLatestStreaming(session, sessionId)
+      if (stopAction) actions.push(stopAction)
+
+      const message = this.createMessage({
+        role: 'assistant',
+        type: 'command',
+        content: event.command || '',
+        metadata: {
+          commandId: event.commandId,
+          tabName: event.tabName || 'Terminal',
+          output: '',
+          isNowait: !!(event as any).isNowait,
+          collapsed: false
+        },
+        streaming: true,
+        backendMessageId: event.messageId
+      }, sessionId)
+      session.messages.push(message)
+      actions.push({ type: 'ADD_MESSAGE', sessionId, message })
+    } else if (type === 'command_finished') {
+      const msg = event.commandId
+        ? session.messages.find((m) => m.metadata?.commandId === event.commandId)
+        : [...session.messages].reverse().find((m) => m.type === 'command' && m.streaming)
+
+      if (msg) {
+        const patch = {
+          metadata: {
+            ...msg.metadata,
+            exitCode: event.exitCode,
+            output: (msg.metadata?.output || '') + (event.outputDelta || '') + (event.message ? `\nError: ${event.message}` : '')
+          },
+          streaming: false
+        }
+        Object.assign(msg, patch)
+        actions.push({ type: 'UPDATE_MESSAGE', sessionId, messageId: msg.id, patch })
+      }
+    } else if (type === 'tool_call') {
+      const stopAction = this.stopLatestStreaming(session, sessionId)
+      if (stopAction) actions.push(stopAction)
+
+      const message = this.createMessage({
+        role: 'assistant',
+        type: 'tool_call',
+        content: event.input || '',
+        metadata: {
+          output: event.output || '',
+          toolName: event.toolName || 'Tool Call'
+        },
+        streaming: false,
+        backendMessageId: event.messageId
+      }, sessionId)
+      session.messages.push(message)
+      actions.push({ type: 'ADD_MESSAGE', sessionId, message })
+    } else if (type === 'file_edit') {
+      const stopAction = this.stopLatestStreaming(session, sessionId)
+      if (stopAction) actions.push(stopAction)
+
+      const message = this.createMessage({
+        role: 'assistant',
+        type: 'file_edit',
+        content: event.output || '',
+        metadata: {
+          toolName: event.toolName || 'create_or_edit',
+          filePath: event.filePath,
+          action: event.action || 'edited',
+          diff: event.diff || '',
+          output: event.output || ''
+        },
+        streaming: false,
+        backendMessageId: event.messageId
+      }, sessionId)
+      session.messages.push(message)
+      actions.push({ type: 'ADD_MESSAGE', sessionId, message })
+    } else if (type === 'file_read') {
+      const stopAction = this.stopLatestStreaming(session, sessionId)
+      if (stopAction) actions.push(stopAction)
+
+      const message = this.createMessage({
+        role: 'assistant',
+        type: 'sub_tool',
+        content: event.output || '',
+        metadata: {
+          subToolTitle: `Read: ${event.filePath || 'unknown'}`,
+          subToolLevel: event.level || (String(event.output || '').startsWith('Error:') ? 'warning' : 'info'),
+          output: event.output || '',
+          collapsed: true
+        },
+        streaming: false,
+        backendMessageId: event.messageId
+      }, sessionId)
+      session.messages.push(message)
+      actions.push({ type: 'ADD_MESSAGE', sessionId, message })
+    } else if (type === 'command_ask') {
+      const stopAction = this.stopLatestStreaming(session, sessionId)
+      if (stopAction) actions.push(stopAction)
+
+      const message = this.createMessage({
+        role: 'system',
+        type: 'ask',
+        content: event.command || '',
+        metadata: {
+          approvalId: event.approvalId,
+          toolName: event.toolName || 'Command',
+          command: event.command || ''
+        },
+        streaming: false,
+        backendMessageId: event.messageId
+      }, sessionId)
+      session.messages.push(message)
+      actions.push({ type: 'ADD_MESSAGE', sessionId, message })
+    } else if (type === 'sub_tool_started') {
+      const stopAction = this.stopLatestStreaming(session, sessionId)
+      if (stopAction) actions.push(stopAction)
+
+      const message = this.createMessage({
+        role: 'assistant',
+        type: 'sub_tool',
+        content: '',
+        metadata: {
+          subToolTitle: event.title || event.toolName || 'Sub Tool',
+          subToolHint: event.hint,
+          output: '',
+          collapsed: true
+        },
+        streaming: true,
+        backendMessageId: event.messageId
+      }, sessionId)
+      session.messages.push(message)
+      actions.push({ type: 'ADD_MESSAGE', sessionId, message })
+    } else if (type === 'sub_tool_delta') {
+      const msg = event.messageId
+        ? session.messages.find((m) => m.backendMessageId === event.messageId)
+        : [...session.messages].reverse().find((m) => m.type === 'sub_tool' && m.streaming)
+
+      if (msg) {
+        const delta = event.outputDelta || ''
+        msg.metadata = {
+          ...msg.metadata,
+          output: (msg.metadata?.output || '') + delta
+        }
+        actions.push({ type: 'APPEND_OUTPUT', sessionId, messageId: msg.id, outputDelta: delta })
+      }
+    } else if (type === 'sub_tool_finished') {
+      const msg = event.messageId
+        ? session.messages.find((m) => m.backendMessageId === event.messageId)
+        : [...session.messages].reverse().find((m) => m.type === 'sub_tool' && m.streaming)
+      if (msg) {
+        msg.streaming = false
+        actions.push({ type: 'UPDATE_MESSAGE', sessionId, messageId: msg.id, patch: { streaming: false } })
+      }
+    } else if (type === 'done') {
+      const stopAction = this.stopLatestStreaming(session, sessionId)
+      if (stopAction) actions.push(stopAction)
+      actions.push({ type: 'DONE', sessionId })
+      // Ensure no messages are in streaming state under done status
+      session.messages.forEach(m => { m.streaming = false; });
+    } else if (type === 'alert') {
+      const stopAction = this.stopLatestStreaming(session, sessionId)
+      if (stopAction) actions.push(stopAction)
+
+      const message = this.createMessage({
+        role: 'system',
+        type: 'alert',
+        content: event.message || 'Unknown alert',
+        backendMessageId: event.messageId
+      }, sessionId)
+      session.messages.push(message)
+      actions.push({ type: 'ADD_MESSAGE', sessionId, message })
+    } else if (type === 'error') {
+      const stopAction = this.stopLatestStreaming(session, sessionId)
+      if (stopAction) actions.push(stopAction)
+
+      const message = this.createMessage({
+        role: 'system',
+        type: 'error',
+        content: event.message || 'Unknown error',
+        backendMessageId: event.messageId
+      }, sessionId)
+      session.messages.push(message)
+      actions.push({ type: 'ADD_MESSAGE', sessionId, message })
+      actions.push({ type: 'DONE', sessionId })
+    } else if (type === 'tokens_count') {
+      const message = this.createMessage({
+        role: 'system',
+        type: 'tokens_count',
+        content: '',
+        metadata: {
+          modelName: event.modelName,
+          totalTokens: event.totalTokens,
+          maxTokens: event.maxTokens
+        }
+      }, sessionId)
+      session.messages.push(message)
+      actions.push({ type: 'ADD_MESSAGE', sessionId, message })
+    } else if ((type as string) === 'rollback') {
+      // Core: handle rollback of memory cache
+      const mid = (event as any).messageId;
+      const idx = session.messages.findIndex(m => m.backendMessageId === mid);
+      if (idx !== -1) {
+        session.messages = session.messages.slice(0, idx);
+        this.dirtySessions.add(sessionId);
+        // Notify frontend UI to execute corresponding rollback Action
+        actions.push({ type: 'ROLLBACK' as any, sessionId, messageId: mid } as any);
+      }
+    }
+    return actions
+  }
+
+  private stopLatestStreaming(session: UIChatSession, sessionId: string): UIUpdateAction | null {
+    const messages = session.messages
+    for (let i = messages.length - 1; i >= 0; i--) {
+      if (messages[i].streaming) {
+        messages[i].streaming = false
+        return { type: 'UPDATE_MESSAGE', sessionId, messageId: messages[i].id, patch: { streaming: false } }
+      }
+    }
+    return null
+  }
+
+  private createMessage(msg: Omit<ChatMessage, 'id' | 'timestamp'>, sessionId: string): ChatMessage {
+    // User messages should always be in 'normal' render mode.
+    const renderMode = msg.role === 'user' ? 'normal' : (msg.renderMode ?? this.getRenderMode(sessionId))
+    return {
+      ...msg,
+      renderMode,
+      id: uuidv4(),
+      timestamp: Date.now()
+    }
+  }
+
+  private getRenderMode(sessionId: string): 'normal' | 'sub' {
+    return this.renderModeBySession.get(sessionId) || 'normal'
+  }
+
+  private checkAutoTitle(session: UIChatSession, role: string, content: string): void {
+    if (role === 'user' && session.messages.filter((m) => m.role === 'user').length === 1) {
+      session.title = content.slice(0, 20) + (content.length > 20 ? '...' : '')
+    }
+  }
+
+  getMessages(sessionId: string): ChatMessage[] {
+    return this.sessionsCache[sessionId]?.messages || []
+  }
+
+  getSession(sessionId: string): UIChatSession | null {
+    return this.sessionsCache[sessionId] || null
+  }
+
+  getAllSessions(): UIChatSession[] {
+    return Object.values(this.sessionsCache).sort((a, b) => b.updatedAt - a.updatedAt)
+  }
+
+  deleteSession(sessionId: string): void {
+    delete this.sessionsCache[sessionId]
+    this.dirtySessions.delete(sessionId)
+    this.saveSessions(this.sessionsCache)
+  }
+
+  rollbackToMessage(sessionId: string, backendMessageId: string): number {
+    const session = this.sessionsCache[sessionId]
+    if (!session) return 0
+
+    const idx = session.messages.findIndex((m) => m.backendMessageId === backendMessageId)
+    if (idx === -1) return 0
+
+    const removedCount = session.messages.length - idx
+    session.messages = session.messages.slice(0, idx)
+    this.dirtySessions.add(sessionId)
+    // Rollback is user-driven and low-frequency; persist immediately.
+    this.flush(sessionId)
+    return removedCount
+  }
+}

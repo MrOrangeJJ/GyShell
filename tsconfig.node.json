@@ -1,0 +1,15 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "composite": true,
+    "types": ["node"]
+  },
+  "include": [
+    "src/main/**/*",
+    "src/preload/**/*",
+    "src/renderer_v2/theme/themes.ts",
+    "src/renderer_v2/theme/builtInSchemes.ts",
+    "src/renderer_v2/theme/terminalColorSchemes.ts"
+  ]
+}
+

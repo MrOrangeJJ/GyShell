@@ -1,0 +1,199 @@
+.panel-terminal {
+  background: var(--panel-bg-2);
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  border-left: none; /* Ensure no double border if ChatPanel has border-right */
+}
+
+.terminal-tabs-container {
+  height: 30px;
+  display: flex;
+  align-items: center;
+  background: color-mix(in srgb, var(--control-bg) 70%, transparent);
+  position: relative;
+}
+
+.terminal-tabs-bar {
+  flex: 1;
+  height: 30px;
+  display: flex;
+  align-items: center;
+  padding-left: 8px;
+  gap: 2px;
+  overflow-x: auto;
+  /* Custom scrollbar */
+  scrollbar-width: thin;
+  scrollbar-color: var(--border) transparent;
+}
+
+.terminal-tabs-bar::-webkit-scrollbar {
+  height: 4px;
+}
+
+.terminal-tabs-bar::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.terminal-tabs-bar::-webkit-scrollbar-thumb {
+  background: var(--border);
+  border-radius: 2px;
+}
+
+.tab-add-btn {
+  margin: 0 8px;
+  z-index: 10;
+}
+
+.tab {
+  height: 24px;
+  padding: 0 4px 0 10px;
+  border-radius: 6px 6px 0 0;
+  background: color-mix(in srgb, var(--control-bg) 80%, transparent);
+  color: var(--fg-muted);
+  font-size: 12px;
+  display: flex;
+  align-items: center;
+  gap: 3px;
+  cursor: pointer;
+  border-bottom: 2px solid transparent;
+  transition: background 0.2s;
+}
+
+.tab-title {
+  max-width: 140px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tab-close {
+  margin: 0;
+  height: 18px;
+  width: 18px;
+  border-radius: 3px;
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--fg-faint);
+  display: grid;
+  place-items: center;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 0.15s, background 0.15s, color 0.15s;
+  line-height: 0;
+  padding: 0;
+}
+
+.tab:hover .tab-close,
+.tab.is-active .tab-close {
+  opacity: 1;
+}
+
+.tab-close:hover {
+  background: var(--control-bg-hover);
+  color: var(--fg);
+  border-color: var(--border);
+}
+
+.tab:hover {
+  background: var(--control-bg-hover);
+}
+
+.tab.is-active {
+  background: var(--panel-bg-2); /* Matches body to look seamless */
+  color: var(--accent);
+  border-bottom: 2px solid var(--accent);
+}
+
+.tab-icon {
+  opacity: 0.7;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.tab-add-btn {
+  margin-left: 4px;
+  opacity: 0.6;
+}
+.tab-add-btn:hover {
+  opacity: 1;
+}
+
+/* Tab add dropdown */
+.tab-menu {
+  position: absolute;
+  top: 34px;
+  left: 8px;
+  min-width: 220px;
+  border-radius: 12px;
+  border: 1px solid var(--border);
+  background: color-mix(in srgb, var(--panel-bg) 92%, transparent);
+  box-shadow: var(--shadow);
+  padding: 6px;
+  z-index: 30;
+}
+
+.tab-menu-item {
+  width: 100%;
+  height: 32px;
+  border-radius: 10px;
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--fg);
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 0 10px;
+  cursor: pointer;
+}
+
+.tab-menu-item:hover {
+  background: var(--control-bg-hover);
+  border-color: var(--border);
+}
+
+.tab-menu-item span {
+  font-size: 13px;
+  color: var(--fg);
+}
+
+.tab-menu-sep {
+  height: 1px;
+  background: var(--border);
+  margin: 6px 4px;
+}
+
+/* Override generic panel body for terminal specific needs */
+.panel-terminal .panel-body {
+  padding: 0;
+  background: var(--app-bg); /* Use darker bg for terminal area */
+  overflow: hidden; /* Terminal handles its own scrolling */
+}
+
+.panel-terminal .placeholder {
+  display: grid;
+  place-items: center;
+  height: 100%;
+  color: var(--fg-faint);
+  font-family: var(--font-mono);
+  font-size: 14px;
+}
+
+.terminal-stack {
+  position: relative;
+  height: 100%;
+  width: 100%;
+}
+
+.terminal-layer {
+  position: absolute;
+  inset: 0;
+  display: none;
+}
+
+.terminal-layer.is-active {
+  display: block;
+}
+
+

@@ -1,0 +1,33 @@
+.xterm-host {
+  height: 100%;
+  width: 100%;
+  padding: 0 10px;
+  box-sizing: border-box;
+  background: var(--app-bg);
+  overflow: hidden;
+}
+
+.xterm-host .xterm {
+  height: 100%;
+  background: var(--app-bg) !important;
+}
+
+.xterm-host .xterm-viewport {
+  background-color: var(--app-bg) !important;
+}
+
+.xterm-host canvas {
+  background-color: var(--app-bg) !important;
+}
+
+/* Scrollbar styles - hidden by default, visible when scrolling */
+.xterm-host .xterm-scrollable-element > .scrollbar {
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 200ms linear;
+}
+
+.xterm-host.is-scrollbar-visible .xterm-scrollable-element > .scrollbar {
+  opacity: 1;
+  pointer-events: auto;
+}

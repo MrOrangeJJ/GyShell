@@ -1,0 +1,119 @@
+.win-select {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  vertical-align: middle; // Prevent pushing lines/overlapping
+  width: auto;
+  min-width: 0;
+}
+
+// Base trigger layout only (do NOT override background/border/padding)
+.win-select-trigger {
+  // IMPORTANT: this is a <button>. Reset ALL UA button styling so it can look
+  // identical to the original mac-styled <select> (via passed-in className).
+  appearance: none;
+  -webkit-appearance: none;
+  border: none;
+  background: transparent;
+  padding: 0;
+  margin: 0;
+  font: inherit;
+  color: inherit;
+  text-align: left;
+  outline: none;
+
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  line-height: 1.2;
+  cursor: pointer;
+  user-select: none;
+  transition: all 0.15s ease;
+
+  // Ensure the trigger can shrink and ellipsis works
+  min-width: 0;
+}
+
+.win-select-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+
+// Popup menu (custom, consistent across platforms)
+.win-select-menu {
+  position: fixed; // positioned by JS
+  width: max-content; // Fit the widest option, then all options fill this width
+  min-width: 0;
+  max-width: 320px;
+  overflow: auto;
+  padding: 4px;
+  border-radius: 12px;
+  background: var(--panel-bg);
+  border: 1px solid var(--border-strong);
+  box-shadow: 0 10px 40px rgba(0, 0, 0, 0.5), 0 0 0 1px rgba(255, 255, 255, 0.05);
+  z-index: 2000;
+  animation: win-select-fade-in 0.1s ease-out;
+}
+
+@keyframes win-select-fade-in {
+  from { opacity: 0; transform: translateY(-4px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+.win-select-option {
+  display: block;
+  width: 100%; // Fill parent width so all options have same width
+  text-align: left;
+  border: none;
+  background: transparent;
+  color: var(--fg);
+  padding: 4px 8px;
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 12px;
+  line-height: 1.4;
+  margin-bottom: 1px;
+  white-space: nowrap; // keep one-line so width can fit longest option
+}
+
+.win-select-option:last-child {
+  margin-bottom: 0;
+}
+
+.win-select-option:hover {
+  background: var(--control-bg-hover);
+}
+
+.win-select-option.is-selected {
+  background: color-mix(in srgb, var(--accent) 15%, transparent);
+  color: var(--accent);
+  font-weight: 500;
+}
+
+// Settings language row trigger: keep it visually identical to native <select> in settings.scss
+// (but rendered as a button)
+.settings-native-select.win-select-trigger {
+  background: color-mix(in srgb, var(--control-bg) 80%, white 3%);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 6px 12px;
+  outline: none;
+  font-size: 13px;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.1);
+  min-height: 32px;
+}
+
+.settings-native-select.win-select-trigger:hover {
+  background: var(--control-bg-hover);
+  border-color: var(--border-strong);
+  box-shadow: 0 2px 4px rgba(0, 0, 0, 0.15);
+}
+
+.settings-native-select.win-select-trigger:active {
+  transform: translateY(0.5px);
+  box-shadow: none;
+}
+

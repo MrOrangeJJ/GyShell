@@ -1,0 +1,60 @@
+.topbar {
+  height: 38px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 12px;
+  /* Use theme background for modern feel */
+  background: color-mix(in srgb, var(--app-bg) 86%, transparent);
+  backdrop-filter: blur(10px);
+  border-bottom: 1px solid var(--border);
+  -webkit-app-region: drag;
+}
+
+.topbar-left {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  /* Push content to avoid MacOS traffic lights */
+  padding-left: 80px; 
+}
+
+.topbar-title {
+  font-size: 12px;
+  letter-spacing: 0.3px;
+  color: var(--fg);
+  opacity: 0.92;
+  user-select: none;
+}
+
+.topbar-right {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  -webkit-app-region: no-drag;
+}
+
+.icon-btn {
+  height: 26px;
+  width: 26px;
+  border-radius: 7px;
+  border: 1px solid transparent;
+  background: var(--control-bg);
+  display: grid;
+  place-items: center;
+  cursor: pointer;
+  line-height: 0;
+  padding: 0;
+}
+
+.icon-btn:hover {
+  background: var(--control-bg-hover);
+  border-color: var(--border);
+}
+
+.icon-btn:active {
+  background: var(--control-bg-active);
+  border-color: var(--border-strong);
+}
+
+

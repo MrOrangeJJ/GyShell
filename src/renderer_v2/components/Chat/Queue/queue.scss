@@ -1,0 +1,138 @@
+.queue-stack {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 4px 0 6px;
+  max-height: 50vh;
+  overflow-y: auto;
+  padding-right: 4px;
+  scrollbar-width: thin;
+  scrollbar-color: var(--border) transparent;
+}
+
+.queue-stack.is-running {
+  opacity: 0.85;
+}
+
+.queue-card {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  background: color-mix(in srgb, var(--panel-bg) 60%, var(--app-bg));
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  cursor: grab;
+  transition: border-color 0.15s ease, background 0.15s ease;
+}
+
+.queue-card.is-hidden {
+  opacity: 0;
+  visibility: hidden;
+}
+
+.queue-card:hover {
+  z-index: 200;
+  border-color: var(--border-strong);
+  background: var(--panel-bg-2);
+}
+
+.queue-card-handle {
+  display: flex;
+  align-items: center;
+  color: var(--fg-faint);
+}
+
+.queue-card-content {
+  flex: 1;
+  font-size: 13px;
+  line-height: 1.45;
+  color: var(--fg);
+  max-height: 20px;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  transition: max-height 0.2s ease, white-space 0.2s ease;
+  user-select: none;
+  -webkit-user-select: none;
+}
+
+.queue-stack:not(.is-dragging) .queue-card:hover .queue-card-content {
+  white-space: normal;
+  max-height: 200px;
+}
+
+.queue-stack.is-dragging .queue-card-content {
+  white-space: nowrap;
+  max-height: 20px;
+}
+
+.queue-stack.is-dragging .queue-card-action {
+  pointer-events: none;
+}
+
+.queue-card-action {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  height: 24px;
+  width: 24px;
+  border-radius: 6px;
+  border: none;
+  background: var(--control-bg);
+  color: var(--fg-muted);
+  cursor: pointer;
+}
+
+.queue-card-action:hover:not(:disabled) {
+  background: var(--control-bg-hover);
+  color: var(--fg);
+}
+
+.queue-card-action:disabled {
+  cursor: not-allowed;
+  opacity: 0.4;
+}
+
+.queue-mode-btn {
+  &.is-active {
+    color: var(--accent) !important;
+    background: color-mix(in srgb, var(--accent) 10%, transparent) !important;
+    
+    &:hover {
+      background: color-mix(in srgb, var(--accent) 20%, transparent) !important;
+    }
+  }
+}
+
+.queue-area {
+  margin: 0 0 6px;
+}
+
+.queue-drop-line {
+  height: 2px;
+  border-radius: 999px;
+  background: var(--accent);
+  margin: 6px 8px;
+  pointer-events: none;
+}
+
+.queue-drop-spacer {
+  height: 16px;
+  pointer-events: none;
+}
+
+.queue-stack::-webkit-scrollbar {
+  width: 6px;
+}
+
+.queue-stack::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.queue-stack::-webkit-scrollbar-thumb {
+  background: var(--border);
+  border-radius: 999px;
+}
