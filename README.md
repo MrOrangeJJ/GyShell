@@ -1,4 +1,4 @@
-# <img src="icon.icns" width="32" height="32" valign="middle"> GyShell - AI-Native Terminal & SSH Client
+# <img src="icon.png" width="32" height="32" valign="middle"> GyShell - AI-Native Terminal & SSH Client
 
 [English](#english) | [中文](#chinese)
 
