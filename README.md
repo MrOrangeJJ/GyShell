@@ -1,7 +1,6 @@
 # <img src="icon.png" width="40" height="40" valign="middle"> GyShell
 
 > **The AI-Native Terminal that Thinks with You.**  
-> **一款会和你并肩思考的 AI 原生终端。**
 
 [![License](https://img.shields.io/badge/License-CC_BY--NC_4.0-lightgrey.svg)](https://creativecommons.org/licenses/by-nc/4.0/)
 [![Platform](https://img.shields.io/badge/Platform-macOS%20%7C%20Windows-blue.svg)](#-multi-platform-desktop-app--多平台桌面应用)
@@ -135,16 +134,14 @@ GyShell 针对终端交互的细微差别进行了底层优化：
 
 ---
 
-## 📄 License / 开源协议
+## 📄 License
 This project is licensed under the **Creative Commons Attribution-NonCommercial 4.0 International (CC BY-NC 4.0)**. 
 You are free to share and adapt the material, but you **must** give appropriate credit and you **may not** use the material for commercial purposes.
 
-本项目采用 **知识共享署名-非商业性使用 4.0 国际许可协议 (CC BY-NC 4.0)**。
-您可以自由地分享和修改本项目，但**必须**给出适当的署名，且**不得**将本项目用于商业目的。
 
 ---
 
-## 🛠️ Tech Stack / 技术栈
+## 🛠️ Tech Stack
 - **Framework**: Electron, Vite, React
 - **State Management**: MobX
 - **Terminal**: xterm.js, node-pty, ssh2
