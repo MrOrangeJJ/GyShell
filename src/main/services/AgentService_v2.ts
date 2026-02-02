@@ -149,6 +149,7 @@ export class AgentService_v2 {
 
     const activeProfile = settings.models.profiles.find((p) => p.id === activeProfileId)
     if (!activeProfile) {
+      console.warn('[AgentService_v2] Active profile not found:', activeProfileId)
       this.resetModels()
       return
     }
@@ -157,18 +158,16 @@ export class AgentService_v2 {
     const modelItem = settings.models.items.find((m) => m.id === globalModelId)
     
     if (!modelItem) {
-      if (globalModelId) {
-        console.warn('[AgentService_v2] Active profile references a missing model item:', {
-          activeProfileId,
-          globalModelId
-        })
-      }
+      console.warn('[AgentService_v2] Active profile references a missing model item:', {
+        activeProfileId,
+        globalModelId
+      })
       this.resetModels()
       return
     }
 
     if (!modelItem.apiKey) {
-      console.error('[AgentService_v2] Model item referenced but has no API Key.')
+      console.warn('[AgentService_v2] Model item referenced but has no API Key.')
       this.resetModels()
       return
     }

@@ -142,6 +142,12 @@ export class SettingsService {
 
     // keep effective fields consistent
     const effectiveModel = this.computeEffectiveModel(normalized as AppSettings)
+    
+    // Auto-activate the first profile if none is active and profiles exist
+    if (!normalized.models.activeProfileId && normalized.models.profiles.length > 0) {
+      normalized.models.activeProfileId = normalized.models.profiles[0].id
+    }
+
     const next: AppSettings = {
       ...(normalized as AppSettings),
       model: effectiveModel,
