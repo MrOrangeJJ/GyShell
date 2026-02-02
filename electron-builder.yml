@@ -14,6 +14,12 @@ asarUnpack:
   - '**/*.node'
 mac:
   icon: icon.icns
+  identity: "-"
+  hardenedRuntime: false
+  gatekeeperAssess: false
+  entitlements: null
+  extendInfo:
+    LSMinimumSystemVersion: "12.0.0"
   target:
     - target: dmg
       arch:
