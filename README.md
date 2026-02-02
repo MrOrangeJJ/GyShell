@@ -1,5 +1,7 @@
 # <img src="icon.png" width="32" height="32" valign="middle"> GyShell - AI-Native Terminal & SSH Client
 
+![GyShell Demo](demo_imgs/demo.png)
+
 [English](#english) | [中文](#chinese)
 
 ---
