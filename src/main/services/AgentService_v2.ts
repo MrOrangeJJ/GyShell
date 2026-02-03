@@ -430,23 +430,35 @@ export class AgentService_v2 {
       const modelWithTools = this.model.bindTools([...builtInTools, ...mcpTools])
 
       const messageId = uuidv4()
-      const stream = await modelWithTools.stream(state.messages, {
-        signal: config?.signal
-      })
-
-      let fullResponse: any = null
-
-      for await (const chunk of stream) {
-        fullResponse = fullResponse ? fullResponse.concat(chunk) : chunk
-        const delta = this.helpers.extractText(chunk.content)
-        if (delta) {
+      
+      const fullResponse = await this.helpers.invokeWithRetry(async (attempt) => {
+        if (attempt > 0) {
           this.helpers.sendEvent(sessionId, {
-            messageId,
-            type: 'say',
-            content: delta
+            type: 'alert',
+            message: `Retrying (${attempt}/4)...`,
+            level: 'info',
+            messageId: `retry-${messageId}-${attempt}`
           })
         }
-      }
+
+        const stream = await modelWithTools.stream(state.messages, {
+          signal: config?.signal
+        })
+
+        let response: any = null
+        for await (const chunk of stream) {
+          response = response ? response.concat(chunk) : chunk
+          const delta = this.helpers.extractText(chunk.content)
+          if (delta) {
+            this.helpers.sendEvent(sessionId, {
+              messageId,
+              type: 'say',
+              content: delta
+            })
+          }
+        }
+        return response
+      })
 
       // NOTE: We do NOT enforce single-tool here anymore.
       // Tool-call cleanup and batch/single selection is handled in batch_toolcall_executor.
@@ -537,22 +549,34 @@ export class AgentService_v2 {
 
       const messageId = uuidv4()
 
-      const stream = await modelWithTools.stream(state.messages, {
-        signal: config?.signal
-      })
-
-      let fullResponse: any = null
-      for await (const chunk of stream) {
-        fullResponse = fullResponse ? fullResponse.concat(chunk) : chunk
-        const delta = this.helpers.extractText(chunk.content)
-        if (delta) {
+      const fullResponse = await this.helpers.invokeWithRetry(async (attempt) => {
+        if (attempt > 0) {
           this.helpers.sendEvent(sessionId, {
-            messageId,
-            type: 'say',
-            content: delta
+            type: 'alert',
+            message: `Retrying (${attempt}/4)...`,
+            level: 'info',
+            messageId: `retry-${messageId}-${attempt}`
           })
         }
-      }
+
+        const stream = await modelWithTools.stream(state.messages, {
+          signal: config?.signal
+        })
+
+        let response: any = null
+        for await (const chunk of stream) {
+          response = response ? response.concat(chunk) : chunk
+          const delta = this.helpers.extractText(chunk.content)
+          if (delta) {
+            this.helpers.sendEvent(sessionId, {
+              messageId,
+              type: 'say',
+              content: delta
+            })
+          }
+        }
+        return response
+      })
 
       const usage = (fullResponse as any)?.usage_metadata || (fullResponse as any)?.additional_kwargs?.usage
       let currentTokens = state.token_state.current_tokens
@@ -1300,36 +1324,53 @@ export class AgentService_v2 {
       boundTerminalId: boundTerminalId // Pass terminal context into graph
     }
 
-    try {
-      const result = await this.graph.invoke(initialState, {
-        recursionLimit: 200,
-        signal,
-        configurable: { thread_id: sessionId }
-      })
+      try {
+        const result = await this.graph.invoke(initialState, {
+          recursionLimit: 200,
+          signal,
+          configurable: { thread_id: sessionId }
+        })
 
-      // Persistence
-      if (result && (result.full_messages || result.messages)) {
-        const finalMessages = result.full_messages || result.messages
-        const sessionToSave = loadedSession || {
-          id: sessionId,
-          title: 'New Session',
-          boundTerminalTabId: boundTerminalId,
-          messages: new Map(),
-          lastCheckpointOffset: 0
+        // Persistence
+        if (result && (result.full_messages || result.messages)) {
+          const finalMessages = result.full_messages || result.messages
+          const sessionToSave = loadedSession || {
+            id: sessionId,
+            title: 'New Session',
+            boundTerminalTabId: boundTerminalId,
+            messages: new Map(),
+            lastCheckpointOffset: 0
+          }
+          this.updateSessionFromMessages(sessionToSave, finalMessages as BaseMessage[])
+          this.chatHistoryService.saveSession(sessionToSave)
         }
-        this.updateSessionFromMessages(sessionToSave, finalMessages as BaseMessage[])
-        this.chatHistoryService.saveSession(sessionToSave)
-      }
-    } catch (err) {
-      console.error(`[AgentService_v2] Run task failed (sessionId=${sessionId}):`, err)
-      // For any error (Abort or internal Error), try to save all history in the current Checkpoint
-      await this.trySaveSessionFromCheckpoint(sessionId, boundTerminalId)
-      
-      if (this.helpers.isAbortError(err)) {
-        return
-      }
-      throw err // Throw to Gateway for UI notification
-    } finally {
+      } catch (err: any) {
+        console.error(`[AgentService_v2] Run task failed (sessionId=${sessionId}):`, err)
+        
+        // Use our new detail extraction helper
+        const errorDetails = this.helpers.extractErrorDetails(err)
+        const errorMessage = err.message || String(err)
+
+        // For any error (Abort or internal Error), try to save all history in the current Checkpoint
+        await this.trySaveSessionFromCheckpoint(sessionId, boundTerminalId)
+        
+        if (this.helpers.isAbortError(err)) {
+          return
+        }
+        
+        // Broadcast with full details
+        ;(global as any).gateway.broadcast({
+          type: 'agent:event',
+          sessionId,
+          payload: { 
+            type: 'error', 
+            message: errorMessage,
+            details: errorDetails
+          }
+        })
+
+        throw err // Throw to Gateway for UI notification
+      } finally {
       await this.clearCheckpoint(sessionId)
     }
   }

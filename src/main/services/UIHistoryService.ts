@@ -110,6 +110,13 @@ export class UIHistoryService {
       const stopAction = this.stopLatestStreaming(session, sessionId)
       if (stopAction) actions.push(stopAction)
 
+      // CRITICAL FIX: If there was a pending 'ask' message with the same ID, 
+      // remove it from history to prevent it from reappearing on reload.
+      const existingIdx = session.messages.findIndex(m => m.backendMessageId === event.messageId && m.type === 'ask')
+      if (existingIdx !== -1) {
+        session.messages.splice(existingIdx, 1)
+      }
+
       const message = this.createMessage({
         role: 'assistant',
         type: 'command',
@@ -127,6 +134,14 @@ export class UIHistoryService {
       session.messages.push(message)
       actions.push({ type: 'ADD_MESSAGE', sessionId, message })
     } else if (type === 'command_finished') {
+      // If this is a finished event for a rejected command, we might need to clear the ask message too
+      if (event.exitCode === -1 && event.outputDelta?.includes('User rejected')) {
+        const existingIdx = session.messages.findIndex(m => m.backendMessageId === event.messageId && m.type === 'ask')
+        if (existingIdx !== -1) {
+          session.messages.splice(existingIdx, 1)
+        }
+      }
+
       const msg = event.commandId
         ? session.messages.find((m) => m.metadata?.commandId === event.commandId)
         : [...session.messages].reverse().find((m) => m.type === 'command' && m.streaming)
@@ -271,6 +286,9 @@ export class UIHistoryService {
         role: 'system',
         type: 'alert',
         content: event.message || 'Unknown alert',
+        metadata: {
+          subToolLevel: event.level || 'warning'
+        },
         backendMessageId: event.messageId
       }, sessionId)
       session.messages.push(message)
@@ -283,6 +301,9 @@ export class UIHistoryService {
         role: 'system',
         type: 'error',
         content: event.message || 'Unknown error',
+        metadata: {
+          details: (event as any).details || ''
+        },
         backendMessageId: event.messageId
       }, sessionId)
       session.messages.push(message)

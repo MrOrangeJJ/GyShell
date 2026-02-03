@@ -103,13 +103,78 @@ export class AgentHelpers {
       configuration: {
         baseURL: item.baseUrl
       },
-      temperature
+      temperature,
+      maxRetries: 0 // Disable built-in retry to use our custom logic
     })
   }
 
   /**
-   * Compute read file support based on model profiles
+   * Custom retry logic for model invocation
    */
+  async invokeWithRetry<T>(
+    fn: (attempt: number) => Promise<T>,
+    maxRetries: number = 4,
+    delays: number[] = [1000, 2000, 4000, 6000]
+  ): Promise<T> {
+    let lastError: any
+    for (let attempt = 0; attempt < maxRetries; attempt++) {
+      try {
+        return await fn(attempt)
+      } catch (error: any) {
+        lastError = error
+        
+        // Never retry on user abort
+        if (this.isAbortError(error)) {
+          throw error
+        }
+
+        if (attempt < maxRetries - 1) {
+          const delay = delays[attempt]
+          console.warn(`[AgentService] Model invocation failed (Attempt ${attempt + 1}/${maxRetries}). Error: ${error.message}. Retrying in ${delay}ms...`)
+          await new Promise((resolve) => setTimeout(resolve, delay))
+          continue
+        }
+      }
+    }
+    throw lastError
+  }
+
+  isRetryableError(error: any): boolean {
+    // Legacy method, keeping for compatibility if needed elsewhere, 
+    // but invokeWithRetry now retries almost everything as requested.
+    if (this.isAbortError(error)) return false
+    return true
+  }
+
+  /**
+   * Extract deep error details from OpenAI/LangChain error objects
+   */
+  extractErrorDetails(error: any): string {
+    let details = ''
+    
+    // 1. Try to get the structured error from OpenAI SDK
+    if (error.error?.metadata?.raw) {
+      try {
+        const raw = typeof error.error.metadata.raw === 'string' 
+          ? JSON.parse(error.error.metadata.raw) 
+          : error.error.metadata.raw
+        details += `Provider Error:\n${JSON.stringify(raw, null, 2)}\n\n`
+      } catch {
+        details += `Provider Error (Raw):\n${error.error.metadata.raw}\n\n`
+      }
+    } else if (error.error?.message) {
+      details += `Provider Message: ${error.error.message}\n\n`
+    }
+
+    // 2. Add status and headers if available
+    if (error.status) details += `Status: ${error.status}\n`
+    
+    // 3. Add the full stack trace
+    details += `Stack Trace:\n${error.stack || error.toString()}`
+    
+    return details
+  }
+
   computeReadFileSupport(
     globalProfile?: ModelDefinition['profile'],
     thinkingProfile?: ModelDefinition['profile']

@@ -283,7 +283,7 @@ export class McpToolService extends EventEmitter {
 
   private renameTool(serverName: string, tool: StructuredTool): StructuredTool {
     const originalName = (tool as any).name || 'tool'
-    const prefixed = `${serverName}::${originalName}`
+    const prefixed = `${serverName}__${originalName}`
     ;(tool as any).name = prefixed
     if (typeof (tool as any).description === 'string') {
       ;(tool as any).description = `[${serverName}] ${(tool as any).description}`
@@ -310,7 +310,7 @@ export class McpToolService extends EventEmitter {
     state.tools = []
     state.error = undefined
     this.toolByName.forEach((_tool, key) => {
-      if (key.startsWith(`${name}::`)) {
+      if (key.startsWith(`${name}__`)) {
         this.toolByName.delete(key)
       }
     })

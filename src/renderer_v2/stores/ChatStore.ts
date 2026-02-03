@@ -31,6 +31,7 @@ export interface ChatMessage {
     modelName?: string
     totalTokens?: number
     maxTokens?: number
+    details?: string
   }
   timestamp: number
   streaming?: boolean

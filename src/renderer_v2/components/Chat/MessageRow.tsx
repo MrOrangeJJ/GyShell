@@ -30,6 +30,16 @@ export const MessageRow: React.FC<MessageRowProps> = observer(({
   
   const msg = session.messagesById.get(messageId)
   if (!msg) return null
+
+  // Logic: If this is an 'alert' (retry hint), only show it if it's the absolute last message in the session
+  // We check messageIds to see if this ID is the very last one.
+  const isLastMessage = session.messageIds[session.messageIds.length - 1] === messageId
+  const isRetryHint = msg.type === 'alert' && msg.metadata?.subToolLevel === 'info'
+  
+  if (isRetryHint && !isLastMessage) {
+    return null
+  }
+
   const renderModeClass = msg.renderMode === 'sub' ? 'render-mode-sub' : ''
 
   // Handle special message types
@@ -78,7 +88,10 @@ export const MessageRow: React.FC<MessageRowProps> = observer(({
   if (msg.type === 'alert' || msg.type === 'error') {
     return (
       <div className={renderModeClass}>
-        <AlertBanner msg={msg} />
+        <AlertBanner 
+          msg={msg} 
+          onRemove={() => store.chat.removeMessage(msg.id, sessionId)}
+        />
       </div>
     )
   }

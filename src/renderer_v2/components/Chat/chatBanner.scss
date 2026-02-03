@@ -16,48 +16,158 @@
 .message-banner.alert {
   border-color: var(--border);
   background: var(--control-bg);
+
+  .alert-head {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 10px 12px 6px 12px;
+
+    .banner-title {
+      flex: 1;
+    }
+
+    .banner-actions {
+      display: flex;
+      align-items: center;
+
+      .banner-close-btn {
+        background: none;
+        border: none;
+        padding: 2px;
+        cursor: pointer;
+        color: var(--fg-muted);
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        border-radius: 4px;
+        transition: all 0.2s;
+        opacity: 0.5;
+
+        &:hover {
+          opacity: 1;
+          background: rgba(var(--fg-rgb), 0.1);
+        }
+      }
+    }
+  }
+
+  .alert-body {
+    padding: 0 12px 10px 12px;
+    cursor: pointer;
+
+    .alert-hint {
+      font-size: 11px;
+      margin-top: 6px;
+      opacity: 0.6;
+      text-decoration: underline;
+    }
+  }
+
+  &.is-error {
+    border-color: color-mix(in srgb, var(--danger) 40%, transparent);
+    background: color-mix(in srgb, var(--danger) 5%, var(--control-bg));
+    
+    .banner-icon { color: var(--danger); }
+    .banner-type { color: var(--danger); }
+  }
+
+  &.is-retry {
+    border-color: color-mix(in srgb, var(--accent) 40%, transparent);
+    background: color-mix(in srgb, var(--accent) 5%, var(--control-bg));
+    border-style: dashed;
+    
+    .banner-icon { color: var(--accent); }
+    .banner-type { color: var(--accent); }
+    
+    .alert-content {
+      font-style: italic;
+      opacity: 0.8;
+    }
+  }
 }
 
-.message-banner.alert .banner-icon {
-  color: var(--warning);
-}
-
-.message-banner.alert.is-error .banner-icon,
-.message-banner.alert.is-error .banner-title {
-  color: var(--danger);
-}
-
-.message-banner.alert .banner-title {
-  color: var(--fg-muted);
-}
-
-.alert-head {
+// Modal Styles
+.gyshell-modal-overlay {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background: rgba(0, 0, 0, 0.6);
   display: flex;
   align-items: center;
-  gap: 10px;
-  padding: 10px 12px 6px 12px;
+  justify-content: center;
+  z-index: 10000;
+  backdrop-filter: blur(4px);
 }
 
-.message-banner.alert .banner-icon {
-  flex: 0 0 auto;
-}
+.gyshell-modal {
+  background: var(--app-bg);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  width: 80%;
+  max-width: 800px;
+  max-height: 80vh;
+  display: flex;
+  flex-direction: column;
+  box-shadow: 0 20px 40px rgba(0, 0, 0, 0.4);
 
-.message-banner.alert .banner-title {
-  flex: 0 0 auto;
-}
+  .modal-header {
+    padding: 16px 20px;
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
 
-.alert-body {
-  padding: 0 12px 10px 12px;
+    h3 {
+      margin: 0;
+      font-size: 16px;
+      font-weight: 600;
+      color: var(--fg);
+    }
+
+    .modal-close-btn {
+      background: none;
+      border: none;
+      padding: 4px;
+      cursor: pointer;
+      color: var(--fg-muted);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      border-radius: 6px;
+      transition: all 0.2s;
+
+      &:hover {
+        color: var(--fg);
+        background: rgba(var(--fg-rgb), 0.1);
+      }
+    }
+  }
+
+  .modal-body {
+    padding: 20px;
+    overflow-y: auto;
+
+    .error-details-pre {
+      margin: 0;
+      white-space: pre-wrap;
+      word-break: break-all;
+      font-family: var(--font-mono);
+      font-size: 13px;
+      line-height: 1.6;
+      color: var(--fg);
+      background: rgba(0, 0, 0, 0.2);
+      padding: 12px;
+      border-radius: 8px;
+    }
+  }
 }
 
 .alert-content {
   color: var(--fg);
   line-height: 1.4;
-}
-
-.message-banner.error {
-  border-color: color-mix(in srgb, var(--danger) 40%, transparent);
-  background: color-mix(in srgb, var(--danger) 5%, var(--control-bg));
 }
 
 .message-banner.command.nowait {
@@ -200,10 +310,6 @@
 
 .message-banner.command .banner-icon {
   color: var(--accent);
-}
-
-.message-banner.error .banner-icon {
-  color: var(--danger);
 }
 
 .banner-title {

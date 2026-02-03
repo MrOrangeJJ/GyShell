@@ -62,7 +62,7 @@ const COMMAND_READ_MAX_BYTES = 50 * 1024
 
 export async function runCommand(args: z.infer<typeof execCommandSchema>, context: ToolExecutionContext): Promise<string> {
   const { tabIdOrName, command } = args
-  const { terminalService, sessionId, messageId, sendEvent } = context
+  const { terminalService, sessionId, messageId } = context
   
   abortIfNeeded(context.signal)
   const { found, bestMatch } = terminalService.resolveTerminal(tabIdOrName)
@@ -73,18 +73,17 @@ export async function runCommand(args: z.infer<typeof execCommandSchema>, contex
     return `Error: Terminal tab "${tabIdOrName}" not found.`
   }
 
-  sendEvent(sessionId, { 
-    messageId,
-    type: 'command_started', 
-    command, 
-    commandId: messageId,
-    tabName: bestMatch.title || bestMatch.id,
-    isNowait: false
-  })
-
   const allowed = await checkCommandPolicy(command, 'run_command', context)
   if (!allowed.allowed) {
-    sendEvent(sessionId, {
+    context.sendEvent(sessionId, {
+      messageId,
+      type: 'command_started',
+      command,
+      commandId: messageId,
+      tabName: bestMatch.title || bestMatch.id,
+      isNowait: false
+    })
+    context.sendEvent(sessionId, {
       messageId,
       type: 'command_finished',
       command,
@@ -96,6 +95,15 @@ export async function runCommand(args: z.infer<typeof execCommandSchema>, contex
     return allowed.message
   }
 
+  context.sendEvent(sessionId, { 
+    messageId,
+    type: 'command_started', 
+    command, 
+    commandId: messageId,
+    tabName: bestMatch.title || bestMatch.id,
+    isNowait: false
+  })
+
   try {
     const result = await terminalService.runCommandAndWait(bestMatch.id, command, {
       signal: context.signal,
@@ -103,7 +111,7 @@ export async function runCommand(args: z.infer<typeof execCommandSchema>, contex
     })
     const historyCommandMatchId = result.history_command_match_id
     const truncatedOutput = truncateCommandOutput(result.stdoutDelta || '', historyCommandMatchId, bestMatch.id)
-    sendEvent(sessionId, { 
+    context.sendEvent(sessionId, { 
       messageId,
       type: 'command_finished', 
       command, 
@@ -118,7 +126,7 @@ export async function runCommand(args: z.infer<typeof execCommandSchema>, contex
       throw error
     }
     const errorMessage = error instanceof Error ? error.message : String(error)
-    sendEvent(sessionId, { 
+    context.sendEvent(sessionId, { 
       messageId,
       type: 'command_finished', 
       command, 
@@ -133,7 +141,7 @@ export async function runCommand(args: z.infer<typeof execCommandSchema>, contex
 
 export async function runCommandNowait(args: z.infer<typeof execCommandSchema>, context: ToolExecutionContext): Promise<string> {
   const { tabIdOrName, command } = args
-  const { terminalService, sessionId, messageId, sendEvent } = context
+  const { terminalService, sessionId, messageId } = context
   
   abortIfNeeded(context.signal)
   const { found, bestMatch } = terminalService.resolveTerminal(tabIdOrName)
@@ -144,18 +152,17 @@ export async function runCommandNowait(args: z.infer<typeof execCommandSchema>, 
     return `Error: Terminal tab "${tabIdOrName}" not found.`
   }
 
-  sendEvent(sessionId, { 
-    messageId,
-    type: 'command_started', 
-    command, 
-    commandId: messageId,
-    tabName: bestMatch.title || bestMatch.id,
-    isNowait: true
-  })
-
   const allowed = await checkCommandPolicy(command, 'run_command_nowait', context)
   if (!allowed.allowed) {
-    sendEvent(sessionId, {
+    context.sendEvent(sessionId, {
+      messageId,
+      type: 'command_started',
+      command,
+      commandId: messageId,
+      tabName: bestMatch.title || bestMatch.id,
+      isNowait: true
+    })
+    context.sendEvent(sessionId, {
       messageId,
       type: 'command_finished',
       command,
@@ -166,12 +173,22 @@ export async function runCommandNowait(args: z.infer<typeof execCommandSchema>, 
     })
     return allowed.message
   }
+
+  context.sendEvent(sessionId, { 
+    messageId,
+    type: 'command_started', 
+    command, 
+    commandId: messageId,
+    tabName: bestMatch.title || bestMatch.id,
+    isNowait: true
+  })
+
   try {
     const historyCommandMatchId = await terminalService.runCommandNoWait(bestMatch.id, command)
     return `Command started in background. Use read_command_output to view output and status(finished or running), history_command_match_id=${historyCommandMatchId}, terminalId=${bestMatch.id}.`
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : String(error)
-    sendEvent(sessionId, { 
+    context.sendEvent(sessionId, { 
       messageId,
       type: 'command_finished', 
       command, 
@@ -385,6 +402,7 @@ async function checkCommandPolicy(
     sendEvent: context.sendEvent,
     signal: context.signal
   })
+
   if (!approved) {
     return { allowed: false, message: `User rejected command: ${command}` }
   }

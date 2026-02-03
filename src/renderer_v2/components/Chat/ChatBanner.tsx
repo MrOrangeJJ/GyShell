@@ -327,23 +327,63 @@ export const AskBanner = observer(
   }
 )
 
-export const AlertBanner = observer(({ msg }: { msg: ChatMessage }) => {
+export const AlertBanner = observer(({ 
+  msg,
+  onRemove
+}: { 
+  msg: ChatMessage,
+  onRemove?: () => void
+}) => {
   const isError = msg.type === 'error'
-  const label = isError ? 'ERROR' : 'ALERT'
+  const isRetry = msg.type === 'alert' && msg.metadata?.subToolLevel === 'info'
+  const label = isError ? 'ERROR' : isRetry ? 'RETRYING' : 'ALERT'
+  const [showDetails, setShowDetails] = React.useState(false)
 
   return (
-    <div className={`message-banner alert ${isError ? 'is-error' : ''}`}>
-      <div className="alert-head">
-        <div className="banner-icon">
-          {isError ? <XCircle size={14} /> : <AlertTriangle size={14} />}
+    <>
+      <div className={`message-banner alert ${isError ? 'is-error' : ''} ${isRetry ? 'is-retry' : ''}`}>
+        <div className="alert-head">
+          <div className="banner-icon">
+            {isError ? <XCircle size={14} /> : isRetry ? <Loader2 size={14} className="spin" /> : <AlertTriangle size={14} />}
+          </div>
+          <div className="banner-title">
+            <span className="banner-type">{label}</span>
+          </div>
+          <div className="banner-actions">
+            {!isRetry && onRemove && msg.metadata?.subToolLevel !== 'info' && (
+              <button 
+                className="banner-close-btn" 
+                onClick={(e) => {
+                  e.stopPropagation()
+                  onRemove()
+                }}
+              >
+                <XCircle size={14} />
+              </button>
+            )}
+          </div>
         </div>
-        <div className="banner-title">
-          <span className="banner-type">{label}</span>
+        <div className="alert-body" onClick={() => isError && msg.metadata?.details && setShowDetails(true)}>
+          <div className="alert-content">{msg.content}</div>
+          {isError && msg.metadata?.details && (
+            <div className="alert-hint">Click to see details</div>
+          )}
         </div>
       </div>
-      <div className="alert-body">
-        <div className="alert-content">{msg.content}</div>
-      </div>
-    </div>
+
+      {showDetails && (
+        <div className="gyshell-modal-overlay" onClick={() => setShowDetails(false)}>
+          <div className="gyshell-modal" onClick={e => e.stopPropagation()}>
+            <div className="modal-header">
+              <h3>Error Details</h3>
+              <button className="modal-close-btn" onClick={() => setShowDetails(false)}><XCircle size={20} /></button>
+            </div>
+            <div className="modal-body">
+              <pre className="error-details-pre">{msg.metadata?.details}</pre>
+            </div>
+          </div>
+        </div>
+      )}
+    </>
   )
 })

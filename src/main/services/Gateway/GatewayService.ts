@@ -188,11 +188,8 @@ export class GatewayService extends EventEmitter implements IGateway {
         // User stopped manually, not treated as an error, handled by stopTask
         return;
       }
-      this.broadcast({
-        type: 'agent:event',
-        sessionId,
-        payload: { type: 'error', message: error.message || String(error) }
-      });
+      // Error broadcasting is now handled inside agentService.run for better detail capture,
+      // but we keep a fallback here just in case.
     } finally {
       if (context.activeRunId === runId) {
         // Unified cleanup of run state
