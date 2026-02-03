@@ -38,7 +38,11 @@ nsis:
   oneClick: true
   allowToChangeInstallationDirectory: false
   createDesktopShortcut: true
+  artifactName: "${productName}.Setup.${version}-${arch}.${ext}"
+portable:
+  artifactName: "${productName}.Portable.${version}-${arch}.${ext}"
 dmg:
+  artifactName: "${productName}-${version}-${arch}.${ext}"
   contents:
     - x: 410
       y: 150
