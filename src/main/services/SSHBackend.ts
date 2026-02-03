@@ -343,37 +343,43 @@ Write-Output "__GYSHELL_READY__"
     }
     const sshConfig = config as SSHConnectionConfig
 
-    return new Promise((resolve, reject) => {
-      const client = new ssh2.Client()
-      
-      const instance: SSHInstance = {
-        client,
-        dataCallbacks: new Set(),
-        exitCallbacks: new Set(),
-        isInitializing: true,
-        buffer: '',
-        oscBuffer: '',
-        forwardServers: [],
-        remoteForwards: [],
-        remoteForwardHandlerInstalled: false
+    const client = new ssh2.Client()
+    
+    const instance: SSHInstance = {
+      client,
+      dataCallbacks: new Set(),
+      exitCallbacks: new Set(),
+      isInitializing: true,
+      buffer: '',
+      oscBuffer: '',
+      forwardServers: [],
+      remoteForwards: [],
+      remoteForwardHandlerInstalled: false
+    }
+    this.sessions.set(config.id, instance)
+
+    // Start connection process in background so we can return the ID immediately
+    // and allow TerminalService to register data listeners.
+    ;(async () => {
+      const emit = (data: string) => {
+        instance.dataCallbacks.forEach(cb => cb(data))
       }
-      this.sessions.set(config.id, instance)
 
       client.on('ready', async () => {
+        emit('\x1b[2J\x1b[H\x1b[32m✔ Connection established.\x1b[0m\r\n')
         console.log(`[SSH] Connection ready for ${sshConfig.host}:${sshConfig.port}`)
         try {
+          emit('\x1b[36m▹ Setting up port forwards...\x1b[0m\r\n')
           console.log(`[SSH] Setting up port forwards...`)
           await this.setupPortForwards(instance, sshConfig)
         } catch (e: any) {
           console.error(`[SSH] Port forward setup failed:`, e)
-          reject(e instanceof Error ? e : new Error(String(e)))
-          return
+          emit(`\x1b[31m✘ Port forward failed: ${e.message}\x1b[0m\r\n`)
+          // We continue anyway to allow shell access
         }
 
-        // Detect OS via exec channel (so we do NOT spam the interactive terminal output).
-        // 1) Try unix via uname
-        // 2) Fallback to windows via cmd ver
         try {
+          emit('\x1b[36m▹ Detecting remote OS...\x1b[0m\r\n')
           console.log(`[SSH] Detecting remote OS...`)
           const uname = await this.execCollect(client, 'uname -s')
           const u = (uname.stdout || uname.stderr || '').toLowerCase()
@@ -395,14 +401,16 @@ Write-Output "__GYSHELL_READY__"
         if (!instance.remoteOs) instance.remoteOs = 'unix'
         console.log(`[SSH] Remote OS detected: ${instance.remoteOs}`)
 
+        emit('\x1b[36m▹ Opening interactive shell...\x1b[0m\r\n')
         console.log(`[SSH] Opening interactive shell...`)
         client.shell({ term: 'xterm-256color', cols: config.cols, rows: config.rows }, (err, stream) => {
           if (err) {
             console.error(`[SSH] Failed to open shell:`, err)
-            reject(err)
+            emit(`\x1b[31m✘ Failed to open shell: ${err.message}\x1b[0m\r\n`)
             return
           }
           instance.stream = stream
+          emit('\x1b[36m▹ Initializing shell integration...\x1b[0m\r\n')
           console.log(`[SSH] Shell stream opened. Starting robust initialization...`)
 
           let retryCount = 0
@@ -413,8 +421,6 @@ Write-Output "__GYSHELL_READY__"
             if (!instance.stream || isReadySent) return
             
             console.log(`[SSH] Injection attempt ${retryCount + 1}...`)
-            
-            // 1. Send Ctrl+C and multiple newlines to clear any pending prompts or error messages
             stream.write('\x03\n\n')
 
             setTimeout(() => {
@@ -424,8 +430,6 @@ Write-Output "__GYSHELL_READY__"
               } else {
                 const script = this.getUnixInjectionScript()
                 const b64 = Buffer.from(script).toString('base64')
-                // Use a more robust Unix injection that works even if base64 command has slight variations
-                // We add a leading space to avoid history and use printf/base64 combination
                 const injection = `  eval "$(printf '%s' '${b64}' | base64 -d 2>/dev/null || printf '%s' '${b64}' | base64 --decode 2>/dev/null)"\n`
                 
                 const CHUNK_SIZE = 256
@@ -436,23 +440,19 @@ Write-Output "__GYSHELL_READY__"
             }, 500)
           }
 
-          // Initial attempt
           setTimeout(attemptInjection, 1000)
 
-          // Watchdog with retry logic
           const watchdogInterval = setInterval(() => {
             if (instance.isInitializing) {
               retryCount++
               if (retryCount >= maxRetries) {
+                emit('\x1b[31m✘ Initialization failed. Entering fallback mode.\x1b[0m\r\n')
                 console.error(`[SSH] Initialization FAILED after ${maxRetries} attempts for ${config.id}.`)
-                console.error(`[SSH] Final buffer snippet:`, instance.buffer.slice(-500))
                 clearInterval(watchdogInterval)
-                // We don't reject here to allow the user to at least see the terminal, 
-                // but the agent won't work correctly.
                 instance.isInitializing = false 
                 return
               }
-              console.warn(`[SSH] Initialization timeout, retrying (${retryCount}/${maxRetries})...`)
+              emit(`\x1b[33m⚠ Initialization timeout, retrying (${retryCount}/${maxRetries})...\x1b[0m\r\n`)
               attemptInjection()
             } else {
               clearInterval(watchdogInterval)
@@ -461,12 +461,10 @@ Write-Output "__GYSHELL_READY__"
 
           stream.on('data', (data: Buffer) => {
             const chunk = data.toString()
-            
             if (instance.isInitializing) {
               instance.buffer += chunk
-
               if (instance.buffer.includes('__GYSHELL_READY__')) {
-                console.log(`[SSH] Received __GYSHELL_READY__ marker for ${config.id}`)
+                emit('\x1b[2J\x1b[H') // Clear screen
                 isReadySent = true
                 clearInterval(watchdogInterval)
                 const sawContinuation = /(?:\r?\n)>>\s*\r?\n/.test(instance.buffer) || instance.buffer.trimEnd().endsWith('\n>>') || instance.buffer.trimEnd().endsWith('\r\n>>')
@@ -474,26 +472,16 @@ Write-Output "__GYSHELL_READY__"
                 const parts = instance.buffer.split('__GYSHELL_READY__')
                 if (parts.length > 1) {
                   const realContent = parts.slice(1).join('__GYSHELL_READY__').trimStart()
-                  if (realContent) {
-                     instance.dataCallbacks.forEach(cb => cb(realContent))
-                  }
+                  if (realContent) emit(realContent)
                 }
                 instance.buffer = '' 
-                // Some Windows PowerShell sessions may show a continuation prompt (">>") right after injection.
-                // Only if we actually saw it, send one extra Enter (CR) to clear it.
                 if (sawContinuation && instance.remoteOs === 'windows' && instance.stream) {
-                  setTimeout(() => {
-                    try {
-                      instance.stream?.write('\r')
-                    } catch {
-                      // ignore
-                    }
-                  }, 50)
+                  setTimeout(() => { try { instance.stream?.write('\r') } catch {} }, 50)
                 }
               }
             } else {
               this.consumeOscMarkers(instance, chunk)
-              instance.dataCallbacks.forEach(cb => cb(chunk))
+              emit(chunk)
             }
           })
 
@@ -504,14 +492,13 @@ Write-Output "__GYSHELL_READY__"
             client.end()
             this.sessions.delete(config.id)
           })
-
-          resolve(config.id)
         })
       })
 
       client.on('error', (err) => {
         console.error(`[SSH] Client error:`, err)
-        reject(err)
+        emit(`\x1b[31m✘ SSH Error: ${err.message}\x1b[0m\r\n`)
+        instance.exitCallbacks.forEach(cb => cb(-1))
       })
 
       const connectConfig: ssh2.ConnectConfig = {
@@ -525,30 +512,39 @@ Write-Output "__GYSHELL_READY__"
         connectConfig.password = sshConfig.password
       } else if (sshConfig.authMethod === 'privateKey') {
         if (sshConfig.privateKey) {
-            connectConfig.privateKey = sshConfig.privateKey
+          connectConfig.privateKey = sshConfig.privateKey
         } else if (sshConfig.privateKeyPath) {
-             connectConfig.privateKey = fs.readFileSync(sshConfig.privateKeyPath)
+          try {
+            connectConfig.privateKey = fs.readFileSync(sshConfig.privateKeyPath)
+          } catch (e: any) {
+            emit(`\x1b[31m✘ Failed to read private key: ${e.message}\x1b[0m\r\n`)
+          }
         }
         if (sshConfig.passphrase) {
           connectConfig.passphrase = sshConfig.passphrase
         }
       }
 
-      ;(async () => {
-        try {
-          console.log(`[SSH] Attempting to connect to ${sshConfig.host}:${sshConfig.port}...`)
-          const sock = await this.buildConnectSocketIfNeeded(sshConfig)
-          if (sock) {
-            console.log(`[SSH] Using proxy socket for connection.`)
-            connectConfig.sock = sock
-          }
-          client.connect(connectConfig)
-        } catch (e: any) {
-          console.error(`[SSH] Connection attempt failed:`, e)
-          reject(e instanceof Error ? e : new Error(String(e)))
+      try {
+        // Give TerminalService a tiny bit of time to register the listener
+        await new Promise(r => setTimeout(r, 50))
+        
+        emit(`\x1b[36m▹ Connecting to ${sshConfig.host}:${sshConfig.port}...\x1b[0m\r\n`)
+        console.log(`[SSH] Attempting to connect to ${sshConfig.host}:${sshConfig.port}...`)
+        const sock = await this.buildConnectSocketIfNeeded(sshConfig)
+        if (sock) {
+          emit('\x1b[36m▹ Using proxy socket...\x1b[0m\r\n')
+          connectConfig.sock = sock
         }
-      })()
-    })
+        client.connect(connectConfig)
+      } catch (e: any) {
+        const errMsg = e instanceof Error ? e.message : String(e)
+        emit(`\x1b[31m✘ Connection failed: ${errMsg}\x1b[0m\r\n`)
+        instance.exitCallbacks.forEach(cb => cb(-1))
+      }
+    })()
+
+    return config.id
   }
 
   write(ptyId: string, data: string): void {

@@ -95,11 +95,28 @@ export const zh = {
       smart: '智能模式'
     },
     commandPolicyModeDesc: {
-      safe: '最严格模式。仅允许执行白名单中的命令，其余命令一律拦截。',
-      standard: '平衡模式。允许白名单命令，拦截黑名单命令，未知命令需用户确认。',
-      smart: '信任模式。允许执行除黑名单以外的所有命令。'
+      safe: '对于不在名单中的未知命令，一律直接拦截。',
+      standard: '对于不在名单中的未知命令，会弹出对话框询问用户。',
+      smart: '对于不在名单中的未知命令，一律直接允许执行。'
     },
-    commandPolicyRuleDesc: '支持通配符规则。例如：\n- "ls *" 匹配 ls 及其所有参数\n- "rm -rf /" 精确匹配该危险命令\n- "*" 匹配所有命令',
+    commandPolicyRuleDesc: '规则优先级：黑名单 > 询问名单 > 白名单。匹配到名单的命令将直接执行对应动作，不受上方模式影响。支持通配符：\n- "ls *"：匹配 ls 及其所有参数\n- "rm -rf /"：精确匹配该危险命令\n- "*"：匹配所有可能的命令',
+    // New tooltips for other sections
+    tooltips: {
+      language: '切换界面的显示语言。目前支持简体中文和英文。',
+      fontSize: '设置终端字符的显示大小（单位：像素）。',
+      lineHeight: '设置终端行与行之间的间距倍数。',
+      scrollback: '终端在内存中保留的历史行数。超过此限制的旧输出将被丢弃。',
+      copyOnSelect: '开启后，在终端中用鼠标选中文本会自动复制到剪贴板，无需手动按键。',
+      rightClickToPaste: '开启后，在终端点击鼠标右键会直接粘贴剪贴板内容。关闭时，右键会显示上下文菜单。',
+      cursorStyle: '选择终端光标的视觉样式。',
+      cursorBlink: '终端光标是否以动画形式闪烁。',
+      themeCustom: '点击打开自定义主题的 JSON 配置文件。你可以按照现有格式添加自己的配色方案。',
+      themeReload: '手动重新加载自定义主题文件，使最新的 JSON 修改生效。',
+      modelAdd: '配置 AI 模型供应商。目前仅支持【OpenAI API 兼容】的接口格式（如 DeepSeek, Claude, Local LLM 等）。',
+      modelProfile: '配置组合（Profile）是在添加完基础模型后使用的。你可以为不同的任务指定不同的模型：\n\n1. 【全局模型 (Global)】：常规对话和任务处理的核心模型。如果你想全部使用同一个模型，只需设置此项，其余保持 None 即可。\n2. 【思考模型 (Thinking)】：仅在开启“思考模式”时使用，负责深度推理和复杂计划制定。\n3. 【执行模型 (Action)】：专门用于决策命令执行方式（如判断命令是否会阻塞、是否需要异步运行）。\n\n【重要提示】：现阶段不建议将带有“思维链 (CoT)”的模型（如 o1, r1 等）设为 Global 或 Action 模型，因为这会导致响应非常缓慢，且目前应用尚不支持显示这些模型的内部思维链内容。',
+      mcpConfig: '打开 MCP (Model Context Protocol) 配置文件。你可以通过此文件接入外部工具，如 Google 搜索、文件索引等。\n\n注意：应用可能无法自动获取你的系统环境变量路径。在配置 mcpServers 时，对于 command 字段（如 npm, node, uv, python 等），请务必填写【绝对路径】！\n例如：使用 "/usr/local/bin/node" 而不是简单的 "node"。',
+      skills: '技能是预定义的复杂任务指令模板。AI 会加载这些指令来更好地完成特定领域的工作。\n\n你可以通过“打开文件夹”来管理技能文件（.md 格式）。每个文件代表一个技能，包含 AI 执行任务所需的背景知识和步骤指南。',
+    },
   },
   connections: {
     title: '连接管理',

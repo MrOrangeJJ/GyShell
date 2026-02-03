@@ -1,5 +1,4 @@
 import { BaseMessage, ToolMessage } from '@langchain/core/messages'
-import { USER_INPUT_TAG } from './prompts'
 
 export class TokenManager {
   // Conservative estimate: 4 chars per token
@@ -118,9 +117,5 @@ export class TokenManager {
     return messages
   }
 
-  private static hasUserInputTag(msg: BaseMessage): boolean {
-    const content = typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content ?? '')
-    return content.includes(USER_INPUT_TAG)
-  }
 }
 

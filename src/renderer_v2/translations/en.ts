@@ -95,11 +95,28 @@ export const en = {
       smart: 'Smart'
     },
     commandPolicyModeDesc: {
-      safe: 'Strict mode. Only allow commands in the allowlist, block everything else.',
-      standard: 'Balanced mode. Allow allowlist, block denylist, ask for anything unknown.',
-      smart: 'Trust mode. Allow all commands except those in the denylist.'
+      safe: 'For unknown commands not in any list, block them immediately.',
+      standard: 'For unknown commands not in any list, ask the user for permission.',
+      smart: 'For unknown commands not in any list, allow them to execute immediately.'
     },
-    commandPolicyRuleDesc: 'Supports wildcard rules. Examples:\n- "ls *" matches ls with any args\n- "rm -rf /" matches exact command\n- "*" matches everything',
+    commandPolicyRuleDesc: 'Priority: Denylist > Asklist > Allowlist. Commands matching a list will follow that list\'s action regardless of the mode above. Wildcards supported:\n- "ls *": Matches ls with any arguments\n- "rm -rf /": Matches this exact dangerous command\n- "*": Matches every possible command',
+    // New tooltips for other sections
+    tooltips: {
+      language: 'Change the display language of the application interface.',
+      fontSize: 'Adjust the size of characters in the terminal (in pixels).',
+      lineHeight: 'Adjust the vertical spacing between lines in the terminal.',
+      scrollback: 'The number of output lines to keep in memory. Older lines are discarded when this limit is reached.',
+      copyOnSelect: 'When enabled, selecting text with the mouse will automatically copy it to the clipboard.',
+      rightClickToPaste: 'When enabled, right-clicking in the terminal will paste clipboard content. When disabled, it shows a context menu.',
+      cursorStyle: 'The visual appearance of the terminal cursor.',
+      cursorBlink: 'Whether the terminal cursor should blink.',
+      themeCustom: 'Open the JSON configuration file for custom themes. You can define your own color schemes here.',
+      themeReload: 'Manually reload the custom theme file to apply your latest JSON changes.',
+      modelAdd: 'Configure AI model providers. Currently, only [OpenAI API Compatible] interfaces are supported (e.g., DeepSeek, Claude, Local LLMs).',
+      modelProfile: 'Profiles are configured after adding Base Models. You can assign different models to specific tasks:\n\n1. [Global Model]: The core model for regular chat and task processing. If you want to use the same model for everything, just set this and leave others as None.\n2. [Thinking Model]: Used only in "Thinking Mode" for deep reasoning and complex planning.\n3. [Action Model]: Specifically used to decide how commands should be executed (e.g., judging if a command will hang and should run asynchronously).\n\n[IMPORTANT]: It is currently NOT recommended to use models with native "Chain of Thought" (CoT) (like o1, r1) as Global or Action models. This will make responses very slow, and the app does not yet support displaying their internal reasoning chains.',
+      mcpConfig: 'Open the MCP (Model Context Protocol) config. Use this to connect external tools like Google Search or File Indexers.\n\nNOTE: The app may not automatically find your system PATH. When configuring mcpServers, please use [ABSOLUTE PATHS] for the command field (e.g., npm, node, uv, python)!\nExample: Use "/usr/local/bin/node" instead of just "node".',
+      skills: 'Skills are predefined instruction templates for complex tasks. AI loads them to perform better in specific domains.\n\nClick "Open Folder" to manage skill files (.md format). Each file represents a skill containing background knowledge and step-by-step guides for the AI.',
+    },
   },
   connections: {
     title: 'Connections',

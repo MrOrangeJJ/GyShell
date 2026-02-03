@@ -214,6 +214,8 @@ export class TerminalService {
   }
 
   private handleExit(terminalId: string, code: number): void {
+    const tab = this.terminals.get(terminalId)
+    
     // Mark active task as aborted if terminal exits unexpectedly
     const activeTaskId = this.activeTaskByTerminal.get(terminalId)
     if (activeTaskId) {
@@ -224,24 +226,29 @@ export class TerminalService {
         task.exitCode = typeof code === 'number' ? code : -1
       }
       this.activeTaskByTerminal.delete(terminalId)
-    const observer = this.waitersByTaskId.get(activeTaskId)
-    if (observer) {
-      this.cleanupWaiter(activeTaskId)
-      observer.onError(new Error('Terminal exited while command was running.'))
-    }
+      const observer = this.waitersByTaskId.get(activeTaskId)
+      if (observer) {
+        this.cleanupWaiter(activeTaskId)
+        observer.onError(new Error('Terminal exited while command was running.'))
+      }
     }
 
-    this.terminals.delete(terminalId)
-    this.buffers.delete(terminalId)
-    this.selectionByTerminal.delete(terminalId)
-    this.oscParseBufByTerminal.delete(terminalId)
-    this.tasksByTerminal.delete(terminalId)
-    this.activeTaskByTerminal.delete(terminalId)
-    
-    const headless = this.headlessPtys.get(terminalId)
-    if (headless) {
-      headless.dispose()
-      this.headlessPtys.delete(terminalId)
+    // If terminal was still initializing, we do NOT delete it from the map.
+    // This allows the error message to remain visible in the UI.
+    // We only delete if it was a normally running terminal.
+    if (tab && !tab.isInitializing) {
+      this.terminals.delete(terminalId)
+      this.buffers.delete(terminalId)
+      this.selectionByTerminal.delete(terminalId)
+      this.oscParseBufByTerminal.delete(terminalId)
+      this.tasksByTerminal.delete(terminalId)
+      this.activeTaskByTerminal.delete(terminalId)
+      
+      const headless = this.headlessPtys.get(terminalId)
+      if (headless) {
+        headless.dispose()
+        this.headlessPtys.delete(terminalId)
+      }
     }
     
     this.sendToRenderer('terminal:exit', { terminalId, code })
@@ -424,15 +431,19 @@ export class TerminalService {
   }
 
   getAllTerminals(): TerminalTab[] {
-    return Array.from(this.terminals.values())
+    return Array.from(this.terminals.values()).filter(t => !t.isInitializing)
   }
 
   getCommandTask(terminalId: string, commandId: string): CommandTask | undefined {
+    const tab = this.terminals.get(terminalId)
+    if (!tab || tab.isInitializing) return undefined
     const taskMap = this.tasksByTerminal.get(terminalId)
     return taskMap ? taskMap[commandId] : undefined
   }
 
   getCommandTasks(terminalId: string): CommandTask[] {
+    const tab = this.terminals.get(terminalId)
+    if (!tab || tab.isInitializing) return []
     const taskMap = this.tasksByTerminal.get(terminalId)
     if (!taskMap) return []
     return Object.values(taskMap).sort((a, b) => b.startTime - a.startTime)

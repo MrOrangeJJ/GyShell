@@ -243,37 +243,69 @@
 }
 
 .editor-row {
-  height: 30px;
+  height: 34px;
   border-radius: 10px;
   border: 1px solid var(--border);
   background: var(--control-bg);
   display: grid;
-  grid-template-columns: 30px 1fr;
+  grid-template-columns: 34px 1fr;
   align-items: center;
   overflow: hidden;
+  position: relative;
+
+  &::after {
+    content: '';
+    position: absolute;
+    right: 10px;
+    top: 50%;
+    transform: translateY(-50%);
+    width: 0;
+    height: 0;
+    border-left: 4px solid transparent;
+    border-right: 4px solid transparent;
+    border-top: 4px solid var(--fg-muted);
+    pointer-events: none;
+    display: none; /* Only show for selects */
+  }
+
+  &:has(.editor-select)::after {
+    display: block;
+  }
 }
 
 .editor-icon {
-  display: grid;
-  place-items: center;
+  display: flex;
+  align-items: center;
+  justify-content: center;
   color: var(--fg-muted);
   line-height: 0;
   padding: 0;
-  /* optical alignment: fonts/icons often look slightly low */
-  transform: translateY(-1px);
 }
 
 .editor-input,
 .editor-select {
-  height: 30px;
+  height: 100%;
   border: none;
   outline: none;
   background: transparent;
   color: var(--fg);
-  padding: 0 8px;
-  /* avoid baseline forcing (it makes text look low); use optical padding instead */
-  line-height: 1.2;
-  padding-bottom: 1px;
+  padding: 0 10px;
+  display: flex;
+  align-items: center;
+  line-height: 1;
+  font-size: 13px;
+  width: 100%;
+  appearance: none;
+  -webkit-appearance: none;
+}
+
+.editor-select {
+  cursor: pointer;
+  padding-right: 24px; /* Space for arrow */
+}
+
+.editor-input::placeholder {
+  color: var(--fg-faint);
 }
 
 .editor-actions {

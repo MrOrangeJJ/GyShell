@@ -76,11 +76,22 @@
   padding: 18px 20px;
 }
 
+.settings-section-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 12px;
+  gap: 8px;
+}
+
 .settings-section-title {
   font-size: 14px;
   font-weight: 500;
   color: var(--fg);
   margin-bottom: 12px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
 }
 
 .theme-grid {
@@ -107,6 +118,7 @@
 
 .theme-tile:hover {
   background: var(--control-bg-hover);
+  border-color: var(--border);
 }
 
 .theme-tile:active {
@@ -704,6 +716,26 @@
   grid-template-columns: 34px 1fr;
   align-items: center;
   overflow: hidden;
+  position: relative;
+
+  &::after {
+    content: '';
+    position: absolute;
+    right: 10px;
+    top: 50%;
+    transform: translateY(-50%);
+    width: 0;
+    height: 0;
+    border-left: 4px solid transparent;
+    border-right: 4px solid transparent;
+    border-top: 4px solid var(--fg-muted);
+    pointer-events: none;
+    display: none;
+  }
+
+  &:has(.editor-select)::after {
+    display: block;
+  }
 }
 
 .editor-row:focus-within {
@@ -712,23 +744,28 @@
 }
 
 .editor-icon {
-  display: grid;
-  place-items: center;
+  display: flex;
+  align-items: center;
+  justify-content: center;
   color: var(--fg-muted);
   line-height: 0;
-  /* optical alignment: fonts/icons often look slightly low */
-  transform: translateY(-1px);
 }
 
-.editor-row .editor-input {
-  height: 34px;
+.editor-row .editor-input,
+.editor-row .editor-select {
+  height: 100%;
   border: none;
   outline: none;
   background: transparent;
   color: var(--fg);
   padding: 0 10px;
-  line-height: 1.2;
-  padding-bottom: 1px;
+  display: flex;
+  align-items: center;
+  line-height: 1;
+  font-size: 13px;
+  width: 100%;
+  appearance: none;
+  -webkit-appearance: none;
 
   /* Hide number input spinners */
   &[type='number']::-webkit-inner-spin-button,
@@ -740,6 +777,11 @@
     -moz-appearance: textfield;
     appearance: textfield;
   }
+}
+
+.editor-row .editor-select {
+  cursor: pointer;
+  padding-right: 24px;
 }
 
 .editor-footer {

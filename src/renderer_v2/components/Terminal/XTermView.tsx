@@ -59,7 +59,7 @@ export function XTermView(props: {
     const fit = new FitAddon()
     term.loadAddon(fit)
 
-    const webLinks = new WebLinksAddon((event, url) => {
+    const webLinks = new WebLinksAddon((_event, url) => {
       window.gyshell.system.openExternal(url).catch(() => {
         // ignore
       })

@@ -391,8 +391,16 @@ export class AppStore {
 
       // Setup Terminal Exit Listener
       window.gyshell.terminal.onExit(({ terminalId }) => {
-        // Automatically close tab when process exits
-        this.closeTab(terminalId)
+        // Only automatically close tab if it's NOT in initializing state.
+        // If it was initializing (e.g. SSH connecting), we want to keep it open
+        // so the user can see the error message.
+        const tab = this.terminalTabs.find(t => t.id === terminalId)
+        // Note: We can't easily check backend state here without a sync call,
+        // but we can assume if it's an SSH tab that just failed, we should keep it.
+        // A better way is to let the user manually close failed connections.
+        if (tab && tab.config.type === 'local') {
+          this.closeTab(terminalId)
+        }
       })
 
       // MCP tool status updates

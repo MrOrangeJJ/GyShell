@@ -332,10 +332,17 @@ export const SettingsView: React.FC<{ store: AppStore }> = observer(({ store }) 
         <div className="settings-section">
           {store.settingsSection === 'general' ? (
             <>
-              <div className="settings-section-title">{t.settings.general}</div>
+              <div className="settings-section-header">
+                <div className="settings-section-title">
+                  {t.settings.general}
+                </div>
+              </div>
               <div className="settings-rows">
                 <div className="settings-row">
-                  <label>{t.settings.language}</label>
+                  <div className="settings-row-label-with-info">
+                    <label>{t.settings.language}</label>
+                    <InfoTooltip content={t.settings.tooltips.language} />
+                  </div>
                   <Select
                     className="settings-native-select"
                     value={store.i18n.locale}
@@ -348,10 +355,17 @@ export const SettingsView: React.FC<{ store: AppStore }> = observer(({ store }) 
                 </div>
               </div>
 
-              <div className="settings-section-title" style={{ marginTop: 24 }}>{t.settings.terminal}</div>
+              <div className="settings-section-header" style={{ marginTop: 24 }}>
+                <div className="settings-section-title">
+                  {t.settings.terminal}
+                </div>
+              </div>
               <div className="settings-rows">
                 <div className="settings-row">
-                  <label>{t.settings.fontSize}</label>
+                  <div className="settings-row-label-with-info">
+                    <label>{t.settings.fontSize}</label>
+                    <InfoTooltip content={t.settings.tooltips.fontSize} />
+                  </div>
                   <NumericInput
                     className="settings-inline-input"
                     style={{ width: 80 }}
@@ -362,7 +376,10 @@ export const SettingsView: React.FC<{ store: AppStore }> = observer(({ store }) 
                   />
                 </div>
                 <div className="settings-row">
-                  <label>{t.settings.lineHeight}</label>
+                  <div className="settings-row-label-with-info">
+                    <label>{t.settings.lineHeight}</label>
+                    <InfoTooltip content={t.settings.tooltips.lineHeight} />
+                  </div>
                   <NumericInput
                     className="settings-inline-input"
                     style={{ width: 80 }}
@@ -374,7 +391,10 @@ export const SettingsView: React.FC<{ store: AppStore }> = observer(({ store }) 
                   />
                 </div>
                 <div className="settings-row">
-                  <label>{t.settings.scrollback}</label>
+                  <div className="settings-row-label-with-info">
+                    <label>{t.settings.scrollback}</label>
+                    <InfoTooltip content={t.settings.tooltips.scrollback} />
+                  </div>
                   <NumericInput
                     className="settings-inline-input"
                     style={{ width: 80 }}
@@ -385,7 +405,10 @@ export const SettingsView: React.FC<{ store: AppStore }> = observer(({ store }) 
                   />
                 </div>
                 <div className="settings-row">
-                  <label>{t.settings.cursorStyle}</label>
+                  <div className="settings-row-label-with-info">
+                    <label>{t.settings.cursorStyle}</label>
+                    <InfoTooltip content={t.settings.tooltips.cursorStyle} />
+                  </div>
                   <Select
                     className="settings-native-select"
                     value={store.settings?.terminal?.cursorStyle || 'block'}
@@ -398,7 +421,10 @@ export const SettingsView: React.FC<{ store: AppStore }> = observer(({ store }) 
                   />
                 </div>
                 <div className="settings-row">
-                  <label>{t.settings.cursorBlink}</label>
+                  <div className="settings-row-label-with-info">
+                    <label>{t.settings.cursorBlink}</label>
+                    <InfoTooltip content={t.settings.tooltips.cursorBlink} />
+                  </div>
                   <label className="switch">
                     <input
                       type="checkbox"
@@ -409,7 +435,10 @@ export const SettingsView: React.FC<{ store: AppStore }> = observer(({ store }) 
                   </label>
                 </div>
                 <div className="settings-row">
-                  <label>{t.settings.copyOnSelect}</label>
+                  <div className="settings-row-label-with-info">
+                    <label>{t.settings.copyOnSelect}</label>
+                    <InfoTooltip content={t.settings.tooltips.copyOnSelect} />
+                  </div>
                   <label className="switch">
                     <input
                       type="checkbox"
@@ -420,7 +449,10 @@ export const SettingsView: React.FC<{ store: AppStore }> = observer(({ store }) 
                   </label>
                 </div>
                 <div className="settings-row">
-                  <label>{t.settings.rightClickToPaste}</label>
+                  <div className="settings-row-label-with-info">
+                    <label>{t.settings.rightClickToPaste}</label>
+                    <InfoTooltip content={t.settings.tooltips.rightClickToPaste} />
+                  </div>
                   <label className="switch">
                     <input
                       type="checkbox"
@@ -439,16 +471,20 @@ export const SettingsView: React.FC<{ store: AppStore }> = observer(({ store }) 
               <div className="settings-section-header">
                 <div className="settings-section-title">{t.settings.theme}</div>
                 <div className="settings-actions">
-                  <button className="btn-secondary" onClick={() => store.openCustomThemeFile()}>
-                    {t.settings.openCustomThemes}
-                  </button>
-                  <button
-                    className="btn-icon-reload"
-                    onClick={() => store.reloadCustomThemes()}
-                    title={t.settings.reloadCustomThemes}
-                  >
-                    <RefreshCw size={14} />
-                  </button>
+                  <InfoTooltip content={t.settings.tooltips.themeCustom}>
+                    <button className="btn-secondary" onClick={() => store.openCustomThemeFile()}>
+                      {t.settings.openCustomThemes}
+                    </button>
+                  </InfoTooltip>
+                  <InfoTooltip content={t.settings.tooltips.themeReload}>
+                    <button
+                      className="btn-icon-reload"
+                      onClick={() => store.reloadCustomThemes()}
+                      title={t.settings.reloadCustomThemes}
+                    >
+                      <RefreshCw size={14} />
+                    </button>
+                  </InfoTooltip>
                 </div>
               </div>
               <div className="theme-grid">
@@ -483,7 +519,10 @@ export const SettingsView: React.FC<{ store: AppStore }> = observer(({ store }) 
           {store.settingsSection === 'models' ? (
             <>
               <div className="settings-section-header">
-                  <div className="settings-section-title">{t.settings.baseModels}</div>
+                  <div className="settings-section-title">
+                    {t.settings.baseModels}
+                    <InfoTooltip content={t.settings.tooltips.modelAdd} />
+                  </div>
                   <button className="icon-btn-sm" title={t.common.add} onClick={() => openModelEditor()}>
                       <Plus size={16} strokeWidth={2} />
                   </button>
@@ -519,6 +558,7 @@ export const SettingsView: React.FC<{ store: AppStore }> = observer(({ store }) 
 
               <div className="settings-section-title" style={{ marginTop: 32 }}>
                 {t.settings.profiles}
+                <InfoTooltip content={t.settings.tooltips.modelProfile} />
               </div>
               
               <div className="profiles-grid">
@@ -745,16 +785,23 @@ export const SettingsView: React.FC<{ store: AppStore }> = observer(({ store }) 
 
           {store.settingsSection === 'tools' ? (
             <>
-              <div className="settings-section-title">{t.settings.tools}</div>
+              <div className="settings-section-header">
+                <div className="settings-section-title">
+                  {t.settings.tools}
+                  <InfoTooltip content={t.settings.tooltips.mcpConfig} />
+                </div>
+              </div>
               <div className="settings-subsection-header">
                 <div className="settings-divider">
                   <span>{t.settings.mcpConfig}</span>
                   <i />
                 </div>
                 <div className="settings-actions">
-                  <button className="btn-secondary" onClick={() => store.openMcpConfig()}>
-                    {t.settings.editMcpConfig}
-                  </button>
+                  <InfoTooltip content={t.settings.tooltips.mcpConfig}>
+                    <button className="btn-secondary" onClick={() => store.openMcpConfig()}>
+                      {t.settings.editMcpConfig}
+                    </button>
+                  </InfoTooltip>
                   <button
                     className="btn-icon-reload"
                     onClick={() => store.reloadMcpTools()}
@@ -826,11 +873,16 @@ export const SettingsView: React.FC<{ store: AppStore }> = observer(({ store }) 
           {store.settingsSection === 'skills' ? (
             <>
               <div className="settings-section-header">
-                <div className="settings-section-title">{t.settings.skills}</div>
+                <div className="settings-section-title">
+                  {t.settings.skills}
+                  <InfoTooltip content={t.settings.tooltips.skills} />
+                </div>
                 <div className="settings-actions">
-                  <button className="btn-secondary" onClick={() => store.openSkillsFolder()}>
-                    {t.settings.openSkillsFolder}
-                  </button>
+                  <InfoTooltip content={t.settings.tooltips.skills}>
+                    <button className="btn-secondary" onClick={() => store.openSkillsFolder()}>
+                      {t.settings.openSkillsFolder}
+                    </button>
+                  </InfoTooltip>
                   <button className="icon-btn-sm" title={t.settings.addSkill} onClick={() => store.createSkill()}>
                     <Plus size={16} strokeWidth={2} />
                   </button>
