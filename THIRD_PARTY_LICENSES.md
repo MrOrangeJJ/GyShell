@@ -52,6 +52,14 @@ The following software may be included in this product:
 | web-tree-sitter | 0.26.3 | MIT | https://github.com/tree-sitter/tree-sitter |
 | zod | 3.25.32 | MIT | https://github.com/colinhacks/zod |
 
+### Special Acknowledgments & Code References
+
+The following projects have provided significant inspiration or code references for **GyShell**:
+
+| Project | License | Repository |
+| :--- | :--- | :--- |
+| Tabby | MIT | https://github.com/Eugeny/tabby |
+
 ---
 
 ## 开源协议声明
@@ -107,3 +115,11 @@ GyShell 采用 **知识共享署名-非商业性使用 4.0 国际许可协议 (C
 | uuid | 9.0.0 | MIT | https://github.com/uuidjs/uuid |
 | web-tree-sitter | 0.26.3 | MIT | https://github.com/tree-sitter/tree-sitter |
 | zod | 3.25.32 | MIT | https://github.com/colinhacks/zod |
+
+### 特别致谢与代码参考
+
+以下项目为 **GyShell** 提供了重要的灵感或代码参考：
+
+| 项目 | 协议 | 仓库地址 |
+| :--- | :--- | :--- |
+| Tabby | MIT | https://github.com/Eugeny/tabby |

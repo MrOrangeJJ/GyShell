@@ -11,7 +11,7 @@
     "start": "electron-vite preview",
     "build": "electron-vite build",
     "dist": "electron-vite build && electron-builder",
-    "dist:mac": "electron-vite build && electron-builder --mac --dir && bash scripts/fix-mac-signatures.sh && electron-builder --mac --prepackaged dist/mac && electron-builder --mac --prepackaged dist/mac-arm64",
+    "dist:mac": "export CSC_IDENTITY_AUTO_DISCOVERY=false && electron-vite build && electron-builder --mac --dir && bash scripts/fix-mac-signatures.sh && electron-builder --mac --prepackaged dist/mac-arm64",
     "dist:win": "electron-vite build && electron-builder --win --x64",
     "typecheck:node": "tsc --noEmit -p tsconfig.node.json",
     "typecheck:web": "tsc --noEmit -p tsconfig.web.json",

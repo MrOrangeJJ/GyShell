@@ -140,6 +140,8 @@ GyShell 针对终端交互的细微差别进行了底层优化：
 This project is licensed under the **Creative Commons Attribution-NonCommercial 4.0 International (CC BY-NC 4.0)**. 
 You are free to share and adapt the material, but you **must** give appropriate credit and you **may not** use the material for commercial purposes.
 
+### Special Acknowledgments
+This project uses code references and inspiration from [Tabby](https://github.com/Eugeny/tabby) (MIT License).
 
 ---
 
