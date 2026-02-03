@@ -29,6 +29,7 @@ Unlike traditional AI assistants that merely generate scripts or execute one-off
 ### ⚡ Deep Shell Optimization
 GyShell is built from the ground up to understand the nuances of terminal interaction:
 *   **Intelligent Execution Modes**: The Agent automatically decides whether to **Wait** for a command to finish (for quick tasks like `ls` or `grep`) or run in **No-Wait (Async) Mode** (for long-running servers or interactive UIs).
+*   **Smart Output Management**: Automatically truncates massive command outputs to save tokens while providing a dedicated tool (`read_command_output`) for the Agent to surgically read specific parts of the history.
 *   **C0 Control Characters & Signals**: Beyond just text, the Agent can send raw **Control Characters** (such as `Ctrl+C`, `ESC`, or `Enter`) to manage interactive programs like `vim`, `top`, or to interrupt hanging processes.
 *   **Clean History Integration**: GyShell tracks command status and environment changes seamlessly without injecting messy wrapper scripts into your terminal history.
 
@@ -76,6 +77,7 @@ GyShell is built from the ground up to understand the nuances of terminal intera
 ### ⚡ 深度 Shell 交互优化
 GyShell 针对终端交互的细微差别进行了底层优化：
 *   **智能执行模式**：Agent 会自动判断是**等待执行完成**（适用于 `ls`、`grep` 等快速任务），还是以**不等待（异步）模式**运行（适用于启动服务器或交互式 UI）。
+*   **智能输出管理**：自动截断海量的命令输出以节省 Token，同时为 Agent 提供专门的工具 (`read_command_output`) 来精确读取历史输出的特定部分。
 *   **C0 控制字符与信号**：除了发送文本，Agent 还能发送原始的 **C0 控制字符**（如 `Ctrl+C`、`ESC` 或 `Enter`），从而精准操控 `vim`、`top` 等交互式程序，或中断卡死的进程。
 *   **纯净的历史记录集成**：GyShell 能够无缝追踪指令状态和路径切换，而无需在您的终端历史中注入杂乱的包装脚本。
 
