@@ -6,6 +6,9 @@
 [![Platform](https://img.shields.io/badge/Platform-macOS%20%7C%20Windows-blue.svg)](#-multi-platform-desktop-app--多平台桌面应用)
 [![Shell](https://img.shields.io/badge/Shell-Zsh%20%7C%20Bash%20%7C%20PowerShell-orange.svg)](#-comprehensive-shell-support--全方位-shell-支持)
 
+> [!WARNING]
+> **Active Development Phase**: This project is in a high-speed development stage. Compatibility of chat history data between versions is not guaranteed. If significant breaking changes occur, they will be clearly marked in the Release notes with a major version jump. Currently, versions remain compatible.
+
 ---
 
 ![GyShell Demo](demo_imgs/demo.png)
@@ -41,6 +44,7 @@ GyShell is built from the ground up to understand the nuances of terminal intera
 *   **Thinking Mode**: Before execution, the Agent enters a dedicated reasoning phase to analyze complex tasks, ensuring accuracy and safety.
 *   **Context Awareness**: The AI "sees" your terminal output, understands your current working directory (CWD), and can even process files you've highlighted in the UI.
 *   **Token Management**: Built-in intelligent pruning ensures your long conversations stay within model limits without losing critical context.
+*   **Reliability & Retries**: Robust custom retry mechanism (4 attempts with exponential backoff) handles network glitches and API rate limits automatically.
 *   **Model Compatibility**: Supports any LLM that provides an **OpenAI-compatible API**. You can easily add your own models by providing an API Key and Base URL.
 
 ### 🌐 Professional Shell & SSH Client
@@ -89,6 +93,7 @@ GyShell 针对终端交互的细微差别进行了底层优化：
 *   **思考模式 (Thinking Mode)**：在执行任务前，Agent 会进入专门的推理阶段，分析复杂任务，确保执行的准确性与安全性。
 *   **上下文感知**：AI 能“看见”您的终端输出，理解当前工作目录（CWD），甚至能处理您在 UI 中选中的高亮内容。
 *   **Token 管理**：内置智能剪裁机制，确保长对话在模型限制内运行，同时不丢失关键上下文。
+*   **可靠性与重试**：内置健壮的自定义重试机制（4 次尝试，指数退避间隔），自动处理网络波动和 API 频率限制。
 *   **模型兼容性**：支持所有提供 **OpenAI 兼容接口** 的大语言模型。您可以通过提供 API Key 和 Base URL 轻松添加自定义模型。
 
 ### 🌐 专业级 Shell 与 SSH
