@@ -43,7 +43,8 @@ const DEFAULT_SETTINGS: AppSettings = {
   layout: {
     panelSizes: [30, 70],
     panelOrder: ['chat', 'terminal']
-  }
+  },
+  recursionLimit: 200
 }
 
 function isObject(x: unknown): x is Record<string, any> {

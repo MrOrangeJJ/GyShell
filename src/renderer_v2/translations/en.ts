@@ -46,6 +46,8 @@ export const en = {
     rightClickToPaste: 'Right Click to Paste',
     cursorStyle: 'Cursor Style',
     cursorBlink: 'Cursor Blink',
+    recursionLimit: 'Agent Recursion Limit',
+    recursionLimitInf: 'Infinite',
     cursorStyles: {
       block: 'Block',
       underline: 'Underline',
@@ -110,6 +112,7 @@ export const en = {
       rightClickToPaste: 'When enabled, right-clicking in the terminal will paste clipboard content. When disabled, it shows a context menu.',
       cursorStyle: 'The visual appearance of the terminal cursor.',
       cursorBlink: 'Whether the terminal cursor should blink.',
+      recursionLimit: 'The maximum number of steps the Agent can take in a single task. Increase this if you encounter "Recursion limit reached" errors. Setting to maximum enables infinite steps.',
       themeCustom: 'Open the JSON configuration file for custom themes. You can define your own color schemes here.',
       themeReload: 'Manually reload the custom theme file to apply your latest JSON changes.',
       modelAdd: 'Configure AI model providers. Currently, only [OpenAI API Compatible] interfaces are supported (e.g., DeepSeek, Claude, Local LLMs).',

@@ -22,6 +22,7 @@ import {
   sendCharSchema,
   writeAndEditSchema,
   waitSchema,
+  waitTerminalIdleSchema,
   buildToolsForThinkingModel,
 
   getThinkingModeAllowedToolNames,
@@ -891,6 +892,15 @@ export class AgentService_v2 {
           }
           break
         }
+        case 'wait_terminal_idle': {
+          try {
+            const validatedArgs = waitTerminalIdleSchema.parse(toolCall.args || {})
+            result = await toolImplementations.waitTerminalIdle(validatedArgs, executionContext)
+          } catch (err) {
+            result = `Parameter validation error for wait_terminal_idle: ${(err as Error).message}`
+          }
+          break
+        }
         default:
           result = `Tool "${toolCall.name}" is not supported.`
       }
@@ -1303,6 +1313,7 @@ export class AgentService_v2 {
     if (!this.graph) throw new Error('Graph not initialized')
 
     const { sessionId, boundTerminalId } = context
+    const recursionLimit = this.settings?.recursionLimit ?? 200
     const loadedSession = this.chatHistoryService.loadSession(sessionId)
     const baseMessages = loadedSession ? mapStoredMessagesToChatMessages(Array.from(loadedSession.messages.values())) : []
 
@@ -1326,7 +1337,7 @@ export class AgentService_v2 {
 
       try {
         const result = await this.graph.invoke(initialState, {
-          recursionLimit: 200,
+          recursionLimit: recursionLimit,
           signal,
           configurable: { thread_id: sessionId }
         })

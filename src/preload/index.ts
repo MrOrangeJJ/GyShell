@@ -84,6 +84,7 @@ interface AppSettings {
     panelSizes?: number[]
     panelOrder?: string[]
   }
+  recursionLimit?: number
 }
 
 interface CommandPolicyLists {

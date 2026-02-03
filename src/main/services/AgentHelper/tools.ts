@@ -6,13 +6,21 @@ import {
   readTerminalTabSchema, 
   readCommandOutputSchema,
   sendCharSchema, 
+  waitTerminalIdleSchema,
   runCommand, 
   runCommandNowait, 
   readTerminalTab, 
   readCommandOutput,
-  sendChar 
+  sendChar,
+  waitTerminalIdle
 } from './terminal_tools'
-import { BUILTIN_TOOL_INFO, THINK_TOOL_DESCRIPTION, THINKING_END_TOOL_DESCRIPTION, buildReadFileDescription } from './prompts'
+import { 
+  BUILTIN_TOOL_INFO, 
+  THINK_TOOL_DESCRIPTION, 
+  THINKING_END_TOOL_DESCRIPTION, 
+  buildReadFileDescription,
+  WAIT_TERMINAL_IDLE_DESCRIPTION
+} from './prompts'
 import type { ReadFileSupport } from './types'
 import { thinkSchema, thinkingEndSchema, waitSchema } from './thinking_tools'
 import { skillToolSchema, buildSkillToolDescription } from './skill_tools'
@@ -28,7 +36,8 @@ export {
   execCommandSchema, 
   readTerminalTabSchema, 
   readCommandOutputSchema,
-  sendCharSchema 
+  sendCharSchema,
+  waitTerminalIdleSchema
 } from './terminal_tools'
 
 export { readFileSchema } from './read_tools'
@@ -81,6 +90,11 @@ export function buildToolsForModel(readFileSupport: ReadFileSupport) {
       name: 'wait',
       description: BUILTIN_TOOL_INFO.find((t) => t.name === 'wait')?.description ?? '',
       schema: waitSchema
+    },
+    {
+      name: 'wait_terminal_idle',
+      description: WAIT_TERMINAL_IDLE_DESCRIPTION,
+      schema: waitTerminalIdleSchema
     }
   ].map((tool) => convertToOpenAITool(tool))
 }
@@ -118,6 +132,7 @@ export const toolImplementations = {
   readTerminalTab,
   readCommandOutput,
   sendChar,
+  waitTerminalIdle,
   writeAndEdit,
   runReadFile
 }

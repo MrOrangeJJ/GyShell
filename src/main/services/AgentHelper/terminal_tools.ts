@@ -32,6 +32,10 @@ export const sendCharSchema = z
     message: 'Provide a non-empty sequence list.'
   })
 
+export const waitTerminalIdleSchema = z.object({
+  tabIdOrName: z.string().describe('The ID or Name of the terminal tab to monitor')
+})
+
 // --- Constants ---
 
 export const C0_NAMES = [
@@ -377,6 +381,73 @@ export async function sendChar(args: z.infer<typeof sendCharSchema>, context: To
   })
 
   return output
+}
+
+export async function waitTerminalIdle(
+  args: z.infer<typeof waitTerminalIdleSchema>,
+  context: ToolExecutionContext
+): Promise<string> {
+  const { tabIdOrName } = args
+  const { terminalService, sessionId, messageId, sendEvent } = context
+
+  abortIfNeeded(context.signal)
+  const { found, bestMatch } = terminalService.resolveTerminal(tabIdOrName)
+  if (!bestMatch) {
+    return found.length > 1
+      ? `Error: Multiple terminal tabs found with name "${tabIdOrName}".`
+      : `Error: Terminal tab "${tabIdOrName}" not found.`
+  }
+
+  sendEvent(sessionId, {
+    messageId,
+    type: 'sub_tool_started',
+    toolName: 'wait_terminal_idle',
+    title: `Waiting for ${bestMatch.title || bestMatch.id} to be idle`,
+    hint: 'Monitoring terminal output stability...'
+  })
+
+  let lastContent = ''
+  let stableCount = 0
+  const maxWaitSeconds = 120
+  let elapsed = 0
+
+  while (elapsed < maxWaitSeconds) {
+    abortIfNeeded(context.signal)
+    
+    // Read last 100 lines
+    const currentContent = terminalService.getRecentOutput(bestMatch.id, 100)
+    
+    if (currentContent === lastContent && currentContent !== '') {
+      stableCount++
+    } else {
+      stableCount = 0
+      lastContent = currentContent
+    }
+
+    if (stableCount >= 4) {
+      const finalOutput = terminalService.getRecentOutput(bestMatch.id, 40)
+      sendEvent(sessionId, {
+        messageId,
+        type: 'sub_tool_finished',
+        output: finalOutput
+      })
+      return `Terminal is now idle. Recent output (last 40 lines):\n${finalOutput}`
+    }
+
+    await waitWithSignal(1000, context.signal)
+    elapsed++
+  }
+
+  const currentOutput = terminalService.getRecentOutput(bestMatch.id, 40)
+  const timeoutMsg = `Wait timeout: The terminal has been running for over 120s and is still not idle. Please check if the task is still running correctly. If you need to continue waiting, run this tool again. If you need to stop it, use send_char (e.g., Ctrl+C). Recent output:\n${currentOutput}`
+  
+  sendEvent(sessionId, {
+    messageId,
+    type: 'sub_tool_finished',
+    output: timeoutMsg
+  })
+
+  return timeoutMsg
 }
 
 // --- Internal Helpers ---

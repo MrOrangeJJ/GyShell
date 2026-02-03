@@ -353,6 +353,29 @@ export const SettingsView: React.FC<{ store: AppStore }> = observer(({ store }) 
                     ]}
                   />
                 </div>
+                <div className="settings-row">
+                  <div className="settings-row-label-with-info">
+                    <label>{t.settings.recursionLimit}</label>
+                    <InfoTooltip content={t.settings.tooltips.recursionLimit} />
+                  </div>
+                  <div className="settings-slider-container">
+                    <input
+                      type="range"
+                      className="settings-slider"
+                      min="100"
+                      max="1010"
+                      step="10"
+                      value={store.settings?.recursionLimit === 2147483647 ? 1010 : (store.settings?.recursionLimit || 200)}
+                      onChange={(e) => {
+                        const val = parseInt(e.target.value)
+                        store.setRecursionLimit(val === 1010 ? 2147483647 : val)
+                      }}
+                    />
+                    <span className="settings-slider-value">
+                      {store.settings?.recursionLimit === 2147483647 ? 'INF' : (store.settings?.recursionLimit || 200)}
+                    </span>
+                  </div>
+                </div>
               </div>
 
               <div className="settings-section-header" style={{ marginTop: 24 }}>

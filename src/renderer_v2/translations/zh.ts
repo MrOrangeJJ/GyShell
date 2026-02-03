@@ -46,6 +46,8 @@ export const zh = {
     rightClickToPaste: '右键直接粘贴',
     cursorStyle: '光标样式',
     cursorBlink: '光标闪烁',
+    recursionLimit: 'Agent 递归上限',
+    recursionLimitInf: '无限制',
     cursorStyles: {
       block: '方块',
       underline: '下划线',
@@ -110,6 +112,7 @@ export const zh = {
       rightClickToPaste: '开启后，在终端点击鼠标右键会直接粘贴剪贴板内容。关闭时，右键会显示上下文菜单。',
       cursorStyle: '选择终端光标的视觉样式。',
       cursorBlink: '终端光标是否以动画形式闪烁。',
+      recursionLimit: 'Agent 在单个任务中允许执行的最大步数。如果经常遇到“递归上限”错误，请调高此值。拉到最右侧为无限制。',
       themeCustom: '点击打开自定义主题的 JSON 配置文件。你可以按照现有格式添加自己的配色方案。',
       themeReload: '手动重新加载自定义主题文件，使最新的 JSON 修改生效。',
       modelAdd: '配置 AI 模型供应商。目前仅支持【OpenAI API 兼容】的接口格式（如 DeepSeek, Claude, Local LLM 等）。',

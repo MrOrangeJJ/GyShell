@@ -90,7 +90,8 @@ export const READ_COMMAND_OUTPUT_DESCRIPTION =
   'Read historical output of a specific command by history_command_match_id and terminal tab. Supports offset/limit for paging large outputs.'
 export const READ_FILE_DESCRIPTION = 'Read a file from a specific terminal tab.'
 export const THINK_TOOL_DESCRIPTION = 'Call this tool to enter THINKING MODE for deep analysis, reasoning, and planning. In THINKING MODE, a more powerful model will help you reason through the context and provide a clear direction. This tool takes no parameters.'
-export const WAIT_TOOL_DESCRIPTION = 'Wait for a specified number of seconds (5-60). Use this when you need to pause execution to wait for a background process to finish or a state to stabilize.'
+export const WAIT_TOOL_DESCRIPTION = 'Wait for a specified number of seconds (5-60). Use this when you need to pause execution to wait for a background process to finish or a state to stabilize. If you are waiting for a terminal command to finish or output to stabilize, prioritize using wait_terminal_idle instead.'
+export const WAIT_TERMINAL_IDLE_DESCRIPTION = 'Wait until the terminal output becomes stable (no changes for a few seconds) or a timeout (120s) is reached. Use this tool when you expect a command to take some time and want to wait for it to finish or reach a steady state before proceeding. It is much more efficient than the "wait" tool for terminal tasks.'
 
 export const THINKING_END_TOOL_DESCRIPTION = [
   'End THINKING MODE once your reasoning or planning is complete.',
@@ -130,6 +131,10 @@ export const BUILTIN_TOOL_INFO = [
   {
     name: 'wait',
     description: WAIT_TOOL_DESCRIPTION
+  },
+  {
+    name: 'wait_terminal_idle',
+    description: WAIT_TERMINAL_IDLE_DESCRIPTION
   }
 ]
 

@@ -148,6 +148,8 @@ export interface AppSettings {
     panelSizes?: number[]
     panelOrder?: string[] // e.g. ['chat', 'terminal']
   }
+  /** Agent recursion limit */
+  recursionLimit?: number
 }
 
 // ============ Terminal Types ============

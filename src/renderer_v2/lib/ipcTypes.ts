@@ -16,5 +16,3 @@ export enum PortForwardType {
 
 export type AppLanguage = AppSettings['language']
 export type ModelDefinition = AppSettings['models']['items'][number]
-
-

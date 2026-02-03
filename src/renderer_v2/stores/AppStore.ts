@@ -121,6 +121,7 @@ export class AppStore {
       reloadMcpTools: action,
       setMcpToolEnabled: action,
       setBuiltInToolEnabled: action,
+      setRecursionLimit: action,
       sendChatMessage: action,
       getUniqueTitle: action
     })
@@ -350,6 +351,15 @@ export class AppStore {
     runInAction(() => {
       this.builtInTools = builtInTools
     })
+  }
+
+  async setRecursionLimit(limit: number): Promise<void> {
+    runInAction(() => {
+      if (this.settings) {
+        this.settings.recursionLimit = limit
+      }
+    })
+    await window.gyshell.settings.set({ recursionLimit: limit })
   }
 
   async openCustomThemeFile(): Promise<void> {
