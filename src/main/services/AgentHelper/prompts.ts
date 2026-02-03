@@ -83,8 +83,11 @@ export const CREATE_OR_EDIT_TOOL_DESCRIPTION = [
   '- replaceAll: replace every occurrence in edit mode.'
 ].join('\n')
 
-export const EXEC_COMMAND_DESCRIPTION = 'Execute a shell command in a specific terminal tab. This appends a trailing "\\n" to run the command automatically. If you do NOT want auto-execute, use send_char instead. The system will decide whether to wait for completion.'
+export const EXEC_COMMAND_DESCRIPTION =
+  'Execute a shell command in a specific terminal tab. This appends a trailing "\\n" to run the command automatically. If you do NOT want auto-execute, use send_char instead. The system will decide whether to wait for completion. Command output may be truncated; use read_command_output with history_command_match_id and terminalId to read full output.'
 export const READ_TERMINAL_TAB_DESCRIPTION = 'Read the recent visible output of a specific terminal tab.'
+export const READ_COMMAND_OUTPUT_DESCRIPTION =
+  'Read historical output of a specific command by history_command_match_id and terminal tab. Supports offset/limit for paging large outputs.'
 export const READ_FILE_DESCRIPTION = 'Read a file from a specific terminal tab.'
 export const THINK_TOOL_DESCRIPTION = 'Call this tool to enter THINKING MODE for deep analysis, reasoning, and planning. In THINKING MODE, a more powerful model will help you reason through the context and provide a clear direction. This tool takes no parameters.'
 export const WAIT_TOOL_DESCRIPTION = 'Wait for a specified number of seconds (5-60). Use this when you need to pause execution to wait for a background process to finish or a state to stabilize.'
@@ -103,6 +106,10 @@ export const BUILTIN_TOOL_INFO = [
   {
     name: 'read_terminal_tab',
     description: READ_TERMINAL_TAB_DESCRIPTION
+  },
+  {
+    name: 'read_command_output',
+    description: READ_COMMAND_OUTPUT_DESCRIPTION
   },
   {
     name: 'read_file',
@@ -227,6 +234,7 @@ export function createBaseSystemPrompt(): SystemMessage {
       '- **Self-Correction**: If you detect an error in your own execution, acknowledge it and use THINK mode to fix it.',
       '- **Verification**: After executing a command, you MUST check the output or the state of the system to confirm it worked as expected. Never assume success without verification.',
       '- **Strict Adherence**: Follow user instructions precisely. If the user specifies a particular tool, path, or method, you must respect that.',
+      '- **Command Output Limits**: Command outputs may be truncated in exec_command. Use read_command_output with history_command_match_id and terminalId to read full output.',
       '',
       '# Environment Awareness & Pre-flight Checks',
       '- **No Assumptions**: You must NEVER assume the state of a terminal environment. Do not assume a command is installed, a path exists, or internet access is available.',

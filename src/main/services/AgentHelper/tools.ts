@@ -4,10 +4,12 @@ import { readFileSchema, runReadFile } from './read_tools'
 import { 
   execCommandSchema, 
   readTerminalTabSchema, 
+  readCommandOutputSchema,
   sendCharSchema, 
   runCommand, 
   runCommandNowait, 
   readTerminalTab, 
+  readCommandOutput,
   sendChar 
 } from './terminal_tools'
 import { BUILTIN_TOOL_INFO, THINK_TOOL_DESCRIPTION, THINKING_END_TOOL_DESCRIPTION, buildReadFileDescription } from './prompts'
@@ -25,6 +27,7 @@ export {
 export { 
   execCommandSchema, 
   readTerminalTabSchema, 
+  readCommandOutputSchema,
   sendCharSchema 
 } from './terminal_tools'
 
@@ -48,6 +51,11 @@ export function buildToolsForModel(readFileSupport: ReadFileSupport) {
       name: 'read_terminal_tab',
       description: BUILTIN_TOOL_INFO.find((t) => t.name === 'read_terminal_tab')?.description ?? '',
       schema: readTerminalTabSchema
+    },
+    {
+      name: 'read_command_output',
+      description: BUILTIN_TOOL_INFO.find((t) => t.name === 'read_command_output')?.description ?? '',
+      schema: readCommandOutputSchema
     },
     {
       name: 'read_file',
@@ -108,6 +116,7 @@ export const toolImplementations = {
   runCommand,
   runCommandNowait,
   readTerminalTab,
+  readCommandOutput,
   sendChar,
   writeAndEdit,
   runReadFile

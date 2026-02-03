@@ -13,6 +13,13 @@ export const readTerminalTabSchema = z.object({
   lines: z.number().optional().default(100).describe('Number of lines to read')
 })
 
+export const readCommandOutputSchema = z.object({
+  tabIdOrName: z.string().describe('The ID or Name of the terminal tab'),
+  history_command_match_id: z.string().describe('The unique command ID to read output from'),
+  offset: z.number().optional().describe('The line number to start reading from (0-based).'),
+  limit: z.number().optional().describe('The number of lines to read (defaults to 2000).')
+})
+
 export const sendCharSchema = z
   .object({
     tabIdOrName: z.string().describe('The ID or Name of the terminal tab'),
@@ -41,6 +48,16 @@ export const C0_CHAR_BY_NAME: Record<(typeof C0_NAMES)[number], string> = {
   CAN: '\x18', EM: '\x19', SUB: '\x1a', ESC: '\x1b', FS: '\x1c', GS: '\x1d', RS: '\x1e', US: '\x1f', DEL: '\x7f'
 }
 
+const COMMAND_OUTPUT_MAX_LINES = 200
+const COMMAND_OUTPUT_HEAD_LINES = 60
+const COMMAND_OUTPUT_TAIL_LINES = 60
+const COMMAND_OUTPUT_MAX_LINE_LENGTH = 2000
+const COMMAND_OUTPUT_MAX_BYTES = 50 * 1024
+
+const COMMAND_READ_DEFAULT_LIMIT = 2000
+const COMMAND_READ_MAX_LINE_LENGTH = 2000
+const COMMAND_READ_MAX_BYTES = 50 * 1024
+
 // --- Implementations ---
 
 export async function runCommand(args: z.infer<typeof execCommandSchema>, context: ToolExecutionContext): Promise<string> {
@@ -56,16 +73,17 @@ export async function runCommand(args: z.infer<typeof execCommandSchema>, contex
     return `Error: Terminal tab "${tabIdOrName}" not found.`
   }
 
+  sendEvent(sessionId, { 
+    messageId,
+    type: 'command_started', 
+    command, 
+    commandId: messageId,
+    tabName: bestMatch.title || bestMatch.id,
+    isNowait: false
+  })
+
   const allowed = await checkCommandPolicy(command, 'run_command', context)
   if (!allowed.allowed) {
-    sendEvent(sessionId, {
-      messageId,
-      type: 'command_started',
-      command,
-      commandId: messageId,
-      tabName: bestMatch.title || bestMatch.id,
-      isNowait: false
-    })
     sendEvent(sessionId, {
       messageId,
       type: 'command_finished',
@@ -77,21 +95,14 @@ export async function runCommand(args: z.infer<typeof execCommandSchema>, contex
     })
     return allowed.message
   }
-  
-  sendEvent(sessionId, { 
-    messageId,
-    type: 'command_started', 
-    command, 
-    commandId: messageId,
-    tabName: bestMatch.title || bestMatch.id,
-    isNowait: false
-  })
-  
+
   try {
     const result = await terminalService.runCommandAndWait(bestMatch.id, command, {
       signal: context.signal,
       interruptOnAbort: true
     })
+    const historyCommandMatchId = result.history_command_match_id
+    const truncatedOutput = truncateCommandOutput(result.stdoutDelta || '', historyCommandMatchId, bestMatch.id)
     sendEvent(sessionId, { 
       messageId,
       type: 'command_finished', 
@@ -99,9 +110,9 @@ export async function runCommand(args: z.infer<typeof execCommandSchema>, contex
       commandId: messageId,
       tabName: bestMatch.title || bestMatch.id,
       exitCode: result.exitCode,
-      outputDelta: result.stdoutDelta
+      outputDelta: truncatedOutput
     })
-    return result.stdoutDelta || `Command executed with exit code ${result.exitCode}`
+    return truncatedOutput || `Command executed with exit code ${result.exitCode}`
   } catch (error) {
     if (isAbortError(error)) {
       throw error
@@ -133,16 +144,17 @@ export async function runCommandNowait(args: z.infer<typeof execCommandSchema>, 
     return `Error: Terminal tab "${tabIdOrName}" not found.`
   }
 
+  sendEvent(sessionId, { 
+    messageId,
+    type: 'command_started', 
+    command, 
+    commandId: messageId,
+    tabName: bestMatch.title || bestMatch.id,
+    isNowait: true
+  })
+
   const allowed = await checkCommandPolicy(command, 'run_command_nowait', context)
   if (!allowed.allowed) {
-    sendEvent(sessionId, {
-      messageId,
-      type: 'command_started',
-      command,
-      commandId: messageId,
-      tabName: bestMatch.title || bestMatch.id,
-      isNowait: true
-    })
     sendEvent(sessionId, {
       messageId,
       type: 'command_finished',
@@ -154,19 +166,9 @@ export async function runCommandNowait(args: z.infer<typeof execCommandSchema>, 
     })
     return allowed.message
   }
-  
-  sendEvent(sessionId, { 
-    messageId,
-    type: 'command_started', 
-    command, 
-    commandId: messageId,
-    tabName: bestMatch.title || bestMatch.id,
-    isNowait: true
-  })
-
   try {
-    await terminalService.runCommandNoWait(bestMatch.id, command)
-    return `Command started in terminal ${bestMatch.title || bestMatch.id} with command ID ${messageId}. This command is running in the background. Please use read_terminal_tab to check its progress later. Do not attempt to run another command in this tab until this one finishes.`
+    const historyCommandMatchId = await terminalService.runCommandNoWait(bestMatch.id, command)
+    return `Command started in background. Use read_command_output to view output and status(finished or running), history_command_match_id=${historyCommandMatchId}, terminalId=${bestMatch.id}.`
   } catch (error) {
     const errorMessage = error instanceof Error ? error.message : String(error)
     sendEvent(sessionId, { 
@@ -217,6 +219,85 @@ export async function readTerminalTab(args: z.infer<typeof readTerminalTabSchema
   })
 
   return output
+}
+
+export async function readCommandOutput(
+  args: z.infer<typeof readCommandOutputSchema>,
+  context: ToolExecutionContext
+): Promise<string> {
+  const { tabIdOrName, history_command_match_id, offset = 0, limit = COMMAND_READ_DEFAULT_LIMIT } = args
+  const { terminalService, sessionId, messageId, sendEvent } = context
+
+  abortIfNeeded(context.signal)
+  const { found, bestMatch } = terminalService.resolveTerminal(tabIdOrName)
+  if (!bestMatch) {
+    const tabs = terminalService.getAllTerminals()
+    const list = tabs.length
+      ? tabs.map((t) => `- ID: ${t.id}, Name: ${t.title}, Type: ${t.type}`).join('\n')
+      : '(No active terminal tabs)'
+    const errorText =
+      found.length > 1
+        ? `Error: Multiple terminal tabs found with name "${tabIdOrName}". Please use a specific Tab ID.\n${list}`
+        : `Error: Terminal tab "${tabIdOrName}" not found.\n${list}`
+    sendEvent(sessionId, {
+      messageId,
+      type: 'tool_call',
+      toolName: 'read_command_output',
+      input: JSON.stringify(args ?? {}),
+      output: errorText
+    })
+    return errorText
+  }
+
+  const task = terminalService.getCommandTask(bestMatch.id, history_command_match_id)
+  if (!task) {
+    const tasks = terminalService.getCommandTasks(bestMatch.id)
+    const history = tasks.length
+      ? tasks
+          .map((t) => {
+            const started = new Date(t.startTime).toISOString()
+            return `- id: ${t.id}, status: ${t.status}, command: ${t.command}, started: ${started}`
+          })
+          .join('\n')
+      : '(No command history for this terminal)'
+    const errorText = `Error: history_command_match_id "${history_command_match_id}" not found in terminal "${bestMatch.title || bestMatch.id}".\n${history}`
+    sendEvent(sessionId, {
+      messageId,
+      type: 'tool_call',
+      toolName: 'read_command_output',
+      input: JSON.stringify(args ?? {}),
+      output: errorText
+    })
+    return errorText
+  }
+
+  const output = task.output || ''
+  const isRunning = task.status === 'running'
+  const result = formatCommandOutputSlice({
+    output,
+    offset,
+    limit,
+    isRunning
+  })
+
+  const header = [
+    `Command: ${task.command}`,
+    `history_command_match_id: ${task.id}`,
+    `Terminal: ${bestMatch.title || bestMatch.id}`,
+    `Status: ${task.status}`
+  ].join('\n')
+
+  const finalOutput = `${header}\n\n${result}`
+
+  sendEvent(sessionId, {
+    messageId,
+    type: 'tool_call',
+    toolName: 'read_command_output',
+    input: JSON.stringify(args ?? {}),
+    output: finalOutput
+  })
+
+  return finalOutput
 }
 
 export async function sendChar(args: z.infer<typeof sendCharSchema>, context: ToolExecutionContext): Promise<string> {
@@ -344,4 +425,93 @@ function waitWithSignal(ms: number, signal?: AbortSignal): Promise<void> {
     }
     signal?.addEventListener('abort', onAbort, { once: true })
   })
+}
+
+function truncateCommandOutput(output: string, historyCommandMatchId: string, terminalId: string): string {
+  const normalized = String(output || '').replace(/\r\n/g, '\n')
+  const lines = normalized.split('\n').map((line) => {
+    if (line.length <= COMMAND_OUTPUT_MAX_LINE_LENGTH) return line
+    return line.slice(0, COMMAND_OUTPUT_MAX_LINE_LENGTH) + '...'
+  })
+  const totalLines = lines.length
+  const totalBytes = Buffer.byteLength(lines.join('\n'), 'utf8')
+
+  if (totalLines <= COMMAND_OUTPUT_MAX_LINES && totalBytes <= COMMAND_OUTPUT_MAX_BYTES) {
+    return normalized.trimEnd()
+  }
+
+  const headCount = Math.min(COMMAND_OUTPUT_HEAD_LINES, totalLines)
+  const tailCount = Math.min(COMMAND_OUTPUT_TAIL_LINES, Math.max(0, totalLines - headCount))
+  const omittedStart = headCount + 1
+  const omittedEnd = totalLines - tailCount
+  const omittedMessage =
+    omittedEnd >= omittedStart
+      ? `... omitted lines ${omittedStart} - ${omittedEnd}. Use read_command_output to view full output, history_command_match_id=${historyCommandMatchId}, terminalId=${terminalId}`
+      : `... output truncated. Use read_command_output to view full output, history_command_match_id=${historyCommandMatchId}, terminalId=${terminalId}`
+
+  const lineLabel = (lineNumber: number) => `${lineNumber.toString().padStart(5, '0')}| `
+  const formatLines = (startIndex: number, segment: string[]) =>
+    segment.map((line, index) => `${lineLabel(startIndex + index)}${line}`)
+
+  const head = formatLines(1, lines.slice(0, headCount))
+  const tailStart = totalLines - tailCount + 1
+  const tail = tailCount > 0 ? formatLines(tailStart, lines.slice(totalLines - tailCount)) : []
+  const omittedLine = `.....| ${omittedMessage}`
+
+  const truncatedLines = [...head, omittedLine, ...tail]
+
+  let result = truncatedLines.join('\n').trimEnd()
+  if (Buffer.byteLength(result, 'utf8') > COMMAND_OUTPUT_MAX_BYTES) {
+    result =
+      result.slice(0, COMMAND_OUTPUT_MAX_BYTES) +
+      `\n.....| ... output truncated. Use read_command_output to view full output, history_command_match_id=${historyCommandMatchId}, terminalId=${terminalId}`
+  }
+  return result
+}
+
+function formatCommandOutputSlice(params: { output: string; offset: number; limit: number; isRunning?: boolean }): string {
+  const { output, offset, limit, isRunning } = params
+  const lines = String(output || '').replace(/\r\n/g, '\n').split('\n')
+  if (lines.length === 1 && lines[0] === '' && !isRunning) {
+    return 'No output captured for this command yet.'
+  }
+
+  const safeOffset = Math.max(0, offset || 0)
+  const safeLimit = Math.max(1, limit || COMMAND_READ_DEFAULT_LIMIT)
+  const raw: string[] = []
+  let bytesCount = 0
+  let truncatedByBytes = false
+
+  for (let i = safeOffset; i < Math.min(lines.length, safeOffset + safeLimit); i++) {
+    const line =
+      lines[i].length > COMMAND_READ_MAX_LINE_LENGTH ? lines[i].slice(0, COMMAND_READ_MAX_LINE_LENGTH) + '...' : lines[i]
+    const size = Buffer.byteLength(line, 'utf8') + (raw.length > 0 ? 1 : 0)
+    if (bytesCount + size > COMMAND_READ_MAX_BYTES) {
+      truncatedByBytes = true
+      break
+    }
+    raw.push(line)
+    bytesCount += size
+  }
+
+  const content = raw.map((line, index) => `${(index + safeOffset + 1).toString().padStart(5, '0')}| ${line}`)
+  let result = '<command_output>\n'
+  result += content.join('\n')
+
+  const totalLines = lines.length
+  const lastReadLine = safeOffset + raw.length
+  const hasMoreLines = totalLines > lastReadLine
+
+  if (truncatedByBytes) {
+    result += `\n\n(Output truncated at ${COMMAND_READ_MAX_BYTES} bytes. Use 'offset' to read beyond line ${lastReadLine})`
+  } else if (hasMoreLines) {
+    result += `\n\n(Output has more lines. Use 'offset' to read beyond line ${lastReadLine})`
+  } else if (isRunning) {
+    result += `\n\n(Command is still running. Total ${totalLines} lines captured so far. Use read_command_output again later to see more)`
+  } else {
+    result += `\n\n(End of output - total ${totalLines} lines)`
+  }
+
+  result += '\n</command_output>'
+  return result
 }

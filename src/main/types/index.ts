@@ -211,6 +211,7 @@ export interface TerminalSystemInfo {
 export interface CommandResult {
   stdoutDelta: string
   exitCode?: number
+  history_command_match_id: string
 }
 
 export interface CommandTask {

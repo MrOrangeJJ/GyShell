@@ -17,6 +17,7 @@ import {
   buildToolsForModel,
   execCommandSchema,
   readTerminalTabSchema,
+  readCommandOutputSchema,
   readFileSchema,
   sendCharSchema,
   writeAndEditSchema,
@@ -822,6 +823,15 @@ export class AgentService_v2 {
             result = await toolImplementations.readTerminalTab(validatedArgs, executionContext)
           } catch (err) {
             result = `Parameter validation error for read_terminal_tab: ${(err as Error).message}`
+          }
+          break
+        }
+        case 'read_command_output': {
+          try {
+            const validatedArgs = readCommandOutputSchema.parse(toolCall.args || {})
+            result = await toolImplementations.readCommandOutput(validatedArgs, executionContext)
+          } catch (err) {
+            result = `Parameter validation error for read_command_output: ${(err as Error).message}`
           }
           break
         }
