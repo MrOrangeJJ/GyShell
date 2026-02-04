@@ -1,6 +1,7 @@
 import fs from 'fs/promises';
 import { SkillService } from '../SkillService';
-import { USEFUL_SKILL_TAG, USER_INPUT_TAG, FILE_CONTENT_TAG } from './prompts';
+import { TerminalService } from '../TerminalService';
+import { USEFUL_SKILL_TAG, USER_INPUT_TAG, FILE_CONTENT_TAG, TERMINAL_CONTENT_TAG } from './prompts';
 import { detectFileKind } from './read_tools';
 
 /**
@@ -12,6 +13,11 @@ export class InputParseHelper {
    * Regex to match skill labels: [MENTION_SKILL:#name#]
    */
   private static SKILL_REGEX = /\[MENTION_SKILL:#(.+?)#\]/g;
+
+  /**
+   * Regex to match terminal tab labels: [MENTION_TAB:#name##id#]
+   */
+  private static TAB_REGEX = /\[MENTION_TAB:#(.+?)##(.+?)#\]/g;
 
   /**
    * Regex to match user paste labels: [MENTION_USER_PASTE:#path##preview#]
@@ -29,7 +35,8 @@ export class InputParseHelper {
    */
   static async parseAndEnrich(
     input: string,
-    skillService: SkillService
+    skillService: SkillService,
+    terminalService: TerminalService
   ): Promise<{ enrichedContent: string; displayContent: string }> {
     // 1. Fetch Skill Details
     const skillMatches = Array.from(input.matchAll(this.SKILL_REGEX));
@@ -46,7 +53,25 @@ export class InputParseHelper {
     }
     this.SKILL_REGEX.lastIndex = 0; // Reset regex state
 
-    // 2. Fetch Large Paste & Mentioned File Details
+    // 2. Fetch Terminal Tab Details
+    const tabMatches = Array.from(input.matchAll(this.TAB_REGEX));
+    const tabIds = Array.from(new Set(tabMatches.map(m => m[2])));
+
+    let tabDetails = '';
+    for (const id of tabIds) {
+      try {
+        const tab = terminalService.getAllTerminals().find(t => t.id === id);
+        if (tab) {
+          const recentOutput = terminalService.getRecentOutput(id, 100);
+          tabDetails += `${TERMINAL_CONTENT_TAG}Terminal Tab: ${tab.title} (ID: ${id})\nRecent Output:\n${recentOutput}\n\n`;
+        }
+      } catch (err) {
+        console.warn(`[InputParseHelper] Failed to fetch terminal output: ${id}`, err);
+      }
+    }
+    this.TAB_REGEX.lastIndex = 0; // Reset regex state
+
+    // 3. Fetch Large Paste & Mentioned File Details
     const pasteMatches = Array.from(input.matchAll(this.PASTE_REGEX));
     const fileMatches = Array.from(input.matchAll(this.FILE_REGEX));
     
@@ -85,8 +110,8 @@ export class InputParseHelper {
     this.PASTE_REGEX.lastIndex = 0; // Reset regex state
     this.FILE_REGEX.lastIndex = 0; // Reset regex state
 
-    // enrichedContent structure: [Skill Details] + [File Details] + [User Input Tag] + [Actual Request]
-    let prefix = skillDetails + fileDetails;
+    // enrichedContent structure: [Skill Details] + [Tab Details] + [File Details] + [User Input Tag] + [Actual Request]
+    let prefix = skillDetails + tabDetails + fileDetails;
     const enrichedContent = prefix 
       ? `${prefix}${USER_INPUT_TAG}${input}` 
       : `${USER_INPUT_TAG}${input}`;

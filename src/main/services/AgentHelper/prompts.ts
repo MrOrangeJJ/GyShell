@@ -13,6 +13,7 @@ export const USER_INPUT_TAG = 'USER_REQUEST_IS:\n'
 
 export const USEFUL_SKILL_TAG = 'USEFUL_SKILL_DETAIL:\n'
 export const FILE_CONTENT_TAG = 'FILE_CONTENT:\n'
+export const TERMINAL_CONTENT_TAG = 'TERMINAL_CONTENT:\n'
 export const USER_PASTE_CONTENT_TAG = FILE_CONTENT_TAG
 export const THINKING_MODE_PROMPT_TAG = 'THINKING_MODE_PROMPT:\n'
 
@@ -287,6 +288,7 @@ export function createBaseSystemPrompt(): SystemMessage {
       `- **\`[MENTION_FILE:#path#]\`**: This label in the user input indicates that the user has provided a file path #path#. If the file is small enough (under 4000 chars), its content is provided at the top of the message under the \`${FILE_CONTENT_TAG.trim()}\` tag. Otherwise, you should use this path when you need to read or modify this file.`,
       `- **\`[MENTION_USER_PASTE:#path##preview#]\`**: This label in the user input indicates that the user has pasted a large amount of text, which has been saved to a temporary file at #path#. If the content is small enough (under 4000 chars), it is provided at the top of the message under the \`${FILE_CONTENT_TAG.trim()}\` tag. If not, you may need to use \`read_file\` on this path to see the full content if it is critical to the task.`,
       `- **\`${USEFUL_SKILL_TAG.trim()}\`**: This tag provides the implementation details or documentation for a specific "Skill" referenced by the user. Use this to understand how to correctly parameterize and call the \`skill\` tool or follow the provided procedure.`,
+      `- **\`${TERMINAL_CONTENT_TAG.trim()}\`**: This tag precedes the recent output (last 100 lines) of a terminal tab explicitly mentioned by the user via \`[MENTION_TAB:#name##id#]\`. Use this to understand the current state of that specific terminal.`,
       `- **\`${FILE_CONTENT_TAG.trim()}\`**: This tag precedes the actual content of a file or large text pasted by the user. Use this as primary context for the user's request.`,
       `- **\`${THINKING_MODE_PROMPT_TAG.trim()}\`**: This tag indicates that you have successfully entered THINK mode. When you see this, you must switch your behavior to deep reasoning and planning as per the THINK mode rules.`
     ].join('\n')

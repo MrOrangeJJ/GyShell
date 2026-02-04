@@ -1293,7 +1293,7 @@ export class AgentService_v2 {
     const userMessageId = uuidv4()
     
     // Parse and enrich input (handle @mentions for skills/tabs)
-    const { enrichedContent, displayContent } = await InputParseHelper.parseAndEnrich(input, this.skillService)
+    const { enrichedContent, displayContent } = await InputParseHelper.parseAndEnrich(input, this.skillService, this.terminalService)
     
     const humanMessage = new HumanMessage(enrichedContent)
     ;(humanMessage as any).additional_kwargs = { 
