@@ -23,6 +23,31 @@ export function QueueCard(props: {
     onDragEnd
   } = props
 
+  // Parser for [MENTION_XXX:#...#] labels
+  const renderContent = (content: string) => {
+    const parts = content.split(/(\[MENTION_(?:SKILL|TAB|FILE|USER_PASTE):#.+?#(?:#.+?#)?\])/g);
+    return parts.map((part, i) => {
+      const skillMatch = part.match(/\[MENTION_SKILL:#(.+?)#\]/);
+      if (skillMatch) {
+        return <span key={i} className="mention-badge skill">@{skillMatch[1]}</span>;
+      }
+      const terminalMatch = part.match(/\[MENTION_TAB:#(.+?)##(.+?)#\]/);
+      if (terminalMatch) {
+        return <span key={i} className="mention-badge terminal">@{terminalMatch[1]}</span>;
+      }
+      const fileMatch = part.match(/\[MENTION_FILE:#(.+?)#\]/);
+      if (fileMatch) {
+        const fileName = fileMatch[1].split(/[/\\]/).pop() || fileMatch[1];
+        return <span key={i} className="mention-badge file">{fileName}</span>;
+      }
+      const pasteMatch = part.match(/\[MENTION_USER_PASTE:#(.+?)##(.+?)#\]/);
+      if (pasteMatch) {
+        return <span key={i} className="mention-badge paste">{pasteMatch[2]}</span>;
+      }
+      return part;
+    });
+  };
+
   return (
     <div
       className={`queue-card ${isHidden ? 'is-hidden' : ''}`}
@@ -40,7 +65,7 @@ export function QueueCard(props: {
       >
         <GripVertical size={14} />
       </div>
-      <div className="queue-card-content">{item.content}</div>
+      <div className="queue-card-content">{renderContent(item.content)}</div>
       <button
         className="queue-card-action"
         onClick={onEdit}

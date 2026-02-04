@@ -13,6 +13,7 @@ import { applyPlatformWindowTweaks, getPlatformBrowserWindowOptions } from './pl
 import { SkillService } from './services/SkillService'
 import { UIHistoryService } from './services/UIHistoryService'
 import { GatewayService } from './services/Gateway/GatewayService'
+import { TempFileService } from './services/TempFileService'
 
 let mainWindow: BrowserWindow | null = null
 let settingsService: SettingsService
@@ -25,6 +26,7 @@ let themeService: ThemeService
 let skillService: SkillService
 let uiHistoryService: UIHistoryService
 let gatewayService: GatewayService
+let tempFileService: TempFileService
 
 function createWindow(): void {
   const settings = settingsService.getSettings()
@@ -320,10 +322,14 @@ app.whenReady().then(async () => {
   commandPolicyService = new CommandPolicyService()
   mcpToolService = new McpToolService()
   themeService = new ThemeService()
-  skillService = new SkillService()
   uiHistoryService = new UIHistoryService()
+  tempFileService = new TempFileService()
+  
+  // Cleanup old pastes on startup
+  void tempFileService.cleanup()
+
   agentService = new AgentService_v2(terminalService, commandPolicyService, mcpToolService, skillService, uiHistoryService)
-  gatewayService = new GatewayService(terminalService, agentService, uiHistoryService, commandPolicyService)
+  gatewayService = new GatewayService(terminalService, agentService, uiHistoryService, commandPolicyService, tempFileService)
   // Mount to global for AgentHelper (temporary solution)
   ;(global as any).gateway = gatewayService;
   modelCapabilityService = new ModelCapabilityService()
@@ -333,6 +339,7 @@ app.whenReady().then(async () => {
   await themeService.loadCustomThemes()
 
   // Ensure skills dir exists + initial scan (best-effort)
+  skillService = new SkillService()
   void skillService.reload()
 
   // Load MCP tools (best-effort)
@@ -361,6 +368,9 @@ app.whenReady().then(async () => {
   })
 })
 
-app.on('window-all-closed', () => {
+app.on('window-all-closed', async () => {
+  if (tempFileService) {
+    await tempFileService.cleanup()
+  }
   app.quit()
 })

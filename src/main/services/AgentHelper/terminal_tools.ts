@@ -402,8 +402,8 @@ export async function waitTerminalIdle(
     messageId,
     type: 'sub_tool_started',
     toolName: 'wait_terminal_idle',
-    title: `Waiting for ${bestMatch.title || bestMatch.id} to be idle`,
-    hint: 'Monitoring terminal output stability...'
+    title: `Waiting on ${bestMatch.title || bestMatch.id}`,
+    hint: ''
   })
 
   let lastContent = ''
@@ -428,8 +428,12 @@ export async function waitTerminalIdle(
       const finalOutput = terminalService.getRecentOutput(bestMatch.id, 40)
       sendEvent(sessionId, {
         messageId,
-        type: 'sub_tool_finished',
-        output: finalOutput
+        type: 'sub_tool_delta',
+        outputDelta: finalOutput
+      })
+      sendEvent(sessionId, {
+        messageId,
+        type: 'sub_tool_finished'
       })
       return `Terminal is now idle. Recent output (last 40 lines):\n${finalOutput}`
     }
@@ -440,11 +444,15 @@ export async function waitTerminalIdle(
 
   const currentOutput = terminalService.getRecentOutput(bestMatch.id, 40)
   const timeoutMsg = `Wait timeout: The terminal has been running for over 120s and is still not idle. Please check if the task is still running correctly. If you need to continue waiting, run this tool again. If you need to stop it, use send_char (e.g., Ctrl+C). Recent output:\n${currentOutput}`
-  
   sendEvent(sessionId, {
     messageId,
-    type: 'sub_tool_finished',
-    output: timeoutMsg
+    type: 'sub_tool_delta',
+    outputDelta: timeoutMsg
+  })
+
+  sendEvent(sessionId, {
+    messageId,
+    type: 'sub_tool_finished'
   })
 
   return timeoutMsg

@@ -57,6 +57,22 @@
   transition: max-height 0.2s ease, white-space 0.2s ease;
   user-select: none;
   -webkit-user-select: none;
+
+  .mention-badge {
+    display: inline-flex;
+    align-items: center;
+    padding: 0 4px;
+    border-radius: 4px;
+    font-weight: 500;
+    font-size: 11px;
+    margin: 0 1px;
+    background: color-mix(in srgb, var(--accent-2) 15%, transparent);
+    color: var(--fg);
+    border: 1px solid color-mix(in srgb, var(--accent-2) 30%, transparent);
+    height: 16px;
+    line-height: 1;
+    vertical-align: middle;
+  }
 }
 
 .queue-stack:not(.is-dragging) .queue-card:hover .queue-card-content {

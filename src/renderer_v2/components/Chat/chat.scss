@@ -315,14 +315,29 @@
   cursor: not-allowed;
 }
 
-.message-text.user {
-  align-self: flex-end;
-  background: color-mix(in srgb, var(--accent) 15%, transparent);
-  padding: 10px 14px;
-  border-radius: 12px 12px 0 12px;
-  max-width: 85%;
-  border: 1px solid color-mix(in srgb, var(--accent) 30%, transparent);
-}
+  .message-text.user {
+    align-self: flex-end;
+    background: color-mix(in srgb, var(--accent) 15%, transparent);
+    padding: 10px 14px;
+    border-radius: 12px 12px 0 12px;
+    max-width: 85%;
+    border: 1px solid color-mix(in srgb, var(--accent) 30%, transparent);
+
+    .mention-badge {
+      display: inline-flex;
+      align-items: center;
+      padding: 0 6px;
+      border-radius: 6px;
+      font-weight: 500;
+      font-size: 12px;
+      margin: 0 2px;
+      background: color-mix(in srgb, var(--accent-2) 15%, transparent);
+      color: var(--fg); // Use normal text color from theme
+      border: 1px solid color-mix(in srgb, var(--accent-2) 30%, transparent);
+      height: 20px;
+      line-height: 1;
+    }
+  }
 
 .message-text.assistant {
   align-self: flex-start;

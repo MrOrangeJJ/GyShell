@@ -1,0 +1,114 @@
+.rich-input-wrapper {
+  position: relative;
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+}
+
+.rich-input-editor {
+  background: transparent;
+  border: none;
+  padding: 10px 12px;
+  color: var(--fg);
+  outline: none;
+  font-family: inherit;
+  font-size: 13px;
+  min-height: 40px;
+  max-height: 150px;
+  line-height: 1.5;
+  width: 100%;
+  overflow-y: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+
+  &:empty::before {
+    content: attr(data-placeholder);
+    color: var(--fg-muted);
+    opacity: 0.5;
+    pointer-events: none;
+  }
+
+  &.disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+  }
+
+  .mention-tag {
+    display: inline-flex;
+    align-items: center;
+    background: color-mix(in srgb, var(--accent-2) 15%, transparent);
+    color: var(--fg); // Use normal text color from theme
+    padding: 0 6px;
+    border-radius: 6px;
+    margin: 0 1px;
+    font-weight: 500;
+    border: 1px solid color-mix(in srgb, var(--accent-2) 30%, transparent);
+    user-select: none;
+    cursor: default;
+    font-size: 12px;
+    height: 22px;
+    line-height: 1;
+  }
+}
+
+.mention-suggestions {
+  background: var(--panel-bg);
+  border: 1px solid var(--border-strong);
+  border-radius: 8px;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.4), 0 0 0 1px rgba(255, 255, 255, 0.05);
+  min-width: 180px;
+  max-height: 200px;
+  overflow-y: auto;
+  z-index: 10001;
+  padding: 2px;
+  margin-bottom: 4px;
+
+  .suggestion-item {
+    display: flex;
+    align-items: center;
+    padding: 4px 8px;
+    border-radius: 6px;
+    cursor: pointer;
+    font-size: 12px;
+    color: var(--fg-muted);
+    transition: all 0.1s;
+    margin-bottom: 1px;
+
+    &:last-child {
+      margin-bottom: 0;
+    }
+
+    &.active {
+      background: color-mix(in srgb, var(--accent) 10%, transparent);
+      color: var(--accent);
+    }
+
+    .item-content {
+      display: grid;
+      grid-template-columns: 42px 1fr;
+      align-items: center;
+      gap: 8px;
+      width: 100%;
+    }
+
+    .item-type {
+      font-size: 10px;
+      text-transform: uppercase;
+      padding: 1px 0;
+      width: 100%;
+      text-align: center;
+      border-radius: 4px;
+      font-weight: 600;
+      background: color-mix(in srgb, var(--accent-2) 15%, transparent);
+      color: var(--fg); // Use normal text color from theme
+    }
+
+    .item-name {
+      flex: 1;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      color: var(--fg); // Use normal text color from theme
+    }
+  }
+}

@@ -33,19 +33,18 @@ import { AgentHelpers } from './AgentHelper/helpers'
 import {
   USER_INPUT_TAG,
   USEFUL_SKILL_TAG,
-  USER_HIGHLIGHT_CONTENT,
   TAB_CONTEXT_MARKER,
   SYS_INFO_MARKER,
   createBaseSystemPrompt,
   createSystemInfoPrompt,
   createTabContextPrompt,
-  createUserHighlightPrompt,
   COMMAND_POLICY_DECISION_SCHEMA,
   createCommandPolicyUserPrompt,
   createThinkingModePrompt,
 } from './AgentHelper/prompts'
 import { runSkillTool } from './AgentHelper/skill_tools'
 import { TokenManager } from './AgentHelper/TokenManager'
+import { InputParseHelper } from './AgentHelper/InputParseHelper'
 
 const Ann: any = Annotation
 
@@ -335,43 +334,16 @@ export class AgentService_v2 {
       
       const contextMsg = this.helpers.markEphemeral(createTabContextPrompt(currentTab, recent))
 
-      const selectionText = currentTabId ? this.terminalService.getSelection(currentTabId) : ''
-      const trimmedSelection = selectionText.trim()
-      const lastHighlight = [...messages]
-        .reverse()
-        .find((m) => typeof m.content === 'string' && m.content.includes(USER_HIGHLIGHT_CONTENT))
-      const lastHighlightText =
-        typeof lastHighlight?.content === 'string'
-          ? lastHighlight.content.split(`${USER_HIGHLIGHT_CONTENT}\n`)[1] ?? ''
-          : ''
-      const shouldInjectHighlight =
-        trimmedSelection.length > 0 && trimmedSelection !== lastHighlightText.trim()
-      const highlightMsg = shouldInjectHighlight ? createUserHighlightPrompt(selectionText) : null
-
       const prefix = hasBaseSystem ? [] : [baseSystemMsg]
-      const newMessages = highlightMsg
-        ? [...prefix, ...otherMsgs, sysInfoMsg, contextMsg, highlightMsg, lastMsg]
-        : [...prefix, ...otherMsgs, sysInfoMsg, contextMsg, lastMsg]
+      const newMessages = [...prefix, ...otherMsgs, sysInfoMsg, contextMsg, lastMsg]
 
       const fullLastMsg = fullMessages[fullMessages.length - 1]
       const fullOtherMsgs = fullMessages.slice(0, -1)
-      const fullLastHighlight = [...fullMessages]
-        .reverse()
-        .find((m) => typeof m.content === 'string' && m.content.includes(USER_HIGHLIGHT_CONTENT))
-      const fullLastHighlightText =
-        typeof fullLastHighlight?.content === 'string'
-          ? fullLastHighlight.content.split(`${USER_HIGHLIGHT_CONTENT}\n`)[1] ?? ''
-          : ''
-      const fullShouldInjectHighlight =
-        trimmedSelection.length > 0 && trimmedSelection !== fullLastHighlightText.trim()
-      const fullHighlightMsg = fullShouldInjectHighlight ? createUserHighlightPrompt(selectionText) : null
       
       const fullHasBaseSystem = fullOtherMsgs.some(m => m.type === 'system' && typeof m.content === 'string' && m.content.includes('# Role: GyShell Assistant'))
       const fullPrefix = fullHasBaseSystem ? [] : [baseSystemMsg]
 
-      const newFullMessages = fullHighlightMsg
-        ? [...fullPrefix, ...fullOtherMsgs, sysInfoMsg, contextMsg, fullHighlightMsg, fullLastMsg]
-        : [...fullPrefix, ...fullOtherMsgs, sysInfoMsg, contextMsg, fullLastMsg]
+      const newFullMessages = [...fullPrefix, ...fullOtherMsgs, sysInfoMsg, contextMsg, fullLastMsg]
       
       // Initialize Token State
       let globalMax = 200000
@@ -543,7 +515,16 @@ export class AgentService_v2 {
         renderMode: 'sub'
       })
 
-      const skills = await this.skillService.getAll().catch(() => [])
+      // Ensure skillService is initialized before calling getAll()
+      let skills: any[] = []
+      if (this.skillService && typeof this.skillService.getAll === 'function') {
+        try {
+          skills = await this.skillService.getAll()
+        } catch (err) {
+          console.warn('[AgentService_v2] Failed to fetch skills for thinking mode:', err)
+        }
+      }
+      
       const thinkingTools = buildToolsForThinkingModel(skills)
       const modelWithTools = this.thinkingModel.bindTools(thinkingTools)
       // const modelWithTools = this.thinkingModel
@@ -884,8 +865,7 @@ export class AgentService_v2 {
             result = `Waited for ${validatedArgs.seconds} seconds.`
             this.helpers.sendEvent(sessionId, {
               messageId,
-              type: 'sub_tool_finished',
-              output: result
+              type: 'sub_tool_finished'
             })
           } catch (err) {
             result = `Parameter validation error for wait: ${(err as Error).message}`
@@ -1318,14 +1298,21 @@ export class AgentService_v2 {
     const baseMessages = loadedSession ? mapStoredMessagesToChatMessages(Array.from(loadedSession.messages.values())) : []
 
     const userMessageId = uuidv4()
-    const humanMessage = new HumanMessage(`${USER_INPUT_TAG}${input}`)
-    ;(humanMessage as any).additional_kwargs = { _gyshellMessageId: userMessageId }
+    
+    // Parse and enrich input (handle @mentions for skills/tabs)
+    const { enrichedContent, displayContent } = await InputParseHelper.parseAndEnrich(input, this.skillService)
+    
+    const humanMessage = new HumanMessage(enrichedContent)
+    ;(humanMessage as any).additional_kwargs = { 
+      _gyshellMessageId: userMessageId,
+      original_input: displayContent // Store for frontend rendering
+    }
 
     // Use the new emit-based event system (via helpers)
     this.helpers.sendEvent(sessionId, {
       messageId: userMessageId,
       type: 'user_input',
-      content: input
+      content: displayContent // Send display version to UI
     })
 
     const initialState = {

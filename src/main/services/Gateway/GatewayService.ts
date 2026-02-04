@@ -6,6 +6,7 @@ import type { TerminalService } from '../TerminalService';
 import type { AgentService_v2 } from '../AgentService_v2';
 import type { UIHistoryService } from '../UIHistoryService';
 import type { CommandPolicyService } from '../CommandPolicy/CommandPolicyService';
+import type { TempFileService } from '../TempFileService';
 
 export class GatewayService extends EventEmitter implements IGateway {
   private sessions: Map<string, SessionContext> = new Map();
@@ -15,7 +16,8 @@ export class GatewayService extends EventEmitter implements IGateway {
     private terminalService: TerminalService,
     private agentService: AgentService_v2,
     private uiHistoryService: UIHistoryService,
-    private commandPolicyService: CommandPolicyService
+    private commandPolicyService: CommandPolicyService,
+    private tempFileService: TempFileService
   ) {
     super();
     this.setupIpcHandlers();
@@ -132,6 +134,11 @@ export class GatewayService extends EventEmitter implements IGateway {
 
       // 3. Let AgentService handle backend history rollback (disk operation)
       return this.agentService.rollbackToMessage(sessionId, messageId);
+    });
+
+    // System/Temp File handlers
+    ipcMain.handle('system:saveTempPaste', async (_, content: string) => {
+      return await this.tempFileService.saveTempPaste(content);
     });
   }
 

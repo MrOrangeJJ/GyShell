@@ -209,6 +209,7 @@ export interface GyShellAPI {
   system: {
     platform: NodeJS.Platform
     openExternal: (url: string) => Promise<void>
+    saveTempPaste: (content: string) => Promise<string>
   }
   // Settings
   settings: {
@@ -297,7 +298,8 @@ export interface GyShellAPI {
 const api: GyShellAPI = {
   system: {
     platform: process.platform,
-    openExternal: (url) => ipcRenderer.invoke('system:openExternal', url)
+    openExternal: (url: string) => ipcRenderer.invoke('system:openExternal', url),
+    saveTempPaste: (content: string) => ipcRenderer.invoke('system:saveTempPaste', content)
   },
   settings: {
     get: () => ipcRenderer.invoke('settings:get'),
