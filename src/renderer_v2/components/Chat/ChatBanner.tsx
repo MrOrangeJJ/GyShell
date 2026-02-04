@@ -1,4 +1,5 @@
 import React from 'react'
+import { createPortal } from 'react-dom'
 import { observer } from 'mobx-react-lite'
 import {
   Loader2,
@@ -371,7 +372,7 @@ export const AlertBanner = observer(({
         </div>
       </div>
 
-      {showDetails && (
+      {showDetails && createPortal(
         <div className="gyshell-modal-overlay" onClick={() => setShowDetails(false)}>
           <div className="gyshell-modal" onClick={e => e.stopPropagation()}>
             <div className="modal-header">
@@ -382,7 +383,8 @@ export const AlertBanner = observer(({
               <pre className="error-details-pre">{msg.metadata?.details}</pre>
             </div>
           </div>
-        </div>
+        </div>,
+        document.body
       )}
     </>
   )

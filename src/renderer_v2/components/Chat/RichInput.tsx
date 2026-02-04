@@ -1,4 +1,5 @@
 import React, { useRef, useState, useCallback, useImperativeHandle, forwardRef } from 'react';
+import { createPortal } from 'react-dom';
 import { observer } from 'mobx-react-lite';
 import { AppStore } from '../../stores/AppStore';
 import './richInput.scss';
@@ -384,14 +385,15 @@ export const RichInput = observer(forwardRef<RichInputHandle, RichInputProps>(({
         data-placeholder={placeholder}
       />
       
-      {showSuggestions && (
+      {showSuggestions && createPortal(
         <div 
           className="mention-suggestions"
           style={{ 
             position: 'fixed',
             top: suggestionPos.top,
             left: suggestionPos.left,
-            transform: 'translateY(-100%)'
+            transform: 'translateY(-100%)',
+            zIndex: 10000
           }}
         >
           {suggestions.map((item, i) => (
@@ -409,7 +411,8 @@ export const RichInput = observer(forwardRef<RichInputHandle, RichInputProps>(({
               </div>
             </div>
           ))}
-        </div>
+        </div>,
+        document.body
       )}
     </div>
   );
