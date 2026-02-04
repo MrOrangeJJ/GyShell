@@ -381,20 +381,25 @@ export async function sendChar(args: z.infer<typeof sendCharSchema>, context: To
   for (const ch of resolved) {
     abortIfNeeded(context.signal)
     terminalService.write(bestMatch.id, ch)
+    // Add 0.5s interval between characters if it's a list
+    if (resolved.length > 1) {
+      await waitWithSignal(500, context.signal)
+    }
   }
 
   await waitWithSignal(1000, context.signal)
   const output = terminalService.getRecentOutput(bestMatch.id, 40) || 'No output available.'
+  const resultHint = `Sent sequence: ${sequence?.join(', ')}. The current state of the terminal 1s after the command was sent is:\n${output}`
 
   sendEvent(sessionId, {
     messageId,
     type: 'tool_call',
     toolName: 'send_char',
     input: JSON.stringify(sequence ?? []),
-    output
+    output: resultHint
   })
 
-  return output
+  return resultHint
 }
 
 export async function waitTerminalIdle(
@@ -439,17 +444,18 @@ export async function waitTerminalIdle(
     }
 
     if (stableCount >= 4) {
-      const finalOutput = terminalService.getRecentOutput(bestMatch.id, 40)
+      const finalOutput = terminalService.getRecentOutput(bestMatch.id, 100)
+      const successMsg = `The terminal has stabilized. The final state of the terminal is:\n${finalOutput}`
       sendEvent(sessionId, {
         messageId,
         type: 'sub_tool_delta',
-        outputDelta: finalOutput
+        outputDelta: successMsg
       })
       sendEvent(sessionId, {
         messageId,
         type: 'sub_tool_finished'
       })
-      return `Terminal is now idle. Recent output (last 40 lines):\n${finalOutput}`
+      return successMsg
     }
 
     await waitWithSignal(1000, context.signal)
