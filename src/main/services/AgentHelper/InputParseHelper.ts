@@ -58,7 +58,6 @@ export class InputParseHelper {
 
     // Use a Set to avoid reading the same file multiple times
     const uniqueFilePaths = Array.from(new Set(allFileMatches.map(m => m.filePath)));
-    console.log('[InputParseHelper] Found unique file paths:', uniqueFilePaths);
 
     let fileDetails = '';
     for (const filePath of uniqueFilePaths) {

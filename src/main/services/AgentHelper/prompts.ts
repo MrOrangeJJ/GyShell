@@ -160,6 +160,14 @@ export const COMMAND_POLICY_DECISION_SCHEMA = z.object({
   reason: z.string()
 })
 
+/**
+ * Action model decision schema for send_char.
+ */
+export const SEND_CHAR_POLICY_DECISION_SCHEMA = z.object({
+  decision: z.enum(['allow', 'block']),
+  reason: z.string()
+})
+
 export const TASK_CHECK_SCHEMA = z.object({
   think_and_why: z.string(),
   next_step: z.enum(['end', 'continue'])
@@ -312,6 +320,38 @@ export function createCommandPolicyUserPrompt(opts: {
       '```',
       opts.recentOutput,
       '```'
+    ].join('\n')
+  )
+}
+
+/**
+ * User prompt for the action model that checks send_char inputs.
+ */
+export function createSendCharPolicyUserPrompt(opts: {
+  chars: any[]
+}): HumanMessage {
+  return new HumanMessage(
+    [
+      '# Send Char Execution Policy Request',
+      'You are acting as a specialized auditor for terminal input. Your task is to check if the `send_char` tool call is correctly formatted, especially regarding C0 control characters.',
+      '',
+      '## Context:',
+      'The main agent is often confused and might try to send literal strings like "Ctrl+C" or "^C" when it actually intends to send a C0 control character. This tool REQUIRES using specific C0 names as separate list items.',
+      '',
+      '## Correct Usage (from tool description):',
+      SEND_CHAR_TOOL_DESCRIPTION,
+      '',
+      '## Current Request:',
+      `Input chars: ${JSON.stringify(opts.chars)}`,
+      '',
+      '## Your Task:',
+      '1. Analyze the intent of the input.',
+      '2. If you see strings like "Ctrl+C", "^C", "\\x03", or any other informal way of expressing a control character, you MUST "block" it.',
+      '3. If the input is correctly using the C0 names (e.g., "ETX" for Ctrl+C) as separate items, or sending normal text, you should "allow" it.',
+      '4. If you block, provide a clear reason explaining what the agent likely intended and how it should have used the C0 names instead.',
+      '',
+      '## Output Format:',
+      'Output ONLY JSON: {"decision":"allow"|"block","reason":"..."}'
     ].join('\n')
   )
 }

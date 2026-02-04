@@ -1,6 +1,12 @@
 import { BrowserWindow } from 'electron'
 import { ChatOpenAI } from '@langchain/openai'
+import { HumanMessage, type BaseMessage } from '@langchain/core/messages'
 import type { AgentEvent, ModelDefinition, AppSettings } from '../../types'
+import { 
+  USER_INPUT_TAG, 
+  TAB_CONTEXT_MARKER, 
+  SYS_INFO_MARKER 
+} from './prompts'
 
 /**
  * Helper functions for AgentService_v2
@@ -8,6 +14,53 @@ import type { AgentEvent, ModelDefinition, AppSettings } from '../../types'
 
 export class AgentHelpers {
   constructor() {
+  }
+
+  /**
+   * Build a temporary history for the action model to make decisions.
+   * This includes the last 3 special marker messages and recent execution details.
+   */
+  buildActionModelHistory(allMessages: BaseMessage[]): BaseMessage[] {
+    // 1. Find the last 3 special marker messages (only from HumanMessages)
+    const specialTags = [USER_INPUT_TAG, TAB_CONTEXT_MARKER, SYS_INFO_MARKER]
+    const last3Special: BaseMessage[] = []
+    for (let i = allMessages.length - 1; i >= 0 && last3Special.length < 3; i--) {
+      const msg = allMessages[i]
+      const content = msg.content
+      if (msg.type === 'human' && typeof content === 'string' && specialTags.some(tag => content.includes(tag))) {
+        last3Special.unshift(msg)
+      }
+    }
+
+    // 2. Locate the very last USER_INPUT_TAG message to define the execution detail range
+    let lastUserInputIndex = -1
+    for (let i = allMessages.length - 1; i >= 0; i--) {
+      const m = allMessages[i]
+      const content = m.content
+      if (m.type === 'human' && typeof content === 'string' && content.includes(USER_INPUT_TAG)) {
+        lastUserInputIndex = i
+        break
+      }
+    }
+    
+    // 3. Get execution details: messages strictly AFTER the last USER_INPUT_TAG
+    const executionDetails = lastUserInputIndex !== -1 
+      ? allMessages.slice(lastUserInputIndex + 1) 
+      : []
+
+    const recentExecutionMsgs: BaseMessage[] = []
+    if (executionDetails.length > 10) {
+      recentExecutionMsgs.push(new HumanMessage({ content: '... (some execution details omitted) ...' }))
+      recentExecutionMsgs.push(...executionDetails.slice(-10))
+    } else {
+      recentExecutionMsgs.push(...executionDetails)
+    }
+
+    // 4. Construct final message list for Action Model
+    return [
+      ...last3Special,
+      ...recentExecutionMsgs
+    ]
   }
 
   /**

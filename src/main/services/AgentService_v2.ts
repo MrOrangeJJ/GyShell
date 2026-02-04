@@ -31,15 +31,14 @@ import {
 import type { ToolExecutionContext } from './AgentHelper/types'
 import { AgentHelpers } from './AgentHelper/helpers'
 import {
-  USER_INPUT_TAG,
   USEFUL_SKILL_TAG,
-  TAB_CONTEXT_MARKER,
-  SYS_INFO_MARKER,
   createBaseSystemPrompt,
   createSystemInfoPrompt,
   createTabContextPrompt,
   COMMAND_POLICY_DECISION_SCHEMA,
+  SEND_CHAR_POLICY_DECISION_SCHEMA,
   createCommandPolicyUserPrompt,
+  createSendCharPolicyUserPrompt,
   createThinkingModePrompt,
 } from './AgentHelper/prompts'
 import { runSkillTool } from './AgentHelper/skill_tools'
@@ -844,6 +843,43 @@ export class AgentService_v2 {
         case 'send_char': {
           try {
             const validatedArgs = sendCharSchema.parse(toolCall.args || {})
+            // const messageId = toolMessage.additional_kwargs._gyshellMessageId as string
+
+            if (this.actionModel) {
+              // Build temporary history for action model
+              const finalActionMessages = this.helpers.buildActionModelHistory(state.full_messages as BaseMessage[])
+
+              // Call action model for send_char policy check
+              const user = createSendCharPolicyUserPrompt({ chars: validatedArgs.sequence ?? [] })
+              const finalMessagesForActionModel = [...finalActionMessages, user]
+
+              let decision: z.infer<typeof SEND_CHAR_POLICY_DECISION_SCHEMA>
+              try {
+                const structuredModel = this.actionModel.withStructuredOutput(SEND_CHAR_POLICY_DECISION_SCHEMA)
+                decision = await this.helpers.invokeWithRetry(async (attempt) => {
+                  if (attempt > 0) {
+                    console.log(`[AgentService_v2] Retrying action model decision for send_char (attempt ${attempt + 1})...`)
+                  }
+                  return await structuredModel.invoke(finalMessagesForActionModel, { signal: config?.signal }) as any
+                })
+              } catch (err: any) {
+                console.warn('[AgentService_v2] Action model decision for send_char failed after retries, falling back to allow:', err)
+                decision = { decision: 'allow', reason: 'Action model error' }
+              }
+
+              if (decision.decision === 'block') {
+                const blockReason = `This call was blocked because the auditor found issues: ${decision.reason}\n\nActually, your intention might be different. Please re-read the description of the send_char tool to confirm what you really want to do, and then call send_char again with the correct parameters.`
+                console.log('[AgentService_v2] Action model decision for send_char blocked:', blockReason)
+                toolMessage.content = blockReason
+                return {
+                  messages: [...state.messages, toolMessage],
+                  full_messages: [...fullHistory, toolMessage],
+                  sessionId,
+                  pendingToolCalls: queue.slice(1)
+                }
+              }
+            }
+
             result = await toolImplementations.sendChar(validatedArgs, executionContext)
           } catch (err) {
             result = `Parameter validation error for send_char: ${(err as Error).message}`
@@ -947,49 +983,7 @@ export class AgentService_v2 {
       }
 
       // Build context for Action Model
-      const allMessages = state.full_messages as BaseMessage[]
-      
-      // 1. Find the last 3 special marker messages (only from HumanMessages)
-      const specialTags = [USER_INPUT_TAG, TAB_CONTEXT_MARKER, SYS_INFO_MARKER]
-      const last3Special: BaseMessage[] = []
-      for (let i = allMessages.length - 1; i >= 0 && last3Special.length < 3; i--) {
-        const msg = allMessages[i]
-        const content = msg.content
-        if (msg.type === 'human' && typeof content === 'string' && specialTags.some(tag => content.includes(tag))) {
-          last3Special.unshift(msg)
-        }
-      }
-
-      // 2. Locate the very last USER_INPUT_TAG message to define the execution detail range
-      let lastUserInputIndex = -1
-      for (let i = allMessages.length - 1; i >= 0; i--) {
-        const m = allMessages[i]
-        const content = m.content
-        if (m.type === 'human' && typeof content === 'string' && content.includes(USER_INPUT_TAG)) {
-          lastUserInputIndex = i
-          break
-        }
-      }
-      
-      // 3. Get execution details: messages strictly AFTER the last USER_INPUT_TAG
-      const executionDetails = lastUserInputIndex !== -1 
-        ? allMessages.slice(lastUserInputIndex + 1) 
-        : []
-
-      const recentExecutionMsgs: BaseMessage[] = []
-      if (executionDetails.length > 10) {
-        recentExecutionMsgs.push(new HumanMessage({ content: '... (some execution details omitted) ...' }))
-        recentExecutionMsgs.push(...executionDetails.slice(-10))
-      } else {
-        recentExecutionMsgs.push(...executionDetails)
-      }
-
-      // 4. Construct final message list for Action Model
-      // Structure: [Last 3 Special Tags] + [Recent Execution Details] + [System/User Prompts]
-      const finalActionMessages: BaseMessage[] = [
-        ...last3Special,
-        ...recentExecutionMsgs
-      ]
+      const finalActionMessages = this.helpers.buildActionModelHistory(state.full_messages as BaseMessage[])
 
       const user = createCommandPolicyUserPrompt({
         tabTitle: bestMatch.title,
@@ -1000,19 +994,18 @@ export class AgentService_v2 {
       })
 
       const finalMessagesForActionModel = [...finalActionMessages, user]
-      console.log('[AgentService_v2] Action Model Context:', JSON.stringify(finalMessagesForActionModel.map(m => ({
-        type: m.type,
-        content: typeof m.content === 'string' ? m.content.slice(0, 200) + (m.content.length > 200 ? '...' : '') : '[Complex Content]'
-      })), null, 2))
 
       let decision: z.infer<typeof COMMAND_POLICY_DECISION_SCHEMA>
       try {
-        const resp = await this.actionModel.invoke(finalMessagesForActionModel, { signal: config?.signal })
-        const raw = this.helpers.extractText((resp as any).content)
-        const parsed = this.helpers.parseStrictJsonObject(String(raw))
-        decision = COMMAND_POLICY_DECISION_SCHEMA.parse(parsed)
+        const structuredModel = this.actionModel.withStructuredOutput(COMMAND_POLICY_DECISION_SCHEMA)
+        decision = await this.helpers.invokeWithRetry(async (attempt) => {
+          if (attempt > 0) {
+            console.log(`[AgentService_v2] Retrying action model decision for exec_command (attempt ${attempt + 1})...`)
+          }
+          return await structuredModel.invoke(finalMessagesForActionModel, { signal: config?.signal }) as any
+        })
       } catch (err: any) {
-        toolMessage.content = `Action model decision failed: ${err?.message || String(err)}`
+        toolMessage.content = `Action model decision failed after retries: ${err?.message || String(err)}`
         return { 
             messages: [...state.messages, toolMessage], 
             full_messages: [...fullHistory, toolMessage],
