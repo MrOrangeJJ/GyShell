@@ -129,7 +129,14 @@ export async function runCommand(args: z.infer<typeof execCommandSchema>, contex
     if (isAbortError(error)) {
       throw error
     }
-    const errorMessage = error instanceof Error ? error.message : String(error)
+    let errorMessage = error instanceof Error ? error.message : String(error)
+    
+    // If it's a "command running" error, append the last 100 lines of terminal output
+    if (errorMessage.includes('There is a running exec_command')) {
+      const recentOutput = terminalService.getRecentOutput(bestMatch.id, 100) || '(No recent output available)'
+      errorMessage = `Error: ${errorMessage}\n\nThe last 100 lines of content from this terminal tab are:\n<terminal_context>\n${recentOutput}\n</terminal_context>\n\nIf you think you need to exit the current command, use send_char.`
+    }
+
     context.sendEvent(sessionId, { 
       messageId,
       type: 'command_finished', 
@@ -139,7 +146,7 @@ export async function runCommand(args: z.infer<typeof execCommandSchema>, contex
       exitCode: -1,
       outputDelta: errorMessage
     })
-    return `Error executing command: ${errorMessage}`
+    return errorMessage
   }
 }
 
@@ -191,7 +198,14 @@ export async function runCommandNowait(args: z.infer<typeof execCommandSchema>, 
     const historyCommandMatchId = await terminalService.runCommandNoWait(bestMatch.id, command)
     return `Command started in background. Use read_command_output to view output and status(finished or running), history_command_match_id=${historyCommandMatchId}, terminalId=${bestMatch.id}.`
   } catch (error) {
-    const errorMessage = error instanceof Error ? error.message : String(error)
+    let errorMessage = error instanceof Error ? error.message : String(error)
+
+    // If it's a "command running" error, append the last 100 lines of terminal output
+    if (errorMessage.includes('There is a running exec_command')) {
+      const recentOutput = terminalService.getRecentOutput(bestMatch.id, 100) || '(No recent output available)'
+      errorMessage = `Error: ${errorMessage}\n\nThe last 100 lines of content from this terminal tab are:\n<terminal_context>\n${recentOutput}\n</terminal_context>\n\nIf you think you need to exit the current command, use send_char.`
+    }
+
     context.sendEvent(sessionId, { 
       messageId,
       type: 'command_finished', 
@@ -201,7 +215,7 @@ export async function runCommandNowait(args: z.infer<typeof execCommandSchema>, 
       exitCode: -1,
       outputDelta: errorMessage
     })
-    return `Error: ${errorMessage}`
+    return errorMessage
   }
 }
 
