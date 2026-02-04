@@ -4,6 +4,7 @@ import { CornerUpLeft } from 'lucide-react'
 import ReactMarkdown from 'react-markdown'
 import type { AppStore } from '../../stores/AppStore'
 import type { ChatMessage } from '../../stores/ChatStore'
+import { renderMentionContent } from '../../lib/MentionParser'
 import { CommandBanner, ToolCallBanner, FileEditBanner, SubToolBanner, AskBanner, AlertBanner } from './ChatBanner'
 
 interface MessageRowProps {
@@ -101,31 +102,6 @@ export const MessageRow: React.FC<MessageRowProps> = observer(({
   const canRollback = isUser && !!msg.backendMessageId && !msg.streaming && !isThinking
 
   if (isUser) {
-    // Parser for [MENTION_XXX:#...#] labels
-    const renderContent = (content: string) => {
-      const parts = content.split(/(\[MENTION_(?:SKILL|TAB|FILE|USER_PASTE):#.+?#(?:#.+?#)?\])/g);
-      return parts.map((part, i) => {
-        const skillMatch = part.match(/\[MENTION_SKILL:#(.+?)#\]/);
-        if (skillMatch) {
-          return <span key={i} className="mention-badge skill">@{skillMatch[1]}</span>;
-        }
-        const terminalMatch = part.match(/\[MENTION_TAB:#(.+?)##(.+?)#\]/);
-        if (terminalMatch) {
-          return <span key={i} className="mention-badge terminal">@{terminalMatch[1]}</span>;
-        }
-        const fileMatch = part.match(/\[MENTION_FILE:#(.+?)#\]/);
-        if (fileMatch) {
-          const fileName = fileMatch[1].split(/[/\\]/).pop() || fileMatch[1];
-          return <span key={i} className="mention-badge file">{fileName}</span>;
-        }
-        const pasteMatch = part.match(/\[MENTION_USER_PASTE:#(.+?)##(.+?)#\]/);
-        if (pasteMatch) {
-          return <span key={i} className="mention-badge paste">{pasteMatch[2]}</span>;
-        }
-        return part;
-      });
-    };
-
     return (
       <div className={`message-user-row ${renderModeClass}`}>
         <button
@@ -138,7 +114,7 @@ export const MessageRow: React.FC<MessageRowProps> = observer(({
         </button>
         <div className={`message-text ${msg.role} ${renderModeClass}`}>
           <div className="plain-text">
-            {renderContent(msg.content)}
+            {renderMentionContent(msg.content)}
             {msg.streaming && <span className="cursor-blink" />}
           </div>
         </div>

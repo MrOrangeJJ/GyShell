@@ -328,19 +328,15 @@ app.whenReady().then(async () => {
   // Cleanup old pastes on startup
   void tempFileService.cleanup()
 
+  // Ensure skills dir exists + initial scan (best-effort)
+  skillService = new SkillService()
+  void skillService.reload()
+
   agentService = new AgentService_v2(terminalService, commandPolicyService, mcpToolService, skillService, uiHistoryService)
   gatewayService = new GatewayService(terminalService, agentService, uiHistoryService, commandPolicyService, tempFileService)
   // Mount to global for AgentHelper (temporary solution)
   ;(global as any).gateway = gatewayService;
   modelCapabilityService = new ModelCapabilityService()
-
-  // Ensure custom themes file exists (best-effort)
-  await themeService.ensureCustomThemeFile()
-  await themeService.loadCustomThemes()
-
-  // Ensure skills dir exists + initial scan (best-effort)
-  skillService = new SkillService()
-  void skillService.reload()
 
   // Load MCP tools (best-effort)
   void mcpToolService.reloadAll()

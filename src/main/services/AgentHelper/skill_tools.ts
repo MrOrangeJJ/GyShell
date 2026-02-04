@@ -33,6 +33,9 @@ export async function runSkillTool(
   args: unknown,
   skillService: SkillService
 ): Promise<SkillToolResult> {
+  if (!skillService) {
+    return { kind: 'error', message: 'Error: SkillService is not initialized.' }
+  }
   const validated = skillToolSchema.safeParse(args)
   const skillName = validated.success ? validated.data.name : String((args as any)?.name || 'unknown')
   const skills = await skillService.getAll().catch(() => [])

@@ -119,132 +119,74 @@ export const RichInput = observer(forwardRef<RichInputHandle, RichInputProps>(({
 
     // 1. Handle the re-select case where we have a direct targetTag
     if (info?.isReSelect && info.targetTag) {
-      const parent = info.targetTag.parentNode;
-      if (!parent) return;
-
-      // Create mention element
-      const span = document.createElement('span');
-      span.className = 'mention-tag';
-      span.contentEditable = 'false';
-      span.dataset.type = item.type;
-      span.dataset.name = item.name;
-      if (item.id) span.dataset.id = item.id;
-      if (item.preview) span.dataset.preview = item.preview;
+      // Create mention HTML
+      const fileName = item.name.split(/[/\\]/).pop() || item.name;
+      const displayText = item.type === 'file' ? fileName : (item.type === 'paste' ? (item.preview || '') : `@${item.name}`);
       
-      if (item.type === 'file') {
-        const fileName = item.name.split(/[/\\]/).pop() || item.name;
-        span.textContent = fileName;
-      } else if (item.type === 'paste') {
-        span.textContent = item.preview || '';
-      } else {
-        span.textContent = `@${item.name}`;
-      }
+      const html = `<span class="mention-tag" contenteditable="false" 
+                    data-type="${item.type}" data-name="${item.name}" 
+                    ${item.id ? `data-id="${item.id}"` : ''}
+                    ${item.preview ? `data-preview="${item.preview}"` : ''}>${displayText}</span>&nbsp;`;
 
-      // Create a space after
-      const afterNode = document.createTextNode('\u00A0');
-      
-      parent.insertBefore(span, info.targetTag);
-      parent.insertBefore(afterNode, info.targetTag);
-      parent.removeChild(info.targetTag);
-
-      // Precise cursor positioning
+      // Select the target tag to replace it
       const newRange = document.createRange();
-      newRange.setStart(afterNode, 1);
-      newRange.collapse(true);
+      newRange.selectNode(info.targetTag);
       selection.removeAllRanges();
       selection.addRange(newRange);
+      
+      // Use insertHTML to replace selection and keep undo stack
+      document.execCommand('insertHTML', false, html);
       
       setShowSuggestions(false);
       editorRef.current?.focus();
       return;
     }
 
-    // 2. Standard insertion case
-    const textNode = range.startContainer;
-    
-    // For file drops or pastes, we might not have a valid textNode selection in a text node
-    if ((item.type as string) === 'file' || (item.type as string) === 'paste') {
-      const span = document.createElement('span');
-      span.className = 'mention-tag';
-      span.contentEditable = 'false';
-      span.dataset.type = item.type;
-      span.dataset.name = item.name;
-      if (item.preview) span.dataset.preview = item.preview;
-      
-      if (item.type === 'file') {
+    // 2. Standard insertion case (triggered by '@')
+    if (info && !info.isReSelect) {
+      const textNode = range.startContainer;
+      if (textNode.nodeType === Node.TEXT_NODE) {
+        // Select the "@query" part to replace it
+        const newRange = document.createRange();
+        newRange.setStart(textNode, info.index);
+        newRange.setEnd(textNode, range.startOffset);
+        selection.removeAllRanges();
+        selection.addRange(newRange);
+
         const fileName = item.name.split(/[/\\]/).pop() || item.name;
-        span.textContent = fileName;
-      } else {
-        span.textContent = item.preview || '';
-      }
-
-      // Check if range exists and is inside the editor
-      const isInside = range && editorRef.current?.contains(range.commonAncestorContainer);
-
-      if (isInside) {
-        range.insertNode(span);
-        const space = document.createTextNode('\u00A0');
-        range.setStartAfter(span);
-        range.insertNode(space);
+        const displayText = item.type === 'file' ? fileName : (item.type === 'paste' ? (item.preview || '') : `@${item.name}`);
         
-        // Move cursor after the space
-        const newRange = document.createRange();
-        newRange.setStartAfter(space);
-        newRange.collapse(true);
-        selection.removeAllRanges();
-        selection.addRange(newRange);
-      } else {
-        // Fallback: append to the end if no valid range inside editor
-        editorRef.current?.appendChild(span);
-        editorRef.current?.appendChild(document.createTextNode('\u00A0'));
+        const html = `<span class="mention-tag" contenteditable="false" 
+                      data-type="${item.type}" data-name="${item.name}" 
+                      ${item.id ? `data-id="${item.id}"` : ''}
+                      ${item.preview ? `data-preview="${item.preview}"` : ''}>${displayText}</span>&nbsp;`;
+
+        document.execCommand('insertHTML', false, html);
         
-        // Move cursor to end
-        const newRange = document.createRange();
-        newRange.selectNodeContents(editorRef.current!);
-        newRange.collapse(false);
-        selection.removeAllRanges();
-        selection.addRange(newRange);
+        setShowSuggestions(false);
+        editorRef.current?.focus();
+        return;
       }
-      editorRef.current?.focus();
-      return;
     }
 
-    if (!info || textNode.nodeType !== Node.TEXT_NODE) return;
+    // 3. Fallback for file drops or pastes (no '@' context)
+    const fileName = item.name.split(/[/\\]/).pop() || item.name;
+    const displayText = item.type === 'file' ? fileName : (item.preview || '');
+    
+    const html = `<span class="mention-tag" contenteditable="false" 
+                  data-type="${item.type}" data-name="${item.name}" 
+                  ${item.preview ? `data-preview="${item.preview}"` : ''}>${displayText}</span>&nbsp;`;
 
-    const fullText = textNode.textContent || '';
-    const beforeText = fullText.slice(0, info.index);
-    const afterText = fullText.slice(range.startOffset);
-
-    // Create the mention element
-    const span = document.createElement('span');
-    span.className = 'mention-tag';
-    span.contentEditable = 'false';
-    span.dataset.type = item.type;
-    span.dataset.name = item.name;
-    if (item.id) span.dataset.id = item.id;
-    span.textContent = (item.type as string) === 'file' ? item.name : `@${item.name}`;
-
-    // Create nodes for before and after text
-    const beforeNode = document.createTextNode(beforeText);
-    const afterNode = document.createTextNode('\u00A0' + afterText);
-
-    // Replace the original text node
-    const parent = textNode.parentNode;
-    if (parent) {
-      parent.insertBefore(beforeNode, textNode);
-      parent.insertBefore(span, textNode);
-      parent.insertBefore(afterNode, textNode);
-      parent.removeChild(textNode);
-
-      // Precise cursor positioning
+    // Ensure range is inside editor
+    if (editorRef.current && !editorRef.current.contains(range.commonAncestorContainer)) {
       const newRange = document.createRange();
-      newRange.setStart(afterNode, 1);
-      newRange.collapse(true);
+      newRange.selectNodeContents(editorRef.current);
+      newRange.collapse(false);
       selection.removeAllRanges();
       selection.addRange(newRange);
     }
-    
-    setShowSuggestions(false);
+
+    document.execCommand('insertHTML', false, html);
     editorRef.current?.focus();
   };
 
