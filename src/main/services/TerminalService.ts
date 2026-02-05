@@ -297,6 +297,14 @@ export class TerminalService {
         headless.dispose()
         this.headlessPtys.delete(terminalId)
       }
+
+      // Thoroughly cleanup all memory state for this terminal
+      this.terminals.delete(terminalId)
+      this.buffers.delete(terminalId)
+      this.selectionByTerminal.delete(terminalId)
+      this.oscParseBufByTerminal.delete(terminalId)
+      this.tasksByTerminal.delete(terminalId)
+      this.activeTaskByTerminal.delete(terminalId)
     }
   }
 
