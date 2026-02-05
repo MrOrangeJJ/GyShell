@@ -26,7 +26,8 @@ import {
   buildToolsForThinkingModel,
 
   getThinkingModeAllowedToolNames,
-  toolImplementations
+  toolImplementations,
+  buildSkillToolDescription
 } from './AgentHelper/tools'
 import type { ToolExecutionContext } from './AgentHelper/types'
 import { AgentHelpers } from './AgentHelper/helpers'
@@ -398,7 +399,16 @@ export class AgentService_v2 {
         renderMode: 'normal'
       })
 
+      // Ensure we get the freshest list from disk
+      const skills = await this.skillService.reload()
       const builtInTools = this.helpers.getEnabledBuiltInTools(this.toolsForModel, this.builtInToolEnabled)
+      
+      // Update skill tool description with latest skills
+      const skillToolIndex = builtInTools.findIndex(t => t.function.name === 'skill')
+      if (skillToolIndex !== -1) {
+        builtInTools[skillToolIndex].function.description = buildSkillToolDescription(skills)
+      }
+
       const mcpTools = this.mcpToolService.getActiveTools()
       const modelWithTools = this.model.bindTools([...builtInTools, ...mcpTools])
 
@@ -761,15 +771,15 @@ export class AgentService_v2 {
         return { messages, full_messages: fullMessages, sessionId, pendingToolCalls }
       }
 
-      const thinkCall = toolCalls.find((tc) => tc?.name === 'think')
-      if (thinkCall) {
-        pendingToolCalls = [thinkCall]
-        this.cleanupModelToolCallMetadata(lastMessage, pendingToolCalls)
-        this.cleanupModelToolCallMetadata(fullLastMessage, pendingToolCalls)
-        return { messages, full_messages: fullMessages, sessionId, pendingToolCalls }
-      }
+    const thinkCall = toolCalls.find((tc) => tc?.name === 'think')
+    if (thinkCall) {
+      pendingToolCalls = [thinkCall]
+      this.cleanupModelToolCallMetadata(lastMessage, pendingToolCalls)
+      this.cleanupModelToolCallMetadata(fullLastMessage, pendingToolCalls)
+      return { messages, full_messages: fullMessages, sessionId, pendingToolCalls }
+    }
 
-      // If ANY exec_command is present, force single-tool: keep only the first tool call.
+    // If ANY exec_command is present, force single-tool: keep only the first tool call.
       const hasExecCommand = toolCalls.some((tc) => tc?.name === 'exec_command')
       if (hasExecCommand) {
         pendingToolCalls = toolCalls.slice(0, 1)
@@ -843,6 +853,32 @@ export class AgentService_v2 {
           this.helpers.sendEvent(sessionId, {
             messageId,
             type: 'sub_tool_finished'
+          })
+          break
+        }
+        case 'create_skill': {
+          let args: any = toolCall.args || {}
+          if (typeof args === 'string') {
+            try {
+              args = this.helpers.parseStrictJsonObject(args)
+            } catch {
+              args = {}
+            }
+          }
+          const messageId = toolMessage.additional_kwargs._gyshellMessageId as string
+          const outcome = await toolImplementations.runCreateSkillTool(args, this.skillService, config?.signal)
+          result = outcome.message
+          
+          // Force a reload of the graph to pick up the new tool definition if needed,
+          // though the dynamic fetching in model_request node should handle it.
+          // But we must ensure the local toolsForModel is updated if we use it elsewhere.
+          
+          this.helpers.sendEvent(sessionId, {
+            messageId,
+            type: 'tool_call',
+            toolName: 'create_skill',
+            input: JSON.stringify(args),
+            output: result
           })
           break
         }
@@ -1240,7 +1276,7 @@ export class AgentService_v2 {
       .map((tool: any) => tool?.function?.name ?? tool?.name)
       .filter((name: any): name is string => typeof name === 'string')
     const mcpNames = this.mcpToolService.getActiveTools().map((tool) => tool.name)
-    return Array.from(new Set([...builtInNames, ...mcpNames]))
+    return Array.from(new Set([...builtInNames, ...mcpNames, 'skill', 'create_skill']))
   }
 
   private routeFirewallOutput = (state: any): string => {
@@ -1258,7 +1294,7 @@ export class AgentService_v2 {
     if (first?.name) {
       if (first.name === 'think') return 'thinking_request'
       if (first.name === 'thinking_end') return 'thinking_finalize'
-      if (first.name === 'skill') return 'tools'
+      if (first.name === 'skill' || first.name === 'create_skill') return 'tools'
       if (this.mcpToolService.isMcpToolName(first.name)) return 'mcp_tools'
       if (first.name === 'exec_command') return 'command_tools'
       if (first.name === 'create_or_edit') return 'file_tools'
@@ -1283,6 +1319,7 @@ export class AgentService_v2 {
       if (first.name === 'exec_command') return 'command_tools'
       if (first.name === 'create_or_edit') return 'file_tools'
       if (first.name === 'read_file') return 'read_file'
+      if (first.name === 'skill' || first.name === 'create_skill') return 'tools'
       return 'tools'
     }
     return 'token_pruner_runtime'

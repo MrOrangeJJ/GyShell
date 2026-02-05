@@ -143,6 +143,35 @@ export class SkillService {
     await this.reload()
   }
 
+  async createSkill(name: string, description: string, content: string): Promise<SkillInfo> {
+    await this.ensureSkillsDir()
+    // Convert name to a safe file name (e.g., "My Skill" -> "my-skill.md")
+    const safeBaseName = name.toLowerCase().replace(/[^a-z0-9]/g, '-')
+    const fileName = `${safeBaseName}-${Date.now()}.md`
+    const filePath = path.join(this.getSkillsDir(), fileName)
+    
+    const fullContent = [
+      '---',
+      `name: ${name}`,
+      `description: ${description}`,
+      '---',
+      '',
+      content
+    ].join('\n')
+
+    await fs.writeFile(filePath, fullContent, 'utf-8')
+    await this.reload()
+    
+    const created = this.cache.find((s) => s.fileName === fileName)
+    if (created) return created
+    return {
+      name,
+      description,
+      fileName,
+      filePath
+    }
+  }
+
   async createSkillFromTemplate(): Promise<SkillInfo> {
     await this.ensureSkillsDir()
     const now = new Date()

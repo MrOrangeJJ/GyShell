@@ -23,7 +23,12 @@ import {
 } from './prompts'
 import type { ReadFileSupport } from './types'
 import { thinkSchema, thinkingEndSchema, waitSchema } from './thinking_tools'
-import { skillToolSchema, buildSkillToolDescription } from './skill_tools'
+import { 
+  skillToolSchema, 
+  buildSkillToolDescription,
+  createSkillSchema,
+  runCreateSkillTool
+} from './skill_tools'
 import type { SkillInfo } from '../SkillService'
 
 // Re-export schemas for AgentService to use
@@ -42,7 +47,7 @@ export {
 
 export { readFileSchema } from './read_tools'
 export { thinkSchema, thinkingEndSchema, waitSchema } from './thinking_tools'
-export { skillToolSchema } from './skill_tools'
+export { skillToolSchema, createSkillSchema, buildSkillToolDescription } from './skill_tools'
 
 export { BUILTIN_TOOL_INFO } from './prompts'
 
@@ -82,6 +87,16 @@ export function buildToolsForModel(readFileSupport: ReadFileSupport) {
       schema: writeAndEditSchema
     },
     {
+      name: 'skill',
+      description: buildSkillToolDescription([]), // Placeholder, will be updated by AgentService
+      schema: skillToolSchema
+    },
+    {
+      name: 'create_skill',
+      description: 'Create a new skill with specialized instructions and add it to the available skills list. Use this to persist complex workflows or expert knowledge that you can reuse later.',
+      schema: createSkillSchema
+    },
+    {
       name: 'think',
       description: THINK_TOOL_DESCRIPTION,
       schema: thinkSchema
@@ -99,28 +114,18 @@ export function buildToolsForModel(readFileSupport: ReadFileSupport) {
   ].map((tool) => convertToOpenAITool(tool))
 }
 
-export function buildToolsForThinkingModel(skills: SkillInfo[]) {
+export function buildToolsForThinkingModel(_skills: SkillInfo[]) {
   return [
-    {
-      name: 'skill',
-      description: buildSkillToolDescription(skills),
-      schema: skillToolSchema
-    },
     {
       name: 'thinking_end',
       description: THINKING_END_TOOL_DESCRIPTION,
       schema: thinkingEndSchema
-    },
-    {
-      name: 'read_terminal_tab',
-      description: 'Read the recent visible output of a specific terminal tab to get context for your analysis.',
-      schema: readTerminalTabSchema
     }
   ].map((tool) => convertToOpenAITool(tool))
 }
 
 export function getThinkingModeAllowedToolNames(): string[] {
-  return ['skill', 'thinking_end', 'read_terminal_tab']
+  return ['thinking_end']
 }
 
 export const TOOLS_FOR_MODEL = buildToolsForModel({ image: false })
@@ -134,5 +139,6 @@ export const toolImplementations = {
   sendChar,
   waitTerminalIdle,
   writeAndEdit,
-  runReadFile
+  runReadFile,
+  runCreateSkillTool
 }
