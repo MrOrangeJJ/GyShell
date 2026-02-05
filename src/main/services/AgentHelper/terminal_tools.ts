@@ -136,7 +136,12 @@ export async function runCommand(args: z.infer<typeof execCommandSchema>, contex
     // If it's a "command running" error, append the last terminal output
     if (errorMessage.includes('There is a running exec_command')) {
       const recentOutput = terminalService.getRecentOutput(bestMatch.id) || '(No recent output available)'
-      errorMessage = `Error: ${errorMessage}\n\nThe current visible state of this terminal tab is:\n<terminal_context>\n${recentOutput}\n</terminal_context>\n\nIf you think you need to exit the current command, use send_char.`
+      errorMessage = `Error: ${errorMessage}\n\nThe current visible state of the terminal tab "${bestMatch.title || bestMatch.id}" is:
+================================================================================
+<terminal_content>
+${recentOutput}
+</terminal_content>
+================================================================================\n\nIf you think you need to exit the current command, use send_char.`
     }
 
     context.sendEvent(sessionId, { 
@@ -207,7 +212,12 @@ export async function runCommandNowait(args: z.infer<typeof execCommandSchema>, 
     // If it's a "command running" error, append the last terminal output
     if (errorMessage.includes('There is a running exec_command')) {
       const recentOutput = terminalService.getRecentOutput(bestMatch.id) || '(No recent output available)'
-      errorMessage = `Error: ${errorMessage}\n\nThe current visible state of this terminal tab is:\n<terminal_context>\n${recentOutput}\n</terminal_context>\n\nIf you think you need to exit the current command, use send_char.`
+      errorMessage = `Error: ${errorMessage}\n\nThe current visible state of the terminal tab "${bestMatch.title || bestMatch.id}" is:
+================================================================================
+<terminal_content>
+${recentOutput}
+</terminal_content>
+================================================================================\n\nIf you think you need to exit the current command, use send_char.`
     }
 
     context.sendEvent(sessionId, { 
@@ -252,7 +262,12 @@ export async function readTerminalTab(args: z.infer<typeof readTerminalTabSchema
     return 'No output available.'
   }
 
-  const finalResult = `The following is the current visible state of the terminal tab "${bestMatch.title || bestMatch.id}":\n${output}`
+  const finalResult = `The following is the current visible state of the terminal tab "${bestMatch.title || bestMatch.id}":
+================================================================================
+<terminal_content>
+${output}
+</terminal_content>
+================================================================================`
   
   sendEvent(sessionId, {
     messageId,
@@ -340,7 +355,12 @@ export async function readCommandOutput(
     `Status: ${task.status}`
   ].join('\n')
 
-  const finalOutput = `${header}\n\n${result}`
+  const finalOutput = `${header}
+================================================================================
+<terminal_content>
+${result}
+</terminal_content>
+================================================================================`
 
   sendEvent(sessionId, {
     messageId,
@@ -409,7 +429,12 @@ export async function sendChar(args: z.infer<typeof sendCharSchema>, context: To
   await waitWithSignal(1000, context.signal)
   abortIfNeeded(context.signal)
   const output = terminalService.getRecentOutput(bestMatch.id) || 'No output available.'
-  const resultHint = `Sent sequence: ${sequence?.join(', ')}. The following is the current visible state of the terminal 1s after the sequence was sent:\n${output}`
+  const resultHint = `Sent sequence: ${sequence?.join(', ')}. The following is the current visible state of the terminal tab "${bestMatch.title || bestMatch.id}" 1s after the sequence was sent:
+================================================================================
+<terminal_content>
+${output}
+</terminal_content>
+================================================================================`
 
   sendEvent(sessionId, {
     messageId,
@@ -465,7 +490,12 @@ export async function waitTerminalIdle(
 
     if (stableCount >= 4) {
       const finalOutput = terminalService.getRecentOutput(bestMatch.id)
-      const successMsg = `The terminal has stabilized. The following is the current visible state of the terminal:\n${finalOutput}`
+      const successMsg = `The terminal has stabilized. The following is the current visible state of the terminal tab "${bestMatch.title || bestMatch.id}":
+================================================================================
+<terminal_content>
+${finalOutput}
+</terminal_content>
+================================================================================`
       sendEvent(sessionId, {
         messageId,
         type: 'sub_tool_delta',
@@ -483,7 +513,12 @@ export async function waitTerminalIdle(
   }
 
   const currentOutput = terminalService.getRecentOutput(bestMatch.id)
-  const timeoutMsg = `Wait timeout: The terminal has been running for over 120s and is still not idle. Please check if the task is still running correctly. If you need to continue waiting, run this tool again. If you need to stop it, use send_char (e.g., Ctrl+C). The following is the current visible state of the terminal:\n${currentOutput}`
+  const timeoutMsg = `Wait timeout: The terminal has been running for over 120s and is still not idle. Please check if the task is still running correctly. If you need to continue waiting, run this tool again. If you need to stop it, use send_char (e.g., Ctrl+C). The following is the current visible state of the terminal tab "${bestMatch.title || bestMatch.id}":
+================================================================================
+<terminal_content>
+${currentOutput}
+</terminal_content>
+================================================================================`
   sendEvent(sessionId, {
     messageId,
     type: 'sub_tool_delta',
@@ -597,7 +632,12 @@ function truncateCommandOutput(output: string, historyCommandMatchId: string, te
 
   const truncatedLines = [...head, omittedLine, ...tail]
 
-  let result = truncatedLines.join('\n').trimEnd()
+  let result = `
+================================================================================
+<terminal_content>
+${truncatedLines.join('\n').trimEnd()}
+</terminal_content>
+================================================================================`
   if (Buffer.byteLength(result, 'utf8') > COMMAND_OUTPUT_MAX_BYTES) {
     result =
       result.slice(0, COMMAND_OUTPUT_MAX_BYTES) +
@@ -632,8 +672,12 @@ function formatCommandOutputSlice(params: { output: string; offset: number; limi
   }
 
   const content = raw.map((line, index) => `${(index + safeOffset + 1).toString().padStart(5, '0')}| ${line}`)
-  let result = '<command_output>\n'
-  result += content.join('\n')
+  let result = `
+================================================================================
+<terminal_content>
+${content.join('\n')}
+</terminal_content>
+================================================================================`
 
   const totalLines = lines.length
   const lastReadLine = safeOffset + raw.length

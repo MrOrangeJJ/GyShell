@@ -197,11 +197,17 @@ export function createSystemInfoPrompt(tabs: TerminalTab[]): HumanMessage {
  */
 export function createTabContextPrompt(tab: TerminalTab | undefined, recentOutput: string): HumanMessage {
   const tabId = tab?.id
-  let contextText = `${TAB_CONTEXT_MARKER}\nCurrent Tab ID: ${tabId || 'None'}`
+  let contextText = `${TAB_CONTEXT_MARKER}\nYou are currently operating in the following terminal tab:
+- Title: ${tab?.title || 'None'}
+- ID: ${tabId || 'None'}
+- Type: ${tab?.type || 'None'}`
   
   if (tab) {
-    contextText += `\nTab Title: ${tab.title}`
-    contextText += `\n\nRecent Output (Last 100 lines):\n\`\`\`\n${recentOutput}\n\`\`\``
+    if (tab.remoteOs) contextText += `\n- Remote OS: ${tab.remoteOs}`
+    if (tab.systemInfo) contextText += `\n- System Info: ${tab.systemInfo}`
+    
+    contextText += `\n\nThe following is the current visible state of this terminal tab:
+${recentOutput || '(No output available)'}`
   }
   
   return new HumanMessage(contextText)

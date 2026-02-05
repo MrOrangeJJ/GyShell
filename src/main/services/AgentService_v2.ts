@@ -333,7 +333,14 @@ export class AgentService_v2 {
       const currentTab = currentTabId ? this.terminalService.getAllTerminals().find(t => t.id === currentTabId) : undefined
       const recent = currentTabId ? this.terminalService.getRecentOutput(currentTabId) : ''
       
-      const contextMsg = this.helpers.markEphemeral(createTabContextPrompt(currentTab, recent))
+      const formattedRecent = recent ? `
+================================================================================
+<terminal_content>
+${recent}
+</terminal_content>
+================================================================================` : ''
+
+      const contextMsg = this.helpers.markEphemeral(createTabContextPrompt(currentTab, formattedRecent))
 
       const prefix = hasBaseSystem ? [] : [baseSystemMsg]
       const newMessages = [...prefix, ...otherMsgs, sysInfoMsg, contextMsg, lastMsg]
