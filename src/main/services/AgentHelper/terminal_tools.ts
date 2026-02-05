@@ -381,9 +381,9 @@ export async function sendChar(args: z.infer<typeof sendCharSchema>, context: To
   for (const ch of resolved) {
     abortIfNeeded(context.signal)
     terminalService.write(bestMatch.id, ch)
-    // Add 0.5s interval between characters if it's a list
+    // Add 0.1s interval between characters if it's a list
     if (resolved.length > 1) {
-      await waitWithSignal(500, context.signal)
+      await waitWithSignal(100, context.signal)
     }
   }
 

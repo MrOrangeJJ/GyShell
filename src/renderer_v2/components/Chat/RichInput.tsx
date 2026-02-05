@@ -127,7 +127,7 @@ export const RichInput = observer(forwardRef<RichInputHandle, RichInputProps>(({
       const html = `<span class="mention-tag" contenteditable="false" 
                     data-type="${item.type}" data-name="${item.name}" 
                     ${item.id ? `data-id="${item.id}"` : ''}
-                    ${item.preview ? `data-preview="${item.preview}"` : ''}>${displayText}</span>&nbsp;`;
+                    ${item.preview ? `data-preview="${item.preview}"` : ''}>${displayText}</span>\uFEFF`;
 
       // Select the target tag to replace it
       const newRange = document.createRange();
@@ -137,6 +137,9 @@ export const RichInput = observer(forwardRef<RichInputHandle, RichInputProps>(({
       
       // Use insertHTML to replace selection and keep undo stack
       document.execCommand('insertHTML', false, html);
+      
+      // Force cursor to move after the zero-width non-break space
+      selection.modify('move', 'forward', 'character');
       
       setShowSuggestions(false);
       editorRef.current?.focus();
@@ -160,9 +163,12 @@ export const RichInput = observer(forwardRef<RichInputHandle, RichInputProps>(({
         const html = `<span class="mention-tag" contenteditable="false" 
                       data-type="${item.type}" data-name="${item.name}" 
                       ${item.id ? `data-id="${item.id}"` : ''}
-                      ${item.preview ? `data-preview="${item.preview}"` : ''}>${displayText}</span>&nbsp;`;
+                      ${item.preview ? `data-preview="${item.preview}"` : ''}>${displayText}</span>\uFEFF`;
 
         document.execCommand('insertHTML', false, html);
+
+        // Force cursor to move after the zero-width non-break space
+        selection.modify('move', 'forward', 'character');
         
         setShowSuggestions(false);
         editorRef.current?.focus();
@@ -176,7 +182,7 @@ export const RichInput = observer(forwardRef<RichInputHandle, RichInputProps>(({
     
     const html = `<span class="mention-tag" contenteditable="false" 
                   data-type="${item.type}" data-name="${item.name}" 
-                  ${item.preview ? `data-preview="${item.preview}"` : ''}>${displayText}</span>&nbsp;`;
+                  ${item.preview ? `data-preview="${item.preview}"` : ''}>${displayText}</span>\uFEFF`;
 
     // Ensure range is inside editor
     if (editorRef.current && !editorRef.current.contains(range.commonAncestorContainer)) {
@@ -188,6 +194,10 @@ export const RichInput = observer(forwardRef<RichInputHandle, RichInputProps>(({
     }
 
     document.execCommand('insertHTML', false, html);
+    
+    // Force cursor to move after the zero-width non-break space
+    selection.modify('move', 'forward', 'character');
+
     editorRef.current?.focus();
   };
 
