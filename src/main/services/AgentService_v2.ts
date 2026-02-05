@@ -117,6 +117,7 @@ export class AgentService_v2 {
   private toolsForModel = TOOLS_FOR_MODEL
   private builtInToolEnabled: Record<string, boolean> = {}
   private readFileSupport = { image: false }
+  private lastAbortedMessage: BaseMessage | null = null
 
   constructor(
     terminalService: TerminalService,
@@ -403,6 +404,7 @@ export class AgentService_v2 {
 
       const messageId = uuidv4()
       
+      let partialText = ''
       const fullResponse = await this.helpers.invokeWithRetry(async (attempt) => {
         if (attempt > 0) {
           this.helpers.sendEvent(sessionId, {
@@ -418,22 +420,31 @@ export class AgentService_v2 {
         })
 
         let response: any = null
-        for await (const chunk of stream) {
-          response = response ? response.concat(chunk) : chunk
-          const delta = this.helpers.extractText(chunk.content)
-          if (delta) {
-            this.helpers.sendEvent(sessionId, {
-              messageId,
-              type: 'say',
-              content: delta
-            })
+        try {
+          for await (const chunk of stream) {
+            response = response ? response.concat(chunk) : chunk
+            const delta = this.helpers.extractText(chunk.content)
+            if (delta) {
+              partialText += delta
+              this.helpers.sendEvent(sessionId, {
+                messageId,
+                type: 'say',
+                content: delta
+              })
+            }
           }
+        } catch (err) {
+          if (partialText.trim()) {
+            this.lastAbortedMessage = new AIMessage({
+              content: partialText,
+              additional_kwargs: { _gyshellMessageId: messageId, _gyshellAborted: true }
+            })
+            console.log('[AgentService_v2] Captured partial message from error/abort in instance variable.')
+          }
+          throw err
         }
         return response
       })
-
-      // NOTE: We do NOT enforce single-tool here anymore.
-      // Tool-call cleanup and batch/single selection is handled in batch_toolcall_executor.
 
       fullResponse.additional_kwargs = {
         ...(fullResponse.additional_kwargs || {}),
@@ -530,6 +541,7 @@ export class AgentService_v2 {
 
       const messageId = uuidv4()
 
+      let partialText = ''
       const fullResponse = await this.helpers.invokeWithRetry(async (attempt) => {
         if (attempt > 0) {
           this.helpers.sendEvent(sessionId, {
@@ -545,16 +557,28 @@ export class AgentService_v2 {
         })
 
         let response: any = null
-        for await (const chunk of stream) {
-          response = response ? response.concat(chunk) : chunk
-          const delta = this.helpers.extractText(chunk.content)
-          if (delta) {
-            this.helpers.sendEvent(sessionId, {
-              messageId,
-              type: 'say',
-              content: delta
-            })
+        try {
+          for await (const chunk of stream) {
+            response = response ? response.concat(chunk) : chunk
+            const delta = this.helpers.extractText(chunk.content)
+            if (delta) {
+              partialText += delta
+              this.helpers.sendEvent(sessionId, {
+                messageId,
+                type: 'say',
+                content: delta
+              })
+            }
           }
+        } catch (err) {
+          if (partialText.trim()) {
+            this.lastAbortedMessage = new AIMessage({
+              content: partialText,
+              additional_kwargs: { _gyshellMessageId: messageId, _gyshellAborted: true }
+            })
+            console.log('[AgentService_v2] Captured partial message from error/abort in instance variable.')
+          }
+          throw err
         }
         return response
       })
@@ -1285,6 +1309,7 @@ export class AgentService_v2 {
   async run(context: any, input: string, signal: AbortSignal): Promise<void> {
     if (!this.graph) throw new Error('Graph not initialized')
 
+    this.lastAbortedMessage = null
     const { sessionId, boundTerminalId } = context
     const recursionLimit = this.settings?.recursionLimit ?? 200
     const loadedSession = this.chatHistoryService.loadSession(sessionId)
@@ -1379,8 +1404,15 @@ export class AgentService_v2 {
     if (!this.graph) return
     try {
       const snapshot = await this.graph.getState({ configurable: { thread_id: sessionId } })
-      const messages = ((snapshot as any)?.values?.full_messages || (snapshot as any)?.values?.messages) as BaseMessage[] | undefined
+      let messages = ((snapshot as any)?.values?.full_messages || (snapshot as any)?.values?.messages) as BaseMessage[] | undefined
       if (!messages || messages.length === 0) return
+      
+      // Check if there's an aborted message captured in the instance variable
+      if (this.lastAbortedMessage) {
+        console.log('[AgentService_v2] Appending aborted message from instance variable to history.')
+        messages = [...messages, this.lastAbortedMessage]
+        this.lastAbortedMessage = null // Clear after use
+      }
       
       const session = this.chatHistoryService.loadSession(sessionId) || {
         id: sessionId,
