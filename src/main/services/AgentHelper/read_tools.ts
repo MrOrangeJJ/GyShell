@@ -244,6 +244,8 @@ export async function runReadFile(
     if (signal?.aborted) throw new Error('AbortError')
 
     const stat = await terminalService.statFile(bestMatch.id, filePath)
+    
+    if (signal?.aborted) throw new Error('AbortError')
 
     if (!stat.exists) {
       resultText = `File not found: ${filePath}`
@@ -253,6 +255,8 @@ export async function runReadFile(
       level = 'warning'
     } else {
       const bytes = await terminalService.readFile(bestMatch.id, filePath)
+      if (signal?.aborted) throw new Error('AbortError')
+      
       const kind = detectFileKind(filePath, bytes)
 
       if (kind === 'image') {
@@ -273,6 +277,7 @@ export async function runReadFile(
         }
       } else if (kind === 'pdf') {
         resultText = await readPdfFile({ bytes, filePath })
+        if (signal?.aborted) throw new Error('AbortError')
       } else {
         resultText = readTextFile({
           filePath: filePath,

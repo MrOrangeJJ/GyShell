@@ -31,18 +31,26 @@ export type SkillToolResult =
 
 export async function runSkillTool(
   args: unknown,
-  skillService: SkillService
+  skillService: SkillService,
+  signal?: AbortSignal
 ): Promise<SkillToolResult> {
   if (!skillService) {
     return { kind: 'error', message: 'Error: SkillService is not initialized.' }
   }
+  if (signal?.aborted) throw new Error('AbortError')
+  
   const validated = skillToolSchema.safeParse(args)
   const skillName = validated.success ? validated.data.name : String((args as any)?.name || 'unknown')
   const skills = await skillService.getAll().catch(() => [])
+  
+  if (signal?.aborted) throw new Error('AbortError')
+  
   const match = skills.find((s) => s.name === skillName)
 
   if (match) {
     const loaded = await skillService.readSkillContentByName(match.name)
+    if (signal?.aborted) throw new Error('AbortError')
+    
     const body = [
       USEFUL_SKILL_TAG,
       `name: ${loaded.info.name}`,

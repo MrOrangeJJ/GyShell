@@ -79,6 +79,7 @@ export async function runCommand(args: z.infer<typeof execCommandSchema>, contex
 
   const allowed = await checkCommandPolicy(command, 'run_command', context)
   if (!allowed.allowed) {
+    abortIfNeeded(context.signal)
     context.sendEvent(sessionId, {
       messageId,
       type: 'command_started',
@@ -99,6 +100,7 @@ export async function runCommand(args: z.infer<typeof execCommandSchema>, contex
     return allowed.message
   }
 
+  abortIfNeeded(context.signal)
   context.sendEvent(sessionId, { 
     messageId,
     type: 'command_started', 
@@ -165,6 +167,7 @@ export async function runCommandNowait(args: z.infer<typeof execCommandSchema>, 
 
   const allowed = await checkCommandPolicy(command, 'run_command_nowait', context)
   if (!allowed.allowed) {
+    abortIfNeeded(context.signal)
     context.sendEvent(sessionId, {
       messageId,
       type: 'command_started',
@@ -185,6 +188,7 @@ export async function runCommandNowait(args: z.infer<typeof execCommandSchema>, 
     return allowed.message
   }
 
+  abortIfNeeded(context.signal)
   context.sendEvent(sessionId, { 
     messageId,
     type: 'command_started', 
@@ -359,6 +363,7 @@ export async function sendChar(args: z.infer<typeof sendCharSchema>, context: To
   const commandText = (sequence ?? []).join('')
   const allowed = await checkCommandPolicy(commandText, 'send_char', context)
   if (!allowed.allowed) {
+    abortIfNeeded(context.signal)
     sendEvent(sessionId, {
       messageId,
       type: 'tool_call',
@@ -388,6 +393,7 @@ export async function sendChar(args: z.infer<typeof sendCharSchema>, context: To
   }
 
   await waitWithSignal(1000, context.signal)
+  abortIfNeeded(context.signal)
   const output = terminalService.getRecentOutput(bestMatch.id, 40) || 'No output available.'
   const resultHint = `Sent sequence: ${sequence?.join(', ')}. The current state of the terminal 1s after the command was sent is:\n${output}`
 

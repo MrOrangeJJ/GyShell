@@ -444,7 +444,7 @@ export class AgentService_v2 {
           throw err
         }
         return response
-      })
+      }, 4, [1000, 2000, 4000, 6000], config?.signal)
 
       fullResponse.additional_kwargs = {
         ...(fullResponse.additional_kwargs || {}),
@@ -581,7 +581,7 @@ export class AgentService_v2 {
           throw err
         }
         return response
-      })
+      }, 4, [1000, 2000, 4000, 6000], config?.signal)
 
       const usage = (fullResponse as any)?.usage_metadata || (fullResponse as any)?.additional_kwargs?.usage
       let currentTokens = state.token_state.current_tokens
@@ -830,7 +830,7 @@ export class AgentService_v2 {
             hint: `${args.name || 'unknown'}...`,
             input: JSON.stringify(args)
           })
-          const outcome = await runSkillTool(args, this.skillService)
+          const outcome = await runSkillTool(args, this.skillService, config?.signal)
           result = outcome.message
           const skillContent = result.split(USEFUL_SKILL_TAG)[1].trim()
 
@@ -885,7 +885,7 @@ export class AgentService_v2 {
                     console.log(`[AgentService_v2] Retrying action model decision for send_char (attempt ${attempt + 1})...`)
                   }
                   return await structuredModel.invoke(finalMessagesForActionModel, { signal: config?.signal }) as any
-                })
+                }, 4, [1000, 2000, 4000, 6000], config?.signal)
               } catch (err: any) {
                 console.warn('[AgentService_v2] Action model decision for send_char failed after retries, falling back to allow:', err)
                 decision = { decision: 'allow', reason: 'Action model error' }
@@ -1027,7 +1027,7 @@ export class AgentService_v2 {
             console.log(`[AgentService_v2] Retrying action model decision for exec_command (attempt ${attempt + 1})...`)
           }
           return await structuredModel.invoke(finalMessagesForActionModel, { signal: config?.signal }) as any
-        })
+        }, 4, [1000, 2000, 4000, 6000], config?.signal)
       } catch (err: any) {
         toolMessage.content = `Action model decision failed after retries: ${err?.message || String(err)}`
         return { 

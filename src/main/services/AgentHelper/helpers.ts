@@ -167,10 +167,14 @@ export class AgentHelpers {
   async invokeWithRetry<T>(
     fn: (attempt: number) => Promise<T>,
     maxRetries: number = 4,
-    delays: number[] = [1000, 2000, 4000, 6000]
+    delays: number[] = [1000, 2000, 4000, 6000],
+    signal?: AbortSignal
   ): Promise<T> {
     let lastError: any
     for (let attempt = 0; attempt < maxRetries; attempt++) {
+      if (signal?.aborted) {
+        throw new Error('AbortError')
+      }
       try {
         return await fn(attempt)
       } catch (error: any) {
@@ -184,7 +188,17 @@ export class AgentHelpers {
         if (attempt < maxRetries - 1) {
           const delay = delays[attempt]
           console.warn(`[AgentService] Model invocation failed (Attempt ${attempt + 1}/${maxRetries}). Error: ${error.message}. Retrying in ${delay}ms...`)
-          await new Promise((resolve) => setTimeout(resolve, delay))
+          
+          // Wait with signal support
+          await new Promise((resolve, reject) => {
+            const timer = setTimeout(resolve, delay)
+            const onAbort = () => {
+              clearTimeout(timer)
+              reject(new Error('AbortError'))
+            }
+            if (signal?.aborted) onAbort()
+            signal?.addEventListener('abort', onAbort, { once: true })
+          })
           continue
         }
       }

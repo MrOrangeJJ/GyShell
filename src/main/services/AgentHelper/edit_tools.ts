@@ -101,6 +101,8 @@ export async function runEditTool(
 
   if (signal?.aborted) throw new Error('AbortError')
   const stat = await terminalService.statFile(terminal.id, filePath)
+  if (signal?.aborted) throw new Error('AbortError')
+  
   if (!stat.exists && args.oldString !== '') {
     throw new Error(`File not found: ${filePath}`)
   }
@@ -128,6 +130,8 @@ export async function runEditTool(
 
   if (signal?.aborted) throw new Error('AbortError')
   contentOld = (await terminalService.readFile(terminal.id, filePath)).toString('utf8')
+  if (signal?.aborted) throw new Error('AbortError')
+  
   contentNew = replace(contentOld, args.oldString, args.newString, args.replaceAll)
   diff = trimDiff(
     createTwoFilesPatch(filePath, filePath, normalizeLineEndings(contentOld), normalizeLineEndings(contentNew))
@@ -136,6 +140,8 @@ export async function runEditTool(
   await terminalService.writeFile(terminal.id, filePath, contentNew)
   if (signal?.aborted) throw new Error('AbortError')
   const contentAfter = (await terminalService.readFile(terminal.id, filePath)).toString('utf8')
+  if (signal?.aborted) throw new Error('AbortError')
+  
   diff = trimDiff(
     createTwoFilesPatch(
       filePath,
@@ -172,15 +178,20 @@ export async function runWriteTool(
   const filePath = args.filePath
   if (signal?.aborted) throw new Error('AbortError')
   const stat = await terminalService.statFile(terminal.id, filePath)
+  if (signal?.aborted) throw new Error('AbortError')
+  
   if (stat.exists && stat.isDirectory) {
     throw new Error(`Path is a directory, not a file: ${filePath}`)
   }
 
   if (signal?.aborted) throw new Error('AbortError')
   const contentOld = stat.exists ? (await terminalService.readFile(terminal.id, filePath)).toString('utf8') : ''
+  if (signal?.aborted) throw new Error('AbortError')
+  
   const diff = trimDiff(createTwoFilesPatch(filePath, filePath, contentOld, args.content))
   if (signal?.aborted) throw new Error('AbortError')
   await terminalService.writeFile(terminal.id, filePath, args.content)
+  if (signal?.aborted) throw new Error('AbortError')
 
   return {
     output: 'Wrote file successfully.',
