@@ -62,8 +62,8 @@ export class InputParseHelper {
       try {
         const tab = terminalService.getAllTerminals().find(t => t.id === id);
         if (tab) {
-          const recentOutput = terminalService.getRecentOutput(id, 100);
-          tabDetails += `${TERMINAL_CONTENT_TAG}Terminal Tab: ${tab.title} (ID: ${id})\nRecent Output:\n${recentOutput}\n\n`;
+          const recentOutput = terminalService.getRecentOutput(id);
+          tabDetails += `${TERMINAL_CONTENT_TAG}Terminal Tab: ${tab.title} (ID: ${id})\nRecent Output (Current Visible Area):\n${recentOutput}\n\n`;
         }
       } catch (err) {
         console.warn(`[InputParseHelper] Failed to fetch terminal output: ${id}`, err);

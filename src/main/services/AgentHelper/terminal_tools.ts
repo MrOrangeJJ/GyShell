@@ -133,10 +133,10 @@ export async function runCommand(args: z.infer<typeof execCommandSchema>, contex
     }
     let errorMessage = error instanceof Error ? error.message : String(error)
     
-    // If it's a "command running" error, append the last 100 lines of terminal output
+    // If it's a "command running" error, append the last terminal output
     if (errorMessage.includes('There is a running exec_command')) {
-      const recentOutput = terminalService.getRecentOutput(bestMatch.id, 100) || '(No recent output available)'
-      errorMessage = `Error: ${errorMessage}\n\nThe last 100 lines of content from this terminal tab are:\n<terminal_context>\n${recentOutput}\n</terminal_context>\n\nIf you think you need to exit the current command, use send_char.`
+      const recentOutput = terminalService.getRecentOutput(bestMatch.id) || '(No recent output available)'
+      errorMessage = `Error: ${errorMessage}\n\nThe current visible state of this terminal tab is:\n<terminal_context>\n${recentOutput}\n</terminal_context>\n\nIf you think you need to exit the current command, use send_char.`
     }
 
     context.sendEvent(sessionId, { 
@@ -204,10 +204,10 @@ export async function runCommandNowait(args: z.infer<typeof execCommandSchema>, 
   } catch (error) {
     let errorMessage = error instanceof Error ? error.message : String(error)
 
-    // If it's a "command running" error, append the last 100 lines of terminal output
+    // If it's a "command running" error, append the last terminal output
     if (errorMessage.includes('There is a running exec_command')) {
-      const recentOutput = terminalService.getRecentOutput(bestMatch.id, 100) || '(No recent output available)'
-      errorMessage = `Error: ${errorMessage}\n\nThe last 100 lines of content from this terminal tab are:\n<terminal_context>\n${recentOutput}\n</terminal_context>\n\nIf you think you need to exit the current command, use send_char.`
+      const recentOutput = terminalService.getRecentOutput(bestMatch.id) || '(No recent output available)'
+      errorMessage = `Error: ${errorMessage}\n\nThe current visible state of this terminal tab is:\n<terminal_context>\n${recentOutput}\n</terminal_context>\n\nIf you think you need to exit the current command, use send_char.`
     }
 
     context.sendEvent(sessionId, { 
@@ -241,10 +241,24 @@ export async function readTerminalTab(args: z.infer<typeof readTerminalTabSchema
     type: 'sub_tool_started',
     toolName: 'read_terminal_tab',
     title: `Read ${bestMatch.title || bestMatch.id} Tab`,
-    hint: `last ${lines} line${lines === 1 ? '' : 's'}`
+    hint: args.lines === undefined ? '' : `last ${lines} lines`
   })
 
-  const output = terminalService.getRecentOutput(bestMatch.id, lines) || 'No output available.'
+  const output = args.lines === undefined 
+    ? terminalService.getRecentOutput(bestMatch.id) 
+    : terminalService.getRecentOutput(bestMatch.id, lines)
+  
+  if (!output || output === 'No output available.') {
+    return 'No output available.'
+  }
+
+  const finalResult = `The following is the current visible state of the terminal tab "${bestMatch.title || bestMatch.id}":\n${output}`
+  
+  sendEvent(sessionId, {
+    messageId,
+    type: 'sub_tool_delta',
+    outputDelta: finalResult
+  })
 
   sendEvent(sessionId, {
     messageId,
@@ -394,8 +408,8 @@ export async function sendChar(args: z.infer<typeof sendCharSchema>, context: To
 
   await waitWithSignal(1000, context.signal)
   abortIfNeeded(context.signal)
-  const output = terminalService.getRecentOutput(bestMatch.id, 40) || 'No output available.'
-  const resultHint = `Sent sequence: ${sequence?.join(', ')}. The current state of the terminal 1s after the command was sent is:\n${output}`
+  const output = terminalService.getRecentOutput(bestMatch.id) || 'No output available.'
+  const resultHint = `Sent sequence: ${sequence?.join(', ')}. The following is the current visible state of the terminal 1s after the sequence was sent:\n${output}`
 
   sendEvent(sessionId, {
     messageId,
@@ -439,8 +453,8 @@ export async function waitTerminalIdle(
   while (elapsed < maxWaitSeconds) {
     abortIfNeeded(context.signal)
     
-    // Read last 100 lines
-    const currentContent = terminalService.getRecentOutput(bestMatch.id, 100)
+    // Read current visible area
+    const currentContent = terminalService.getRecentOutput(bestMatch.id)
     
     if (currentContent === lastContent && currentContent !== '') {
       stableCount++
@@ -450,8 +464,8 @@ export async function waitTerminalIdle(
     }
 
     if (stableCount >= 4) {
-      const finalOutput = terminalService.getRecentOutput(bestMatch.id, 100)
-      const successMsg = `The terminal has stabilized. The final state of the terminal is:\n${finalOutput}`
+      const finalOutput = terminalService.getRecentOutput(bestMatch.id)
+      const successMsg = `The terminal has stabilized. The following is the current visible state of the terminal:\n${finalOutput}`
       sendEvent(sessionId, {
         messageId,
         type: 'sub_tool_delta',
@@ -468,8 +482,8 @@ export async function waitTerminalIdle(
     elapsed++
   }
 
-  const currentOutput = terminalService.getRecentOutput(bestMatch.id, 40)
-  const timeoutMsg = `Wait timeout: The terminal has been running for over 120s and is still not idle. Please check if the task is still running correctly. If you need to continue waiting, run this tool again. If you need to stop it, use send_char (e.g., Ctrl+C). Recent output:\n${currentOutput}`
+  const currentOutput = terminalService.getRecentOutput(bestMatch.id)
+  const timeoutMsg = `Wait timeout: The terminal has been running for over 120s and is still not idle. Please check if the task is still running correctly. If you need to continue waiting, run this tool again. If you need to stop it, use send_char (e.g., Ctrl+C). The following is the current visible state of the terminal:\n${currentOutput}`
   sendEvent(sessionId, {
     messageId,
     type: 'sub_tool_delta',

@@ -331,7 +331,7 @@ export class AgentService_v2 {
       // boundTerminalId will be passed from Gateway via metadata or state
       const currentTabId = state.boundTerminalId
       const currentTab = currentTabId ? this.terminalService.getAllTerminals().find(t => t.id === currentTabId) : undefined
-      const recent = currentTabId ? this.terminalService.getRecentOutput(currentTabId, 100) : ''
+      const recent = currentTabId ? this.terminalService.getRecentOutput(currentTabId) : ''
       
       const contextMsg = this.helpers.markEphemeral(createTabContextPrompt(currentTab, recent))
 
@@ -1030,7 +1030,7 @@ export class AgentService_v2 {
         }
       }
 
-      const recent = this.terminalService.getRecentOutput(bestMatch.id, 50) || ''
+      const recent = this.terminalService.getRecentOutput(bestMatch.id) || ''
 
       if (!this.actionModel) {
         toolMessage.content = 'Action model not initialized.'

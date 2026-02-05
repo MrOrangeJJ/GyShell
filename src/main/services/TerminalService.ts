@@ -403,21 +403,30 @@ export class TerminalService {
     return buffer?.offset || 0
   }
 
-  getRecentOutput(terminalId: string, lines: number = 100): string {
+  /**
+   * Get the recent output of the terminal.
+   * If lines is not provided, it dynamically uses the current visible rows.
+   */
+  getRecentOutput(terminalId: string, lines?: number): string {
+    const tab = this.terminals.get(terminalId)
     const headless = this.headlessPtys.get(terminalId)
+    
+    // If lines is not provided, use the synchronized rows from frontend, fallback to 24
+    const finalLines = lines ?? (tab?.rows || 24)
+
     if (!headless) {
       // Fallback to raw buffer if headless is not available
       const buffer = this.buffers.get(terminalId)
       if (!buffer) return ''
       const allLines = buffer.content.split('\n')
-      const start = Math.max(0, allLines.length - lines)
+      const start = Math.max(0, allLines.length - finalLines)
       return allLines.slice(start).join('\n')
     }
     
     // Use xterm headless buffer for clean, rendered text
     const buffer = headless.buffer.active
     const totalLines = buffer.length
-    const startRow = Math.max(0, totalLines - lines)
+    const startRow = Math.max(0, totalLines - finalLines)
     
     const result: string[] = []
     for (let i = startRow; i < totalLines; i++) {
@@ -429,6 +438,8 @@ export class TerminalService {
     
     return result.join('\n')
   }
+
+  // dynGetRecentOutput is no longer needed as getRecentOutput handles it
 
   getAllTerminals(): TerminalTab[] {
     return Array.from(this.terminals.values()).filter(t => !t.isInitializing)
