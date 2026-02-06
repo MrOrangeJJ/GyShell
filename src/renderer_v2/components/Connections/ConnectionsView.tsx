@@ -83,7 +83,11 @@ export const ConnectionsView: React.FC<{ store: AppStore }> = observer(({ store 
       const next = {
         ...draft,
         port: Number(draft.port) || 22,
-        authMethod: draft.authMethod === 'privateKey' ? 'privateKey' : 'password'
+        authMethod: draft.authMethod === 'privateKey' ? 'privateKey' : 'password',
+        jumpHost: draft.jumpHost ? {
+          ...draft.jumpHost,
+          port: Number(draft.jumpHost.port) || 22
+        } : undefined
       }
       await store.saveSshConnection(next)
     } else if (section === 'proxies') {
@@ -344,6 +348,33 @@ export const ConnectionsView: React.FC<{ store: AppStore }> = observer(({ store 
                       >
                         <option value="">{t.connections.proxy}: None</option>
                         {proxies.map(p => <option key={p.id} value={p.id}>{p.name}</option>)}
+                      </select>
+                    </div>
+
+                    <div className="editor-row">
+                      <span className="editor-icon">
+                        <Waypoints size={16} strokeWidth={2} />
+                      </span>
+                      <select
+                        className="editor-select"
+                        value={draft.jumpHost?.id ?? ''}
+                        onChange={(e) => {
+                          const selectedId = e.target.value
+                          if (!selectedId) {
+                            const { jumpHost, ...rest } = draft
+                            setDraft(rest)
+                          } else {
+                            const selected = ssh.find(s => s.id === selectedId)
+                            if (selected) {
+                              setDraft({ ...draft, jumpHost: { ...selected } })
+                            }
+                          }
+                        }}
+                      >
+                        <option value="">{t.connections.jumpHost}: None</option>
+                        {ssh.filter(s => s.id !== draft.id).map(s => (
+                          <option key={s.id} value={s.id}>{s.name || s.host}</option>
+                        ))}
                       </select>
                     </div>
 

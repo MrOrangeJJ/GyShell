@@ -139,7 +139,91 @@ Write-Output "__GYSHELL_READY__"
     return info.socket
   }
 
-  private async buildConnectSocketIfNeeded(sshConfig: SSHConnectionConfig): Promise<net.Socket | undefined> {
+  private async buildConnectSocketIfNeeded(sshConfig: SSHConnectionConfig, emit: (data: string) => void): Promise<net.Socket | undefined> {
+    // 1. Handle Jump Host (Recursive)
+    if (sshConfig.jumpHost) {
+      const jumpId = `[Jump:${sshConfig.jumpHost.host}]`
+      console.log(`${jumpId} Starting jump host connection flow...`)
+      emit(`\x1b[36m▹ ${jumpId} Establishing tunnel via jump host ${sshConfig.jumpHost.host}...\x1b[0m\r\n`)
+      
+      const jumpClient = new ssh2.Client()
+      
+      // Recursive call to handle nested jump hosts or proxies for the jump host itself
+      const jumpSock = await this.buildConnectSocketIfNeeded(sshConfig.jumpHost, emit)
+      if (jumpSock) {
+        console.log(`${jumpId} Jump host will itself connect via a proxy/nested jump.`)
+      }
+      
+      await new Promise<void>((resolve, reject) => {
+        const jumpConnectConfig: ssh2.ConnectConfig = {
+          host: sshConfig.jumpHost!.host,
+          port: sshConfig.jumpHost!.port,
+          username: sshConfig.jumpHost!.username,
+          readyTimeout: 20000,
+          sock: jumpSock
+        }
+
+        if (sshConfig.jumpHost!.authMethod === 'password') {
+          jumpConnectConfig.password = sshConfig.jumpHost!.password
+        } else if (sshConfig.jumpHost!.authMethod === 'privateKey') {
+          if (sshConfig.jumpHost!.privateKey) {
+            jumpConnectConfig.privateKey = sshConfig.jumpHost!.privateKey
+          } else if (sshConfig.jumpHost!.privateKeyPath) {
+            try {
+              jumpConnectConfig.privateKey = fs.readFileSync(sshConfig.jumpHost!.privateKeyPath)
+            } catch (e: any) {
+              reject(new Error(`${jumpId} Failed to read private key: ${e.message}`))
+              return
+            }
+          }
+          if (sshConfig.jumpHost!.passphrase) {
+            jumpConnectConfig.passphrase = sshConfig.jumpHost!.passphrase
+          }
+        }
+
+        jumpClient.on('ready', () => {
+          console.log(`${jumpId} Jump host connection READY.`)
+          resolve()
+        })
+        
+        jumpClient.on('error', (err) => {
+          console.error(`${jumpId} Jump host connection ERROR:`, err)
+          reject(err)
+        })
+        
+        jumpClient.connect(jumpConnectConfig)
+      })
+
+      emit(`\x1b[32m✔ ${jumpId} Jump host ready. Requesting forward to target ${sshConfig.host}:${sshConfig.port}...\x1b[0m\r\n`)
+      console.log(`${jumpId} Requesting forwardOut to ${sshConfig.host}:${sshConfig.port}`)
+
+      // Create stream to target
+      return await new Promise((resolve, reject) => {
+        jumpClient.forwardOut(
+          '127.0.0.1', 0,
+          sshConfig.host, sshConfig.port,
+          (err, stream) => {
+            if (err) {
+              console.error(`${jumpId} forwardOut FAILED to ${sshConfig.host}:`, err)
+              jumpClient.end()
+              reject(new Error(`${jumpId} Jump host failed to forward to ${sshConfig.host}: ${err.message}`))
+            } else {
+              console.log(`${jumpId} forwardOut SUCCESS. Tunnel established.`)
+              // We need to keep jumpClient alive as long as the stream is alive
+              stream.on('close', () => {
+                console.log(`${jumpId} Tunnel stream closed, ending jump client connection.`)
+                jumpClient.end()
+              })
+              // In ssh2, the stream returned by forwardOut satisfies the Duplex stream interface
+              // which is what 'sock' expects.
+              resolve(stream as unknown as net.Socket)
+            }
+          }
+        )
+      })
+    }
+
+    // 2. Handle Proxy
     const proxy = sshConfig.proxy
     if (!proxy) return undefined
 
@@ -531,10 +615,13 @@ Write-Output "__GYSHELL_READY__"
         
         emit(`\x1b[36m▹ Connecting to ${sshConfig.host}:${sshConfig.port}...\x1b[0m\r\n`)
         console.log(`[SSH] Attempting to connect to ${sshConfig.host}:${sshConfig.port}...`)
-        const sock = await this.buildConnectSocketIfNeeded(sshConfig)
+        const sock = await this.buildConnectSocketIfNeeded(sshConfig, emit)
         if (sock) {
-          emit('\x1b[36m▹ Using proxy socket...\x1b[0m\r\n')
+          console.log(`[SSH] SUCCESS: Connection to ${sshConfig.host} will be tunneled through sock (Jump Host/Proxy).`)
+          emit('\x1b[36m▹ [Final] Using tunnel socket for target connection...\x1b[0m\r\n')
           connectConfig.sock = sock
+        } else {
+          console.log(`[SSH] DIRECT: No jump host or proxy, connecting directly to ${sshConfig.host}.`)
         }
         client.connect(connectConfig)
       } catch (e: any) {

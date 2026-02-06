@@ -133,6 +133,7 @@ export const en = {
     targetHost: 'Target Host',
     targetPort: 'Target Port',
     localPort: 'Local Port',
+    jumpHost: 'Jump Host',
   },
   terminal: {
     local: 'Local',

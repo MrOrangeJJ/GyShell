@@ -133,6 +133,7 @@ export const zh = {
     targetHost: '目标主机',
     targetPort: '目标端口',
     localPort: '本地端口',
+    jumpHost: '跳板机',
   },
   terminal: {
     local: '本地终端',

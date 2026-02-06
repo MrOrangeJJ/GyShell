@@ -482,7 +482,8 @@ export class AppStore {
       privateKeyPath: entry.privateKeyPath,
       passphrase: entry.passphrase,
       proxy,
-      tunnels
+      tunnels,
+      jumpHost: entry.jumpHost ? toJS(entry.jumpHost) : undefined
     }
     const tab: TerminalTabModel = { id, title, config: cfg, connectionRef: { type: 'ssh', entryId } }
     this.terminalTabs.push(tab)

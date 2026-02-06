@@ -51,6 +51,8 @@ export interface SSHConnectionEntry {
   // optional proxy/tunnel refs (future)
   proxyId?: string
   tunnelIds?: string[]
+  /** Optional jump host configuration for this SSH connection */
+  jumpHost?: SSHConnectionEntry
 }
 
 export interface ProxyEntry {
@@ -184,6 +186,8 @@ export interface SSHConnectionConfig extends BaseConnectionConfig {
   proxy?: ProxyEntry
   /** Port forwarding rules to activate for this SSH session */
   tunnels?: TunnelEntry[]
+  /** Optional jump host configuration for this SSH connection */
+  jumpHost?: SSHConnectionConfig
 }
 
 export type TerminalConfig = LocalConnectionConfig | SSHConnectionConfig
