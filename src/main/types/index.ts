@@ -257,7 +257,6 @@ export interface ChatSession {
 
 // ============ Agent Events (Main → Renderer) ============
 export type AgentEventType =
-  | 'render_mode'
   | 'say'
   | 'command_started'
   | 'command_finished'
@@ -277,7 +276,6 @@ export type AgentEventType =
 
 export interface AgentEvent {
   type: AgentEventType
-  renderMode?: 'normal' | 'sub'
   messageId?: string
   level?: 'info' | 'warning' | 'error'
   content?: string

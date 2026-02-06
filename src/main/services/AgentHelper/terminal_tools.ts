@@ -113,7 +113,7 @@ export async function runCommand(args: z.infer<typeof execCommandSchema>, contex
   try {
     const result = await terminalService.runCommandAndWait(bestMatch.id, command, {
       signal: context.signal,
-      interruptOnAbort: true
+      interruptOnAbort: false
     })
     const historyCommandMatchId = result.history_command_match_id
     const truncatedOutput = truncateCommandOutput(result.stdoutDelta || '', historyCommandMatchId, bestMatch.id)

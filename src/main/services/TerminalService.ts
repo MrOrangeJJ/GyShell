@@ -536,13 +536,20 @@ export class TerminalService {
 
       if (opts?.signal) {
         const onAbort = () => {
+          const taskId = this.activeTaskByTerminal.get(terminalId)
           if (opts.interruptOnAbort !== false) {
             this.interrupt(terminalId)
-          }
-          const taskId = this.activeTaskByTerminal.get(terminalId)
-          if (taskId) {
-            this.markTaskAborted(terminalId, taskId)
-            this.cleanupWaiter(taskId)
+            if (taskId) {
+              this.markTaskAborted(terminalId, taskId)
+              this.cleanupWaiter(taskId)
+            }
+          } else {
+            // If we don't interrupt, we just detach the waiter (Promise)
+            // but keep the task in activeTaskByTerminal so the watch dog
+            // continues to monitor for OSC markers.
+            if (taskId) {
+              this.cleanupWaiter(taskId)
+            }
           }
           resolve({ stdoutDelta: 'Command aborted by user.', exitCode: -2, history_command_match_id: taskId || '' })
         }

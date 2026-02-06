@@ -16,20 +16,17 @@ import {
 } from './terminal_tools'
 import { 
   BUILTIN_TOOL_INFO, 
-  THINK_TOOL_DESCRIPTION, 
-  THINKING_END_TOOL_DESCRIPTION, 
   buildReadFileDescription,
   WAIT_TERMINAL_IDLE_DESCRIPTION
 } from './prompts'
 import type { ReadFileSupport } from './types'
-import { thinkSchema, thinkingEndSchema, waitSchema } from './thinking_tools'
+import { waitSchema, thinkSchema } from './thinking_tools'
 import { 
   skillToolSchema, 
   buildSkillToolDescription,
   createSkillSchema,
   runCreateSkillTool
 } from './skill_tools'
-import type { SkillInfo } from '../SkillService'
 
 // Re-export schemas for AgentService to use
 export { 
@@ -46,7 +43,7 @@ export {
 } from './terminal_tools'
 
 export { readFileSchema } from './read_tools'
-export { thinkSchema, thinkingEndSchema, waitSchema } from './thinking_tools'
+export { waitSchema, thinkSchema } from './thinking_tools'
 export { skillToolSchema, createSkillSchema, buildSkillToolDescription } from './skill_tools'
 
 export { BUILTIN_TOOL_INFO } from './prompts'
@@ -97,11 +94,6 @@ export function buildToolsForModel(readFileSupport: ReadFileSupport) {
       schema: createSkillSchema
     },
     {
-      name: 'think',
-      description: THINK_TOOL_DESCRIPTION,
-      schema: thinkSchema
-    },
-    {
       name: 'wait',
       description: BUILTIN_TOOL_INFO.find((t) => t.name === 'wait')?.description ?? '',
       schema: waitSchema
@@ -110,22 +102,13 @@ export function buildToolsForModel(readFileSupport: ReadFileSupport) {
       name: 'wait_terminal_idle',
       description: WAIT_TERMINAL_IDLE_DESCRIPTION,
       schema: waitTerminalIdleSchema
-    }
-  ].map((tool) => convertToOpenAITool(tool))
-}
-
-export function buildToolsForThinkingModel(_skills: SkillInfo[]) {
-  return [
+    },
     {
-      name: 'thinking_end',
-      description: THINKING_END_TOOL_DESCRIPTION,
-      schema: thinkingEndSchema
+      name: 'think',
+      description: BUILTIN_TOOL_INFO.find((t) => t.name === 'think')?.description ?? '',
+      schema: thinkSchema
     }
   ].map((tool) => convertToOpenAITool(tool))
-}
-
-export function getThinkingModeAllowedToolNames(): string[] {
-  return ['thinking_end']
 }
 
 export const TOOLS_FOR_MODEL = buildToolsForModel({ image: false })

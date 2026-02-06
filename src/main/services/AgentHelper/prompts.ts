@@ -15,7 +15,6 @@ export const USEFUL_SKILL_TAG = 'USEFUL_SKILL_DETAIL:\n'
 export const FILE_CONTENT_TAG = 'FILE_CONTENT:\n'
 export const TERMINAL_CONTENT_TAG = 'TERMINAL_CONTENT:\n'
 export const USER_PASTE_CONTENT_TAG = FILE_CONTENT_TAG
-export const THINKING_MODE_PROMPT_TAG = 'THINKING_MODE_PROMPT:\n'
 
 // --- Tool Descriptions ---
 
@@ -91,15 +90,9 @@ export const READ_TERMINAL_TAB_DESCRIPTION = 'Read the recent visible output of 
 export const READ_COMMAND_OUTPUT_DESCRIPTION =
   'Read historical output of a specific command by history_command_match_id and terminal tab. Supports offset/limit for paging large outputs.'
 export const READ_FILE_DESCRIPTION = 'Read a file from a specific terminal tab.'
-export const THINK_TOOL_DESCRIPTION = 'Call this tool to enter THINKING MODE for deep analysis, reasoning, and planning. In THINKING MODE, a more powerful model will help you reason through the context and provide a clear direction. This tool takes no parameters.'
+export const THINK_TOOL_DESCRIPTION = 'Use this tool to perform deep thinking, complex planning, or detailed analysis. When you encounter a difficult problem, need to coordinate multiple steps, or want to reflect on an error, call this tool. Write your detailed thoughts in the "thought" parameter. This tool helps you organize your internal reasoning before taking further actions.'
 export const WAIT_TOOL_DESCRIPTION = 'Wait for a specified number of seconds (5-60). Use this when you need to pause execution to wait for a background process to finish or a state to stabilize. If you are waiting for a terminal command to finish or output to stabilize, prioritize using wait_terminal_idle instead.'
 export const WAIT_TERMINAL_IDLE_DESCRIPTION = 'Wait until the terminal output becomes stable (no changes for a few seconds) or a timeout (120s) is reached. Use this tool when you expect a command to take some time and want to wait for it to finish or reach a steady state before proceeding. It is much more efficient than the "wait" tool for terminal tasks.'
-
-export const THINKING_END_TOOL_DESCRIPTION = [
-  'End THINKING MODE once your reasoning or planning is complete.',
-  'Use this when you are done thinking and want to return to normal mode.',
-  'This tool takes no parameters.'
-].join('\n')
 
 export const BUILTIN_TOOL_INFO = [
   {
@@ -127,16 +120,16 @@ export const BUILTIN_TOOL_INFO = [
     description: CREATE_OR_EDIT_TOOL_DESCRIPTION
   },
   {
-    name: 'think',
-    description: THINK_TOOL_DESCRIPTION
-  },
-  {
     name: 'wait',
     description: WAIT_TOOL_DESCRIPTION
   },
   {
     name: 'wait_terminal_idle',
     description: WAIT_TERMINAL_IDLE_DESCRIPTION
+  },
+  {
+    name: 'think',
+    description: THINK_TOOL_DESCRIPTION
   }
 ]
 
@@ -226,37 +219,10 @@ export function createBaseSystemPrompt(): SystemMessage {
       '# Core Responsibility',
       'Your primary task is to fulfill user requests by utilizing all tools at your disposal. You must strictly adhere to the usage instructions and constraints defined in each tool\'s description.',
       '',
-      '# Thinking Mode (THINK Mode)',
-      'Thinking mode is your most powerful tool for reasoning and planning. It uses a more capable model to help you handle complex tasks.',
-      '',
-      '## When to use THINK mode:',
-      '1. **Task Start**: Use it at the beginning of any non-trivial task to deeply analyze the request and decide if a formal execution plan is needed.',
-      '2. **Errors/Timeouts**: If a command fails, returns an error, or times out, you MUST enter THINK mode to analyze why and find an alternative path.',
-      '3. **Blocked Path**: If a planned file path or approach is found to be invalid or inaccessible, enter THINK mode to re-route.',
-      '4. **User Rejection**: If the user denies a command or request, you MUST enter THINK mode to analyze why. Consider if the required privileges were too high, or if there is a more secure and better alternative to achieve the same goal.',
-      '5. **Pre-Completion**: Before concluding that a task is finished, you MUST enter THINK mode to verify that ALL user requirements have been met and the results are correct.',
-      '',
-      '## THINK mode Rules:',
-      '- **Reasoning Only**: In THINK mode, you focus on analysis and planning. You CANNOT execute destructive actions or modify the system.',
-      '- **Tool Constraints**: In THINKING mode, you CANNOT call any tools to execute actions or modify the system. You can ONLY call the `thinking_end` tool to return to normal mode once your reasoning is complete.',
-      '- **Mandatory Reasoning Text**: You MUST provide your detailed reasoning, analysis, and thoughts as plain text in your response. It is STRICTLY FORBIDDEN to only call tools without providing accompanying thought process text. Your thoughts are the primary output of this mode; tools are secondary.',
-      // '- **No Blind Tooling**: Calling a tool in THINKING mode without explaining WHY you are calling it and WHAT you expect to learn is a violation of your core protocol.',
-      '- **If you cannot see think tool, that means user banned you from using it. In this case, ignore the above rules and examples, do not try to enter think mode.',
-      '',
-      '## THINK mode Usage Example:',
-      '```',
-      '<call think tool>',
-      '<output your thoughts>',
-      '<output your thoughts>',
-      '<call thinking_end tool> (this tool is only visible once you enter think mode)',
-      '<report your decision, conclusion, and reasoning to the user>',
-      '<start executing the task>',
-      '...',
-      '```',
-      '',
       '# Execution & Verification',
       '- **Completeness**: You must complete the user\'s request fully. Do not stop halfway.',
-      '- **Self-Correction**: If you detect an error in your own execution, acknowledge it and use THINK mode to fix it.',
+      '- **Deep Thinking**: For complex tasks, multi-step plans, or error recovery, you MUST use the `think` tool to organize your thoughts and strategy. This ensures a more robust and logical execution.',
+      '- **Self-Correction**: If you detect an error in your own execution, acknowledge it and use `think` tool to analyze why it happened and how to fix it.',
       '- **Verification**: After executing a command, you MUST check the output or the state of the system to confirm it worked as expected. Never assume success without verification.',
       '- **Strict Adherence**: Follow user instructions precisely. If the user specifies a particular tool, path, or method, you must respect that.',
       '- **Command Output Limits**: Command outputs may be truncated in exec_command. Use read_command_output with history_command_match_id and terminalId to read full output.',
@@ -294,8 +260,7 @@ export function createBaseSystemPrompt(): SystemMessage {
       `- **\`[MENTION_USER_PASTE:#path##preview#]\`**: This label in the user input indicates that the user has pasted a large amount of text, which has been saved to a temporary file at #path#. If the content is small enough (under 4000 chars), it is provided at the top of the message under the \`${FILE_CONTENT_TAG.trim()}\` tag. If not, you may need to use \`read_file\` on this path to see the full content if it is critical to the task.`,
       `- **\`${USEFUL_SKILL_TAG.trim()}\`**: This tag provides the implementation details or documentation for a specific "Skill" referenced by the user. Use this to understand how to correctly parameterize and call the \`skill\` tool or follow the provided procedure.`,
       `- **\`${TERMINAL_CONTENT_TAG.trim()}\`**: This tag precedes the recent output (last 100 lines) of a terminal tab explicitly mentioned by the user via \`[MENTION_TAB:#name##id#]\`. Use this to understand the current state of that specific terminal.`,
-      `- **\`${FILE_CONTENT_TAG.trim()}\`**: This tag precedes the actual content of a file or large text pasted by the user. Use this as primary context for the user's request.`,
-      `- **\`${THINKING_MODE_PROMPT_TAG.trim()}\`**: This tag indicates that you have successfully entered THINK mode. When you see this, you must switch your behavior to deep reasoning and planning as per the THINK mode rules.`
+      `- **\`${FILE_CONTENT_TAG.trim()}\`**: This tag precedes the actual content of a file or large text pasted by the user. Use this as primary context for the user's request.`
     ].join('\n')
   )
 }
@@ -381,28 +346,6 @@ export function createTaskCheckUserPrompt(): HumanMessage {
       'Please check whether you have fully completed the user request (if you are not sure, you can ask the agent to go back to do a verification).',
       'If not, decide whether you can continue (maybe try some other approaches/tools) or the user must take over.',
       'Return JSON only.'
-    ].join('\n')
-  )
-}
-
-export function createThinkingModePrompt(): HumanMessage {
-  return new HumanMessage(
-    [
-      THINKING_MODE_PROMPT_TAG,
-      'You are now in THINKING mode.',
-      '',
-      'Goal:',
-      '- Deeply analyze the current situation using the full prior context.',
-      '- Focus on reasoning, exploration, tradeoffs, and identifying a strong direction.',
-      '',
-      'Rules:',
-      '- Your PRIMARY task is thinking, reasoning, and planning. Do NOT attempt to execute tasks directly.',
-      '- You can ONLY call the `thinking_end` tool to return to normal mode once your reasoning is complete.',
-      '- Do NOT attempt to call any tools other than `thinking_end`; they are NOT available in this mode.',
-      '- Do NOT ask the user questions in this mode.',
-      '- Keep output concise and structured for internal use.',
-
-      'Now, You may start to deeply think about it. First list what you want to think about, then list your thoughts and plans.'
     ].join('\n')
   )
 }

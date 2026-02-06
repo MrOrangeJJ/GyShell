@@ -41,43 +41,41 @@ export const MessageRow: React.FC<MessageRowProps> = observer(({
     return null
   }
 
-  const renderModeClass = msg.renderMode === 'sub' ? 'render-mode-sub' : ''
-
   // Handle special message types
   if (msg.type === 'tokens_count') {
     return null
   }
   if (msg.type === 'command') {
     return (
-      <div className={renderModeClass}>
+      <div>
         <CommandBanner msg={msg} />
       </div>
     )
   }
   if (msg.type === 'tool_call') {
     return (
-      <div className={renderModeClass}>
+      <div>
         <ToolCallBanner msg={msg} />
       </div>
     )
   }
   if (msg.type === 'file_edit') {
     return (
-      <div className={renderModeClass}>
+      <div>
         <FileEditBanner msg={msg} />
       </div>
     )
   }
   if (msg.type === 'sub_tool') {
     return (
-      <div className={renderModeClass}>
+      <div>
         <SubToolBanner msg={msg} />
       </div>
     )
   }
   if (msg.type === 'ask') {
     return (
-      <div className={renderModeClass}>
+      <div>
         <AskBanner 
           msg={msg} 
           onDecision={(decision) => onAskDecision(msg, decision)} 
@@ -88,7 +86,7 @@ export const MessageRow: React.FC<MessageRowProps> = observer(({
   }
   if (msg.type === 'alert' || msg.type === 'error') {
     return (
-      <div className={renderModeClass}>
+      <div>
         <AlertBanner 
           msg={msg} 
           onRemove={() => store.chat.removeMessage(msg.id, sessionId)}
@@ -103,7 +101,7 @@ export const MessageRow: React.FC<MessageRowProps> = observer(({
 
   if (isUser) {
     return (
-      <div className={`message-user-row ${renderModeClass}`}>
+      <div className="message-user-row">
         <button
           className="message-rollback-btn"
           title="Rollback and re-edit"
@@ -112,7 +110,7 @@ export const MessageRow: React.FC<MessageRowProps> = observer(({
         >
           <CornerUpLeft size={14} />
         </button>
-        <div className={`message-text ${msg.role} ${renderModeClass}`}>
+        <div className={`message-text ${msg.role}`}>
           <div className="plain-text">
             {renderMentionContent(msg.content)}
             {msg.streaming && <span className="cursor-blink" />}
@@ -123,7 +121,7 @@ export const MessageRow: React.FC<MessageRowProps> = observer(({
   }
 
   return (
-    <div className={`message-text ${msg.role} ${renderModeClass}`}>
+    <div className={`message-text ${msg.role}`}>
       {msg.role === 'assistant' && <div className="message-role-icon"><div className="avatar-ai" /></div>}
       <div className={msg.role === 'assistant' ? "markdown-body" : "plain-text"}>
         {msg.role === 'assistant' ? (

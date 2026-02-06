@@ -5,7 +5,6 @@ import type { AppStore } from '../../stores/AppStore'
 import type { ChatMessage } from '../../stores/ChatStore'
 import { ChatHistoryPanel } from './ChatHistoryPanel'
 import { MessageRow } from './MessageRow'
-import { ThinkingGroup } from './ThinkingGroup'
 import { ConfirmDialog } from '../Common/ConfirmDialog'
 import { Select } from '../../platform/Select'
 import type { SelectHandle } from '../../platform/windows/WindowsSelect'
@@ -120,31 +119,15 @@ export const ChatPanel: React.FC<{ store: AppStore }> = observer(({ store }) => 
 
   const renderItems = (() => {
     if (!activeSession) return []
-    const items: Array<
-      | { kind: 'message'; id: string }
-      | { kind: 'thinking_group'; ids: string[]; isFinished: boolean }
-    > = []
-    let subBuffer: string[] = []
-
-    const flushSubBuffer = (isFinished: boolean) => {
-      if (!subBuffer.length) return
-      items.push({ kind: 'thinking_group', ids: subBuffer, isFinished })
-      subBuffer = []
-    }
+    const items: Array<{ kind: 'message'; id: string }> = []
 
     messageIds.forEach((msgId) => {
       const msg = activeSession.messagesById.get(msgId)
       if (!msg) return
       if (msg.type === 'tokens_count') return
-      if (msg.renderMode === 'sub') {
-        subBuffer.push(msgId)
-        return
-      }
-      flushSubBuffer(true)
       items.push({ kind: 'message', id: msgId })
     })
 
-    flushSubBuffer(false)
     return items
   })()
 
@@ -421,29 +404,14 @@ export const ChatPanel: React.FC<{ store: AppStore }> = observer(({ store }) => 
       
       <div className="panel-body" ref={scrollRef} onScroll={handleScroll}>
         <div className="message-list">
-          {renderItems.map((item, index) => {
+          {renderItems.map((item) => {
             if (!activeSessionId) return null
-            if (item.kind === 'message') {
-              return (
-                <MessageRow
-                  key={item.id}
-                  store={store}
-                  sessionId={activeSessionId}
-                  messageId={item.id}
-                  onAskDecision={handleAskDecision}
-                  onRollback={(m) => setRollbackTarget(m)}
-                  askLabels={askLabels}
-                  isThinking={isThinking}
-                />
-              )
-            }
             return (
-              <ThinkingGroup
-                key={`thinking-${index}-${item.ids[0]}`}
+              <MessageRow
+                key={item.id}
                 store={store}
                 sessionId={activeSessionId}
-                messageIds={item.ids}
-                isFinished={item.isFinished}
+                messageId={item.id}
                 onAskDecision={handleAskDecision}
                 onRollback={(m) => setRollbackTarget(m)}
                 askLabels={askLabels}

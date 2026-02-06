@@ -12,7 +12,6 @@ export class UIHistoryService {
   // Keep UI history hot in memory to avoid sync electron-store overhead on every stream chunk.
   private sessionsCache: Record<string, UIChatSession>
   private dirtySessions: Set<string> = new Set()
-  private renderModeBySession: Map<string, 'normal' | 'sub'> = new Map()
 
   constructor() {
     this.store = new Store<StoredUIHistory>({
@@ -35,10 +34,6 @@ export class UIHistoryService {
         updatedAt: Date.now()
       }
     }
-    if (!this.renderModeBySession.has(sessionId)) {
-      this.renderModeBySession.set(sessionId, 'normal')
-    }
-
     const session = this.sessionsCache[sessionId]
     session.updatedAt = Date.now()
 
@@ -69,12 +64,6 @@ export class UIHistoryService {
   private processEvent(session: UIChatSession, event: AgentEvent, sessionId: string): UIUpdateAction[] {
     const type = event.type as AgentEventType
     const actions: UIUpdateAction[] = []
-
-    if (type === 'render_mode') {
-      const nextMode = event.renderMode === 'sub' ? 'sub' : 'normal'
-      this.renderModeBySession.set(sessionId, nextMode)
-      return actions
-    }
 
     if (type === 'user_input') {
       const message = this.createMessage({
@@ -348,18 +337,11 @@ export class UIHistoryService {
   }
 
   private createMessage(msg: Omit<ChatMessage, 'id' | 'timestamp'>, sessionId: string): ChatMessage {
-    // User messages should always be in 'normal' render mode.
-    const renderMode = msg.role === 'user' ? 'normal' : (msg.renderMode ?? this.getRenderMode(sessionId))
     return {
       ...msg,
-      renderMode,
       id: uuidv4(),
       timestamp: Date.now()
     }
-  }
-
-  private getRenderMode(sessionId: string): 'normal' | 'sub' {
-    return this.renderModeBySession.get(sessionId) || 'normal'
   }
 
   private checkAutoTitle(session: UIChatSession, role: string, content: string): void {

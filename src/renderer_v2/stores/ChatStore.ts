@@ -10,7 +10,6 @@ export interface ChatMessage {
   role: 'user' | 'assistant' | 'system'
   type: MessageType
   content: string
-  renderMode?: 'normal' | 'sub'
   metadata?: {
     tabName?: string
     commandId?: string

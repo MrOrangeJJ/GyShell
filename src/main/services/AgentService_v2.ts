@@ -22,10 +22,9 @@ import {
   sendCharSchema,
   writeAndEditSchema,
   waitSchema,
+  thinkSchema,
   waitTerminalIdleSchema,
-  buildToolsForThinkingModel,
 
-  getThinkingModeAllowedToolNames,
   toolImplementations,
   buildSkillToolDescription
 } from './AgentHelper/tools'
@@ -40,7 +39,6 @@ import {
   SEND_CHAR_POLICY_DECISION_SCHEMA,
   createCommandPolicyUserPrompt,
   createSendCharPolicyUserPrompt,
-  createThinkingModePrompt,
 } from './AgentHelper/prompts'
 import { runSkillTool } from './AgentHelper/skill_tools'
 import { TokenManager } from './AgentHelper/TokenManager'
@@ -94,10 +92,6 @@ const StateAnnotation = Ann.Root({
       return x
     },
     default: () => []
-  }),
-  mode: Ann({
-    reducer: (x: 'normal' | 'thinking', y?: 'normal' | 'thinking') => y ?? x,
-    default: () => 'normal'
   })
 })
 
@@ -215,10 +209,6 @@ export class AgentService_v2 {
     workflow.addNode('token_pruner_runtime', this.createTokenManagerNode())
     
     workflow.addNode('model_request', this.createModelRequestNode())
-    workflow.addNode('thinking_request', this.createThinkingRequestNode())
-    workflow.addNode('thinking_model_request', this.createThinkingModelRequestNode())
-    workflow.addNode('thinking_finalize', this.createThinkingFinalizeNode())
-    workflow.addNode('firewall', this.createFirewallNode())
     workflow.addNode('batch_toolcall_executor', this.createBatchToolcallExecutorNode())
     workflow.addNode('tools', this.createToolsNode())
     workflow.addNode('command_tools', this.createCommandToolsNode())
@@ -231,26 +221,14 @@ export class AgentService_v2 {
     workflow.addEdge('context_manager', 'token_pruner_initial')
     workflow.addEdge('token_pruner_initial', 'token_pruner_runtime')
     
-    workflow.addConditionalEdges(
-      'token_pruner_runtime',
-      (state: any) => state.mode === 'thinking' ? 'thinking_model_request' : 'model_request',
-      ['thinking_model_request', 'model_request']
-    )
+    workflow.addEdge('token_pruner_runtime', 'model_request')
     
-    workflow.addEdge('model_request', 'firewall')
-    workflow.addEdge('thinking_model_request', 'firewall')
-    workflow.addConditionalEdges(
-      'firewall',
-      this.routeFirewallOutput,
-      ['batch_toolcall_executor', 'token_pruner_runtime']
-    )
+    workflow.addEdge('model_request', 'batch_toolcall_executor')
     workflow.addConditionalEdges(
       'batch_toolcall_executor',
       this.routeModelOutput,
-      ['thinking_request', 'thinking_finalize', 'tools', 'command_tools', 'file_tools', 'read_file', 'mcp_tools', 'final_output']
+      ['tools', 'command_tools', 'file_tools', 'read_file', 'mcp_tools', 'final_output']
     )
-
-    workflow.addEdge('thinking_request', 'token_pruner_runtime')
     
     // Tools route back to runtime pruner before model request
     workflow.addConditionalEdges(
@@ -280,7 +258,6 @@ export class AgentService_v2 {
     )
     
     workflow.addEdge('final_output', END)
-    workflow.addEdge('thinking_finalize', 'token_pruner_runtime')
 
     this.graph = workflow.compile({ checkpointer: this.checkpointer })
   }
@@ -401,11 +378,6 @@ ${recent}
       const sessionId = state.sessionId;
       if (!sessionId) throw new Error('No session ID in state');
 
-      this.helpers.sendEvent(sessionId, {
-        type: 'render_mode',
-        renderMode: 'normal'
-      })
-
       // Ensure we get the freshest list from disk
       const skills = await this.skillService.reload()
       const builtInTools = this.helpers.getEnabledBuiltInTools(this.toolsForModel, this.builtInToolEnabled)
@@ -495,255 +467,6 @@ ${recent}
     })
   }
 
-  private createThinkingRequestNode() {
-    return RunnableLambda.from(async (state: any) => {
-      const sessionId = state.sessionId
-      if (!sessionId) throw new Error('No session ID in state')
-
-      const queue: any[] = Array.isArray(state.pendingToolCalls) ? state.pendingToolCalls : []
-      const toolCall = queue[0]
-      if (!toolCall || toolCall.name !== 'think') return state
-
-      const thinkingModePrompt = createThinkingModePrompt()
-      const toolMessage = this.createToolMessage(toolCall)
-      toolMessage.content = thinkingModePrompt.content as string
-
-      // Keep strict: clean up other possible tool_calls except for think
-      const messages: BaseMessage[] = [...state.messages]
-      const fullMessages: BaseMessage[] = [...state.full_messages]
-      const lastMsg = messages[messages.length - 1]
-      const fullLastMsg = fullMessages[fullMessages.length - 1]
-
-      if (AIMessage.isInstance(lastMsg)) {
-        this.cleanupModelToolCallMetadata(lastMsg, [toolCall])
-      }
-      if (AIMessage.isInstance(fullLastMsg)) {
-        this.cleanupModelToolCallMetadata(fullLastMsg, [toolCall])
-      }
-
-      return {
-        messages: [...messages, toolMessage],
-        full_messages: [...fullMessages, toolMessage],
-        sessionId,
-        pendingToolCalls: queue.slice(1),
-        mode: 'thinking'
-      }
-    })
-  }
-
-  private createThinkingModelRequestNode() {
-    return RunnableLambda.from(async (state: any, config: any) => {
-      if (!this.thinkingModel) throw new Error('Thinking model not initialized')
-      const sessionId = state.sessionId
-      if (!sessionId) throw new Error('No session ID in state')
-
-      this.helpers.sendEvent(sessionId, {
-        type: 'render_mode',
-        renderMode: 'sub'
-      })
-
-      // Ensure skillService is initialized before calling getAll()
-      let skills: any[] = []
-      if (this.skillService && typeof this.skillService.getAll === 'function') {
-        try {
-          skills = await this.skillService.getAll()
-        } catch (err) {
-          console.warn('[AgentService_v2] Failed to fetch skills for thinking mode:', err)
-        }
-      }
-      
-      const thinkingTools = buildToolsForThinkingModel(skills)
-      const modelWithTools = this.thinkingModel.bindTools(thinkingTools)
-      // const modelWithTools = this.thinkingModel
-
-      const messageId = uuidv4()
-
-      let partialText = ''
-      const fullResponse = await this.helpers.invokeWithRetry(async (attempt) => {
-        if (attempt > 0) {
-          this.helpers.sendEvent(sessionId, {
-            type: 'alert',
-            message: `Retrying (${attempt}/4)...`,
-            level: 'info',
-            messageId: `retry-${messageId}-${attempt}`
-          })
-        }
-
-        const stream = await modelWithTools.stream(state.messages, {
-          signal: config?.signal
-        })
-
-        let response: any = null
-        try {
-          for await (const chunk of stream) {
-            response = response ? response.concat(chunk) : chunk
-            const delta = this.helpers.extractText(chunk.content)
-            if (delta) {
-              partialText += delta
-              this.helpers.sendEvent(sessionId, {
-                messageId,
-                type: 'say',
-                content: delta
-              })
-            }
-          }
-        } catch (err) {
-          if (partialText.trim()) {
-            this.lastAbortedMessage = new AIMessage({
-              content: partialText,
-              additional_kwargs: { _gyshellMessageId: messageId, _gyshellAborted: true }
-            })
-            console.log('[AgentService_v2] Captured partial message from error/abort in instance variable.')
-          }
-          throw err
-        }
-        return response
-      }, 4, [1000, 2000, 4000, 6000], config?.signal)
-
-      const usage = (fullResponse as any)?.usage_metadata || (fullResponse as any)?.additional_kwargs?.usage
-      let currentTokens = state.token_state.current_tokens
-
-      if (usage) {
-        currentTokens = usage.total_tokens || usage.totalTokens || 0
-        const modelName = (fullResponse as any)?.response_metadata?.model_name || (this.thinkingModel as any)?.modelName || 'unknown'
-        this.helpers.sendEvent(sessionId, {
-          type: 'tokens_count',
-          modelName,
-          totalTokens: currentTokens,
-          maxTokens: state.token_state.max_tokens
-        })
-      }
-
-      if (fullResponse) {
-        fullResponse.additional_kwargs = {
-          ...(fullResponse.additional_kwargs || {}),
-          _gyshellMessageId: messageId
-        }
-
-      }
-
-      const fullHistory: BaseMessage[] = state.full_messages
-      return {
-        messages: fullResponse ? [...state.messages, fullResponse] : [...state.messages],
-        full_messages: fullResponse ? [...fullHistory, fullResponse] : [...fullHistory],
-        token_state: { current_tokens: currentTokens },
-        sessionId,
-        pendingToolCalls: []
-      }
-    })
-  }
-
-  private createThinkingFinalizeNode() {
-    return RunnableLambda.from(async (state: any) => {
-      const sessionId = state.sessionId
-      if (!sessionId) return state
-
-      const messages: BaseMessage[] = [...state.messages]
-      const fullMessages: BaseMessage[] = [...state.full_messages]
-
-      const lastMessage = messages[messages.length - 1]
-      const fullLastMessage = fullMessages[fullMessages.length - 1]
-
-      if (AIMessage.isInstance(lastMessage)) {
-        const toolCalls: any[] = Array.isArray((lastMessage as any).tool_calls) ? (lastMessage as any).tool_calls : []
-        let thinkingEndCall = toolCalls.find(tc => tc.name === 'thinking_end')
-        
-        // Case 1: LLM has actively called thinking_end
-        if (thinkingEndCall) {
-          const toolMessage = this.createToolMessage(thinkingEndCall)
-          toolMessage.content = `You have exited thinking mode. You can now start executing tasks.`
-
-          this.cleanupModelToolCallMetadata(lastMessage, [thinkingEndCall])
-          this.cleanupModelToolCallMetadata(fullLastMessage, [thinkingEndCall])
-
-          return {
-            messages: [...messages, toolMessage],
-            full_messages: [...fullMessages, toolMessage],
-            sessionId,
-            mode: 'normal'
-          }
-        }
-
-        // Case 2: LLM did not call any tools (or only output text), auto-end
-        // We need to manually construct a thinking_end tool_call and insert it into the last message
-        const syntheticId = `call_${uuidv4().replace(/-/g, '')}`
-        const syntheticCall = {
-          id: syntheticId,
-          name: 'thinking_end',
-          args: {}
-        }
-
-        // Modify the last AI message, inject this constructed tool_call
-        if (AIMessage.isInstance(lastMessage)) {
-          lastMessage.tool_calls = [syntheticCall]
-          // Also need to clean up possible metadata like chunks to ensure correct format
-          this.cleanupModelToolCallMetadata(lastMessage, [syntheticCall])
-        }
-        if (AIMessage.isInstance(fullLastMessage)) {
-          fullLastMessage.tool_calls = [syntheticCall]
-          this.cleanupModelToolCallMetadata(fullLastMessage, [syntheticCall])
-        }
-
-        // Create corresponding ToolMessage response
-        const toolMessage = this.createToolMessage(syntheticCall)
-        toolMessage.content = `You have exited thinking mode. You can now start executing tasks.`
-
-        return {
-          messages: [...messages, toolMessage],
-          full_messages: [...fullMessages, toolMessage],
-          sessionId,
-          mode: 'normal'
-        }
-      }
-
-      return {
-        sessionId,
-        mode: 'normal'
-      }
-    })
-  }
-
-  private createFirewallNode() {
-    return RunnableLambda.from(async (state: any) => {
-      const messages: BaseMessage[] = [...state.messages]
-      const lastMessage = messages[messages.length - 1]
-
-      if (!AIMessage.isInstance(lastMessage)) {
-        return {}
-      }
-
-      const toolCalls: any[] = Array.isArray((lastMessage as any).tool_calls) ? (lastMessage as any).tool_calls : []
-      if (toolCalls.length === 0) return {}
-
-      const allowedTools =
-        state.mode === 'thinking'
-          ? getThinkingModeAllowedToolNames()
-          : this.getAllowedNormalToolNames()
-
-      const illegalCall = toolCalls.find((tc: any) => !allowedTools.includes(tc.name))
-      if (!illegalCall) return {}
-
-      this.cleanupModelToolCallMetadata(lastMessage, [illegalCall])
-
-      const toolMessage = this.createToolMessage(illegalCall)
-      toolMessage.content =
-        state.mode === 'thinking'
-          ? `Error: You are currently in THINKING mode. In this mode, you can ONLY call the following tools: ${allowedTools.join(', ')}. ` +
-            'Your PRIMARY task is to reason, analyze and plan, not to execute actions. Please use the allowed tools if needed, ' +
-            'or provide your final reasoning/plan to exit thinking mode.' + 
-            'Please use the thinking_end tool to exit thinking mode if you are done thinking. Before exit thinking mode, you cannot execute any tasks.'
-          : `Error: Tool "${illegalCall.name}" is not allowed or not enabled in the current mode. ` +
-            `Allowed tools: ${allowedTools.join(', ') || 'None'}.`
-
-      const fullHistory: BaseMessage[] = state.full_messages
-      return {
-        messages: [...messages, toolMessage],
-        full_messages: [...fullHistory, toolMessage],
-        pendingToolCalls: []
-      }
-    })
-  }
-
   private createBatchToolcallExecutorNode() {
     return RunnableLambda.from(async (state: any) => {
       const sessionId = state.sessionId
@@ -777,14 +500,6 @@ ${recent}
         this.cleanupModelToolCallMetadata(fullLastMessage, pendingToolCalls)
         return { messages, full_messages: fullMessages, sessionId, pendingToolCalls }
       }
-
-    const thinkCall = toolCalls.find((tc) => tc?.name === 'think')
-    if (thinkCall) {
-      pendingToolCalls = [thinkCall]
-      this.cleanupModelToolCallMetadata(lastMessage, pendingToolCalls)
-      this.cleanupModelToolCallMetadata(fullLastMessage, pendingToolCalls)
-      return { messages, full_messages: fullMessages, sessionId, pendingToolCalls }
-    }
 
     // If ANY exec_command is present, force single-tool: keep only the first tool call.
       const hasExecCommand = toolCalls.some((tc) => tc?.name === 'exec_command')
@@ -981,6 +696,39 @@ ${recent}
             result = await toolImplementations.waitTerminalIdle(validatedArgs, executionContext)
           } catch (err) {
             result = `Parameter validation error for wait_terminal_idle: ${(err as Error).message}`
+          }
+          break
+        }
+        case 'think': {
+          try {
+            const validatedArgs = thinkSchema.parse(toolCall.args || {})
+            const messageId = toolMessage.additional_kwargs._gyshellMessageId as string
+            
+            // Send event to frontend to show "Thinking" banner
+            this.helpers.sendEvent(sessionId, {
+              messageId,
+              type: 'sub_tool_started',
+              title: 'Thinking',
+              hint: 'Analyzing and planning...',
+              input: JSON.stringify(validatedArgs)
+            })
+
+            // Stream the thought content to the banner
+            this.helpers.sendEvent(sessionId, {
+              messageId,
+              type: 'sub_tool_delta',
+              outputDelta: validatedArgs.thought
+            })
+
+            // Finish the tool call
+            this.helpers.sendEvent(sessionId, {
+              messageId,
+              type: 'sub_tool_finished'
+            })
+
+            result = 'Thinking process recorded.'
+          } catch (err) {
+            result = `Parameter validation error for think: ${(err as Error).message}`
           }
           break
         }
@@ -1277,30 +1025,11 @@ ${recent}
     }
   }
 
-  private getAllowedNormalToolNames(): string[] {
-    const builtIn = this.helpers.getEnabledBuiltInTools(this.toolsForModel, this.builtInToolEnabled)
-    const builtInNames = builtIn
-      .map((tool: any) => tool?.function?.name ?? tool?.name)
-      .filter((name: any): name is string => typeof name === 'string')
-    const mcpNames = this.mcpToolService.getActiveTools().map((tool) => tool.name)
-    return Array.from(new Set([...builtInNames, ...mcpNames, 'skill', 'create_skill']))
-  }
-
-  private routeFirewallOutput = (state: any): string => {
-    const lastMsg = state.messages[state.messages.length - 1]
-    if (lastMsg instanceof ToolMessage && String((lastMsg as any).content || '').startsWith('Error:')) {
-      return 'token_pruner_runtime'
-    }
-    return 'batch_toolcall_executor'
-  }
-
   private routeModelOutput = (state: any): string => {
     const queue: any[] = Array.isArray(state.pendingToolCalls) ? state.pendingToolCalls : []
     const first = queue[0]
     // console.log(first);
     if (first?.name) {
-      if (first.name === 'think') return 'thinking_request'
-      if (first.name === 'thinking_end') return 'thinking_finalize'
       if (first.name === 'skill' || first.name === 'create_skill') return 'tools'
       if (this.mcpToolService.isMcpToolName(first.name)) return 'mcp_tools'
       if (first.name === 'exec_command') return 'command_tools'
@@ -1309,7 +1038,6 @@ ${recent}
       return 'tools'
     }
 
-    if (state.mode === 'thinking') return 'thinking_finalize'
     return 'final_output'
   }
 
@@ -1317,11 +1045,9 @@ ${recent}
     const queue: any[] = Array.isArray(state.pendingToolCalls) ? state.pendingToolCalls : []
     const first = queue[0]
     if (!first) {
-      // Both normal and thinking modes should go through token pruning before the next model request
       return 'token_pruner_runtime'
     }
     if (first?.name) {
-      if (first.name === 'think') return 'thinking_request'
       if (this.mcpToolService.isMcpToolName(first.name)) return 'mcp_tools'
       if (first.name === 'exec_command') return 'command_tools'
       if (first.name === 'create_or_edit') return 'file_tools'

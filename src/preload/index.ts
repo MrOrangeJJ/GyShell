@@ -94,7 +94,6 @@ interface CommandPolicyLists {
 }
 
 type AgentEventType =
-  | 'render_mode'
   | 'say'
   | 'command_started'
   | 'command_finished'
@@ -114,7 +113,6 @@ type AgentEventType =
 
 interface AgentEvent {
   type: AgentEventType
-  renderMode?: 'normal' | 'sub'
   level?: 'info' | 'warning' | 'error'
   content?: string
   command?: string
