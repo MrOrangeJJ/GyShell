@@ -157,7 +157,10 @@ export class AgentHelpers {
         baseURL: item.baseUrl
       },
       temperature,
-      maxRetries: 0 // Disable built-in retry to use our custom logic
+      maxRetries: 0, // Disable built-in retry to use our custom logic
+      modelKwargs: {
+        include_reasoning: true,
+      }
     })
   }
 

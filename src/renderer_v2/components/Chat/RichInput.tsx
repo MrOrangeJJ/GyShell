@@ -73,7 +73,10 @@ export const RichInput = observer(forwardRef<RichInputHandle, RichInputProps>(({
     }
 
     const query = info.query.toLowerCase();
-    const skills = store.skills.map(s => ({ type: 'skill' as const, name: s.name }));
+    
+    // Only show enabled skills
+    const enabledSkills = store.skills.filter(s => store.settings?.tools?.skills?.[s.name] !== false);
+    const skills = enabledSkills.map(s => ({ type: 'skill' as const, name: s.name }));
     const tabs = store.terminalTabs.map(t => ({ type: 'terminal' as const, name: t.title, id: t.id }));
     
     const filtered = [...skills, ...tabs]

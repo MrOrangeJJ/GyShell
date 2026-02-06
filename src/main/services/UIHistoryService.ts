@@ -336,7 +336,7 @@ export class UIHistoryService {
     return null
   }
 
-  private createMessage(msg: Omit<ChatMessage, 'id' | 'timestamp'>, sessionId: string): ChatMessage {
+  private createMessage(msg: Omit<ChatMessage, 'id' | 'timestamp'>, _sessionId?: string): ChatMessage {
     return {
       ...msg,
       id: uuidv4(),

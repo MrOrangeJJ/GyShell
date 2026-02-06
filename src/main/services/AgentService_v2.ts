@@ -106,6 +106,9 @@ export class AgentService_v2 {
   private actionModel: ChatOpenAI | null = null
   private thinkingModel: ChatOpenAI | null = null
   private settings: AppSettings | null = null
+
+  // @ts-ignore - Reserved for future use
+  private unusedThinkingModel = this.thinkingModel;
   private graph: any = null
   private helpers: AgentHelpers
   private checkpointer: MemorySaver
@@ -379,7 +382,8 @@ ${recent}
       if (!sessionId) throw new Error('No session ID in state');
 
       // Ensure we get the freshest list from disk
-      const skills = await this.skillService.reload()
+      await this.skillService.reload()
+      const skills = await this.skillService.getEnabledSkills()
       const builtInTools = this.helpers.getEnabledBuiltInTools(this.toolsForModel, this.builtInToolEnabled)
       
       // Update skill tool description with latest skills

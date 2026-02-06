@@ -2,12 +2,17 @@ import fs from 'fs/promises'
 import path from 'path'
 import { app, shell } from 'electron'
 import { z } from 'zod'
+import { SettingsService } from './SettingsService'
 
 export const SkillInfoSchema = z.object({
   name: z.string().min(1),
   description: z.string().min(1),
-  fileName: z.string().min(1),
-  filePath: z.string().min(1)
+  fileName: z.string().min(1), // For nested structures, this is SKILL.md
+  filePath: z.string().min(1), // Full path to SKILL.md
+  baseDir: z.string().min(1),  // Skill root directory (the folder containing SKILL.md)
+  scanRoot: z.string().min(1), // The root directory that was scanned
+  isNested: z.boolean(),       // Whether it's a nested structure
+  supportingFiles: z.array(z.string()).optional() // List of relative paths
 })
 
 export type SkillInfo = z.infer<typeof SkillInfoSchema>
@@ -15,14 +20,6 @@ export type SkillInfo = z.infer<typeof SkillInfoSchema>
 type ParsedMarkdown = {
   frontmatter: Record<string, string>
   content: string
-}
-
-function isSafeSkillFileName(fileName: string): boolean {
-  if (!fileName) return false
-  if (fileName.includes('..')) return false
-  if (fileName.includes('/') || fileName.includes('\\')) return false
-  if (!fileName.toLowerCase().endsWith('.md')) return false
-  return true
 }
 
 function parseFrontmatter(raw: string): ParsedMarkdown {
@@ -80,6 +77,33 @@ function parseFrontmatter(raw: string): ParsedMarkdown {
   return { frontmatter: fm, content }
 }
 
+async function getSupportingFiles(dir: string, skillFilePath: string): Promise<string[]> {
+  const files: string[] = []
+  
+  async function scan(currentDir: string) {
+    const entries = await fs.readdir(currentDir, { withFileTypes: true })
+    for (const entry of entries) {
+      const fullPath = path.join(currentDir, entry.name)
+      if (fullPath === skillFilePath) continue
+      if (entry.name.startsWith('.')) continue
+
+      if (entry.isDirectory()) {
+        await scan(fullPath)
+      } else {
+        files.push(path.relative(dir, fullPath))
+      }
+    }
+  }
+
+  try {
+    await scan(dir)
+  } catch (err) {
+    console.error(`[SkillService] Failed to scan supporting files in ${dir}`, err)
+  }
+  
+  return files
+}
+
 function defaultSkillTemplate(now: Date): string {
   const ts = now.toISOString()
   return [
@@ -108,47 +132,97 @@ function defaultSkillTemplate(now: Date): string {
 
 export class SkillService {
   private cache: SkillInfo[] = []
+  private settingsService?: SettingsService
 
-  getSkillsDir(): string {
+  constructor(settingsService?: SettingsService) {
+    this.settingsService = settingsService
+  }
+
+  setSettingsService(settingsService: SettingsService) {
+    this.settingsService = settingsService
+  }
+
+  getSkillsDirs(): string[] {
+    const dirs: string[] = []
+    
+    // 1. GyShell specific data directory (highest priority)
     const baseDir = app.getPath('userData')
-    return path.join(baseDir, 'skills')
+    dirs.push(path.join(baseDir, 'skills'))
+
+    // 2. Compatibility directories (Referencing Goose/Claude specifications)
+    const homeDir = app.getPath('home')
+    if (homeDir) {
+      dirs.push(path.join(homeDir, '.claude', 'skills'))
+      dirs.push(path.join(homeDir, '.agents', 'skills'))
+      
+      // Compatibility for common Windows AppData paths
+      if (process.platform === 'win32') {
+        const appData = process.env.APPDATA
+        if (appData) {
+          dirs.push(path.join(appData, 'agents', 'skills'))
+        }
+      } else {
+        // Compatibility for common macOS/Linux .config paths
+        dirs.push(path.join(homeDir, '.config', 'agents', 'skills'))
+      }
+    }
+
+    return [...new Set(dirs)] // Deduplicate
   }
 
   async ensureSkillsDir(): Promise<void> {
-    const dir = this.getSkillsDir()
-    await fs.mkdir(dir, { recursive: true })
+    const dirs = this.getSkillsDirs()
+    for (const dir of dirs) {
+      try {
+        await fs.mkdir(dir, { recursive: true })
+      } catch (err) {
+        // Ignore directories that cannot be created (likely permission issues)
+      }
+    }
   }
 
   async openSkillsFolder(): Promise<void> {
-    await this.ensureSkillsDir()
-    await shell.openPath(this.getSkillsDir())
+    const primaryDir = this.getSkillsDirs()[0]
+    await fs.mkdir(primaryDir, { recursive: true })
+    await shell.openPath(primaryDir)
   }
 
   async openSkillFile(fileName: string): Promise<void> {
-    if (!isSafeSkillFileName(fileName)) {
-      throw new Error('Invalid skill file name')
+    // Search for the file in all directories
+    const dirs = this.getSkillsDirs()
+    for (const dir of dirs) {
+      const filePath = path.join(dir, fileName)
+      const exists = await fs.access(filePath).then(() => true).catch(() => false)
+      if (exists) {
+        await shell.openPath(filePath)
+        return
+      }
     }
-    await this.ensureSkillsDir()
-    const filePath = path.join(this.getSkillsDir(), fileName)
-    await shell.openPath(filePath)
+    throw new Error(`Skill file "${fileName}" not found in any skill directory`)
   }
 
   async deleteSkillFile(fileName: string): Promise<void> {
-    if (!isSafeSkillFileName(fileName)) {
-      throw new Error('Invalid skill file name')
+    const dirs = this.getSkillsDirs()
+    for (const dir of dirs) {
+      const filePath = path.join(dir, fileName)
+      const exists = await fs.access(filePath).then(() => true).catch(() => false)
+      if (exists) {
+        await fs.unlink(filePath)
+        await this.reload()
+        return
+      }
     }
-    await this.ensureSkillsDir()
-    const filePath = path.join(this.getSkillsDir(), fileName)
-    await fs.unlink(filePath)
-    await this.reload()
+    throw new Error(`Skill file "${fileName}" not found`)
   }
 
   async createSkill(name: string, description: string, content: string): Promise<SkillInfo> {
-    await this.ensureSkillsDir()
+    const primaryDir = this.getSkillsDirs()[0]
+    await fs.mkdir(primaryDir, { recursive: true })
+    
     // Convert name to a safe file name (e.g., "My Skill" -> "my-skill.md")
     const safeBaseName = name.toLowerCase().replace(/[^a-z0-9]/g, '-')
     const fileName = `${safeBaseName}-${Date.now()}.md`
-    const filePath = path.join(this.getSkillsDir(), fileName)
+    const filePath = path.join(primaryDir, fileName)
     
     const fullContent = [
       '---',
@@ -168,15 +242,20 @@ export class SkillService {
       name,
       description,
       fileName,
-      filePath
+      filePath,
+      baseDir: primaryDir,
+      scanRoot: primaryDir,
+      isNested: false
     }
   }
 
   async createSkillFromTemplate(): Promise<SkillInfo> {
-    await this.ensureSkillsDir()
+    const primaryDir = this.getSkillsDirs()[0]
+    await fs.mkdir(primaryDir, { recursive: true })
+    
     const now = new Date()
     const fileName = `skill-${now.getTime()}.md`
-    const filePath = path.join(this.getSkillsDir(), fileName)
+    const filePath = path.join(primaryDir, fileName)
     await fs.writeFile(filePath, defaultSkillTemplate(now), 'utf-8')
     await this.reload()
     const created = this.cache.find((s) => s.fileName === fileName)
@@ -185,37 +264,98 @@ export class SkillService {
       name: `skill-${now.getTime()}`,
       description: 'New skill',
       fileName,
-      filePath
+      filePath,
+      baseDir: primaryDir,
+      scanRoot: primaryDir,
+      isNested: false
     }
   }
 
   async reload(): Promise<SkillInfo[]> {
-    await this.ensureSkillsDir()
-    const dir = this.getSkillsDir()
-    const entries = await fs.readdir(dir, { withFileTypes: true })
-    const mdFiles = entries
-      .filter((e) => e.isFile() && e.name.toLowerCase().endsWith('.md') && !e.name.startsWith('.'))
-      .map((e) => e.name)
-      .sort((a, b) => a.localeCompare(b))
-
+    const dirs = this.getSkillsDirs()
     const result: SkillInfo[] = []
-    for (const fileName of mdFiles) {
-      const filePath = path.join(dir, fileName)
+    const seenNames = new Set<string>()
+
+    for (const dir of dirs) {
       try {
-        const raw = await fs.readFile(filePath, 'utf-8')
-        const parsed = parseFrontmatter(raw)
-        const name = String(parsed.frontmatter.name || '').trim()
-        const description = String(parsed.frontmatter.description || '').trim()
-        if (!name || !description) continue
-        const info: SkillInfo = { name, description, fileName, filePath }
-        const ok = SkillInfoSchema.safeParse(info)
-        if (ok.success) result.push(ok.data)
-      } catch {
-        // ignore unreadable/invalid files
+        const exists = await fs.access(dir).then(() => true).catch(() => false)
+        if (!exists) continue
+
+        const entries = await fs.readdir(dir, { withFileTypes: true })
+        
+        for (const entry of entries) {
+          if (entry.name.startsWith('.')) continue
+
+          if (entry.isFile() && entry.name.toLowerCase().endsWith('.md')) {
+            // Mode A: Flat file
+            const filePath = path.join(dir, entry.name)
+            try {
+              const raw = await fs.readFile(filePath, 'utf-8')
+              const parsed = parseFrontmatter(raw)
+              const name = String(parsed.frontmatter.name || '').trim()
+              const description = String(parsed.frontmatter.description || '').trim()
+              if (!name || !description || seenNames.has(name)) continue
+
+              const info: SkillInfo = {
+                name,
+                description,
+                fileName: entry.name,
+                filePath,
+                baseDir: dir,
+                scanRoot: dir,
+                isNested: false
+              }
+              const ok = SkillInfoSchema.safeParse(info)
+              if (ok.success) {
+                result.push(ok.data)
+                seenNames.add(name)
+              }
+            } catch {
+              // ignore
+            }
+          } else if (entry.isDirectory()) {
+            // Mode B: Nested directory (SKILL.md)
+            const skillDir = path.join(dir, entry.name)
+            const skillFilePath = path.join(skillDir, 'SKILL.md')
+            
+            try {
+              const skillExists = await fs.access(skillFilePath).then(() => true).catch(() => false)
+              if (!skillExists) continue
+
+              const raw = await fs.readFile(skillFilePath, 'utf-8')
+              const parsed = parseFrontmatter(raw)
+              const name = String(parsed.frontmatter.name || '').trim()
+              const description = String(parsed.frontmatter.description || '').trim()
+              if (!name || !description || seenNames.has(name)) continue
+
+              const supportingFiles = await getSupportingFiles(skillDir, skillFilePath)
+
+              const info: SkillInfo = {
+                name,
+                description,
+                fileName: 'SKILL.md',
+                filePath: skillFilePath,
+                baseDir: skillDir,
+                scanRoot: dir,
+                isNested: true,
+                supportingFiles
+              }
+              const ok = SkillInfoSchema.safeParse(info)
+              if (ok.success) {
+                result.push(ok.data)
+                seenNames.add(name)
+              }
+            } catch {
+              // ignore
+            }
+          }
+        }
+      } catch (err) {
+        console.error(`[SkillService] Failed to reload skills from ${dir}`, err)
       }
     }
 
-    this.cache = result
+    this.cache = result.sort((a, b) => a.name.localeCompare(b.name))
     return this.cache
   }
 
@@ -226,6 +366,16 @@ export class SkillService {
     return this.cache
   }
 
+  async getEnabledSkills(): Promise<SkillInfo[]> {
+    const all = await this.getAll()
+    if (!this.settingsService) return all
+    
+    const settings = this.settingsService.getSettings()
+    const skillStates = settings.tools?.skills ?? {}
+    
+    return all.filter(s => skillStates[s.name] !== false)
+  }
+
   async readSkillContentByName(name: string): Promise<{ info: SkillInfo; content: string }> {
     const skills = await this.getAll()
     const match = skills.find((s) => s.name === name)
@@ -234,7 +384,20 @@ export class SkillService {
     }
     const raw = await fs.readFile(match.filePath, 'utf-8')
     const parsed = parseFrontmatter(raw)
-    return { info: match, content: parsed.content.trim() }
+    
+    // Inject resource list into content if it exists
+    let enrichedContent = parsed.content.trim()
+    if (match.isNested && match.supportingFiles && match.supportingFiles.length > 0) {
+      // Ensure absolute paths using path.join with match.baseDir
+      const filesList = match.supportingFiles.map((f: string) => {
+        const absolutePath = path.isAbsolute(f) ? f : path.join(match.baseDir, f)
+        return `- ${absolutePath}`
+      }).join('\n')
+      
+      enrichedContent += `\n\n## Supporting Files\n\nSkill directory: ${match.baseDir}\n\nThe following supporting files are available (absolute paths):\n${filesList}\n\nUse the "read_file" tool to access these files as needed, or run scripts as directed using the terminal.`
+    }
+
+    return { info: match, content: enrichedContent }
   }
 }
 

@@ -15,18 +15,18 @@ export const createSkillSchema = z.object({
 export function buildSkillToolDescription(skills: SkillInfo[]): string {
   const header = [
     'Load a skill to get detailed instructions for a specific task.',
-    'Skills provide specialized knowledge and step-by-step guidance.',
+    'Skills provide specialized knowledge, step-by-step guidance, and may include supporting files (scripts, references).',
     'You MUST choose a valid skill name from the list below.',
+    'When a skill is loaded, you will receive its instructions and a list of any available supporting files in its directory.'
   ]
 
-  const available = [
-    ...(skills || []).flatMap((s) => [
-      '  <skill>',
-      `    <name>${s.name}</name>`,
-      `    <description>${s.description}</description>`,
-      '  </skill>'
-    ])
-  ]
+  const available = (skills || []).flatMap((s) => [
+    '  <skill>',
+    `    <name>${s.name}</name>`,
+    `    <description>${s.description}</description>`,
+    `    <type>${s.isNested ? 'Nested (Complex)' : 'Flat (Simple)'}</type>`,
+    '  </skill>'
+  ])
 
   return [...header, '<available_skills>', ...available, '</available_skills>'].join('\n')
 }

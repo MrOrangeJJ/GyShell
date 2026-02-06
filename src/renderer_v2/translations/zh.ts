@@ -118,7 +118,11 @@ export const zh = {
       modelAdd: '配置 AI 模型供应商。目前仅支持【OpenAI API 兼容】的接口格式（如 DeepSeek, Claude, Local LLM 等）。',
       modelProfile: '配置组合（Profile）是在添加完基础模型后使用的。你可以为不同的任务指定不同的模型：\n\n1. 【全局模型 (Global)】：常规对话和任务处理的核心模型。如果你想全部使用同一个模型，只需设置此项，其余保持 None 即可。\n2. 【思考模型 (Thinking)】：仅在开启“思考模式”时使用，负责深度推理和复杂计划制定。\n3. 【执行模型 (Action)】：专门用于决策命令执行方式（如判断命令是否会阻塞、是否需要异步运行）。\n\n【重要提示】：现阶段不建议将带有“思维链 (CoT)”的模型（如 o1, r1 等）设为 Global 或 Action 模型，因为这会导致响应非常缓慢，且目前应用尚不支持显示这些模型的内部思维链内容。',
       mcpConfig: '打开 MCP (Model Context Protocol) 配置文件。你可以通过此文件接入外部工具，如 Google 搜索、文件索引等。\n\n注意：应用可能无法自动获取你的系统环境变量路径。在配置 mcpServers 时，对于 command 字段（如 npm, node, uv, python 等），请务必填写【绝对路径】！\n例如：使用 "/usr/local/bin/node" 而不是简单的 "node"。',
-      skills: '技能是预定义的复杂任务指令模板。AI 会加载这些指令来更好地完成特定领域的工作。\n\n你可以通过“打开文件夹”来管理技能文件（.md 格式）。每个文件代表一个技能，包含 AI 执行任务所需的背景知识和步骤指南。',
+      skills: '技能是预定义的复杂任务指令模板。AI 会加载这些指令来更好地完成特定领域的工作。\n\nGyShell 会扫描以下目录中的技能：\n1. 【GyShell Custom】：用户自定义技能（存储在 GyShell 数据目录中）。\n2. 【Claude/Goose 兼容】：~/.claude/skills、~/.agents/skills 以及平台特定的配置路径。\n\n注意：对于不在 "GyShell Custom" 文件夹中的技能，请在文件管理器中手动进行编辑或删除管理。',
+    },
+    skillSections: {
+      custom: 'GyShell 自定义',
+      others: '外部技能',
     },
   },
   connections: {

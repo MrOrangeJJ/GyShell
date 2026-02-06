@@ -126,6 +126,7 @@ export interface AppSettings {
   /** Tools enablement (built-in only; MCP is managed separately) */
   tools: {
     builtIn: Record<string, boolean>
+    skills?: Record<string, boolean>
   }
 
   /** Terminal visual settings */

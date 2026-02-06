@@ -216,45 +216,6 @@ function setupIpcHandlers(): void {
     return await themeService.loadCustomThemes()
   })
 
-  // Skills
-  ipcMain.handle('skills:openFolder', async () => {
-    await skillService.openSkillsFolder()
-  })
-
-  ipcMain.handle('skills:reload', async () => {
-    return await skillService.reload()
-  })
-
-  ipcMain.handle('skills:getAll', async () => {
-    return await skillService.getAll()
-  })
-
-  ipcMain.handle('skills:create', async () => {
-    return await skillService.createSkillFromTemplate()
-  })
-
-  ipcMain.handle('skills:openFile', async (_evt, fileName: string) => {
-    await skillService.openSkillFile(fileName)
-  })
-
-  ipcMain.handle('skills:delete', async (_evt, fileName: string) => {
-    await skillService.deleteSkillFile(fileName)
-    return await skillService.getAll()
-  })
-
-  ipcMain.handle('tools:setBuiltInEnabled', async (_, name: string, enabled: boolean) => {
-    const settings = settingsService.getSettings()
-    const nextBuiltIn = { ...(settings.tools?.builtIn ?? {}) }
-    nextBuiltIn[name] = enabled
-    settingsService.setSettings({ tools: { builtIn: nextBuiltIn } })
-    agentService.updateSettings(settingsService.getSettings())
-    return BUILTIN_TOOL_INFO.map((tool) => ({
-      name: tool.name,
-      description: tool.description,
-      enabled: nextBuiltIn[tool.name] ?? true
-    }))
-  })
-
   // Terminal
   ipcMain.handle('terminal:createTab', async (_, config) => {
     const tab = await terminalService.createTerminal(config)
@@ -329,13 +290,14 @@ app.whenReady().then(async () => {
   void tempFileService.cleanup()
 
   // Ensure skills dir exists + initial scan (best-effort)
-  skillService = new SkillService()
+  skillService = new SkillService(settingsService)
   void skillService.reload()
 
   agentService = new AgentService_v2(terminalService, commandPolicyService, mcpToolService, skillService, uiHistoryService)
-  gatewayService = new GatewayService(terminalService, agentService, uiHistoryService, commandPolicyService, tempFileService)
-  // Mount to global for AgentHelper (temporary solution)
+  gatewayService = new GatewayService(terminalService, agentService, uiHistoryService, commandPolicyService, tempFileService, skillService)
+  // Mount to global for AgentHelper and Gateway (temporary solution)
   ;(global as any).gateway = gatewayService;
+  ;(global as any).settingsService = settingsService;
   modelCapabilityService = new ModelCapabilityService()
 
   // Load MCP tools (best-effort)

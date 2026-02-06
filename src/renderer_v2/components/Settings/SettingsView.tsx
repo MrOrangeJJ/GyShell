@@ -1,5 +1,5 @@
 import React, { useMemo, useState } from 'react'
-import { ArrowLeft, Cpu, Palette, Settings, Plus, Trash2, X, Key, Globe, Box, Tag, Shield, Image, Loader2, Wrench, RefreshCw, BookOpenText } from 'lucide-react'
+import { ArrowLeft, Cpu, Palette, Settings, Plus, Trash2, X, Key, Globe, Box, Tag, Shield, Image, Loader2, Wrench, RefreshCw, BookOpenText, Pencil } from 'lucide-react'
 import { observer } from 'mobx-react-lite'
 import type { AppStore } from '../../stores/AppStore'
 import type { ModelDefinition } from '../../lib/ipcTypes'
@@ -919,33 +919,101 @@ export const SettingsView: React.FC<{ store: AppStore }> = observer(({ store }) 
                 </div>
               </div>
 
-              <div className="settings-divider">
-                <span>{t.settings.skills}</span>
-                <i />
-              </div>
-              <div className="tools-list">
-                {store.skills.map((s) => (
-                  <div key={s.fileName} className="tool-item">
-                    <div className="tool-info">
-                      <div className="tool-name">{s.name}</div>
-                      <div className="tool-meta">{s.description}</div>
-                    </div>
-                    <div className="tool-actions">
-                      <button className="icon-btn-sm" title={t.common.edit} onClick={() => store.editSkill(s.fileName)}>
-                        <Tag size={14} />
-                      </button>
-                      <button
-                        className="icon-btn-sm danger"
-                        title={t.common.delete}
-                        onClick={() => setDeleteSkillConfirm({ fileName: s.fileName })}
-                      >
-                        <Trash2 size={14} />
-                      </button>
-                    </div>
-                  </div>
-                ))}
-                {store.skills.length === 0 ? <div className="tool-empty">{t.settings.noSkills}</div> : null}
-              </div>
+              {(() => {
+                const skillsByDir: Record<string, typeof store.skills> = {}
+                store.skills.forEach((s) => {
+                  const dir = s.scanRoot // Group by the scan root directory
+                  if (!skillsByDir[dir]) skillsByDir[dir] = []
+                  skillsByDir[dir].push(s)
+                })
+
+                const sortedDirs = Object.keys(skillsByDir).sort((a, b) => {
+                  const isACustom = a.includes('GyShell') || a.endsWith('skills') && !a.includes('.claude') && !a.includes('.agents')
+                  const isBCustom = b.includes('GyShell') || b.endsWith('skills') && !b.includes('.claude') && !b.includes('.agents')
+                  if (isACustom && !isBCustom) return -1
+                  if (!isACustom && isBCustom) return 1
+                  return a.localeCompare(b)
+                })
+
+                return sortedDirs.map((dir) => {
+                  const dirSkills = skillsByDir[dir]
+                  const isCustom = dir.includes('GyShell') || (dir.endsWith('skills') && !dir.includes('.claude') && !dir.includes('.agents'))
+                  const sectionTitle = isCustom ? t.settings.skillSections.custom : dir
+                  
+                  const allEnabled = dirSkills.every(s => store.settings?.tools?.skills?.[s.name] !== false)
+                  const someEnabled = dirSkills.some(s => store.settings?.tools?.skills?.[s.name] !== false)
+
+                  return (
+                    <React.Fragment key={dir}>
+                      <div className="settings-divider settings-divider-spaced">
+                        <span>{sectionTitle}</span>
+                        <i />
+                        {!isCustom && (
+                          <div className="section-global-toggle">
+                            <label className="switch switch-sm">
+                              <input
+                                type="checkbox"
+                                checked={allEnabled}
+                                ref={el => { if (el) el.indeterminate = someEnabled && !allEnabled }}
+                                onChange={async (e) => {
+                                  const enabled = e.target.checked
+                                  // Update all skills in this directory
+                                  for (const s of dirSkills) {
+                                    await store.setSkillEnabled(s.name, enabled)
+                                  }
+                                }}
+                              />
+                              <span className="switch-slider" />
+                            </label>
+                          </div>
+                        )}
+                      </div>
+                      <div className="tools-list">
+                        {dirSkills.map((s) => {
+                          const isEnabled = store.settings?.tools?.skills?.[s.name] !== false
+                          return (
+                            <div key={s.filePath} className="tool-item">
+                              <div className="tool-info">
+                                <div className="tool-name">
+                                  {s.name}
+                                  {s.isNested && <span className="skill-type-tag">Nested</span>}
+                                </div>
+                                <div className="tool-meta">{s.description}</div>
+                              </div>
+                              <div className="tool-actions">
+                                <span className={`status-dot ${isEnabled ? 'is-ok' : 'is-disabled'}`} />
+                                <label className="switch">
+                                  <input
+                                    type="checkbox"
+                                    checked={isEnabled}
+                                    onChange={(e) => store.setSkillEnabled(s.name, e.target.checked)}
+                                  />
+                                  <span className="switch-slider" />
+                                </label>
+                                {isCustom && (
+                                  <>
+                                    <button className="icon-btn-sm" title={t.common.edit} onClick={() => store.editSkill(s.fileName)}>
+                                      <Pencil size={14} />
+                                    </button>
+                                    <button
+                                      className="icon-btn-sm danger"
+                                      title={t.common.delete}
+                                      onClick={() => setDeleteSkillConfirm({ fileName: s.fileName })}
+                                    >
+                                      <Trash2 size={14} />
+                                    </button>
+                                  </>
+                                )}
+                              </div>
+                            </div>
+                          )
+                        })}
+                      </div>
+                    </React.Fragment>
+                  )
+                })
+              })()}
+              {store.skills.length === 0 ? <div className="tool-empty">{t.settings.noSkills}</div> : null}
             </>
           ) : null}
         </div>

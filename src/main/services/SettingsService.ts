@@ -13,7 +13,8 @@ const DEFAULT_SETTINGS: AppSettings = {
   themeId: 'gyshell-dark',
   commandPolicyMode: 'standard',
   tools: {
-    builtIn: DEFAULT_BUILTIN_TOOLS
+    builtIn: DEFAULT_BUILTIN_TOOLS,
+    skills: {}
   },
   // Current effective settings (runtime binding)
   model: '',
@@ -88,7 +89,7 @@ export class SettingsService {
       }))
     }
 
-    const normalized = this.normalizeBuiltInTools(merged)
+    const normalized = this.normalizeTools(merged)
 
     // Recompute effective model from active profile
     const effectiveModel = this.computeEffectiveModel(normalized)
@@ -111,13 +112,15 @@ export class SettingsService {
     this.store.store = fixed as any
   }
 
-  private normalizeBuiltInTools(settings: AppSettings): AppSettings {
+  private normalizeTools(settings: AppSettings): AppSettings {
     const builtIn = settings.tools?.builtIn ?? {}
+    const skills = settings.tools?.skills ?? {}
     const normalizedBuiltIn = { ...DEFAULT_BUILTIN_TOOLS, ...builtIn }
     return {
       ...settings,
       tools: {
-        builtIn: normalizedBuiltIn
+        builtIn: normalizedBuiltIn,
+        skills
       }
     }
   }
@@ -139,7 +142,7 @@ export class SettingsService {
     this.ensureMigrated()
     const current = this.store.store as AppSettings
     const merged = deepMerge(current, settings)
-    const normalized = this.normalizeBuiltInTools(merged as AppSettings)
+    const normalized = this.normalizeTools(merged as AppSettings)
 
     // keep effective fields consistent
     const effectiveModel = this.computeEffectiveModel(normalized as AppSettings)

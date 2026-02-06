@@ -7,6 +7,8 @@ import type { AgentService_v2 } from '../AgentService_v2';
 import type { UIHistoryService } from '../UIHistoryService';
 import type { CommandPolicyService } from '../CommandPolicy/CommandPolicyService';
 import type { TempFileService } from '../TempFileService';
+import type { SkillService } from '../SkillService';
+import { BUILTIN_TOOL_INFO } from '../AgentHelper/tools';
 
 export class GatewayService extends EventEmitter implements IGateway {
   private sessions: Map<string, SessionContext> = new Map();
@@ -17,7 +19,8 @@ export class GatewayService extends EventEmitter implements IGateway {
     private agentService: AgentService_v2,
     private uiHistoryService: UIHistoryService,
     private commandPolicyService: CommandPolicyService,
-    private tempFileService: TempFileService
+    private tempFileService: TempFileService,
+    private skillService: SkillService
   ) {
     super();
     this.setupIpcHandlers();
@@ -139,6 +142,69 @@ export class GatewayService extends EventEmitter implements IGateway {
     // System/Temp File handlers
     ipcMain.handle('system:saveTempPaste', async (_, content: string) => {
       return await this.tempFileService.saveTempPaste(content);
+    });
+
+    // Skill handlers
+    ipcMain.handle('skills:openFolder', async () => {
+      await this.skillService.openSkillsFolder();
+    });
+
+    ipcMain.handle('skills:reload', async () => {
+      return await this.skillService.reload();
+    });
+
+    ipcMain.handle('skills:getAll', async () => {
+      return await this.skillService.getAll();
+    });
+
+    ipcMain.handle('skills:getEnabled', async () => {
+      return await this.skillService.getEnabledSkills();
+    });
+
+    ipcMain.handle('skills:create', async () => {
+      return await this.skillService.createSkillFromTemplate();
+    });
+
+    ipcMain.handle('skills:openFile', async (_evt, fileName: string) => {
+      await this.skillService.openSkillFile(fileName);
+    });
+
+    ipcMain.handle('skills:delete', async (_evt, fileName: string) => {
+      await this.skillService.deleteSkillFile(fileName);
+      return await this.skillService.getAll();
+    });
+
+    ipcMain.handle('skills:setEnabled', async (_, name: string, enabled: boolean) => {
+      // This will update settings via SettingsService internally
+      const settings = (global as any).settingsService.getSettings();
+      const nextSkills = { ...(settings.tools?.skills ?? {}) };
+      nextSkills[name] = enabled;
+      (global as any).settingsService.setSettings({ tools: { builtIn: settings.tools?.builtIn ?? {}, skills: nextSkills } });
+      
+      // Notify AgentService to refresh its tool definitions
+      this.agentService.updateSettings((global as any).settingsService.getSettings());
+      
+      // Broadcast to all windows that skills have been updated
+      const windows = BrowserWindow.getAllWindows();
+      const enabledSkills = await this.skillService.getEnabledSkills();
+      windows.forEach(win => {
+        win.webContents.send('skills:updated', enabledSkills);
+      });
+
+      return enabledSkills;
+    });
+
+    ipcMain.handle('tools:setBuiltInEnabled', async (_, name: string, enabled: boolean) => {
+      const settings = (global as any).settingsService.getSettings();
+      const nextBuiltIn = { ...(settings.tools?.builtIn ?? {}) };
+      nextBuiltIn[name] = enabled;
+      (global as any).settingsService.setSettings({ tools: { builtIn: nextBuiltIn, skills: settings.tools?.skills ?? {} } });
+      this.agentService.updateSettings((global as any).settingsService.getSettings());
+      return BUILTIN_TOOL_INFO.map((tool) => ({
+        name: tool.name,
+        description: tool.description,
+        enabled: nextBuiltIn[tool.name] ?? true
+      }));
     });
   }
 

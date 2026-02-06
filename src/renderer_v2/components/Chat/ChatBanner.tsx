@@ -13,7 +13,6 @@ import {
   AlertTriangle,
   XCircle
 } from 'lucide-react'
-import ReactMarkdown from 'react-markdown'
 import type { ChatMessage } from '../../stores/ChatStore'
 import './chatBanner.scss'
 

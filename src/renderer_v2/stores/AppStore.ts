@@ -121,6 +121,7 @@ export class AppStore {
       reloadMcpTools: action,
       setMcpToolEnabled: action,
       setBuiltInToolEnabled: action,
+      setSkillEnabled: action,
       setRecursionLimit: action,
       sendChatMessage: action,
       getUniqueTitle: action
@@ -353,6 +354,18 @@ export class AppStore {
     })
   }
 
+  async setSkillEnabled(name: string, enabled: boolean): Promise<void> {
+    const enabledSkills = await window.gyshell.skills.setEnabled(name, enabled)
+    const settings = await window.gyshell.settings.get()
+    runInAction(() => {
+      this.settings = settings
+      this.skills = this.skills.map(s => ({
+        ...s,
+        enabled: enabledSkills.some(es => es.name === s.name)
+      }))
+    })
+  }
+
   async setRecursionLimit(limit: number): Promise<void> {
     runInAction(() => {
       if (this.settings) {
@@ -420,6 +433,16 @@ export class AppStore {
         })
       })
 
+      // Skill status updates
+      window.gyshell.skills.onUpdated((enabledSkills: SkillSummary[]) => {
+        runInAction(() => {
+          this.skills = this.skills.map(s => ({
+            ...s,
+            enabled: enabledSkills.some(es => es.name === s.name)
+          }))
+        })
+      })
+
       // Ensure at least one terminal exists
       if (this.terminalTabs.length === 0) {
         this.createLocalTab()
@@ -467,6 +490,7 @@ export class AppStore {
     const id = `ssh-${uuidv4()}`
     const baseTitle = entry.name || `${entry.username}@${entry.host}`
     const title = this.getUniqueTitle(baseTitle)
+    const jumpHost = (entry as any).jumpHost ? (toJS((entry as any).jumpHost) as any) : undefined
     const cfg: TerminalConfig = {
       type: 'ssh',
       id,
@@ -483,8 +507,8 @@ export class AppStore {
       passphrase: entry.passphrase,
       proxy,
       tunnels,
-      jumpHost: entry.jumpHost ? toJS(entry.jumpHost) : undefined
-    }
+      jumpHost
+    } as any
     const tab: TerminalTabModel = { id, title, config: cfg, connectionRef: { type: 'ssh', entryId } }
     this.terminalTabs.push(tab)
     this.activeTerminalId = id

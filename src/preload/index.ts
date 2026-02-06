@@ -8,6 +8,7 @@ interface AppSettings {
   commandPolicyMode: 'safe' | 'standard' | 'smart'
   tools: {
     builtIn: Record<string, boolean>
+    skills?: Record<string, boolean>
   }
   models: {
     items: Array<{
@@ -156,6 +157,9 @@ interface SkillSummary {
   description: string
   fileName: string
   filePath: string
+  baseDir: string
+  scanRoot: string
+  isNested: boolean
 }
 
 interface TerminalColorScheme {
@@ -290,6 +294,8 @@ export interface GyShellAPI {
     create: () => Promise<SkillSummary>
     openFile: (fileName: string) => Promise<void>
     delete: (fileName: string) => Promise<SkillSummary[]>
+    setEnabled: (name: string, enabled: boolean) => Promise<SkillSummary[]>
+    onUpdated: (callback: (data: SkillSummary[]) => void) => () => void
   }
 }
 
@@ -395,7 +401,13 @@ const api: GyShellAPI = {
     getAll: () => ipcRenderer.invoke('skills:getAll'),
     create: () => ipcRenderer.invoke('skills:create'),
     openFile: (fileName) => ipcRenderer.invoke('skills:openFile', fileName),
-    delete: (fileName) => ipcRenderer.invoke('skills:delete', fileName)
+    delete: (fileName) => ipcRenderer.invoke('skills:delete', fileName),
+    setEnabled: (name: string, enabled: boolean) => ipcRenderer.invoke('skills:setEnabled', name, enabled),
+    onUpdated: (callback: (data: SkillSummary[]) => void) => {
+      const handler = (_: IpcRendererEvent, data: SkillSummary[]) => callback(data)
+      ipcRenderer.on('skills:updated', handler)
+      return () => ipcRenderer.off('skills:updated', handler)
+    }
   }
 }
 
