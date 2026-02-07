@@ -96,6 +96,16 @@ export class ChatHistoryService {
     this.store.set('sessions', [])
   }
 
+  renameSession(sessionId: string, newTitle: string): void {
+    const sessions = this.store.get('sessions') as StoredChatSession[]
+    const sessionIndex = sessions.findIndex((s: StoredChatSession) => s.id === sessionId)
+    if (sessionIndex >= 0) {
+      sessions[sessionIndex].title = newTitle
+      sessions[sessionIndex].updatedAt = Date.now()
+      this.store.set('sessions', sessions)
+    }
+  }
+
   exportSession(sessionId: string): StoredChatSession | null {
     const sessions = this.store.get('sessions') as StoredChatSession[]
     const storedSession = sessions.find((s: StoredChatSession) => s.id === sessionId)

@@ -1258,6 +1258,12 @@ ${recent}
 
   deleteChatSession(sessionId: string): void {
     this.chatHistoryService.deleteSession(sessionId)
+    this.uiHistoryService.deleteSession(sessionId)
+  }
+
+  renameChatSession(sessionId: string, newTitle: string): void {
+    this.chatHistoryService.renameSession(sessionId, newTitle)
+    this.uiHistoryService.renameSession(sessionId, newTitle)
   }
 
   exportChatSession(sessionId: string): any | null {

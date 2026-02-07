@@ -1,13 +1,11 @@
-import { app, BrowserWindow, ipcMain, screen, Menu, shell } from 'electron'
+import { app, BrowserWindow, screen, shell } from 'electron'
 import { join } from 'path'
-import { resolveTheme } from '../renderer_v2/theme/themes'
 import { SettingsService } from './services/SettingsService'
 import { TerminalService } from './services/TerminalService'
 import { AgentService_v2 } from './services/AgentService_v2'
 import { CommandPolicyService } from './services/CommandPolicy/CommandPolicyService'
 import { ModelCapabilityService } from './services/ModelCapabilityService'
 import { McpToolService } from './services/McpToolService'
-import { BUILTIN_TOOL_INFO } from './services/AgentHelper/tools'
 import { ThemeService } from './services/ThemeService'
 import { applyPlatformWindowTweaks, getPlatformBrowserWindowOptions } from './platform/windowChrome'
 import { SkillService } from './services/SkillService'
@@ -122,163 +120,6 @@ function createWindow(): void {
   mainWindow.on('move', saveBounds)
 }
 
-function setupIpcHandlers(): void {
-  // System
-  ipcMain.handle('system:openExternal', async (_, url: string) => {
-    if (url && (url.startsWith('http:') || url.startsWith('https:'))) {
-      await shell.openExternal(url)
-    }
-  })
-
-  // Settings
-  ipcMain.handle('settings:get', async () => {
-    return settingsService.getSettings()
-  })
-
-  ipcMain.handle('settings:set', async (_, settings) => {
-    const before = settingsService.getSettings()
-    settingsService.setSettings(settings)
-    const currentSettings = settingsService.getSettings()
-    agentService.updateSettings(currentSettings)
-
-    // Sync Windows title bar overlay at runtime when theme changes
-    if (
-      process.platform === 'win32' &&
-      mainWindow &&
-      before.themeId !== currentSettings.themeId &&
-      typeof mainWindow.setTitleBarOverlay === 'function'
-    ) {
-      const theme = resolveTheme(currentSettings.themeId, themeService.getCustomThemes())
-      const bg = theme.terminal.background
-      const fg = theme.terminal.foreground
-      mainWindow.setTitleBarOverlay({ color: bg, symbolColor: fg, height: 38 })
-      mainWindow.setBackgroundColor(bg)
-    }
-  })
-
-  ipcMain.handle('models:probe', async (_evt, model) => {
-    return await modelCapabilityService.probe(model)
-  })
-
-  ipcMain.handle('settings:openCommandPolicyFile', async () => {
-    await commandPolicyService.openPolicyFile()
-  })
-
-  ipcMain.handle('settings:getCommandPolicyLists', async () => {
-    return await commandPolicyService.getLists()
-  })
-
-  ipcMain.handle('settings:addCommandPolicyRule', async (_evt, listName: 'allowlist' | 'denylist' | 'asklist', rule: string) => {
-    return await commandPolicyService.addRule(listName, rule)
-  })
-
-  ipcMain.handle('settings:deleteCommandPolicyRule', async (_evt, listName: 'allowlist' | 'denylist' | 'asklist', rule: string) => {
-    return await commandPolicyService.deleteRule(listName, rule)
-  })
-
-  // Tools (MCP)
-  ipcMain.handle('tools:openMcpConfig', async () => {
-    await mcpToolService.openConfigFile()
-  })
-
-  ipcMain.handle('tools:reloadMcp', async () => {
-    return await mcpToolService.reloadAll()
-  })
-
-  ipcMain.handle('tools:getMcp', async () => {
-    return mcpToolService.getSummaries()
-  })
-
-  ipcMain.handle('tools:setMcpEnabled', async (_, name: string, enabled: boolean) => {
-    return await mcpToolService.setServerEnabled(name, enabled)
-  })
-
-  ipcMain.handle('tools:getBuiltIn', async () => {
-    const settings = settingsService.getSettings()
-    const enabledMap = settings.tools?.builtIn ?? {}
-    return BUILTIN_TOOL_INFO.map((tool) => ({
-      name: tool.name,
-      description: tool.description,
-      enabled: enabledMap[tool.name] ?? true
-    }))
-  })
-
-  // Themes (Custom)
-  ipcMain.handle('themes:openCustomConfig', async () => {
-    await themeService.openCustomThemeFile()
-  })
-
-  ipcMain.handle('themes:reloadCustom', async () => {
-    return await themeService.loadCustomThemes()
-  })
-
-  ipcMain.handle('themes:getCustom', async () => {
-    return await themeService.loadCustomThemes()
-  })
-
-  // Terminal
-  ipcMain.handle('terminal:createTab', async (_, config) => {
-    const tab = await terminalService.createTerminal(config)
-    return { id: tab.id }
-  })
-
-  ipcMain.handle('terminal:write', async (_, terminalId: string, data: string) => {
-    terminalService.write(terminalId, data)
-  })
-
-  ipcMain.handle('terminal:writePaths', async (_, terminalId: string, paths: string[]) => {
-    terminalService.writePaths(terminalId, paths)
-  })
-
-  ipcMain.handle('terminal:resize', async (_, terminalId: string, cols: number, rows: number) => {
-    terminalService.resize(terminalId, cols, rows)
-  })
-
-  ipcMain.handle('terminal:kill', async (_, terminalId: string) => {
-    terminalService.kill(terminalId)
-  })
-
-  ipcMain.handle('terminal:setSelection', async (_, terminalId: string, selectionText: string) => {
-    terminalService.setSelection(terminalId, selectionText)
-  })
-
-  // Agent
-  ipcMain.handle('agent:replyCommandApproval', async (_, approvalId: string, decision: 'allow' | 'deny') => {
-    // Forward to the new unified feedback system in Gateway
-    if ((global as any).gateway) {
-      (global as any).gateway.feedbackBus.emit(`feedback:${approvalId}`, { decision });
-    }
-  })
-
-  // UI
-  ipcMain.handle(
-    'ui:showContextMenu',
-    async (event, payload: { id: string; canCopy: boolean; canPaste: boolean }) => {
-      const window = BrowserWindow.fromWebContents(event.sender)
-      if (!window) return
-
-      const menu = Menu.buildFromTemplate([
-        {
-          label: 'Copy',
-          enabled: payload.canCopy,
-          click: () => {
-            window.webContents.send('ui:contextMenuAction', { id: payload.id, action: 'copy' })
-          }
-        },
-        {
-          label: 'Paste',
-          enabled: payload.canPaste,
-          click: () => {
-            window.webContents.send('ui:contextMenuAction', { id: payload.id, action: 'paste' })
-          }
-        }
-      ])
-
-      menu.popup({ window })
-    }
-  )
-}
-
 app.whenReady().then(async () => {
   // Initialize services
   settingsService = new SettingsService()
@@ -297,7 +138,18 @@ app.whenReady().then(async () => {
   void skillService.reload()
 
   agentService = new AgentService_v2(terminalService, commandPolicyService, mcpToolService, skillService, uiHistoryService)
-  gatewayService = new GatewayService(terminalService, agentService, uiHistoryService, commandPolicyService, tempFileService, skillService)
+  gatewayService = new GatewayService(
+    terminalService, 
+    agentService, 
+    uiHistoryService, 
+    commandPolicyService, 
+    tempFileService, 
+    skillService,
+    settingsService,
+    modelCapabilityService,
+    mcpToolService,
+    themeService
+  )
   // Mount to global for AgentHelper and Gateway (temporary solution)
   ;(global as any).gateway = gatewayService;
   ;(global as any).settingsService = settingsService;
@@ -305,19 +157,10 @@ app.whenReady().then(async () => {
 
   // Load MCP tools (best-effort)
   void mcpToolService.reloadAll()
-  mcpToolService.on('updated', (summary) => {
-    const windows = BrowserWindow.getAllWindows()
-    windows.forEach((window) => {
-      window.webContents.send('tools:mcpUpdated', summary)
-    })
-  })
 
   // Update agent with current settings
   const settings = settingsService.getSettings()
   agentService.updateSettings(settings)
-
-  // Setup IPC handlers
-  setupIpcHandlers()
 
   // Create window
   createWindow()

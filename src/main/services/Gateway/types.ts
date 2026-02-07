@@ -18,6 +18,29 @@ export interface GatewayEvent {
 }
 
 /**
+ * Client Transport interface for cross-platform communication
+ */
+export interface IClientTransport {
+  id: string;
+  type: 'electron' | 'websocket' | 'other';
+  
+  /**
+   * Send a raw event to the client
+   */
+  send(channel: string, data: any): void;
+  
+  /**
+   * Broadcast a GatewayEvent to this transport
+   */
+  emitEvent(event: GatewayEvent): void;
+  
+  /**
+   * Send a UI update action (Backend as Source of Truth)
+   */
+  sendUIUpdate(action: any): void;
+}
+
+/**
  * SessionContext maintains the full state of a conversation
  */
 export interface SessionContext {

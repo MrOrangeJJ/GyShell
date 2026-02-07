@@ -1,4 +1,3 @@
-import { BrowserWindow } from 'electron'
 import pkg from '@xterm/headless'
 import type { Terminal as TerminalType } from '@xterm/headless'
 const { Terminal } = pkg
@@ -694,9 +693,14 @@ export class TerminalService {
   }
 
   private sendToRenderer(channel: string, data: unknown): void {
-    const windows = BrowserWindow.getAllWindows()
-    windows.forEach((window) => {
-      window.webContents.send(channel, data)
-    })
+    if ((global as any).gateway) {
+      (global as any).gateway.broadcastRaw(channel, data);
+    } else {
+      const { BrowserWindow } = require('electron');
+      const windows = BrowserWindow.getAllWindows()
+      windows.forEach((window: any) => {
+        window.webContents.send(channel, data)
+      })
+    }
   }
 }

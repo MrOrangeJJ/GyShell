@@ -1,4 +1,3 @@
-import { BrowserWindow } from 'electron'
 import { ChatOpenAI } from '@langchain/openai'
 import { HumanMessage, type BaseMessage } from '@langchain/core/messages'
 import type { AgentEvent, ModelDefinition, AppSettings } from '../../types'
@@ -94,8 +93,9 @@ export class AgentHelpers {
       });
     } else {
       // Fallback for initialization phase or tests
+      const { BrowserWindow } = require('electron');
       const windows = BrowserWindow.getAllWindows()
-      windows.forEach((window) => {
+      windows.forEach((window: any) => {
         window.webContents.send('agent:event', { sessionId, event })
       })
     }

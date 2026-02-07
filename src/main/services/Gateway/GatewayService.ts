@@ -1,32 +1,62 @@
-import { BrowserWindow, ipcMain } from 'electron';
+import { ipcMain, shell, Menu, BrowserWindow } from 'electron';
 import { v4 as uuidv4 } from 'uuid';
 import { EventEmitter } from 'events';
-import type { IGateway, GatewayEvent, GatewayEventType, SessionContext } from './types';
+import type { IGateway, GatewayEvent, GatewayEventType, SessionContext, IClientTransport } from './types';
+import { ElectronWindowTransport } from './ElectronWindowTransport';
 import type { TerminalService } from '../TerminalService';
 import type { AgentService_v2 } from '../AgentService_v2';
 import type { UIHistoryService } from '../UIHistoryService';
 import type { CommandPolicyService } from '../CommandPolicy/CommandPolicyService';
 import type { TempFileService } from '../TempFileService';
 import type { SkillService } from '../SkillService';
+import type { SettingsService } from '../SettingsService';
+import type { ModelCapabilityService } from '../ModelCapabilityService';
+import type { McpToolService } from '../McpToolService';
+import type { ThemeService } from '../ThemeService';
 import { BUILTIN_TOOL_INFO } from '../AgentHelper/tools';
+import { resolveTheme } from '../../../renderer_v2/theme/themes';
 
 export class GatewayService extends EventEmitter implements IGateway {
   private sessions: Map<string, SessionContext> = new Map();
   private eventBus: EventEmitter = new EventEmitter();
   private feedbackBus: EventEmitter = new EventEmitter();
   private feedbackCache: Map<string, any> = new Map();
+  private transports: Map<string, IClientTransport> = new Map();
 
   constructor(
     private terminalService: TerminalService,
     private agentService: AgentService_v2,
     private uiHistoryService: UIHistoryService,
-    _commandPolicyService: CommandPolicyService,
+    private commandPolicyService: CommandPolicyService,
     private tempFileService: TempFileService,
-    private skillService: SkillService
+    private skillService: SkillService,
+    private settingsService: SettingsService,
+    private modelCapabilityService: ModelCapabilityService,
+    private mcpToolService: McpToolService,
+    private themeService: ThemeService
   ) {
     super();
+    // Register default Electron transport
+    this.registerTransport(new ElectronWindowTransport());
+    
     this.setupIpcHandlers();
     this.setupInternalSubscriptions();
+    this.setupServiceSubscriptions();
+  }
+
+  public registerTransport(transport: IClientTransport) {
+    this.transports.set(transport.id, transport);
+  }
+
+  public unregisterTransport(transportId: string) {
+    this.transports.delete(transportId);
+  }
+
+  private setupServiceSubscriptions() {
+    // MCP tool status updates
+    this.mcpToolService.on('updated', (summary) => {
+      this.transports.forEach(t => t.send('tools:mcpUpdated', summary));
+    });
   }
 
   private setupInternalSubscriptions() {
@@ -34,45 +64,49 @@ export class GatewayService extends EventEmitter implements IGateway {
     this.subscribe('agent:event', (event) => {
       const actions = this.uiHistoryService.recordEvent(event.sessionId!, event.payload);
       
-      const windows = BrowserWindow.getAllWindows();
-      windows.forEach(win => {
+      this.transports.forEach(transport => {
         // 1. Send processed UI Action (for core UI like message list)
-        actions.forEach(action => win.webContents.send('agent:ui-update', action));
+        actions.forEach(action => transport.sendUIUpdate(action));
         
         // 2. Send raw Agent Event (for auxiliary components like Banners, status lights, etc.)
-        win.webContents.send('agent:event', { 
-          sessionId: event.sessionId, 
-          event: event.payload 
-        });
+        transport.emitEvent(event);
       });
     });
   }
 
   private setupIpcHandlers() {
     // Take over IPC originally in AgentService
-    ipcMain.handle('agent:startTask', async (_, sessionId: string, terminalId: string, userText: string) => {
+    ipcMain.handle('agent:startTask', async (_: any, sessionId: string, terminalId: string, userText: string) => {
       return this.dispatchTask(sessionId, userText, terminalId);
     });
 
-    ipcMain.handle('agent:stopTask', async (_, sessionId: string) => {
+    ipcMain.handle('agent:stopTask', async (_: any, sessionId: string) => {
       return this.stopTask(sessionId);
     });
 
-    ipcMain.handle('agent:replyMessage', async (_, messageId: string, payload: any) => {
+    ipcMain.handle('agent:replyMessage', async (_: any, messageId: string, payload: any) => {
       console.log(`[GatewayService] Received replyMessage for messageId=${messageId}:`, payload);
       this.feedbackCache.set(messageId, payload);
       this.feedbackBus.emit(`feedback:${messageId}`, payload);
       return { ok: true };
     });
 
-    ipcMain.handle('agent:deleteChatSession', async (_, sessionId: string) => {
+    ipcMain.handle('agent:deleteChatSession', async (_: any, sessionId: string) => {
       await this.stopTask(sessionId);
       this.agentService.deleteChatSession(sessionId);
       this.uiHistoryService.deleteSession(sessionId);
       this.sessions.delete(sessionId);
     });
 
-    ipcMain.handle('agent:exportHistory', async (_, sessionId: string) => {
+    ipcMain.handle('agent:renameSession', async (_: any, sessionId: string, newTitle: string) => {
+      this.agentService.renameChatSession(sessionId, newTitle);
+    });
+
+    ipcMain.handle('agent:replyCommandApproval', async (_: any, approvalId: string, decision: 'allow' | 'deny') => {
+      this.feedbackBus.emit(`feedback:${approvalId}`, { decision });
+    });
+
+    ipcMain.handle('agent:exportHistory', async (_: any, sessionId: string) => {
       const backendSession = this.agentService.exportChatSession(sessionId);
       if (!backendSession) {
         throw new Error(`Session with ID ${sessionId} not found`);
@@ -94,7 +128,7 @@ export class GatewayService extends EventEmitter implements IGateway {
         return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}_${pad(d.getHours())}-${pad(d.getMinutes())}-${pad(d.getSeconds())}`;
       };
 
-      const { dialog } = await import('electron');
+      const { dialog } = require('electron');
       const baseName = safeFileBaseName(uiSession?.title || backendSession.title);
       const ts = formatTimestamp(new Date());
       const { filePath } = await dialog.showSaveDialog({
@@ -107,7 +141,7 @@ export class GatewayService extends EventEmitter implements IGateway {
       });
 
       if (filePath) {
-        const fs = await import('fs');
+        const fs = require('fs');
         const historyToExport = {
           sessionId: backendSession.id,
           title: uiSession?.title || backendSession.title,
@@ -128,9 +162,9 @@ export class GatewayService extends EventEmitter implements IGateway {
 
     // Forward other query-type IPCs
     ipcMain.handle('agent:getAllChatHistory', () => this.agentService.getAllChatHistory());
-    ipcMain.handle('agent:loadChatSession', (_, id) => this.agentService.loadChatSession(id));
-    ipcMain.handle('agent:getUiMessages', (_, id) => this.uiHistoryService.getMessages(id));
-    ipcMain.handle('agent:rollbackToMessage', async (_, sessionId: string, messageId: string) => {
+    ipcMain.handle('agent:loadChatSession', (_: any, id: string) => this.agentService.loadChatSession(id));
+    ipcMain.handle('agent:getUiMessages', (_: any, id: string) => this.uiHistoryService.getMessages(id));
+    ipcMain.handle('agent:rollbackToMessage', async (_: any, sessionId: string, messageId: string) => {
       // 1. Stop currently running task if any
       await this.stopTask(sessionId);
 
@@ -149,7 +183,7 @@ export class GatewayService extends EventEmitter implements IGateway {
     });
 
     // System/Temp File handlers
-    ipcMain.handle('system:saveTempPaste', async (_, content: string) => {
+    ipcMain.handle('system:saveTempPaste', async (_: any, content: string) => {
       return await this.tempFileService.saveTempPaste(content);
     });
 
@@ -174,16 +208,16 @@ export class GatewayService extends EventEmitter implements IGateway {
       return await this.skillService.createSkillFromTemplate();
     });
 
-    ipcMain.handle('skills:openFile', async (_evt, fileName: string) => {
+    ipcMain.handle('skills:openFile', async (_evt: any, fileName: string) => {
       await this.skillService.openSkillFile(fileName);
     });
 
-    ipcMain.handle('skills:delete', async (_evt, fileName: string) => {
+    ipcMain.handle('skills:delete', async (_evt: any, fileName: string) => {
       await this.skillService.deleteSkillFile(fileName);
       return await this.skillService.getAll();
     });
 
-    ipcMain.handle('skills:setEnabled', async (_, name: string, enabled: boolean) => {
+    ipcMain.handle('skills:setEnabled', async (_: any, name: string, enabled: boolean) => {
       // This will update settings via SettingsService internally
       const settings = (global as any).settingsService.getSettings();
       const nextSkills = { ...(settings.tools?.skills ?? {}) };
@@ -194,16 +228,13 @@ export class GatewayService extends EventEmitter implements IGateway {
       this.agentService.updateSettings((global as any).settingsService.getSettings());
       
       // Broadcast to all windows that skills have been updated
-      const windows = BrowserWindow.getAllWindows();
       const enabledSkills = await this.skillService.getEnabledSkills();
-      windows.forEach(win => {
-        win.webContents.send('skills:updated', enabledSkills);
-      });
+      this.transports.forEach(t => t.send('skills:updated', enabledSkills));
 
       return enabledSkills;
     });
 
-    ipcMain.handle('tools:setBuiltInEnabled', async (_, name: string, enabled: boolean) => {
+    ipcMain.handle('tools:setBuiltInEnabled', async (_: any, name: string, enabled: boolean) => {
       const settings = (global as any).settingsService.getSettings();
       const nextBuiltIn = { ...(settings.tools?.builtIn ?? {}) };
       nextBuiltIn[name] = enabled;
@@ -215,6 +246,159 @@ export class GatewayService extends EventEmitter implements IGateway {
         enabled: nextBuiltIn[tool.name] ?? true
       }));
     });
+
+    // --- System ---
+    ipcMain.handle('system:openExternal', async (_: any, url: string) => {
+      if (url && (url.startsWith('http:') || url.startsWith('https:'))) {
+        await shell.openExternal(url);
+      }
+    });
+
+    // --- Settings ---
+    ipcMain.handle('settings:get', async () => {
+      return this.settingsService.getSettings();
+    });
+
+    ipcMain.handle('settings:set', async (_: any, settings: any) => {
+      const before = this.settingsService.getSettings();
+      this.settingsService.setSettings(settings);
+      const currentSettings = this.settingsService.getSettings();
+      this.agentService.updateSettings(currentSettings);
+
+      // Sync Windows title bar overlay at runtime when theme changes
+      if (
+        process.platform === 'win32' &&
+        before.themeId !== currentSettings.themeId
+      ) {
+        const theme = resolveTheme(currentSettings.themeId, this.themeService.getCustomThemes());
+        const bg = theme.terminal.background;
+        const fg = theme.terminal.foreground;
+        
+        // This is a platform-specific UI tweak, we still need BrowserWindow here 
+        // as it's about the native window frame, not the client content.
+        const windows = BrowserWindow.getAllWindows();
+        windows.forEach(win => {
+          if (typeof win.setTitleBarOverlay === 'function') {
+            win.setTitleBarOverlay({ color: bg, symbolColor: fg, height: 38 });
+            win.setBackgroundColor(bg);
+          }
+        });
+      }
+    });
+
+    ipcMain.handle('models:probe', async (_evt: any, model: any) => {
+      return await this.modelCapabilityService.probe(model);
+    });
+
+    ipcMain.handle('settings:openCommandPolicyFile', async () => {
+      await this.commandPolicyService.openPolicyFile();
+    });
+
+    ipcMain.handle('settings:getCommandPolicyLists', async () => {
+      return await this.commandPolicyService.getLists();
+    });
+
+    ipcMain.handle('settings:addCommandPolicyRule', async (_evt: any, listName: 'allowlist' | 'denylist' | 'asklist', rule: string) => {
+      return await this.commandPolicyService.addRule(listName, rule);
+    });
+
+    ipcMain.handle('settings:deleteCommandPolicyRule', async (_evt: any, listName: 'allowlist' | 'denylist' | 'asklist', rule: string) => {
+      return await this.commandPolicyService.deleteRule(listName, rule);
+    });
+
+    // --- Tools (MCP) ---
+    ipcMain.handle('tools:openMcpConfig', async () => {
+      await this.mcpToolService.openConfigFile();
+    });
+
+    ipcMain.handle('tools:reloadMcp', async () => {
+      return await this.mcpToolService.reloadAll();
+    });
+
+    ipcMain.handle('tools:getMcp', async () => {
+      return this.mcpToolService.getSummaries();
+    });
+
+    ipcMain.handle('tools:setMcpEnabled', async (_: any, name: string, enabled: boolean) => {
+      return await this.mcpToolService.setServerEnabled(name, enabled);
+    });
+
+    ipcMain.handle('tools:getBuiltIn', async () => {
+      const settings = this.settingsService.getSettings();
+      const enabledMap = settings.tools?.builtIn ?? {};
+      return BUILTIN_TOOL_INFO.map((tool) => ({
+        name: tool.name,
+        description: tool.description,
+        enabled: enabledMap[tool.name] ?? true
+      }));
+    });
+
+    // --- Themes (Custom) ---
+    ipcMain.handle('themes:openCustomConfig', async () => {
+      await this.themeService.openCustomThemeFile();
+    });
+
+    ipcMain.handle('themes:reloadCustom', async () => {
+      return await this.themeService.loadCustomThemes();
+    });
+
+    ipcMain.handle('themes:getCustom', async () => {
+      return await this.themeService.loadCustomThemes();
+    });
+
+    // --- Terminal ---
+    ipcMain.handle('terminal:createTab', async (_: any, config: any) => {
+      const tab = await this.terminalService.createTerminal(config);
+      return { id: tab.id };
+    });
+
+    ipcMain.handle('terminal:write', async (_: any, terminalId: string, data: string) => {
+      this.terminalService.write(terminalId, data);
+    });
+
+    ipcMain.handle('terminal:writePaths', async (_: any, terminalId: string, paths: string[]) => {
+      this.terminalService.writePaths(terminalId, paths);
+    });
+
+    ipcMain.handle('terminal:resize', async (_: any, terminalId: string, cols: number, rows: number) => {
+      this.terminalService.resize(terminalId, cols, rows);
+    });
+
+    ipcMain.handle('terminal:kill', async (_: any, terminalId: string) => {
+      this.terminalService.kill(terminalId);
+    });
+
+    ipcMain.handle('terminal:setSelection', async (_: any, terminalId: string, selectionText: string) => {
+      this.terminalService.setSelection(terminalId, selectionText);
+    });
+
+    // --- UI ---
+    ipcMain.handle(
+      'ui:showContextMenu',
+      async (event: any, payload: { id: string; canCopy: boolean; canPaste: boolean }) => {
+        const window = BrowserWindow.fromWebContents(event.sender);
+        if (!window) return;
+
+        const menu = Menu.buildFromTemplate([
+          {
+            label: 'Copy',
+            enabled: payload.canCopy,
+            click: () => {
+              window.webContents.send('ui:contextMenuAction', { id: payload.id, action: 'copy' });
+            }
+          },
+          {
+            label: 'Paste',
+            enabled: payload.canPaste,
+            click: () => {
+              window.webContents.send('ui:contextMenuAction', { id: payload.id, action: 'paste' });
+            }
+          }
+        ]);
+
+        menu.popup({ window });
+      }
+    );
   }
 
   async createSession(terminalId: string): Promise<string> {
@@ -280,10 +464,7 @@ export class GatewayService extends EventEmitter implements IGateway {
         this.broadcast({ type: 'agent:event', sessionId, payload: { type: 'done' } });
         // 2. Send SESSION_READY action (for admission control and queue scheduling)
         // This MUST be sent after clearRunState to ensure backend is truly idle
-        const windows = BrowserWindow.getAllWindows();
-        windows.forEach(win => {
-          win.webContents.send('agent:ui-update', { type: 'SESSION_READY', sessionId });
-        });
+        this.transports.forEach(t => t.sendUIUpdate({ type: 'SESSION_READY', sessionId }));
         this.uiHistoryService.flush(sessionId);
       }
     }
@@ -297,10 +478,7 @@ export class GatewayService extends EventEmitter implements IGateway {
       // Sync UI and disk immediately when manually stopped
       this.broadcast({ type: 'agent:event', sessionId, payload: { type: 'done' } });
       
-      const windows = BrowserWindow.getAllWindows();
-      windows.forEach(win => {
-        win.webContents.send('agent:ui-update', { type: 'SESSION_READY', sessionId });
-      });
+      this.transports.forEach(t => t.sendUIUpdate({ type: 'SESSION_READY', sessionId }));
       
       this.uiHistoryService.flush(sessionId);
     }
@@ -335,10 +513,16 @@ export class GatewayService extends EventEmitter implements IGateway {
     // 1. Internal bus distribution (for other Services like UIHistoryService)
     this.eventBus.emit(fullEvent.type, fullEvent);
 
-    // 2. Send to frontend
-    const windows = BrowserWindow.getAllWindows();
-    windows.forEach(win => {
-      win.webContents.send('gateway:event', fullEvent);
+    // 2. Send to frontend via all transports
+    this.transports.forEach(transport => {
+      transport.emitEvent(fullEvent);
+    });
+  }
+
+  // Raw data distribution for non-GatewayEvent messages (e.g. terminal data)
+  broadcastRaw(channel: string, data: any): void {
+    this.transports.forEach(transport => {
+      transport.send(channel, data);
     });
   }
 

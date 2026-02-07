@@ -386,6 +386,15 @@ export class UIHistoryService {
     this.saveSessions(this.sessionsCache)
   }
 
+  renameSession(sessionId: string, newTitle: string): void {
+    if (this.sessionsCache[sessionId]) {
+      this.sessionsCache[sessionId].title = newTitle
+      this.sessionsCache[sessionId].updatedAt = Date.now()
+      this.dirtySessions.add(sessionId)
+      this.flush(sessionId)
+    }
+  }
+
   rollbackToMessage(sessionId: string, backendMessageId: string): number {
     const session = this.sessionsCache[sessionId]
     if (!session) return 0

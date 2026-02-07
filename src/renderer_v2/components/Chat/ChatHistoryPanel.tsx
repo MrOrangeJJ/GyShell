@@ -1,7 +1,7 @@
 import React, { useEffect, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { observer } from 'mobx-react-lite'
-import { Clock, Trash2, X, History, CheckSquare, Square } from 'lucide-react'
+import { Clock, Trash2, X, History, CheckSquare, Square, Edit2, Check, X as Close } from 'lucide-react'
 import type { AppStore } from '../../stores/AppStore'
 import { ConfirmDialog } from '../Common/ConfirmDialog'
 import './chatHistory.scss'
@@ -33,6 +33,8 @@ export const ChatHistoryPanel: React.FC<ChatHistoryPanelProps> = observer(({ sto
   const [lastSelectedIndex, setLastSelectedIndex] = useState<number | null>(null)
   const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null)
   const [showBulkDeleteConfirm, setShowBulkDeleteConfirm] = useState(false)
+  const [editingId, setEditingId] = useState<string | null>(null)
+  const [editingTitle, setEditingTitle] = useState('')
   
   // Selection box state
   const [isDragging, setIsDragging] = useState(false)
@@ -50,7 +52,6 @@ export const ChatHistoryPanel: React.FC<ChatHistoryPanelProps> = observer(({ sto
   useEffect(() => {
     if (!isDragging || !dragStart || !dragEnd || !listRef.current) return
 
-    const rect = listRef.current.getBoundingClientRect()
     const selectionRect = {
       left: Math.min(dragStart.x, dragEnd.x),
       top: Math.min(dragStart.y, dragEnd.y),
@@ -129,7 +130,7 @@ export const ChatHistoryPanel: React.FC<ChatHistoryPanelProps> = observer(({ sto
 
   const handleItemClick = (e: React.MouseEvent, index: number) => {
     const session = history[index]
-    if (!session) return
+    if (!session || editingId === session.id) return
 
     if (!isSelectionMode) {
       handleLoadSession(session.id)
@@ -161,12 +162,45 @@ export const ChatHistoryPanel: React.FC<ChatHistoryPanelProps> = observer(({ sto
   }
 
   const handleLoadSession = async (sessionId: string) => {
+    if (editingId) return
     try {
       await store.chat.loadChatHistory(sessionId)
       onClose()
     } catch (error) {
       console.error('Failed to load session:', error)
     }
+  }
+
+  const handleStartRename = (e: React.MouseEvent, session: StoredChatSession) => {
+    e.stopPropagation()
+    setEditingId(session.id)
+    setEditingTitle(session.title)
+  }
+
+  const handleConfirmRename = async (e: React.MouseEvent | React.KeyboardEvent) => {
+    e.stopPropagation()
+    if (!editingId) return
+    const newTitle = editingTitle.trim()
+    if (!newTitle) {
+      setEditingId(null)
+      return
+    }
+
+    try {
+      // Optimistic update
+      setHistory(prev => prev.map(s => s.id === editingId ? { ...s, title: newTitle } : s))
+      await store.chat.renameChatSession(editingId, newTitle)
+    } catch (error) {
+      console.error('Failed to rename session:', error)
+      await loadHistory(false)
+    } finally {
+      setEditingId(null)
+    }
+  }
+
+  const handleCancelRename = (e: React.MouseEvent) => {
+    e.stopPropagation()
+    setEditingId(null)
   }
 
   const handleDeleteSession = async (sessionId: string) => {
@@ -350,7 +384,30 @@ export const ChatHistoryPanel: React.FC<ChatHistoryPanelProps> = observer(({ sto
                   onClick={(e) => handleItemClick(e, index)}
                 >
                   <div className="chat-history-item-main">
-                    <div className="chat-history-item-title">{session.title}</div>
+                    {editingId === session.id ? (
+                      <div className="chat-history-item-edit-wrapper" onClick={e => e.stopPropagation()}>
+                        <input
+                          autoFocus
+                          className="chat-history-item-edit-input"
+                          value={editingTitle}
+                          onChange={e => setEditingTitle(e.target.value)}
+                          onKeyDown={e => {
+                            if (e.key === 'Enter') handleConfirmRename(e)
+                            if (e.key === 'Escape') handleCancelRename(e as any)
+                          }}
+                        />
+                        <div className="chat-history-item-edit-actions">
+                          <button className="confirm" onClick={handleConfirmRename}>
+                            <Check size={14} />
+                          </button>
+                          <button className="cancel" onClick={handleCancelRename}>
+                            <Close size={14} />
+                          </button>
+                        </div>
+                      </div>
+                    ) : (
+                      <div className="chat-history-item-title">{session.title}</div>
+                    )}
                     <div className="chat-history-item-meta">
                       <Clock size={12} />
                       <span>{formatDate(session.updatedAt)}</span>
@@ -369,6 +426,15 @@ export const ChatHistoryPanel: React.FC<ChatHistoryPanelProps> = observer(({ sto
                   >
                     <Trash2 size={14} />
                   </button>
+                  {!isSelectionMode && editingId !== session.id && (
+                    <button
+                      className="chat-history-item-rename"
+                      onClick={(e) => handleStartRename(e, session)}
+                      title={t.chat.history.renameSession}
+                    >
+                      <Edit2 size={14} />
+                    </button>
+                  )}
                 </div>
               ))}
             </div>

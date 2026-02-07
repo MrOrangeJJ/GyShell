@@ -258,6 +258,7 @@ export interface GyShellAPI {
       callback: (action: any) => void
     ) => () => void
     exportHistory: (sessionId: string, frontendSession?: any) => Promise<void>
+    renameSession: (sessionId: string, newTitle: string) => Promise<void>
     replyCommandApproval: (approvalId: string, decision: 'allow' | 'deny') => Promise<void>
   }
 
@@ -374,6 +375,7 @@ const api: GyShellAPI = {
       return () => ipcRenderer.off('agent:ui-update', handler)
     },
     exportHistory: (sessionId, frontendSession?) => ipcRenderer.invoke('agent:exportHistory', sessionId, frontendSession),
+    renameSession: (sessionId, newTitle) => ipcRenderer.invoke('agent:renameSession', sessionId, newTitle),
     replyCommandApproval: (approvalId, decision) =>
       ipcRenderer.invoke('agent:replyCommandApproval', approvalId, decision)
   },

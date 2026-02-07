@@ -70,6 +70,7 @@ export class ChatStore {
       handleUiUpdate: action,
       loadChatHistory: action,
       deleteChatSession: action,
+      renameChatSession: action,
       rollbackToMessage: action,
       setQueueRunner: action,
       startQueue: action,
@@ -385,6 +386,21 @@ export class ChatStore {
       this.queue.clearSession(sessionId)
     } catch (error) {
       console.error('Failed to delete chat session:', error)
+      throw error
+    }
+  }
+
+  async renameChatSession(sessionId: string, newTitle: string): Promise<void> {
+    try {
+      await window.gyshell.agent.renameSession(sessionId, newTitle)
+      runInAction(() => {
+        const session = this.sessions.find(s => s.id === sessionId)
+        if (session) {
+          session.title = newTitle
+        }
+      })
+    } catch (error) {
+      console.error('Failed to rename chat session:', error)
       throw error
     }
   }
