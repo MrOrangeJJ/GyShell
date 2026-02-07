@@ -10,6 +10,7 @@
     // Make interactive elements non-draggable so they can be clicked
     .chat-tab-add,
     .chat-tab-history,
+    .chat-tab-history-menu,
     .chat-tabs {
       -webkit-app-region: no-drag;
     }

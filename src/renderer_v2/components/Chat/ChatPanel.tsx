@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, useState, useLayoutEffect, useCallback } from 'react'
-import { Square, Plus, X, History, Bot, CornerDownLeft, Play } from 'lucide-react'
+import { Square, Plus, X, History, Bot, CornerDownLeft, Play, MoreVertical } from 'lucide-react'
 import { observer } from 'mobx-react-lite'
 import type { AppStore } from '../../stores/AppStore'
 import type { ChatMessage } from '../../stores/ChatStore'
@@ -99,6 +99,10 @@ export const ChatPanel: React.FC<{ store: AppStore }> = observer(({ store }) => 
   const [rollbackTarget, setRollbackTarget] = useState<ChatMessage | null>(null)
   const [queueEditTarget, setQueueEditTarget] = useState<QueueItem | null>(null)
   const [mousePos, setMousePos] = useState<{ x: number; y: number } | null>(null)
+  const [showExportMenu, setShowExportMenu] = useState(false)
+  const [exportMenuPos, setExportMenuPos] = useState<{ top: number; left: number }>({ top: 0, left: 0 })
+  const exportMenuButtonRef = useRef<HTMLButtonElement>(null)
+  const exportMenuRef = useRef<HTMLDivElement>(null)
   const t = store.i18n.t
   const contextMenuIdRef = useRef<string>('chat-panel')
   
@@ -204,6 +208,38 @@ export const ChatPanel: React.FC<{ store: AppStore }> = observer(({ store }) => 
   const useQueueAddIcon = isQueueMode && !inputEmpty
   const shouldShowStop = isThinking
   const runtimeActionCount = (shouldShowPrimary ? 1 : 0) + (shouldShowStop ? 1 : 0)
+
+  const computeExportMenuPosition = useCallback(() => {
+    const button = exportMenuButtonRef.current
+    if (!button) return
+    const rect = button.getBoundingClientRect()
+    const menuWidth = exportMenuRef.current?.offsetWidth || 180
+    const menuHeight = exportMenuRef.current?.offsetHeight || 92
+    const margin = 8
+    const left = Math.max(margin, Math.min(rect.left, window.innerWidth - margin - menuWidth))
+    const top = Math.min(rect.bottom + 2, window.innerHeight - margin - menuHeight)
+    setExportMenuPos({ top, left })
+  }, [])
+
+  const toggleExportMenu = (e: React.MouseEvent) => {
+    e.stopPropagation()
+    if (showExportMenu) {
+      setShowExportMenu(false)
+      return
+    }
+    setShowExportMenu(true)
+  }
+
+  const handleHistoryExport = async (mode: 'simple' | 'detailed') => {
+    if (!store.chat.activeSessionId) return
+    try {
+      await window.gyshell.agent.exportHistory(store.chat.activeSessionId, mode)
+    } catch (error) {
+      console.error('Failed to export history:', error)
+    } finally {
+      setShowExportMenu(false)
+    }
+  }
 
   const stopCurrentRun = () => {
     if (store.chat.activeSessionId) {
@@ -400,6 +436,38 @@ export const ChatPanel: React.FC<{ store: AppStore }> = observer(({ store }) => 
     }
   }, [])
 
+  useEffect(() => {
+    if (!showExportMenu) return
+    computeExportMenuPosition()
+
+    const onDocMouseDown = (event: MouseEvent) => {
+      const target = event.target as Node
+      if (exportMenuRef.current?.contains(target)) return
+      if (exportMenuButtonRef.current?.contains(target)) return
+      setShowExportMenu(false)
+    }
+
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        setShowExportMenu(false)
+      }
+    }
+
+    const onReflow = () => computeExportMenuPosition()
+
+    document.addEventListener('mousedown', onDocMouseDown)
+    document.addEventListener('keydown', onKeyDown)
+    window.addEventListener('resize', onReflow)
+    window.addEventListener('scroll', onReflow, true)
+
+    return () => {
+      document.removeEventListener('mousedown', onDocMouseDown)
+      document.removeEventListener('keydown', onKeyDown)
+      window.removeEventListener('resize', onReflow)
+      window.removeEventListener('scroll', onReflow, true)
+    }
+  }, [showExportMenu, computeExportMenuPosition])
+
   return (
     <div 
       className={`panel panel-chat${store.layout.isDragging ? ' is-dragging-source' : ''}`} 
@@ -432,7 +500,45 @@ export const ChatPanel: React.FC<{ store: AppStore }> = observer(({ store }) => 
         <button className="chat-tab-history" onClick={() => setShowHistory(true)}>
             <History size={14} />
         </button>
+        <button
+          ref={exportMenuButtonRef}
+          className="chat-tab-history-menu"
+          onClick={toggleExportMenu}
+          title={t.chat.history.exportMenuTitle}
+          aria-label={t.chat.history.exportMenuTitle}
+          aria-haspopup="menu"
+          aria-expanded={showExportMenu}
+        >
+          <MoreVertical size={14} />
+        </button>
       </div>
+
+      {showExportMenu && createPortal(
+        <div
+          ref={exportMenuRef}
+          className="win-select-menu chat-export-menu"
+          role="menu"
+          style={{ top: exportMenuPos.top, left: exportMenuPos.left }}
+        >
+          <button
+            type="button"
+            className="win-select-option"
+            role="menuitem"
+            onClick={() => handleHistoryExport('simple')}
+          >
+            {t.chat.history.exportSimple}
+          </button>
+          <button
+            type="button"
+            className="win-select-option"
+            role="menuitem"
+            onClick={() => handleHistoryExport('detailed')}
+          >
+            {t.chat.history.exportDetailed}
+          </button>
+        </div>,
+        document.body
+      )}
       
       {showHistory && <ChatHistoryPanel store={store} onClose={() => setShowHistory(false)} />}
 
@@ -534,26 +640,6 @@ export const ChatPanel: React.FC<{ store: AppStore }> = observer(({ store }) => 
                       labelOn={t.chat.queue.modeQueue}
                       labelOff={t.chat.queue.modeNormal}
                     />
-                    <button
-                      className="icon-btn-sm secondary"
-                      disabled={isThinking}
-                      onClick={async () => {
-                        if (store.chat.activeSessionId) {
-                          try {
-                            await window.gyshell.agent.exportHistory(store.chat.activeSessionId)
-                          } catch (error) {
-                            console.error('Failed to export history:', error)
-                          }
-                        }
-                      }}
-                      title="Export conversation history"
-                    >
-                      <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                        <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
-                        <polyline points="7 10 12 15 17 10"></polyline>
-                        <line x1="12" y1="15" x2="12" y2="3"></line>
-                      </svg>
-                    </button>
                   </div>
                   <div className="input-actions-runtime">
                     {runtimeActionCount <= 1 ? (

@@ -5,7 +5,7 @@ import type { IGateway, GatewayEvent, GatewayEventType, SessionContext, IClientT
 import { ElectronWindowTransport } from './ElectronWindowTransport';
 import type { TerminalService } from '../TerminalService';
 import type { AgentService_v2 } from '../AgentService_v2';
-import type { UIHistoryService } from '../UIHistoryService';
+import type { UIHistoryService, HistoryExportMode } from '../UIHistoryService';
 import type { CommandPolicyService } from '../CommandPolicy/CommandPolicyService';
 import type { TempFileService } from '../TempFileService';
 import type { SkillService } from '../SkillService';
@@ -111,7 +111,7 @@ export class GatewayService extends EventEmitter implements IGateway {
       this.feedbackBus.emit(`feedback:${approvalId}`, { decision });
     });
 
-    ipcMain.handle('agent:exportHistory', async (_: any, sessionId: string) => {
+    ipcMain.handle('agent:exportHistory', async (_: any, sessionId: string, mode: HistoryExportMode = 'detailed') => {
       await this.waitForRunCompletionIfAny(sessionId);
       const backendSession = this.agentService.exportChatSession(sessionId);
       if (!backendSession) {
@@ -137,32 +137,46 @@ export class GatewayService extends EventEmitter implements IGateway {
       const { dialog } = require('electron');
       const baseName = safeFileBaseName(uiSession?.title || backendSession.title);
       const ts = formatTimestamp(new Date());
+      const isSimple = mode === 'simple';
       const { filePath } = await dialog.showSaveDialog({
-        title: 'Export Conversation History',
-        defaultPath: `${baseName}_${ts}.json`,
-        filters: [
-          { name: 'JSON', extensions: ['json'] },
-          { name: 'All Files', extensions: ['*'] }
-        ]
+        title: isSimple ? 'Export Conversation (Markdown)' : 'Export Conversation History',
+        defaultPath: isSimple ? `${baseName}_${ts}.md` : `${baseName}_${ts}.json`,
+        filters: isSimple
+          ? [
+              { name: 'Markdown', extensions: ['md'] },
+              { name: 'All Files', extensions: ['*'] }
+            ]
+          : [
+              { name: 'JSON', extensions: ['json'] },
+              { name: 'All Files', extensions: ['*'] }
+            ]
       });
 
       if (filePath) {
         const fs = require('fs');
-        const historyToExport = {
-          sessionId: backendSession.id,
-          title: uiSession?.title || backendSession.title,
-          boundTerminalTabId: backendSession.boundTerminalTabId,
-          lastCheckpointOffset: backendSession.lastCheckpointOffset,
-          createdAt: new Date(backendSession.createdAt).toISOString(),
-          updatedAt: new Date(backendSession.updatedAt).toISOString(),
-          frontendMessages: uiSession?.messages || [],
-          backendMessages: backendSession.messages.map((msg: any) => ({
-            messageId: msg.id,
-            messageType: msg.type,
-            messageData: msg.data
-          }))
-        };
-        await fs.promises.writeFile(filePath, JSON.stringify(historyToExport, null, 2));
+        if (isSimple) {
+          const markdown = this.uiHistoryService.toReadableMarkdown(
+            uiSession?.messages || [],
+            uiSession?.title || backendSession.title
+          );
+          await fs.promises.writeFile(filePath, markdown, 'utf8');
+        } else {
+          const historyToExport = {
+            sessionId: backendSession.id,
+            title: uiSession?.title || backendSession.title,
+            boundTerminalTabId: backendSession.boundTerminalTabId,
+            lastCheckpointOffset: backendSession.lastCheckpointOffset,
+            createdAt: new Date(backendSession.createdAt).toISOString(),
+            updatedAt: new Date(backendSession.updatedAt).toISOString(),
+            frontendMessages: uiSession?.messages || [],
+            backendMessages: backendSession.messages.map((msg: any) => ({
+              messageId: msg.id,
+              messageType: msg.type,
+              messageData: msg.data
+            }))
+          };
+          await fs.promises.writeFile(filePath, JSON.stringify(historyToExport, null, 2));
+        }
       }
     });
 

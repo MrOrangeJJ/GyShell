@@ -175,6 +175,9 @@ export const zh = {
     dragHint: '拖到左右边缘以切换面板位置',
     history: {
       title: '聊天历史',
+      exportMenuTitle: '导出历史',
+      exportSimple: '导出历史记录',
+      exportDetailed: '导出详细 JSON 历史记录',
       loading: '加载中...',
       empty: '暂无聊天记录',
       messages: '条消息',

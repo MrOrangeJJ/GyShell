@@ -106,7 +106,8 @@
 }
 
 .chat-tab-history,
-.chat-tab-add {
+.chat-tab-add,
+.chat-tab-history-menu {
   height: 24px;
   width: 24px;
   border-radius: 4px;
@@ -118,17 +119,29 @@
   cursor: pointer;
   line-height: 0;
   padding: 0;
-  margin: 0 4px;
-}
-
-.chat-tab-history {
-  margin-right: -2px;
+  margin: 0;
+  margin-left: 4px;
 }
 
 .chat-tab-history:hover,
-.chat-tab-add:hover {
+.chat-tab-add:hover,
+.chat-tab-history-menu:hover {
   background: color-mix(in srgb, var(--fg) 10%, transparent);
   color: var(--fg);
+}
+
+.chat-export-menu {
+  min-width: 170px;
+  z-index: 3000;
+  padding: 3px;
+}
+
+.chat-export-menu .win-select-option {
+  text-transform: uppercase;
+  letter-spacing: 0;
+  font-size: 11px;
+  font-weight: 600;
+  padding: 5px 8px;
 }
 
 /* Panel Body */

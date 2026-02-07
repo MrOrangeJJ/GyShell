@@ -3,6 +3,8 @@ import { v4 as uuidv4 } from 'uuid'
 import type { AgentEvent, AgentEventType } from '../types'
 import type { ChatMessage, UIChatSession, UIUpdateAction } from '../types/ui-chat'
 
+export type HistoryExportMode = 'simple' | 'detailed'
+
 interface StoredUIHistory {
   sessions: Record<string, UIChatSession>
 }
@@ -411,5 +413,129 @@ export class UIHistoryService {
     // Rollback is user-driven and low-frequency; persist immediately.
     this.flush(sessionId)
     return removedCount
+  }
+
+  toReadableMarkdown(messages: ChatMessage[], title: string): string {
+    const lines: string[] = []
+    lines.push(`# ${title || 'Conversation'}`)
+    lines.push('')
+    lines.push(`Exported at: ${new Date().toISOString()}`)
+    lines.push('')
+
+    let visibleCount = 0
+
+    for (const msg of messages) {
+      if (msg.role !== 'user' && msg.role !== 'assistant') continue
+
+      const body = msg.role === 'user'
+        ? this.normalizeText(msg.content)
+        : this.extractAssistantRichContent(msg)
+
+      if (!body) continue
+
+      visibleCount += 1
+      lines.push(`## ${visibleCount}. ${msg.role === 'user' ? 'User' : 'Assistant'}`)
+      lines.push('')
+      lines.push(body)
+      lines.push('')
+    }
+
+    if (visibleCount === 0) {
+      lines.push('No user/assistant content found in frontend UI history.')
+      lines.push('')
+    }
+
+    return lines.join('\n')
+  }
+
+  private extractAssistantRichContent(msg: ChatMessage): string {
+    const chunks: string[] = []
+
+    switch (msg.type) {
+      case 'text': {
+        const text = this.normalizeText(msg.content)
+        if (text) chunks.push(text)
+        break
+      }
+      case 'command': {
+        const commandText = this.normalizeText(msg.content || msg.metadata?.command || '')
+        const outputText = this.normalizeText(msg.metadata?.output || '')
+        if (commandText) {
+          chunks.push('Command:')
+          chunks.push('```bash')
+          chunks.push(commandText)
+          chunks.push('```')
+        }
+        if (outputText) {
+          chunks.push('Output:')
+          chunks.push('```text')
+          chunks.push(outputText)
+          chunks.push('```')
+        }
+        break
+      }
+      case 'tool_call': {
+        const inputText = this.normalizeText(msg.content || '')
+        const outputText = this.normalizeText(msg.metadata?.output || '')
+        const toolName = this.normalizeText(msg.metadata?.toolName || 'Tool Call')
+        chunks.push(`Tool: ${toolName}`)
+        if (inputText) {
+          chunks.push('Input:')
+          chunks.push('```text')
+          chunks.push(inputText)
+          chunks.push('```')
+        }
+        if (outputText) {
+          chunks.push('Output:')
+          chunks.push('```text')
+          chunks.push(outputText)
+          chunks.push('```')
+        }
+        break
+      }
+      case 'file_edit': {
+        const filePath = this.normalizeText(msg.metadata?.filePath || '')
+        const outputText = this.normalizeText(msg.metadata?.output || msg.content || '')
+        const diffText = this.normalizeText(msg.metadata?.diff || '')
+        const action = this.normalizeText(msg.metadata?.action || 'edited')
+        chunks.push(`File Edit (${action})${filePath ? `: ${filePath}` : ''}`)
+        if (outputText) {
+          chunks.push('Result:')
+          chunks.push('```text')
+          chunks.push(outputText)
+          chunks.push('```')
+        }
+        if (diffText) {
+          chunks.push('Diff:')
+          chunks.push('```diff')
+          chunks.push(diffText)
+          chunks.push('```')
+        }
+        break
+      }
+      case 'sub_tool': {
+        const title = this.normalizeText(msg.metadata?.subToolTitle || 'Sub Tool')
+        const outputText = this.normalizeText(msg.metadata?.output || msg.content || '')
+        chunks.push(`Sub Tool: ${title}`)
+        if (outputText) {
+          chunks.push('```text')
+          chunks.push(outputText)
+          chunks.push('```')
+        }
+        break
+      }
+      default: {
+        const text = this.normalizeText(msg.content)
+        if (text) chunks.push(text)
+      }
+    }
+
+    return this.normalizeText(chunks.join('\n\n'))
+  }
+
+  private normalizeText(input: string): string {
+    return String(input || '')
+      .replace(/\r\n?/g, '\n')
+      .trim()
   }
 }

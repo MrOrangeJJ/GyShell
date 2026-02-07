@@ -175,6 +175,9 @@ export const en = {
     dragHint: 'Drag to the edges to swap panels',
     history: {
       title: 'Chat History',
+      exportMenuTitle: 'Export History',
+      exportSimple: 'Export history',
+      exportDetailed: 'Export detailed JSON history',
       loading: 'Loading...',
       empty: 'No chat history yet',
       messages: 'messages',

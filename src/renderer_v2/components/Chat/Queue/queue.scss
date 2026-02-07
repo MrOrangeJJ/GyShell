@@ -113,6 +113,10 @@
 }
 
 .queue-mode-btn {
+  width: 28px !important;
+  height: 28px !important;
+  border-radius: 4px !important;
+
   &.is-active {
     color: var(--accent) !important;
     background: color-mix(in srgb, var(--accent) 10%, transparent) !important;
