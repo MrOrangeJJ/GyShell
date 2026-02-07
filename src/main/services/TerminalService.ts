@@ -195,7 +195,12 @@ export class TerminalService {
       const markerContent = buf.slice(precmdIdx, suffixIdx)
       const ecMatch = markerContent.match(/ec=(\d+)/)
       const exitCode = ecMatch ? parseInt(ecMatch[1], 10) : undefined
-      this.finishActiveTask(terminalId, exitCode)
+      
+      // Give headless xterm a tiny bit of time to finish rendering the last chunk
+      // before we finalize the task and extract its output.
+      setTimeout(() => {
+        this.finishActiveTask(terminalId, exitCode)
+      }, 50)
 
       buf = buf.slice(suffixIdx + OSC_SUFFIX.length)
     }
