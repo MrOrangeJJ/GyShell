@@ -107,6 +107,8 @@ export const en = {
     versionUpdateTitle: 'Update Available',
     versionUpdateMessage: (current: string, latest: string) =>
       `A newer version is available (${current} -> ${latest}). Please manually visit the download page to update.`,
+    versionDifferentMessage: (current: string, latest: string) =>
+      `Version mismatch detected (${current} vs ${latest}). Please visit the download page manually.`,
     versionNetworkWarning: (detail: string) => `Version check failed: ${detail}`,
     versionCheckNoteTitle: 'Privacy Note',
     versionCheckNote:

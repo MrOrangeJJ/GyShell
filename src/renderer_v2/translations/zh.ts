@@ -107,6 +107,8 @@ export const zh = {
     versionUpdateTitle: '发现版本更新',
     versionUpdateMessage: (current: string, latest: string) =>
       `检测到新版本（${current} -> ${latest}）。请你手动访问下载页面完成更新。`,
+    versionDifferentMessage: (current: string, latest: string) =>
+      `检测到版本不一致（${current} vs ${latest}）。请手动访问下载页面处理。`,
     versionNetworkWarning: (detail: string) => `版本检查失败：${detail}`,
     versionCheckNoteTitle: '隐私说明',
     versionCheckNote:

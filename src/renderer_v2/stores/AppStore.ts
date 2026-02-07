@@ -203,7 +203,7 @@ export class AppStore {
     }
   }
 
-  async checkVersion(options?: { showPopupOnUpdate?: boolean }): Promise<void> {
+  async checkVersion(options?: { showPopupOnVersionChange?: boolean }): Promise<void> {
     if (this.versionCheckInProgress) return
     runInAction(() => {
       this.versionCheckInProgress = true
@@ -212,7 +212,13 @@ export class AppStore {
       const result = await window.gyshell.version.check()
       runInAction(() => {
         this.versionInfo = result
-        if (result.status === 'update-available' && options?.showPopupOnUpdate) {
+        const hasVersionDifference =
+          result.status !== 'error' &&
+          typeof result.latestVersion === 'string' &&
+          result.latestVersion.length > 0 &&
+          result.latestVersion !== result.currentVersion
+        const shouldShowPopup = options?.showPopupOnVersionChange ?? true
+        if (hasVersionDifference && shouldShowPopup) {
           this.showVersionUpdateDialog = true
         }
       })
@@ -507,7 +513,7 @@ export class AppStore {
       void this.loadSkills()
       void this.loadCommandPolicyLists()
       void this.loadVersionState()
-      void this.checkVersion({ showPopupOnUpdate: true })
+      void this.checkVersion({ showPopupOnVersionChange: true })
     } catch (err) {
       console.error('Failed to bootstrap settings', err)
       runInAction(() => {
@@ -520,7 +526,7 @@ export class AppStore {
       void this.loadSkills()
       void this.loadCommandPolicyLists()
       void this.loadVersionState()
-      void this.checkVersion({ showPopupOnUpdate: true })
+      void this.checkVersion({ showPopupOnVersionChange: true })
     }
   }
 

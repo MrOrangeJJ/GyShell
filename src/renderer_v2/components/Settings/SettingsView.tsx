@@ -1072,7 +1072,17 @@ export const SettingsView: React.FC<{ store: AppStore }> = observer(({ store }) 
                 </div>
                 <div className="version-item">
                   <span className="version-label">{t.settings.downloadPage}</span>
-                  <span className="version-value">{versionInfo?.downloadUrl || '-'}</span>
+                  {versionInfo?.downloadUrl ? (
+                    <button
+                      className="version-link"
+                      onClick={() => store.openVersionDownload()}
+                      title={versionInfo.downloadUrl}
+                    >
+                      {versionInfo.downloadUrl}
+                    </button>
+                  ) : (
+                    <span className="version-value">-</span>
+                  )}
                 </div>
               </div>
 

@@ -180,7 +180,6 @@ interface VersionCheckResult {
   latestVersion?: string
   downloadUrl: string
   releaseNotes?: string
-  note: string
   checkedAt: number
   sourceUrl: string
   warning?: string

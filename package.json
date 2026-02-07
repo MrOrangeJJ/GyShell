@@ -1,6 +1,6 @@
 {
   "name": "gyshell",
-  "version": "0.1.4",
+  "version": "0.1.4-beta1",
   "description": "GyShell - AI-Native macOS Shell App",
   "main": "./out/main/index.js",
   "author": "TUOTUO",

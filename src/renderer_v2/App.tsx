@@ -20,6 +20,12 @@ export const App: React.FC = observer(() => {
   const platform = (window as any)?.gyshell?.system?.platform
   const t = store.i18n.t
   const versionInfo = store.versionInfo
+  const hasVersionDifference =
+    !!versionInfo &&
+    versionInfo.status !== 'error' &&
+    typeof versionInfo.latestVersion === 'string' &&
+    versionInfo.latestVersion.length > 0 &&
+    versionInfo.latestVersion !== versionInfo.currentVersion
   const panelGroupRef = React.useRef<any>(null)
   const applyingLayoutRef = React.useRef(false)
   const platformClass =
@@ -47,9 +53,12 @@ export const App: React.FC = observer(() => {
   return (
     <div className={`gyshell ${platformClass}`}>
       <ConfirmDialog
-        open={store.showVersionUpdateDialog && !!versionInfo && versionInfo.status === 'update-available'}
+        open={store.showVersionUpdateDialog && hasVersionDifference}
         title={t.settings.versionUpdateTitle}
-        message={`${t.settings.versionUpdateMessage(versionInfo?.currentVersion || '-', versionInfo?.latestVersion || '-')}\n\n${t.settings.versionCheckNote}`}
+        message={`${versionInfo?.status === 'update-available'
+          ? t.settings.versionUpdateMessage(versionInfo?.currentVersion || '-', versionInfo?.latestVersion || '-')
+          : t.settings.versionDifferentMessage(versionInfo?.currentVersion || '-', versionInfo?.latestVersion || '-')
+        }\n\n${t.settings.versionCheckNote}`}
         confirmText={t.settings.goToDownload}
         cancelText={t.common.close}
         onCancel={() => store.closeVersionUpdateDialog()}

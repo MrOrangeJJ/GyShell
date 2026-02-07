@@ -22,16 +22,13 @@ export interface VersionCheckResult {
   latestVersion?: string
   downloadUrl: string
   releaseNotes?: string
-  note: string
   checkedAt: number
   sourceUrl: string
   warning?: string
 }
 
-const VERSION_MANIFEST_URL = 'https://raw.githubusercontent.com/MrOrangeJJ/GyShell/main/version.json'
+const VERSION_MANIFEST_URL = 'https://api.github.com/repos/MrOrangeJJ/GyShell/contents/version.json?ref=main'
 const FALLBACK_DOWNLOAD_URL = 'https://github.com/MrOrangeJJ/GyShell/releases/latest'
-const VERSION_NOTE =
-  'Version checks are sent only to this project GitHub repository (version.json). No third-party websites are contacted. This is the only network request the app may perform automatically in the background.'
 
 export class VersionService {
   private readonly store: Store<VersionCache>
@@ -67,7 +64,6 @@ export class VersionService {
       latestVersion: cachedVersion,
       downloadUrl,
       releaseNotes,
-      note: VERSION_NOTE,
       checkedAt,
       sourceUrl: VERSION_MANIFEST_URL
     }
@@ -112,7 +108,6 @@ export class VersionService {
         latestVersion,
         downloadUrl,
         releaseNotes,
-        note: VERSION_NOTE,
         checkedAt: now,
         sourceUrl: VERSION_MANIFEST_URL
       }
@@ -126,7 +121,6 @@ export class VersionService {
         latestVersion: this.store.get('latestVersion'),
         downloadUrl: this.store.get('downloadUrl') ?? FALLBACK_DOWNLOAD_URL,
         releaseNotes: this.store.get('releaseNotes'),
-        note: VERSION_NOTE,
         checkedAt: now,
         sourceUrl: VERSION_MANIFEST_URL,
         warning
@@ -176,7 +170,13 @@ export class VersionService {
           })
           res.on('end', () => {
             try {
-              const parsed = JSON.parse(rawData) as VersionManifest
+              const payload = JSON.parse(rawData) as { content?: string; encoding?: string }
+              if (!payload || payload.encoding !== 'base64' || typeof payload.content !== 'string') {
+                reject(new Error('Invalid GitHub contents payload'))
+                return
+              }
+              const decoded = Buffer.from(payload.content.replace(/\n/g, ''), 'base64').toString('utf8')
+              const parsed = JSON.parse(decoded) as VersionManifest
               if (!parsed || typeof parsed.version !== 'string') {
                 reject(new Error('Invalid version manifest format'))
                 return
@@ -202,10 +202,84 @@ export class VersionService {
   }
 
   private normalizeVersion(version: string): string {
-    return String(version || '').trim().replace(/^v/i, '')
+    const raw = String(version || '').trim().replace(/^v/i, '')
+    // Compatibility for legacy tags like "0.1.4.beta" -> "0.1.4-beta"
+    const legacyPre = raw.match(/^(\d+\.\d+\.\d+)\.(alpha|beta|rc)(?:\.(\d+))?$/i)
+    if (legacyPre) {
+      const [, core, label, num] = legacyPre
+      return `${core}-${label.toLowerCase()}${num ? `.${num}` : ''}`
+    }
+    // Normalize x.y into x.y.0
+    const short = raw.match(/^(\d+)\.(\d+)$/)
+    if (short) {
+      return `${short[1]}.${short[2]}.0`
+    }
+    return raw
   }
 
   private compareVersions(a: string, b: string): number {
+    const left = this.parseSemver(this.normalizeVersion(a))
+    const right = this.parseSemver(this.normalizeVersion(b))
+
+    if (!left || !right) {
+      return this.compareFallbackNumeric(a, b)
+    }
+
+    if (left.major !== right.major) return left.major > right.major ? 1 : -1
+    if (left.minor !== right.minor) return left.minor > right.minor ? 1 : -1
+    if (left.patch !== right.patch) return left.patch > right.patch ? 1 : -1
+
+    const leftPre = left.pre
+    const rightPre = right.pre
+
+    if (leftPre.length === 0 && rightPre.length === 0) return 0
+    if (leftPre.length === 0) return 1
+    if (rightPre.length === 0) return -1
+
+    const maxLen = Math.max(leftPre.length, rightPre.length)
+    for (let i = 0; i < maxLen; i += 1) {
+      const l = leftPre[i]
+      const r = rightPre[i]
+      if (l === undefined) return -1
+      if (r === undefined) return 1
+      if (l === r) continue
+
+      const lNum = /^\d+$/.test(l)
+      const rNum = /^\d+$/.test(r)
+      if (lNum && rNum) {
+        const ln = Number.parseInt(l, 10)
+        const rn = Number.parseInt(r, 10)
+        if (ln !== rn) return ln > rn ? 1 : -1
+        continue
+      }
+      if (lNum && !rNum) return -1
+      if (!lNum && rNum) return 1
+      return l > r ? 1 : -1
+    }
+    return 0
+  }
+
+  private parseSemver(version: string):
+    | {
+        major: number
+        minor: number
+        patch: number
+        pre: string[]
+      }
+    | null {
+    const m = version.match(
+      /^(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?(?:\+[0-9A-Za-z.-]+)?$/
+    )
+    if (!m) return null
+    return {
+      major: Number.parseInt(m[1], 10),
+      minor: Number.parseInt(m[2], 10),
+      patch: Number.parseInt(m[3], 10),
+      pre: m[4] ? m[4].split('.') : []
+    }
+  }
+
+  private compareFallbackNumeric(a: string, b: string): number {
     const aParts = this.normalizeVersion(a)
       .split('.')
       .map((n) => Number.parseInt(n, 10) || 0)

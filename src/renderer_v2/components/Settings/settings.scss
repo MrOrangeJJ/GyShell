@@ -1358,6 +1358,25 @@
   word-break: break-all;
 }
 
+.version-link {
+  font-family: var(--font-mono);
+  font-size: 13px;
+  color: var(--accent);
+  background: transparent;
+  border: none;
+  padding: 0;
+  margin: 0;
+  text-align: left;
+  cursor: pointer;
+  word-break: break-all;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+.version-link:hover {
+  filter: brightness(1.1);
+}
+
 .version-status {
   font-family: var(--font-mono);
   font-size: 11px;
@@ -1394,6 +1413,8 @@
 
 .version-note-card {
   margin-top: 10px;
+  max-width: none;
+  width: 100%;
 }
 
 .version-note-title {
