@@ -65,9 +65,16 @@ export class NodePtyBackend implements TerminalBackend {
     const cwdCandidate = localConfig.cwd || os.homedir()
     const cwd = fs.existsSync(cwdCandidate) ? cwdCandidate : os.homedir()
     const env = this.getSafeEnv()
+    
+    // Fix for Chinese characters rendering issues in packaged apps
+    // Setting LC_ALL and LANG to UTF-8 ensures the shell and sub-processes use UTF-8 encoding
+    const localeEnv = {
+      LC_ALL: 'en_US.UTF-8',
+      LANG: 'en_US.UTF-8'
+    }
 
     const { args, envOverrides, tmpPath } = this.buildShellIntegration(shell)
-    const mergedEnv = { ...env, ...envOverrides }
+    const mergedEnv = { ...env, ...localeEnv, ...envOverrides }
 
     const ptyProcess = pty.spawn(shell, args, {
       name: 'xterm-256color',

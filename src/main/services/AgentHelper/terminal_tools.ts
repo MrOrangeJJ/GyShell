@@ -136,7 +136,7 @@ export async function runCommand(args: z.infer<typeof execCommandSchema>, contex
     
     let finalResult = ''
     if (result.exitCode === -3 || result.stdoutDelta === 'USER_SKIPPED_WAIT') {
-      finalResult = `The user has chosen to skip the wait for the command "${command}". The command is still running in the background. You can use read_command_output to check its current progress, or use wait_command_end to wait for it to finish later. history_command_match_id=${historyCommandMatchId}, terminalId=${bestMatch.id}`
+      finalResult = `The user has chosen to run the command "${command}" asynchronously. The command is currently running in the background. Please DO NOT wait for it to finish unless specifically asked. You can use read_command_output to check its progress if needed. history_command_match_id=${historyCommandMatchId}, terminalId=${bestMatch.id}`
       
       // Update the finished event to mark it as isNowait: true so the UI banner switches to Async style
       context.sendEvent(sessionId, { 
@@ -632,7 +632,7 @@ export async function waitCommandEnd(
     
     let finalResult = ''
     if (result.exitCode === -3 || result.stdoutDelta === 'USER_SKIPPED_WAIT') {
-      finalResult = `The user has chosen to skip the wait for the command "${commandName}". The command is still running in the background. You can use read_command_output to check its current progress, or call wait_command_end again if you believe it needs more time to finish. history_command_match_id=${historyCommandMatchId}, terminalId=${bestMatch.id}`
+      finalResult = `The user has chosen to run the command "${commandName}" asynchronously. The command is currently running in the background. You can use read_command_output to check its progress if needed. history_command_match_id=${historyCommandMatchId}, terminalId=${bestMatch.id}`
       
       // Update the finished event to mark it as isNowait: true so the UI banner switches to Async style
       sendEvent(sessionId, { 

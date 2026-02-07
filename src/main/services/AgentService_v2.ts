@@ -385,6 +385,8 @@ ${recent}
       // Ensure we get the freshest list from disk
       await this.skillService.reload()
       const skills = await this.skillService.getEnabledSkills()
+      
+      // Filter built-in tools based on the latest enabled status
       const builtInTools = this.helpers.getEnabledBuiltInTools(this.toolsForModel, this.builtInToolEnabled)
       
       // Update skill tool description with latest skills
@@ -1042,8 +1044,15 @@ ${recent}
   private routeModelOutput = (state: any): string => {
     const queue: any[] = Array.isArray(state.pendingToolCalls) ? state.pendingToolCalls : []
     const first = queue[0]
-    // console.log(first);
+    
     if (first?.name) {
+      // Security: Double-check if the tool is actually enabled before routing.
+      // This prevents the Agent from calling tools that were disabled during the session.
+      if (this.builtInToolEnabled[first.name] === false) {
+        console.warn(`[AgentService_v2] LLM tried to call disabled tool: ${first.name}`)
+        return 'final_output'
+      }
+
       if (first.name === 'skill' || first.name === 'create_skill') return 'tools'
       if (this.mcpToolService.isMcpToolName(first.name)) return 'mcp_tools'
       if (first.name === 'exec_command') return 'command_tools'
