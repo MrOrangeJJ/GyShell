@@ -157,6 +157,7 @@ export const zh = {
       empty: '暂无聊天记录',
       messages: '条消息',
       deleteSession: '删除会话',
+      renameSession: '重命名会话',
       deleteSelected: '删除选中',
       selectAll: '全选',
       confirmDeleteTitle: '删除聊天记录',
@@ -179,4 +180,3 @@ export const zh = {
     },
   },
 }
-

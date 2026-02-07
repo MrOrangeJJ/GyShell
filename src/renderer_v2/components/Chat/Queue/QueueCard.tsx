@@ -6,7 +6,6 @@ import type { QueueItem } from '../../../stores/ChatQueueStore'
 export function QueueCard(props: {
   item: QueueItem
   index: number
-  isRunning: boolean
   isHidden: boolean
   onEdit: () => void
   editLabel: string
@@ -16,7 +15,6 @@ export function QueueCard(props: {
   const {
     item,
     index,
-    isRunning,
     isHidden,
     onEdit,
     editLabel,
@@ -31,7 +29,7 @@ export function QueueCard(props: {
         marginTop: index === 0 ? 0 : -10,
         zIndex: 100 - index
       }}
-      draggable={!isRunning}
+      draggable
       onDragStart={onDragStart}
       onDragEnd={onDragEnd}
     >
@@ -45,7 +43,6 @@ export function QueueCard(props: {
       <button
         className="icon-btn-sm queue-card-action"
         onClick={onEdit}
-        disabled={isRunning}
         title={editLabel}
       >
         <Pencil size={14} />

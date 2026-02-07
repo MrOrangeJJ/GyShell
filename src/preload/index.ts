@@ -114,6 +114,7 @@ type AgentEventType =
 
 interface AgentEvent {
   type: AgentEventType
+  inputKind?: 'normal' | 'inserted'
   level?: 'info' | 'warning' | 'error'
   content?: string
   command?: string
@@ -243,7 +244,12 @@ export interface GyShellAPI {
 
   // Agent
   agent: {
-    startTask: (sessionId: string, terminalId: string, userText: string) => Promise<void>
+    startTask: (
+      sessionId: string,
+      terminalId: string,
+      userText: string,
+      options?: { startMode?: 'normal' | 'inserted' }
+    ) => Promise<void>
     stopTask: (sessionId: string) => Promise<void>
     getAllChatHistory: () => Promise<any[]>
     loadChatSession: (sessionId: string) => Promise<any>
@@ -350,8 +356,8 @@ const api: GyShellAPI = {
   },
 
   agent: {
-    startTask: (sessionId, terminalId, userText) =>
-      ipcRenderer.invoke('agent:startTask', sessionId, terminalId, userText),
+    startTask: (sessionId, terminalId, userText, options) =>
+      ipcRenderer.invoke('agent:startTask', sessionId, terminalId, userText, options),
     stopTask: (sessionId) => ipcRenderer.invoke('agent:stopTask', sessionId),
     getAllChatHistory: () => ipcRenderer.invoke('agent:getAllChatHistory'),
     loadChatSession: (sessionId) => ipcRenderer.invoke('agent:loadChatSession', sessionId),

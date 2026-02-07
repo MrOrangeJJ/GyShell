@@ -9,6 +9,21 @@ import { z } from 'zod'
 export const SYS_INFO_MARKER = 'SYSTEM_INFO_MSG:\n'
 export const TAB_CONTEXT_MARKER = 'TAB_CONTEXT_MSG:\n'
 export const USER_INPUT_TAG = 'USER_REQUEST_IS:\n'
+export const USER_INSERTED_INPUT_TAG = 'USER_INTERRUPT_INSERTED_REQUEST:\n'
+export const USER_INPUT_TAGS = [USER_INPUT_TAG, USER_INSERTED_INPUT_TAG] as const
+export const NORMAL_USER_INPUT_TAGS = [USER_INPUT_TAG] as const
+export const USER_INSERTED_INPUT_INSTRUCTION =
+  'The user inserted a message mid-run. Based on the latest input, decide whether to adjust and continue the previous task, or stop the previous path and switch to a new task.'
+
+export function hasAnyUserInputTag(content: unknown): boolean {
+  if (typeof content !== 'string') return false
+  return USER_INPUT_TAGS.some((tag) => content.includes(tag))
+}
+
+export function hasAnyNormalUserInputTag(content: unknown): boolean {
+  if (typeof content !== 'string') return false
+  return NORMAL_USER_INPUT_TAGS.some((tag) => content.includes(tag))
+}
 
 
 export const USEFUL_SKILL_TAG = 'USEFUL_SKILL_DETAIL:\n'
@@ -264,6 +279,7 @@ export function createBaseSystemPrompt(): SystemMessage {
       `- **\`${SYS_INFO_MARKER.trim()}\`**: This tag precedes a list of all currently open terminal tabs and their detailed system information (OS, Arch, Hostname, etc.). Use this to understand your available "workspace".`,
       `- **\`${TAB_CONTEXT_MARKER.trim()}\`**: This tag precedes the real-time state of the currently active terminal tab, including its recent output. This is your "eyes" on the terminal.`,
       `- **\`${USER_INPUT_TAG.trim()}\`**: This tag marks the **latest and most authoritative user requirement**. When you see this tag, you must **immediately begin the task** described. Do NOT attempt to "continue" or "autocomplete" the user\'s text; treat it as a command to action.`,
+      `- **\`${USER_INSERTED_INPUT_TAG.trim()}\`**: This tag marks a user interrupt message inserted while a previous run was in progress. Treat this as higher-priority live correction. First decide whether to continue prior work, adjust plan, or pivot immediately based on the inserted content.`,
       `- **\`[MENTION_SKILL:#name#]\`**: This label in the user input indicates that the user is specifically pointing you to a "Skill" named #name#. The full content of this skill is provided at the top of the message under the \`${USEFUL_SKILL_TAG.trim()}\` tag. Skills can be simple instruction files or complex directories containing supporting scripts and reference materials.`,
       `- **\`[MENTION_TAB:#name##id#]\`**: This label in the user input indicates that the user is specifically pointing you to a terminal tab named #name# with ID #id#. You should prioritize using this tab for the requested task.`,
       `- **\`[MENTION_FILE:#path#]\`**: This label in the user input indicates that the user has provided a file path #path#. If the file is small enough (under 4000 chars), its content is provided at the top of the message under the \`${FILE_CONTENT_TAG.trim()}\` tag. Otherwise, you should use this path when you need to read or modify this file.`,

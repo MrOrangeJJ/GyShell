@@ -1,7 +1,7 @@
 import { ipcMain, shell, Menu, BrowserWindow } from 'electron';
 import { v4 as uuidv4 } from 'uuid';
 import { EventEmitter } from 'events';
-import type { IGateway, GatewayEvent, GatewayEventType, SessionContext, IClientTransport } from './types';
+import type { IGateway, GatewayEvent, GatewayEventType, SessionContext, IClientTransport, StartTaskOptions } from './types';
 import { ElectronWindowTransport } from './ElectronWindowTransport';
 import type { TerminalService } from '../TerminalService';
 import type { AgentService_v2 } from '../AgentService_v2';
@@ -76,9 +76,12 @@ export class GatewayService extends EventEmitter implements IGateway {
 
   private setupIpcHandlers() {
     // Take over IPC originally in AgentService
-    ipcMain.handle('agent:startTask', async (_: any, sessionId: string, terminalId: string, userText: string) => {
-      return this.dispatchTask(sessionId, userText, terminalId);
-    });
+    ipcMain.handle(
+      'agent:startTask',
+      async (_: any, sessionId: string, terminalId: string, userText: string, options?: StartTaskOptions) => {
+        return this.dispatchTask(sessionId, userText, terminalId, options);
+      }
+    );
 
     ipcMain.handle('agent:stopTask', async (_: any, sessionId: string) => {
       return this.stopTask(sessionId);
@@ -107,6 +110,7 @@ export class GatewayService extends EventEmitter implements IGateway {
     });
 
     ipcMain.handle('agent:exportHistory', async (_: any, sessionId: string) => {
+      await this.waitForRunCompletionIfAny(sessionId);
       const backendSession = this.agentService.exportChatSession(sessionId);
       if (!backendSession) {
         throw new Error(`Session with ID ${sessionId} not found`);
@@ -419,7 +423,7 @@ export class GatewayService extends EventEmitter implements IGateway {
     return this.sessions.get(sessionId);
   }
 
-  async dispatchTask(sessionId: string, input: string, terminalId?: string): Promise<void> {
+  async dispatchTask(sessionId: string, input: string, terminalId?: string, options?: StartTaskOptions): Promise<void> {
     let context = this.sessions.get(sessionId);
     if (!context) {
       const tid = terminalId || this.terminalService.getAllTerminals()[0]?.id || '';
@@ -435,19 +439,28 @@ export class GatewayService extends EventEmitter implements IGateway {
     }
 
     if (context.status !== 'idle') {
-      await this.stopTask(sessionId);
+      await this.stopTask(sessionId, { waitForCompletion: true });
+    } else {
+      // Handle race: status already idle but previous run finalization not finished yet.
+      await this.waitForRunCompletionIfAny(sessionId);
     }
 
     const runId = uuidv4();
     const abortController = new AbortController();
+    let resolveRunCompletion: () => void = () => {};
+    const runCompletion = new Promise<void>((resolve) => {
+      resolveRunCompletion = resolve;
+    });
 
     context.activeRunId = runId;
     context.abortController = abortController;
     context.status = 'running';
+    context.metadata.runCompletion = runCompletion;
+    context.metadata.runId = runId;
 
     try {
       // AgentService has been refactored as stateless run
-      await this.agentService.run(context, input, abortController.signal);
+      await this.agentService.run(context, input, abortController.signal, options?.startMode || 'normal');
     } catch (error: any) {
       console.error(`[GatewayService] Task execution error (sessionId=${sessionId}):`, error);
       if (this.agentService['helpers'].isAbortError(error)) {
@@ -457,6 +470,12 @@ export class GatewayService extends EventEmitter implements IGateway {
       // Error broadcasting is now handled inside agentService.run for better detail capture,
       // but we keep a fallback here just in case.
     } finally {
+      resolveRunCompletion();
+      // clear completion tracker for this run id
+      if (context.metadata.runId === runId) {
+        delete context.metadata.runCompletion;
+        delete context.metadata.runId;
+      }
       if (context.activeRunId === runId) {
         // Unified cleanup of run state
         this.clearRunState(context);
@@ -470,9 +489,10 @@ export class GatewayService extends EventEmitter implements IGateway {
     }
   }
 
-  async stopTask(sessionId: string): Promise<void> {
+  async stopTask(sessionId: string, options?: { waitForCompletion?: boolean }): Promise<void> {
     const context = this.sessions.get(sessionId);
     if (context && context.abortController) {
+      const runCompletion = context.metadata.runCompletion as Promise<void> | undefined;
       context.abortController.abort();
       this.clearRunState(context);
       // Sync UI and disk immediately when manually stopped
@@ -481,6 +501,25 @@ export class GatewayService extends EventEmitter implements IGateway {
       this.transports.forEach(t => t.sendUIUpdate({ type: 'SESSION_READY', sessionId }));
       
       this.uiHistoryService.flush(sessionId);
+      if (options?.waitForCompletion && runCompletion) {
+        await runCompletion.catch(() => undefined);
+      }
+      return;
+    }
+    if (context && options?.waitForCompletion) {
+      const runCompletion = context.metadata.runCompletion as Promise<void> | undefined;
+      if (runCompletion) {
+        await runCompletion.catch(() => undefined);
+      }
+    }
+  }
+
+  private async waitForRunCompletionIfAny(sessionId: string): Promise<void> {
+    const context = this.sessions.get(sessionId);
+    if (!context) return;
+    const runCompletion = context.metadata.runCompletion as Promise<void> | undefined;
+    if (runCompletion) {
+      await runCompletion.catch(() => undefined);
     }
   }
 

@@ -2,7 +2,8 @@ import { ChatOpenAI } from '@langchain/openai'
 import { HumanMessage, type BaseMessage } from '@langchain/core/messages'
 import type { AgentEvent, ModelDefinition, AppSettings } from '../../types'
 import { 
-  USER_INPUT_TAG, 
+  NORMAL_USER_INPUT_TAGS,
+  hasAnyNormalUserInputTag,
   TAB_CONTEXT_MARKER, 
   SYS_INFO_MARKER 
 } from './prompts'
@@ -21,7 +22,7 @@ export class AgentHelpers {
    */
   buildActionModelHistory(allMessages: BaseMessage[]): BaseMessage[] {
     // 1. Find the last 3 special marker messages (only from HumanMessages)
-    const specialTags = [USER_INPUT_TAG, TAB_CONTEXT_MARKER, SYS_INFO_MARKER]
+    const specialTags = [...NORMAL_USER_INPUT_TAGS, TAB_CONTEXT_MARKER, SYS_INFO_MARKER]
     const last3Special: BaseMessage[] = []
     for (let i = allMessages.length - 1; i >= 0 && last3Special.length < 3; i--) {
       const msg = allMessages[i]
@@ -31,18 +32,18 @@ export class AgentHelpers {
       }
     }
 
-    // 2. Locate the very last USER_INPUT_TAG message to define the execution detail range
+    // 2. Locate the very last user-input-tagged message to define the execution detail range
     let lastUserInputIndex = -1
     for (let i = allMessages.length - 1; i >= 0; i--) {
       const m = allMessages[i]
       const content = m.content
-      if (m.type === 'human' && typeof content === 'string' && content.includes(USER_INPUT_TAG)) {
+      if (m.type === 'human' && hasAnyNormalUserInputTag(content)) {
         lastUserInputIndex = i
         break
       }
     }
     
-    // 3. Get execution details: messages strictly AFTER the last USER_INPUT_TAG
+    // 3. Get execution details: messages strictly AFTER the last user-input-tagged message
     const executionDetails = lastUserInputIndex !== -1 
       ? allMessages.slice(lastUserInputIndex + 1) 
       : []

@@ -52,6 +52,12 @@ export interface SessionContext {
   metadata: Record<string, any>;
 }
 
+export type StartTaskMode = 'normal' | 'inserted';
+
+export interface StartTaskOptions {
+  startMode?: StartTaskMode;
+}
+
 /**
  * Gateway interface definition
  */
@@ -61,7 +67,7 @@ export interface IGateway {
   getSession(sessionId: string): SessionContext | undefined;
   
   // Task scheduling
-  dispatchTask(sessionId: string, input: string, terminalId?: string): Promise<void>;
+  dispatchTask(sessionId: string, input: string, terminalId?: string, options?: StartTaskOptions): Promise<void>;
   stopTask(sessionId: string): Promise<void>;
   pauseTask(sessionId: string): Promise<void>;
   resumeTask(sessionId: string): Promise<void>;

@@ -88,6 +88,9 @@ export class UIHistoryService {
         role: 'user',
         type: 'text',
         content: event.content || '',
+        metadata: {
+          inputKind: event.inputKind || 'normal'
+        },
         backendMessageId: event.messageId
       }, sessionId)
       session.messages.push(message)

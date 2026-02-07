@@ -265,7 +265,7 @@
     font-family: var(--font-mono);
     margin: 0 2px;
     background: color-mix(in srgb, var(--accent-2) 15%, transparent);
-    color: var(--accent-2);
+    color: var(--fg);
     border: 1px solid color-mix(in srgb, var(--accent-2) 30%, transparent);
     height: 1.4em; /* Use relative height */
     line-height: 1;
@@ -515,7 +515,75 @@
   display: flex !important;
   flex-direction: row !important;
   align-items: center !important;
-  gap: 6px !important;
+  gap: 8px !important;
+}
+
+.input-actions-static {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.input-actions-runtime {
+  width: 63px; /* 1.5x of 42px action width */
+  min-width: 63px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: stretch;
+}
+
+.runtime-buttons {
+  display: grid;
+  align-items: center;
+  gap: 4px;
+  width: 100%;
+  height: 28px;
+}
+
+.runtime-buttons.is-single {
+  grid-template-columns: 1fr;
+}
+
+.runtime-buttons.is-double {
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+}
+
+.runtime-buttons .icon-btn-sm {
+  width: 100%;
+  min-width: 0;
+  height: 100%;
+  border-radius: 0;
+}
+
+.chat-input-area .runtime-buttons .icon-btn-sm.primary,
+.chat-input-area .runtime-buttons .icon-btn-sm.danger {
+  width: 100%;
+  height: 100%;
+}
+
+.runtime-buttons .icon-btn-sm.danger {
+  background: color-mix(in srgb, var(--danger) 15%, transparent) !important;
+  color: color-mix(in srgb, var(--danger) 78%, #ff7d7d 22%) !important;
+  border-color: color-mix(in srgb, var(--danger) 30%, transparent) !important;
+  box-shadow: inset 0 1px 0 color-mix(in srgb, #fff 8%, transparent);
+
+  &:hover:not(:disabled) {
+    background: color-mix(in srgb, var(--danger) 25%, transparent) !important;
+    border-color: var(--danger) !important;
+    color: color-mix(in srgb, var(--danger) 88%, #ff9a9a 12%) !important;
+  }
+}
+
+.runtime-buttons.is-single .icon-btn-sm {
+  border-radius: 4px;
+}
+
+.runtime-buttons.is-double .icon-btn-sm:first-child {
+  border-radius: 4px;
+}
+
+.runtime-buttons.is-double .icon-btn-sm:last-child {
+  border-radius: 4px;
 }
 
 .chat-input-area {

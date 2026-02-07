@@ -31,6 +31,7 @@ export interface ChatMessage {
     totalTokens?: number
     maxTokens?: number
     details?: string
+    inputKind?: 'normal' | 'inserted'
   }
   timestamp: number
   streaming?: boolean
@@ -73,6 +74,7 @@ export class ChatStore {
       renameChatSession: action,
       rollbackToMessage: action,
       setQueueRunner: action,
+      setQueueMode: action,
       startQueue: action,
       stopQueue: action,
       addQueueItem: action,
@@ -284,7 +286,7 @@ export class ChatStore {
           break
         case 'SESSION_READY':
           session.isSessionBusy = false
-          if (this.queue.isRunning(sessionId)) {
+          if (this.queue.shouldDispatchNextOnSessionReady(sessionId)) {
             this.runNextQueueItem(sessionId)
           }
           break
@@ -434,6 +436,27 @@ export class ChatStore {
     this.queueRunner = runner
   }
 
+  setQueueMode(sessionId: string, enabled: boolean): void {
+    this.queue.setQueueMode(enabled, sessionId)
+    const session = this.sessions.find(s => s.id === sessionId)
+    const isBusy = !!session?.isSessionBusy
+    if (enabled) {
+      if (isBusy) {
+        // Inherit active run from normal mode; queue continues seamlessly after current run.
+        this.queue.startRun(sessionId)
+      } else {
+        this.queue.stopRun(sessionId)
+      }
+      return
+    }
+    if (isBusy && this.queue.isRunning(sessionId)) {
+      // Switching to normal while queue is running: finish current run, then stop queue dispatch.
+      this.queue.requestStopAfterCurrent(sessionId)
+    } else {
+      this.queue.stopRun(sessionId)
+    }
+  }
+
   addQueueItem(sessionId: string, content: string): QueueItem | null {
     const trimmed = String(content || '').trim()
     if (!trimmed) return null
@@ -451,24 +474,24 @@ export class ChatStore {
   startQueue(sessionId: string): void {
     if (this.queue.isRunning(sessionId)) return
     if (this.queue.getQueue(sessionId).length === 0) return
-    this.queue.setState(sessionId, 'running')
+    this.queue.startRun(sessionId)
     this.runNextQueueItem(sessionId)
   }
 
   stopQueue(sessionId: string): void {
     if (!sessionId) return
-    this.queue.setState(sessionId, 'editing')
+    this.queue.stopRun(sessionId)
   }
 
   private runNextQueueItem(sessionId: string): void {
     const next = this.queue.shiftItem(sessionId)
     if (!next) {
-      this.queue.setState(sessionId, 'editing')
+      this.queue.stopRun(sessionId)
       return
     }
     if (!this.queueRunner || !this.queueRunner(sessionId, next.content)) {
       this.queue.unshiftItem(sessionId, next)
-      this.queue.setState(sessionId, 'editing')
+      this.queue.stopRun(sessionId)
       return
     }
   }

@@ -282,6 +282,7 @@ export type AgentEventType =
 export interface AgentEvent {
   type: AgentEventType
   messageId?: string
+  inputKind?: 'normal' | 'inserted'
   level?: 'info' | 'warning' | 'error'
   content?: string
   command?: string

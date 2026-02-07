@@ -71,7 +71,6 @@ export function QueueManager(props: {
   }
 
   const handleDragStart = (itemId: string) => (e: React.DragEvent) => {
-    if (isRunning) return
     e.dataTransfer.effectAllowed = 'move'
     e.dataTransfer.setData('text/plain', itemId)
     setDropIndexSafe(null)
@@ -83,7 +82,6 @@ export function QueueManager(props: {
   }
 
   const handleContainerDragOver = (e: React.DragEvent) => {
-    if (isRunning) return
     e.preventDefault()
     e.dataTransfer.dropEffect = 'move'
     const container = stackRef.current
@@ -103,7 +101,6 @@ export function QueueManager(props: {
   }
 
   const handleContainerDrop = (e: React.DragEvent) => {
-    if (isRunning) return
     e.preventDefault()
     if (handledDropRef.current) return
     const fromId = e.dataTransfer.getData('text/plain')
@@ -131,6 +128,16 @@ export function QueueManager(props: {
       stopAutoScroll()
     }
   }, [])
+
+  useEffect(() => {
+    if (!draggingId) return
+    if (!items.some(item => item.id === draggingId)) {
+      setDraggingId(null)
+      setDropIndexSafe(null)
+      stopAutoScroll()
+      return
+    }
+  }, [draggingId, items])
 
   useEffect(() => {
     if (!draggingId) return
@@ -163,6 +170,8 @@ export function QueueManager(props: {
       }
       const fromIndex = items.findIndex((item) => item.id === fromId)
       if (fromIndex < 0) {
+        setDraggingId(null)
+        setDropIndexSafe(null)
         stopAutoScroll()
         return
       }
@@ -200,7 +209,6 @@ export function QueueManager(props: {
           <QueueCard
             item={item}
             index={index}
-            isRunning={isRunning}
             isHidden={draggingId === item.id}
             onEdit={() => onEdit(item)}
             editLabel={editLabel}

@@ -1,7 +1,7 @@
 import fs from 'fs/promises';
 import { SkillService } from '../SkillService';
 import { TerminalService } from '../TerminalService';
-import { USEFUL_SKILL_TAG, USER_INPUT_TAG, FILE_CONTENT_TAG, TERMINAL_CONTENT_TAG } from './prompts';
+import { USEFUL_SKILL_TAG, USER_INPUT_TAGS, FILE_CONTENT_TAG, TERMINAL_CONTENT_TAG } from './prompts';
 import { detectFileKind } from './read_tools';
 
 /**
@@ -9,6 +9,7 @@ import { detectFileKind } from './read_tools';
  * It enriches the message content for the AI by fetching referenced data.
  */
 export class InputParseHelper {
+  static readonly DEFAULT_USER_INPUT_TAG = USER_INPUT_TAGS[0];
   /**
    * Regex to match skill labels: [MENTION_SKILL:#name#]
    */
@@ -36,90 +37,101 @@ export class InputParseHelper {
   static async parseAndEnrich(
     input: string,
     skillService: SkillService,
-    terminalService: TerminalService
+    terminalService: TerminalService,
+    options?: {
+      userInputTag?: string
+      includeContextDetails?: boolean
+      userInputInstruction?: string
+      keepTaggedBodyLiteral?: boolean
+    }
   ): Promise<{ enrichedContent: string; displayContent: string }> {
+    const userInputTag = options?.userInputTag || USER_INPUT_TAGS[0];
+    const includeContextDetails = options?.includeContextDetails !== false;
     // 1. Fetch Skill Details
-    const skillMatches = Array.from(input.matchAll(this.SKILL_REGEX));
-    const skillNames = Array.from(new Set(skillMatches.map(m => m[1])));
-
     let skillDetails = '';
-    for (const name of skillNames) {
-      try {
-        const { content } = await skillService.readSkillContentByName(name);
-        skillDetails += `${USEFUL_SKILL_TAG}Skill Name: ${name}\nContent:\n${content}\n\n`;
-      } catch (err) {
-        console.warn(`[InputParseHelper] Failed to fetch skill: ${name}`, err);
+    if (includeContextDetails) {
+      const skillMatches = Array.from(input.matchAll(this.SKILL_REGEX));
+      const skillNames = Array.from(new Set(skillMatches.map(m => m[1])));
+      for (const name of skillNames) {
+        try {
+          const { content } = await skillService.readSkillContentByName(name);
+          skillDetails += `${USEFUL_SKILL_TAG}Skill Name: ${name}\nContent:\n${content}\n\n`;
+        } catch (err) {
+          console.warn(`[InputParseHelper] Failed to fetch skill: ${name}`, err);
+        }
       }
     }
     this.SKILL_REGEX.lastIndex = 0; // Reset regex state
 
     // 2. Fetch Terminal Tab Details
-    const tabMatches = Array.from(input.matchAll(this.TAB_REGEX));
-    const tabIds = Array.from(new Set(tabMatches.map(m => m[2])));
-
     let tabDetails = '';
-    for (const id of tabIds) {
-      try {
-        const tab = terminalService.getAllTerminals().find(t => t.id === id);
-        if (tab) {
-          const recentOutput = terminalService.getRecentOutput(id);
-          tabDetails += `${TERMINAL_CONTENT_TAG}Terminal Tab: ${tab.title} (ID: ${id})
+    if (includeContextDetails) {
+      const tabMatches = Array.from(input.matchAll(this.TAB_REGEX));
+      const tabIds = Array.from(new Set(tabMatches.map(m => m[2])));
+      for (const id of tabIds) {
+        try {
+          const tab = terminalService.getAllTerminals().find(t => t.id === id);
+          if (tab) {
+            const recentOutput = terminalService.getRecentOutput(id);
+            tabDetails += `${TERMINAL_CONTENT_TAG}Terminal Tab: ${tab.title} (ID: ${id})
 ================================================================================
 <terminal_content>
 ${recentOutput}
 </terminal_content>
 ================================================================================\n\n`;
+          }
+        } catch (err) {
+          console.warn(`[InputParseHelper] Failed to fetch terminal output: ${id}`, err);
         }
-      } catch (err) {
-        console.warn(`[InputParseHelper] Failed to fetch terminal output: ${id}`, err);
       }
     }
     this.TAB_REGEX.lastIndex = 0; // Reset regex state
 
     // 3. Fetch Large Paste & Mentioned File Details
-    const pasteMatches = Array.from(input.matchAll(this.PASTE_REGEX));
-    const fileMatches = Array.from(input.matchAll(this.FILE_REGEX));
-    
-    // Combine both to handle them with the same logic
-    const allFileMatches = [
-      ...pasteMatches.map(m => ({ filePath: m[1] })),
-      ...fileMatches.map(m => ({ filePath: m[1] }))
-    ];
-
-    // Use a Set to avoid reading the same file multiple times
-    const uniqueFilePaths = Array.from(new Set(allFileMatches.map(m => m.filePath)));
-
     let fileDetails = '';
-    for (const filePath of uniqueFilePaths) {
-      try {
-        const stats = await fs.stat(filePath);
-        console.log(`[InputParseHelper] Checking file: ${filePath}, size: ${stats.size}`);
-        // Only read and include if under 4000 chars (approx 4KB)
-        if (stats.size < 4000) {
-          const buffer = await fs.readFile(filePath);
-          // Use the same detection logic as the Agent's read tool
-          const kind = detectFileKind(filePath, new Uint8Array(buffer));
-          console.log(`[InputParseHelper] File kind for ${filePath}: ${kind}`);
-          
-          if (kind === 'text') {
-            const content = buffer.toString('utf-8');
-            fileDetails += `${FILE_CONTENT_TAG}<${filePath}>\n${content}\n\n`;
+    if (includeContextDetails) {
+      const pasteMatches = Array.from(input.matchAll(this.PASTE_REGEX));
+      const fileMatches = Array.from(input.matchAll(this.FILE_REGEX));
+      const allFileMatches = [
+        ...pasteMatches.map(m => ({ filePath: m[1] })),
+        ...fileMatches.map(m => ({ filePath: m[1] }))
+      ];
+      const uniqueFilePaths = Array.from(new Set(allFileMatches.map(m => m.filePath)));
+      for (const filePath of uniqueFilePaths) {
+        try {
+          const stats = await fs.stat(filePath);
+          if (stats.size < 4000) {
+            const buffer = await fs.readFile(filePath);
+            const kind = detectFileKind(filePath, new Uint8Array(buffer));
+            if (kind === 'text') {
+              const content = buffer.toString('utf-8');
+              fileDetails += `${FILE_CONTENT_TAG}<${filePath}>\n${content}\n\n`;
+            }
           }
-        } else {
-          console.log(`[InputParseHelper] File ${filePath} too large: ${stats.size} >= 4000`);
+        } catch (err) {
+          console.warn(`[InputParseHelper] Failed to read file: ${filePath}`, err);
         }
-      } catch (err) {
-        console.warn(`[InputParseHelper] Failed to read file: ${filePath}`, err);
       }
     }
     this.PASTE_REGEX.lastIndex = 0; // Reset regex state
     this.FILE_REGEX.lastIndex = 0; // Reset regex state
 
-    // enrichedContent structure: [Skill Details] + [Tab Details] + [File Details] + [User Input Tag] + [Actual Request]
+    const normalizedInstruction = String(options?.userInputInstruction || '').trim();
+    const keepTaggedBodyLiteral = options?.keepTaggedBodyLiteral === true;
+    const taggedInputLiteral = `"${userInputTag}${input}`;
+    const userBody = normalizedInstruction
+      ? keepTaggedBodyLiteral
+        ? `${normalizedInstruction}\n${taggedInputLiteral}`
+        : `${normalizedInstruction}\n${input}`
+      : input;
+
+    // enrichedContent structure: [Skill Details] + [Tab Details] + [File Details] + [User Body]
+    // For inserted mode with keepTaggedBodyLiteral=true, userBody already contains the tagged block.
     let prefix = skillDetails + tabDetails + fileDetails;
+    const decoratedBody = keepTaggedBodyLiteral ? userBody : `${userInputTag}${userBody}`;
     const enrichedContent = prefix 
-      ? `${prefix}${USER_INPUT_TAG}${input}` 
-      : `${USER_INPUT_TAG}${input}`;
+      ? `${prefix}${decoratedBody}` 
+      : `${decoratedBody}`;
     
     // displayContent is the original input with labels (used for frontend rendering)
     const displayContent = input;

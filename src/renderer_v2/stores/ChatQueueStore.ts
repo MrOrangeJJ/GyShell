@@ -13,14 +13,21 @@ export class ChatQueueStore {
   modeBySession: Record<string, boolean> = {}
   queuesBySession: Record<string, QueueItem[]> = {}
   statesBySession: Record<string, QueueState> = {}
+  stopAfterCurrentBySession: Record<string, boolean> = {}
 
   constructor() {
     makeObservable(this, {
       modeBySession: observable,
       queuesBySession: observable,
       statesBySession: observable,
+      stopAfterCurrentBySession: observable,
       setQueueMode: action,
       setState: action,
+      requestStopAfterCurrent: action,
+      clearStopAfterCurrent: action,
+      startRun: action,
+      stopRun: action,
+      shouldDispatchNextOnSessionReady: action,
       addItem: action,
       removeItem: action,
       moveItem: action,
@@ -32,9 +39,6 @@ export class ChatQueueStore {
 
   setQueueMode(enabled: boolean, sessionId: string): void {
     this.modeBySession[sessionId] = enabled
-    if (enabled) {
-      this.setState(sessionId, 'editing')
-    }
   }
 
   isQueueMode(sessionId: string): boolean {
@@ -51,6 +55,37 @@ export class ChatQueueStore {
 
   isRunning(sessionId: string): boolean {
     return this.getState(sessionId) === 'running'
+  }
+
+  requestStopAfterCurrent(sessionId: string): void {
+    this.stopAfterCurrentBySession[sessionId] = true
+  }
+
+  clearStopAfterCurrent(sessionId: string): void {
+    this.stopAfterCurrentBySession[sessionId] = false
+  }
+
+  startRun(sessionId: string): void {
+    this.setState(sessionId, 'running')
+    this.clearStopAfterCurrent(sessionId)
+  }
+
+  stopRun(sessionId: string): void {
+    this.setState(sessionId, 'editing')
+    this.clearStopAfterCurrent(sessionId)
+  }
+
+  shouldDispatchNextOnSessionReady(sessionId: string): boolean {
+    if (!this.isRunning(sessionId)) return false
+    if (this.stopAfterCurrentBySession[sessionId]) {
+      this.stopRun(sessionId)
+      return false
+    }
+    if (this.getQueue(sessionId).length === 0) {
+      this.stopRun(sessionId)
+      return false
+    }
+    return true
   }
 
   getQueue(sessionId: string): QueueItem[] {
@@ -100,5 +135,6 @@ export class ChatQueueStore {
     delete this.modeBySession[sessionId]
     delete this.queuesBySession[sessionId]
     delete this.statesBySession[sessionId]
+    delete this.stopAfterCurrentBySession[sessionId]
   }
 }

@@ -111,7 +111,7 @@ export const ChatPanel: React.FC<{ store: AppStore }> = observer(({ store }) => 
   const isQueueMode = activeSessionId ? store.chat.queue.isQueueMode(activeSessionId) : false
   const queueItems = activeSessionId ? store.chat.queue.getQueue(activeSessionId) : []
   const isQueueRunning = activeSessionId ? store.chat.queue.isRunning(activeSessionId) : false
-  const queueLocked = isThinking || isQueueRunning
+  const inputDisabled = false
   const canQueueRun = isQueueMode && !isQueueRunning && queueItems.length > 0
   const primaryDisabled = isQueueMode ? (inputEmpty && !canQueueRun) : inputEmpty
   const latestTokens = store.chat.activeSessionLatestTokens
@@ -163,9 +163,9 @@ export const ChatPanel: React.FC<{ store: AppStore }> = observer(({ store }) => 
   // Auto-resize input - removed as RichInput handles its own size via contentEditable
 
   const handleSendNormal = (val: string) => {
-    if (!val.trim() || isThinking) return
+    if (!val.trim()) return
     const sessionId = store.chat.activeSessionId || store.chat.createSession()
-    store.sendChatMessage(sessionId, val)
+    store.sendChatMessage(sessionId, val, { mode: 'normal' })
     richInputRef.current?.clear()
     setInputEmpty(true)
   }
@@ -184,18 +184,53 @@ export const ChatPanel: React.FC<{ store: AppStore }> = observer(({ store }) => 
   }
 
   const handlePrimaryAction = () => {
-    if (isThinking) return
     const val = richInputRef.current?.getValue() || ''
     if (isQueueMode) {
       if (val.trim()) {
         handleQueueAdd(val)
-      } else if (queueItems.length > 0 && !isQueueRunning) {
+      } else if (!isThinking && queueItems.length > 0 && !isQueueRunning) {
         handleQueueRun()
       }
       return
     }
-    handleSendNormal(val)
+    if (val.trim()) {
+      handleSendNormal(val)
+    }
   }
+
+  const shouldShowInlinePrimaryWhileThinking = isThinking && !inputEmpty
+  const shouldShowPrimaryIdle = !isThinking
+  const shouldShowPrimary = shouldShowInlinePrimaryWhileThinking || shouldShowPrimaryIdle
+  const useQueueAddIcon = isQueueMode && !inputEmpty
+  const shouldShowStop = isThinking
+  const runtimeActionCount = (shouldShowPrimary ? 1 : 0) + (shouldShowStop ? 1 : 0)
+
+  const stopCurrentRun = () => {
+    if (store.chat.activeSessionId) {
+      store.chat.stopQueue(store.chat.activeSessionId)
+      window.gyshell.agent.stopTask(store.chat.activeSessionId)
+      // Optimistically stop thinking in UI
+      store.chat.setThinking(false, store.chat.activeSessionId!)
+    }
+  }
+
+  const renderPrimaryAction = () => (
+    <button className="icon-btn-sm primary" onClick={handlePrimaryAction} disabled={shouldShowPrimaryIdle ? primaryDisabled : false}>
+      {useQueueAddIcon ? (
+        <Plus size={16} strokeWidth={2} />
+      ) : isQueueMode ? (
+        <Play size={16} strokeWidth={2} />
+      ) : (
+        <CornerDownLeft size={16} strokeWidth={2} />
+      )}
+    </button>
+  )
+
+  const renderStopAction = () => (
+    <button className="icon-btn-sm danger" onClick={stopCurrentRun}>
+      <Square size={16} fill="currentColor" />
+    </button>
+  )
 
   // --- Drag & Drop Layout Logic ---
   const dragTimerRef = useRef<NodeJS.Timeout | null>(null)
@@ -306,6 +341,13 @@ export const ChatPanel: React.FC<{ store: AppStore }> = observer(({ store }) => 
     setInputEmpty(false)
     setQueueEditTarget(null)
   }
+
+  useEffect(() => {
+    if (!queueEditTarget) return
+    if (!queueItems.some((item) => item.id === queueEditTarget.id)) {
+      setQueueEditTarget(null)
+    }
+  }, [queueEditTarget, queueItems])
 
   useEffect(() => {
     const panelEl = panelRef.current
@@ -458,7 +500,7 @@ export const ChatPanel: React.FC<{ store: AppStore }> = observer(({ store }) => 
               placeholder={t.chat.placeholder}
               onSend={isQueueMode ? handleQueueAdd : handleSendNormal}
               onInput={checkInputEmpty}
-              disabled={isThinking}
+              disabled={inputDisabled}
             />
             
             <div className="input-footer">
@@ -480,60 +522,51 @@ export const ChatPanel: React.FC<{ store: AppStore }> = observer(({ store }) => 
                   </div>
                 </div>
                 <div className="input-actions">
+                  <div className="input-actions-static">
                     <QueueModeSwitch
                       enabled={isQueueMode}
-                      disabled={queueLocked}
+                      disabled={!activeSessionId}
                       onToggle={() => {
                         if (activeSessionId) {
-                          store.chat.queue.setQueueMode(!isQueueMode, activeSessionId)
+                          store.chat.setQueueMode(activeSessionId, !isQueueMode)
                         }
                       }}
                       labelOn={t.chat.queue.modeQueue}
                       labelOff={t.chat.queue.modeNormal}
                     />
-                    <button 
-                        className="icon-btn-sm secondary" 
-                        disabled={isThinking}
-                        onClick={async () => {
-                            if (store.chat.activeSessionId) {
-                                try {
-                                    // Export is now fully backed by backend UI history storage
-                                    await window.gyshell.agent.exportHistory(store.chat.activeSessionId);
-                                    // Optionally show a success notification here
-                                } catch (error) {
-                                    console.error('Failed to export history:', error);
-                                    // Optionally show an error notification here
-                                }
-                            }
-                        }}
-                        title="Export conversation history"
+                    <button
+                      className="icon-btn-sm secondary"
+                      disabled={isThinking}
+                      onClick={async () => {
+                        if (store.chat.activeSessionId) {
+                          try {
+                            await window.gyshell.agent.exportHistory(store.chat.activeSessionId)
+                          } catch (error) {
+                            console.error('Failed to export history:', error)
+                          }
+                        }
+                      }}
+                      title="Export conversation history"
                     >
-                        <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                            <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
-                            <polyline points="7 10 12 15 17 10"></polyline>
-                            <line x1="12" y1="15" x2="12" y2="3"></line>
-                        </svg>
+                      <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                        <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+                        <polyline points="7 10 12 15 17 10"></polyline>
+                        <line x1="12" y1="15" x2="12" y2="3"></line>
+                      </svg>
                     </button>
-                    {isThinking ? (
-                        <button className="icon-btn-sm danger" onClick={() => {
-                            if (store.chat.activeSessionId) {
-                                store.chat.stopQueue(store.chat.activeSessionId)
-                                window.gyshell.agent.stopTask(store.chat.activeSessionId)
-                                // Optimistically stop thinking in UI
-                                store.chat.setThinking(false, store.chat.activeSessionId!)
-                            }
-                        }}>
-                        <Square size={16} fill="currentColor" />
-                        </button>
+                  </div>
+                  <div className="input-actions-runtime">
+                    {runtimeActionCount <= 1 ? (
+                      <div className="runtime-buttons is-single">
+                        {shouldShowPrimary ? renderPrimaryAction() : shouldShowStop ? renderStopAction() : null}
+                      </div>
                     ) : (
-                        <button className="icon-btn-sm primary" onClick={handlePrimaryAction} disabled={primaryDisabled}>
-                        {isQueueMode ? (
-                          <Play size={16} strokeWidth={2} />
-                        ) : (
-                          <CornerDownLeft size={16} strokeWidth={2} />
-                        )}
-                        </button>
+                      <div className="runtime-buttons is-double">
+                        {shouldShowPrimary ? renderPrimaryAction() : null}
+                        {shouldShowStop ? renderStopAction() : null}
+                      </div>
                     )}
+                  </div>
                 </div>
             </div>
 

@@ -36,6 +36,7 @@ export class ChatHistoryService {
   saveSession(session: ChatSession): void {
     const sessions = this.store.get('sessions') as StoredChatSession[]
     const sessionIndex = sessions.findIndex((s: StoredChatSession) => s.id === session.id)
+    const existing = sessionIndex >= 0 ? sessions[sessionIndex] : null
     
     const storedSession: StoredChatSession = {
       id: session.id,
@@ -47,7 +48,7 @@ export class ChatHistoryService {
         data: msg
       })),
       lastCheckpointOffset: session.lastCheckpointOffset,
-      createdAt: Date.now(),
+      createdAt: existing?.createdAt || Date.now(),
       updatedAt: Date.now()
     }
 

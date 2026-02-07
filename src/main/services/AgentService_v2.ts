@@ -33,6 +33,8 @@ import type { ToolExecutionContext } from './AgentHelper/types'
 import { AgentHelpers } from './AgentHelper/helpers'
 import {
   USEFUL_SKILL_TAG,
+  USER_INSERTED_INPUT_TAG,
+  USER_INSERTED_INPUT_INSTRUCTION,
   createBaseSystemPrompt,
   createSystemInfoPrompt,
   createTabContextPrompt,
@@ -85,6 +87,14 @@ const StateAnnotation = Ann.Root({
   sessionId: Ann({
     reducer: (x: string, y?: string) => y ?? x,
     default: () => ""
+  }),
+  startup_input: Ann({
+    reducer: (x: string, y?: string) => y ?? x,
+    default: () => ''
+  }),
+  startup_mode: Ann({
+    reducer: (x: 'normal' | 'inserted', y?: 'normal' | 'inserted') => y ?? x,
+    default: () => 'normal'
   }),
   pendingToolCalls: Ann({
     reducer: (x: any[], y?: any[] | any) => {
@@ -207,7 +217,7 @@ export class AgentService_v2 {
 
     const workflow = new StateGraph(StateAnnotation) as any
 
-    workflow.addNode('context_manager', this.createContextManagerNode())
+    workflow.addNode('startup_message_builder', this.createStartupMessageBuilderNode())
     // Add token_manager nodes for double interception
     workflow.addNode('token_pruner_initial', this.createTokenManagerNode())
     workflow.addNode('token_pruner_runtime', this.createTokenManagerNode())
@@ -221,8 +231,8 @@ export class AgentService_v2 {
     workflow.addNode('mcp_tools', this.createMcpToolsNode())
     workflow.addNode('final_output', this.createFinalOutputNode())
 
-    workflow.addEdge(START, 'context_manager')
-    workflow.addEdge('context_manager', 'token_pruner_initial')
+    workflow.addEdge(START, 'startup_message_builder')
+    workflow.addEdge('startup_message_builder', 'token_pruner_initial')
     workflow.addEdge('token_pruner_initial', 'token_pruner_runtime')
     
     workflow.addEdge('token_pruner_runtime', 'model_request')
@@ -289,52 +299,93 @@ export class AgentService_v2 {
     })
   }
 
-  private createContextManagerNode() {
+  private createStartupMessageBuilderNode() {
     return RunnableLambda.from(async (state: any) => {
-      const sessionId = state.sessionId;
-      if (!sessionId) return state;
+      const sessionId = state.sessionId
+      if (!sessionId) return state
+
+      const startupInput = String(state.startup_input || '')
+      const startupMode: 'normal' | 'inserted' = state.startup_mode === 'inserted' ? 'inserted' : 'normal'
 
       const messages: BaseMessage[] = [...state.messages]
       const fullMessages: BaseMessage[] = [...state.full_messages]
-      if (messages.length === 0 || fullMessages.length === 0) return state
 
-      const lastMsg = messages[messages.length - 1]
-      const otherMsgs = messages.slice(0, -1)
+      const userMessageId = uuidv4()
+      const { enrichedContent, displayContent } = await InputParseHelper.parseAndEnrich(
+        startupInput,
+        this.skillService,
+        this.terminalService,
+        {
+          userInputTag: startupMode === 'inserted' ? USER_INSERTED_INPUT_TAG : InputParseHelper.DEFAULT_USER_INPUT_TAG,
+          includeContextDetails: true,
+          userInputInstruction: startupMode === 'inserted' ? USER_INSERTED_INPUT_INSTRUCTION : undefined,
+          keepTaggedBodyLiteral: startupMode === 'inserted'
+        }
+      )
 
-      const tabs = this.terminalService.getAllTerminals()
-      
-      const sysInfoMsg = this.helpers.markEphemeral(createSystemInfoPrompt(tabs))
+      const humanMessage = new HumanMessage(enrichedContent)
+      ;(humanMessage as any).additional_kwargs = {
+        _gyshellMessageId: userMessageId,
+        original_input: displayContent,
+        input_kind: startupMode
+      }
+
+      this.helpers.sendEvent(sessionId, {
+        messageId: userMessageId,
+        type: 'user_input',
+        content: displayContent,
+        inputKind: startupMode
+      })
+
+      const withUserMessages = [...messages, humanMessage]
+      const withUserFullMessages = [...fullMessages, humanMessage]
+
       const baseSystemMsg = createBaseSystemPrompt()
+      const hasBaseSystem = withUserMessages.some(
+        m => m.type === 'system' && typeof m.content === 'string' && m.content.includes('# Role: GyShell Assistant')
+      )
+      const fullHasBaseSystem = withUserFullMessages.some(
+        m => m.type === 'system' && typeof m.content === 'string' && m.content.includes('# Role: GyShell Assistant')
+      )
 
-      // Check if base system prompt already exists in history
-      const hasBaseSystem = otherMsgs.some(m => m.type === 'system' && typeof m.content === 'string')
+      const contextMessages: BaseMessage[] = []
+      if (startupMode === 'normal') {
+        const tabs = this.terminalService.getAllTerminals()
+        const sysInfoMsg = this.helpers.markEphemeral(createSystemInfoPrompt(tabs))
 
-      // boundTerminalId will be passed from Gateway via metadata or state
-      const currentTabId = state.boundTerminalId
-      const currentTab = currentTabId ? this.terminalService.getAllTerminals().find(t => t.id === currentTabId) : undefined
-      const recent = currentTabId ? this.terminalService.getRecentOutput(currentTabId) : ''
-      
-      const formattedRecent = recent ? `
+        const currentTabId = state.boundTerminalId
+        const currentTab = currentTabId ? tabs.find(t => t.id === currentTabId) : undefined
+        const recent = currentTabId ? this.terminalService.getRecentOutput(currentTabId) : ''
+        const formattedRecent = recent
+          ? `
 ================================================================================
 <terminal_content>
 ${recent}
 </terminal_content>
-================================================================================` : ''
+================================================================================`
+          : ''
+        const contextMsg = this.helpers.markEphemeral(createTabContextPrompt(currentTab, formattedRecent))
+        contextMessages.push(sysInfoMsg, contextMsg)
+      }
 
-      const contextMsg = this.helpers.markEphemeral(createTabContextPrompt(currentTab, formattedRecent))
+      const userLast = withUserMessages[withUserMessages.length - 1]
+      const beforeUser = withUserMessages.slice(0, -1)
+      const newMessages = [
+        ...(hasBaseSystem ? [] : [baseSystemMsg]),
+        ...beforeUser,
+        ...contextMessages,
+        userLast
+      ]
 
-      const prefix = hasBaseSystem ? [] : [baseSystemMsg]
-      const newMessages = [...prefix, ...otherMsgs, sysInfoMsg, contextMsg, lastMsg]
+      const fullUserLast = withUserFullMessages[withUserFullMessages.length - 1]
+      const fullBeforeUser = withUserFullMessages.slice(0, -1)
+      const newFullMessages = [
+        ...(fullHasBaseSystem ? [] : [baseSystemMsg]),
+        ...fullBeforeUser,
+        ...contextMessages,
+        fullUserLast
+      ]
 
-      const fullLastMsg = fullMessages[fullMessages.length - 1]
-      const fullOtherMsgs = fullMessages.slice(0, -1)
-      
-      const fullHasBaseSystem = fullOtherMsgs.some(m => m.type === 'system' && typeof m.content === 'string' && m.content.includes('# Role: GyShell Assistant'))
-      const fullPrefix = fullHasBaseSystem ? [] : [baseSystemMsg]
-
-      const newFullMessages = [...fullPrefix, ...fullOtherMsgs, sysInfoMsg, contextMsg, fullLastMsg]
-      
-      // Initialize Token State
       let globalMax = 200000
       let thinkingMax = 200000
       if (this.settings?.models) {
@@ -353,25 +404,24 @@ ${recent}
         if (typeof thinkingItem?.maxTokens === 'number') thinkingMax = thinkingItem.maxTokens
       }
       const maxTokens = Math.min(globalMax, thinkingMax)
-      
+
       let currentTokens = 0
-      const historyToCheck = state.full_messages?.length > 0 ? state.full_messages : state.messages
-      for (let i = historyToCheck.length - 1; i >= 0; i--) {
-        const m = historyToCheck[i]
+      for (let i = newFullMessages.length - 1; i >= 0; i--) {
+        const m = newFullMessages[i]
         const usage = (m as any).usage_metadata || (m as any).additional_kwargs?.usage
         if (usage?.total_tokens) {
-            currentTokens = usage.total_tokens
-            break
+          currentTokens = usage.total_tokens
+          break
         }
       }
 
-      return { 
-          messages: newMessages,
-          full_messages: newFullMessages, 
-          token_state: {
-              max_tokens: maxTokens,
-              current_tokens: currentTokens
-          }
+      return {
+        messages: newMessages,
+        full_messages: newFullMessages,
+        token_state: {
+          max_tokens: maxTokens,
+          current_tokens: currentTokens
+        }
       }
     })
   }
@@ -1099,7 +1149,7 @@ ${recent}
 
   // --- Execution Core ---
 
-  async run(context: any, input: string, signal: AbortSignal): Promise<void> {
+  async run(context: any, input: string, signal: AbortSignal, startMode: 'normal' | 'inserted' = 'normal'): Promise<void> {
     if (!this.graph) throw new Error('Graph not initialized')
 
     this.lastAbortedMessage = null
@@ -1108,29 +1158,13 @@ ${recent}
     const loadedSession = this.chatHistoryService.loadSession(sessionId)
     const baseMessages = loadedSession ? mapStoredMessagesToChatMessages(Array.from(loadedSession.messages.values())) : []
 
-    const userMessageId = uuidv4()
-    
-    // Parse and enrich input (handle @mentions for skills/tabs)
-    const { enrichedContent, displayContent } = await InputParseHelper.parseAndEnrich(input, this.skillService, this.terminalService)
-    
-    const humanMessage = new HumanMessage(enrichedContent)
-    ;(humanMessage as any).additional_kwargs = { 
-      _gyshellMessageId: userMessageId,
-      original_input: displayContent // Store for frontend rendering
-    }
-
-    // Use the new emit-based event system (via helpers)
-    this.helpers.sendEvent(sessionId, {
-      messageId: userMessageId,
-      type: 'user_input',
-      content: displayContent // Send display version to UI
-    })
-
     const initialState = {
-      messages: [...baseMessages, humanMessage],
-      full_messages: [...baseMessages, humanMessage],
+      messages: [...baseMessages],
+      full_messages: [...baseMessages],
       sessionId: sessionId,
-      boundTerminalId: boundTerminalId // Pass terminal context into graph
+      boundTerminalId: boundTerminalId,
+      startup_input: input,
+      startup_mode: startMode
     }
 
       try {

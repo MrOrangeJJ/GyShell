@@ -126,7 +126,7 @@ export class AppStore {
       sendChatMessage: action,
       getUniqueTitle: action
     })
-    this.chat.setQueueRunner(this.sendChatMessage.bind(this))
+    this.chat.setQueueRunner((sessionId, content) => this.sendChatMessage(sessionId, content, { mode: 'queue' }))
   }
 
   getUniqueTitle(baseTitle: string): string {
@@ -735,15 +735,21 @@ export class AppStore {
     }
   }
 
-  sendChatMessage(sessionId: string, content: string): boolean {
+  sendChatMessage(
+    sessionId: string,
+    content: string,
+    options?: { mode?: 'normal' | 'queue' }
+  ): boolean {
     const activeTabId = this.activeTerminalId
+    const mode = options?.mode || 'normal'
     let targetSessionId = sessionId
     if (!targetSessionId) {
       targetSessionId = this.chat.createSession()
     }
     
     const session = this.chat.sessions.find(s => s.id === targetSessionId)
-    if (session?.isSessionBusy) {
+    const wasBusy = !!session?.isSessionBusy
+    if (mode === 'queue' && session?.isSessionBusy) {
       console.warn('[AppStore] Session is busy, ignoring message:', content)
       return false
     }
@@ -763,7 +769,8 @@ export class AppStore {
     window.gyshell.terminal.setSelection(activeTabId, selectionText).catch(() => {
       // ignore
     })
-    window.gyshell.agent.startTask(targetSessionId, activeTabId, content)
+    const startMode = wasBusy && mode === 'normal' ? 'inserted' : 'normal'
+    window.gyshell.agent.startTask(targetSessionId, activeTabId, content, { startMode })
     return true
   }
 
@@ -793,5 +800,3 @@ export class AppStore {
     }
   }
 }
-
-

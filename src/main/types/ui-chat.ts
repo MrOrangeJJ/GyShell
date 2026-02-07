@@ -36,6 +36,7 @@ export interface ChatMessage {
     totalTokens?: number
     maxTokens?: number
     details?: string
+    inputKind?: 'normal' | 'inserted'
   }
   timestamp: number
   streaming?: boolean
