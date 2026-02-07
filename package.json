@@ -1,6 +1,6 @@
 {
   "name": "gyshell",
-  "version": "0.1.4-beta1",
+  "version": "0.1.4-beta2",
   "description": "GyShell - AI-Native Terminal App",
   "main": "./out/main/index.js",
   "author": "TUOTUO",
