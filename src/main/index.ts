@@ -244,7 +244,10 @@ function setupIpcHandlers(): void {
 
   // Agent
   ipcMain.handle('agent:replyCommandApproval', async (_, approvalId: string, decision: 'allow' | 'deny') => {
-    commandPolicyService.resolveApproval(approvalId, decision)
+    // Forward to the new unified feedback system in Gateway
+    if ((global as any).gateway) {
+      (global as any).gateway.feedbackBus.emit(`feedback:${approvalId}`, { decision });
+    }
   })
 
   // UI

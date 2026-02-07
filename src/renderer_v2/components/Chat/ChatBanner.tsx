@@ -11,7 +11,8 @@ import {
   ChevronDown,
   ShieldAlert,
   AlertTriangle,
-  XCircle
+  XCircle,
+  FastForward
 } from 'lucide-react'
 import type { ChatMessage } from '../../stores/ChatStore'
 import './chatBanner.scss'
@@ -68,7 +69,21 @@ export const CommandBanner = observer(({ msg }: { msg: ChatMessage }) => {
   const isError = msg.metadata?.exitCode !== 0 && isDone
   const isNowait = msg.metadata?.isNowait || false
   const [expanded, setExpanded] = React.useState(true)
+  const [isSkipping, setIsSkipping] = React.useState(false)
   const { ref, isSelected, setSelected } = useBannerSelection<HTMLDivElement>()
+
+  const handleSkipWait = async (e: React.MouseEvent) => {
+    e.stopPropagation()
+    if (isSkipping || isDone) return
+    setIsSkipping(true)
+    const feedbackId = msg.backendMessageId || msg.id
+    try {
+      await window.gyshell.agent.replyMessage(feedbackId, { type: 'SKIP_WAIT' })
+    } catch (err) {
+      console.error('Failed to skip wait:', err)
+      setIsSkipping(false)
+    }
+  }
 
   return (
     <div
@@ -94,6 +109,19 @@ export const CommandBanner = observer(({ msg }: { msg: ChatMessage }) => {
           <span className="banner-type">{isNowait ? 'RUN ASYNC' : 'RUN'}</span>
           <span className="banner-target">{msg.metadata?.tabName ? `on ${msg.metadata.tabName}` : ''}</span>
         </div>
+        <div className="banner-actions">
+          {!isDone && !isNowait && (
+            <button 
+              className={`banner-action-btn skip-wait ${isSkipping ? 'loading' : ''}`}
+              onClick={handleSkipWait}
+              title="Skip waiting and run in background"
+              disabled={isSkipping}
+            >
+              <FastForward size={14} />
+              <span>Skip Wait</span>
+            </button>
+          )}
+        </div>
         <div className="banner-chevron">
           {expanded ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
         </div>
@@ -101,7 +129,7 @@ export const CommandBanner = observer(({ msg }: { msg: ChatMessage }) => {
       {expanded && (
         <div className="banner-content">
           <div className="cmd-line">$ {msg.content}</div>
-          {msg.metadata?.output && <pre className="cmd-output">{msg.metadata.output}</pre>}
+          {!isNowait && msg.metadata?.output && <pre className="cmd-output">{msg.metadata.output}</pre>}
         </div>
       )}
     </div>
@@ -267,7 +295,7 @@ export const AskBanner = observer(
     labels
   }: {
     msg: ChatMessage
-    onDecision: (decision: 'allow' | 'deny') => void
+    onDecision: (messageId: string, decision: 'allow' | 'deny') => void
     labels: { allow: string; deny: string; allowed: string; denied: string }
   }) => {
     const [expanded, setExpanded] = React.useState(true)
@@ -305,14 +333,20 @@ export const AskBanner = observer(
             <div className="ask-actions">
               <button
                 className="btn-secondary"
-                onClick={() => onDecision('deny')}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onDecision(msg.id, 'deny');
+                }}
                 disabled={!!decision}
               >
                 {labels.deny}
               </button>
               <button
                 className="btn-primary"
-                onClick={() => onDecision('allow')}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onDecision(msg.id, 'allow');
+                }}
                 disabled={!!decision}
               >
                 {labels.allow}

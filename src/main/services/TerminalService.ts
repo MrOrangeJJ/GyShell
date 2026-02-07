@@ -493,7 +493,12 @@ export class TerminalService {
   async runCommandAndWait(
     terminalId: string,
     command: string,
-    opts?: { signal?: AbortSignal; interruptOnAbort?: boolean; onFinished?: (result: CommandResult) => void }
+    opts?: { 
+      signal?: AbortSignal; 
+      interruptOnAbort?: boolean; 
+      onFinished?: (result: CommandResult) => void;
+      shouldSkip?: () => boolean;
+    }
   ): Promise<CommandResult> {
     const taskId = await this.executeCommandInternal(terminalId, command, 'wait', opts?.onFinished)
     return this.waitForTask(terminalId, taskId, opts)
@@ -502,7 +507,11 @@ export class TerminalService {
   async waitForTask(
     terminalId: string,
     taskId: string,
-    opts?: { signal?: AbortSignal; interruptOnAbort?: boolean }
+    opts?: { 
+      signal?: AbortSignal; 
+      interruptOnAbort?: boolean;
+      shouldSkip?: () => boolean;
+    }
   ): Promise<CommandResult> {
     const startTime = Date.now()
     const timeoutMs = 120_000
@@ -514,6 +523,15 @@ export class TerminalService {
           this.markTaskAborted(terminalId, taskId)
         }
         return { stdoutDelta: 'Command aborted by user.', exitCode: -2, history_command_match_id: taskId }
+      }
+
+      // Check if user manually skipped the wait
+      if (opts?.shouldSkip?.()) {
+        return { 
+          stdoutDelta: 'USER_SKIPPED_WAIT', 
+          exitCode: -3, 
+          history_command_match_id: taskId 
+        }
       }
 
       const task = this.getTaskMap(terminalId)[taskId]

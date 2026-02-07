@@ -1,7 +1,6 @@
 import fs from 'fs/promises'
 import path from 'path'
 import { app, shell } from 'electron'
-import { v4 as uuidv4 } from 'uuid'
 import { BashArity } from './commandArity'
 import { Wildcard } from './wildcard'
 import { getBashParser } from './commandParser'
@@ -15,16 +14,6 @@ export interface CommandPolicyLists {
 }
 
 export type CommandPolicyListName = keyof CommandPolicyLists
-
-interface CommandAskRequest {
-  approvalId: string
-  sessionId: string
-  messageId: string
-  command: string
-  toolName: string
-  resolve: (allowed: boolean) => void
-  reject: (error: Error) => void
-}
 
 const DEFAULT_LISTS: CommandPolicyLists = {
   allowlist: [],
@@ -41,8 +30,6 @@ const DEFAULT_POLICY_FILE_CONTENT = {
 }
 
 export class CommandPolicyService {
-  private pending: Map<string, CommandAskRequest> = new Map()
-
   getPolicyFilePath(): string {
     const baseDir = app.getPath('userData')
     return path.join(baseDir, 'command-policy.json')
@@ -203,28 +190,16 @@ export class CommandPolicyService {
     sendEvent: (sessionId: string, event: any) => void
     signal?: AbortSignal
   }): Promise<boolean> {
-    const approvalId = uuidv4()
-    return new Promise<boolean>((resolve, reject) => {
+    const gateway = (global as any).gateway
+    if (!gateway) {
+      throw new Error('Gateway not initialized')
+    }
+
+    return new Promise<boolean>(async (resolve, reject) => {
       const onAbort = () => {
-        this.pending.delete(approvalId)
         reject(new Error('AbortError'))
       }
-      this.pending.set(approvalId, {
-        approvalId,
-        sessionId: params.sessionId,
-        messageId: params.messageId,
-        command: params.command,
-        toolName: params.toolName,
-        resolve,
-        reject
-      })
-      params.sendEvent(params.sessionId, {
-        type: 'command_ask',
-        approvalId,
-        command: params.command,
-        toolName: params.toolName,
-        messageId: params.messageId
-      })
+
       if (params.signal) {
         if (params.signal.aborted) {
           onAbort()
@@ -232,22 +207,34 @@ export class CommandPolicyService {
         }
         params.signal.addEventListener('abort', onAbort, { once: true })
       }
+
+      params.sendEvent(params.sessionId, {
+        type: 'command_ask',
+        approvalId: params.messageId, // This is the _gyshellMessageId (backendMessageId in frontend)
+        command: params.command,
+        toolName: params.toolName,
+        messageId: params.messageId,
+        decision: undefined
+      })
+
+      try {
+        console.log(`[CommandPolicyService] Waiting for feedback on messageId=${params.messageId} (backendMessageId)`);
+        const feedback = await (gateway as any).waitForFeedback(params.messageId)
+        console.log(`[CommandPolicyService] Received feedback for messageId=${params.messageId}:`, feedback);
+        if (params.signal) {
+          params.signal.removeEventListener('abort', onAbort)
+        }
+
+        if (!feedback) {
+          // Timeout or other issue
+          resolve(false)
+        } else {
+          resolve(feedback.decision === 'allow')
+        }
+      } catch (err) {
+        reject(err)
+      }
     })
-  }
-
-  resolveApproval(approvalId: string, decision: 'allow' | 'deny'): void {
-    const pending = this.pending.get(approvalId)
-    if (!pending) return
-    this.pending.delete(approvalId)
-    pending.resolve(decision === 'allow')
-  }
-
-  cancelPendingBySession(sessionId: string, reason: string = 'AbortError'): void {
-    for (const [id, pending] of this.pending.entries()) {
-      if (pending.sessionId !== sessionId) continue
-      this.pending.delete(id)
-      pending.reject(new Error(reason))
-    }
   }
 
   private matchesList(patterns: string[], list: string[]): boolean {

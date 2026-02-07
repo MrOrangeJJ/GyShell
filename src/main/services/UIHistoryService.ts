@@ -18,11 +18,29 @@ export class UIHistoryService {
       name: 'gyshell-ui-history',
       defaults: { sessions: {} }
     })
-    this.sessionsCache = this.store.get('sessions') || {}
+    this.sessionsCache = this.sanitizeSessions(this.store.get('sessions') || {})
+    this.saveSessions(this.sessionsCache)
+  }
+
+  private sanitizeSessions(sessions: Record<string, UIChatSession>): Record<string, UIChatSession> {
+    const sanitized = JSON.parse(JSON.stringify(sessions)) as Record<string, UIChatSession>
+    Object.values(sanitized).forEach(session => {
+      session.messages = session.messages.filter(m => m.type !== 'ask') // Remove all hanging ask banners
+      session.messages.forEach(m => {
+        if (m.type === 'command' && m.streaming) {
+          m.streaming = false
+          if (m.metadata && m.metadata.exitCode === undefined) {
+            m.metadata.exitCode = -1 // Mark as failed/interrupted
+            m.metadata.output = (m.metadata.output || '') + '\n[Session closed before command finished]'
+          }
+        }
+      })
+    })
+    return sanitized
   }
 
   private saveSessions(sessions: Record<string, UIChatSession>): void {
-    this.store.set('sessions', sessions)
+    this.store.set('sessions', this.sanitizeSessions(sessions))
   }
 
   recordEvent(sessionId: string, event: AgentEvent): UIUpdateAction[] {
@@ -99,7 +117,7 @@ export class UIHistoryService {
       const stopAction = this.stopLatestStreaming(session, sessionId)
       if (stopAction) actions.push(stopAction)
 
-      // CRITICAL FIX: If there was a pending 'ask' message with the same ID, 
+      // CRITICAL FIX: If there was a pending 'ask' message with the same backendMessageId, 
       // remove it from history to prevent it from reappearing on reload.
       const existingIdx = session.messages.findIndex(m => m.backendMessageId === event.messageId && m.type === 'ask')
       if (existingIdx !== -1) {
@@ -124,11 +142,9 @@ export class UIHistoryService {
       actions.push({ type: 'ADD_MESSAGE', sessionId, message })
     } else if (type === 'command_finished') {
       // If this is a finished event for a rejected command, we might need to clear the ask message too
-      if (event.exitCode === -1 && event.outputDelta?.includes('User rejected')) {
-        const existingIdx = session.messages.findIndex(m => m.backendMessageId === event.messageId && m.type === 'ask')
-        if (existingIdx !== -1) {
-          session.messages.splice(existingIdx, 1)
-        }
+      const existingIdx = session.messages.findIndex(m => m.backendMessageId === event.messageId && m.type === 'ask')
+      if (existingIdx !== -1) {
+        session.messages.splice(existingIdx, 1)
       }
 
       const msg = event.commandId
@@ -140,7 +156,8 @@ export class UIHistoryService {
           metadata: {
             ...msg.metadata,
             exitCode: event.exitCode,
-            output: (msg.metadata?.output || '') + (event.outputDelta || '') + (event.message ? `\nError: ${event.message}` : '')
+            output: (msg.metadata?.output || '') + (event.outputDelta || '') + (event.message ? `\nError: ${event.message}` : ''),
+            isNowait: (event as any).isNowait ?? msg.metadata?.isNowait
           },
           streaming: false
         }
@@ -214,7 +231,8 @@ export class UIHistoryService {
         metadata: {
           approvalId: event.approvalId,
           toolName: event.toolName || 'Command',
-          command: event.command || ''
+          command: event.command || '',
+          decision: (event as any).decision
         },
         streaming: false,
         backendMessageId: event.messageId

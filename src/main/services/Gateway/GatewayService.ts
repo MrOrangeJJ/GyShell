@@ -13,12 +13,14 @@ import { BUILTIN_TOOL_INFO } from '../AgentHelper/tools';
 export class GatewayService extends EventEmitter implements IGateway {
   private sessions: Map<string, SessionContext> = new Map();
   private eventBus: EventEmitter = new EventEmitter();
+  private feedbackBus: EventEmitter = new EventEmitter();
+  private feedbackCache: Map<string, any> = new Map();
 
   constructor(
     private terminalService: TerminalService,
     private agentService: AgentService_v2,
     private uiHistoryService: UIHistoryService,
-    private commandPolicyService: CommandPolicyService,
+    _commandPolicyService: CommandPolicyService,
     private tempFileService: TempFileService,
     private skillService: SkillService
   ) {
@@ -54,6 +56,13 @@ export class GatewayService extends EventEmitter implements IGateway {
 
     ipcMain.handle('agent:stopTask', async (_, sessionId: string) => {
       return this.stopTask(sessionId);
+    });
+
+    ipcMain.handle('agent:replyMessage', async (_, messageId: string, payload: any) => {
+      console.log(`[GatewayService] Received replyMessage for messageId=${messageId}:`, payload);
+      this.feedbackCache.set(messageId, payload);
+      this.feedbackBus.emit(`feedback:${messageId}`, payload);
+      return { ok: true };
     });
 
     ipcMain.handle('agent:deleteChatSession', async (_, sessionId: string) => {
@@ -295,13 +304,15 @@ export class GatewayService extends EventEmitter implements IGateway {
       
       this.uiHistoryService.flush(sessionId);
     }
-    this.commandPolicyService.cancelPendingBySession(sessionId, 'AbortError');
   }
 
   private clearRunState(context: SessionContext) {
     context.status = 'idle';
     context.activeRunId = null;
     context.abortController = null;
+    // Clean up cache for this session's messages if any remain
+    // (In a real scenario, we might need a way to map messageId to sessionId here,
+    // but for now, the cache is self-cleaning on read)
   }
 
   async pauseTask(sessionId: string): Promise<void> {
@@ -334,5 +345,32 @@ export class GatewayService extends EventEmitter implements IGateway {
   subscribe(type: GatewayEventType, handler: (event: GatewayEvent) => void): () => void {
     this.eventBus.on(type, handler);
     return () => this.eventBus.off(type, handler);
+  }
+
+  async waitForFeedback<T>(messageId: string, timeoutMs: number = 120000): Promise<T | null> {
+    // 1. Check cache first (in case frontend replied before backend started waiting)
+    if (this.feedbackCache.has(messageId)) {
+      const cached = this.feedbackCache.get(messageId);
+      this.feedbackCache.delete(messageId);
+      console.log(`[GatewayService] Using cached feedback for messageId=${messageId}`);
+      return cached as T;
+    }
+
+    return new Promise((resolve) => {
+      const eventName = `feedback:${messageId}`;
+      const timer = setTimeout(() => {
+        this.feedbackBus.off(eventName, handler);
+        resolve(null);
+      }, timeoutMs);
+
+      const handler = (payload: T) => {
+        clearTimeout(timer);
+        this.feedbackBus.off(eventName, handler);
+        this.feedbackCache.delete(messageId); // Cleanup cache if it was set during waiting
+        resolve(payload);
+      };
+
+      this.feedbackBus.on(eventName, handler);
+    });
   }
 }

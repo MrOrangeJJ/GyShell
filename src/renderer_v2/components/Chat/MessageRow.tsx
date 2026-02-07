@@ -11,7 +11,7 @@ interface MessageRowProps {
   store: AppStore
   sessionId: string
   messageId: string
-  onAskDecision: (msg: ChatMessage, decision: 'allow' | 'deny') => void
+  onAskDecision: (messageId: string, decision: 'allow' | 'deny') => void
   onRollback: (msg: ChatMessage) => void
   askLabels: { allow: string; deny: string; allowed: string; denied: string }
   isThinking: boolean
@@ -78,7 +78,7 @@ export const MessageRow: React.FC<MessageRowProps> = observer(({
       <div>
         <AskBanner 
           msg={msg} 
-          onDecision={(decision) => onAskDecision(msg, decision)} 
+          onDecision={(messageId, decision) => onAskDecision(messageId, decision)} 
           labels={askLabels} 
         />
       </div>

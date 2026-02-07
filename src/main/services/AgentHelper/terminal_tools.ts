@@ -115,19 +115,50 @@ export async function runCommand(args: z.infer<typeof execCommandSchema>, contex
   })
 
   try {
+    // Subscribe to skip wait feedback for this message
+    let userSkipped = false
+    const gateway = (global as any).gateway
+    if (gateway) {
+      gateway.waitForFeedback(messageId).then((payload: any) => {
+        if (payload?.type === 'SKIP_WAIT') {
+          userSkipped = true
+        }
+      })
+    }
+
     const result = await terminalService.runCommandAndWait(bestMatch.id, command, {
       signal: context.signal,
-      interruptOnAbort: false
+      interruptOnAbort: false,
+      shouldSkip: () => userSkipped
     })
     const historyCommandMatchId = result.history_command_match_id
     const truncatedOutput = truncateCommandOutput(result.stdoutDelta || '', historyCommandMatchId, bestMatch.id)
     
     let finalResult = ''
-    if (result.exitCode === -1 && result.stdoutDelta?.includes('timed out')) {
+    if (result.exitCode === -3 || result.stdoutDelta === 'USER_SKIPPED_WAIT') {
+      finalResult = `The user has chosen to skip the wait for the command "${command}". The command is still running in the background. You can use read_command_output to check its current progress, or use wait_command_end to wait for it to finish later. history_command_match_id=${historyCommandMatchId}, terminalId=${bestMatch.id}`
+      
+      // Update the finished event to mark it as isNowait: true so the UI banner switches to Async style
+      context.sendEvent(sessionId, { 
+        messageId,
+        type: 'command_finished', 
+        command, 
+        commandId: messageId,
+        tabName: bestMatch.title || bestMatch.id,
+        exitCode: result.exitCode,
+        outputDelta: finalResult,
+        isNowait: true // Force UI to switch to Async style
+      })
+      return finalResult
+    } else if (result.exitCode === -1 && result.stdoutDelta?.includes('timed out')) {
       finalResult = `The command "${command}" is still running, but the wait has timed out (120s). You can use read_command_output to check its current progress, or call wait_command_end again if you believe it needs more time to finish. history_command_match_id=${historyCommandMatchId}, terminalId=${bestMatch.id}`
     } else {
       finalResult = `The command "${command}" has finished executing. The following is the output (history_command_match_id=${historyCommandMatchId}):
-${truncatedOutput}`
+================================================================================
+<terminal_content>
+${truncatedOutput}
+</terminal_content>
+================================================================================`
     }
 
     context.sendEvent(sessionId, { 
@@ -577,9 +608,21 @@ export async function waitCommandEnd(
   })
 
   try {
+    // Subscribe to skip wait feedback for this message
+    let userSkipped = false
+    const gateway = (global as any).gateway
+    if (gateway) {
+      gateway.waitForFeedback(messageId).then((payload: any) => {
+        if (payload?.type === 'SKIP_WAIT') {
+          userSkipped = true
+        }
+      })
+    }
+
     const result = await terminalService.waitForTask(bestMatch.id, taskId, {
       signal: context.signal,
-      interruptOnAbort: false
+      interruptOnAbort: false,
+      shouldSkip: () => userSkipped
     })
 
     const task = terminalService.getCommandTask(bestMatch.id, taskId)
@@ -588,11 +631,30 @@ export async function waitCommandEnd(
     const truncatedOutput = truncateCommandOutput(result.stdoutDelta || '', historyCommandMatchId, bestMatch.id)
     
     let finalResult = ''
-    if (result.exitCode === -1 && result.stdoutDelta?.includes('timed out')) {
+    if (result.exitCode === -3 || result.stdoutDelta === 'USER_SKIPPED_WAIT') {
+      finalResult = `The user has chosen to skip the wait for the command "${commandName}". The command is still running in the background. You can use read_command_output to check its current progress, or call wait_command_end again if you believe it needs more time to finish. history_command_match_id=${historyCommandMatchId}, terminalId=${bestMatch.id}`
+      
+      // Update the finished event to mark it as isNowait: true so the UI banner switches to Async style
+      sendEvent(sessionId, { 
+        messageId,
+        type: 'command_finished', 
+        command: commandName, 
+        commandId: messageId,
+        tabName: bestMatch.title || bestMatch.id,
+        exitCode: result.exitCode,
+        outputDelta: finalResult,
+        isNowait: true // Force UI to switch to Async style
+      })
+      return finalResult
+    } else if (result.exitCode === -1 && result.stdoutDelta?.includes('timed out')) {
       finalResult = `The command "${commandName}" is still running, but the wait has timed out (120s). You can use read_command_output to check its current progress, or call wait_command_end again if you believe it needs more time to finish. history_command_match_id=${historyCommandMatchId}, terminalId=${bestMatch.id}`
     } else {
       finalResult = `The command "${commandName}" has finished executing. The following is the output (history_command_match_id=${historyCommandMatchId}):
-${truncatedOutput}`
+================================================================================
+<terminal_content>
+${truncatedOutput}
+</terminal_content>
+================================================================================`
     }
 
     sendEvent(sessionId, {

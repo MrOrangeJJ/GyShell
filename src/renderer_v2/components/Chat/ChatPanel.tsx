@@ -251,12 +251,18 @@ export const ChatPanel: React.FC<{ store: AppStore }> = observer(({ store }) => 
   const profiles = store.settings?.models.profiles || []
   const activeProfileId = store.settings?.models.activeProfileId
 
-  const handleAskDecision = async (msg: ChatMessage, decision: 'allow' | 'deny') => {
+  const handleAskDecision = async (messageId: string, decision: 'allow' | 'deny') => {
     const sessionId = activeSession?.id
-    const approvalId = msg.metadata?.approvalId
-    if (!sessionId || !approvalId || msg.metadata?.decision) return
-    store.chat.removeMessage(msg.id, sessionId)
-    await window.gyshell.agent.replyCommandApproval(approvalId, decision)
+    if (!sessionId) return
+    
+    const msg = activeSession.messagesById.get(messageId)
+    if (msg?.backendMessageId) {
+      // 1. Immediately remove from UI for instant feedback
+      store.chat.removeMessage(messageId, sessionId)
+      // 2. Send decision using backendMessageId
+      console.log(`[ChatPanel] Sending decision ${decision} for feedbackId=${msg.backendMessageId}`);
+      await window.gyshell.agent.replyMessage(msg.backendMessageId, { decision })
+    }
   }
 
   const handleRollbackConfirm = async () => {
