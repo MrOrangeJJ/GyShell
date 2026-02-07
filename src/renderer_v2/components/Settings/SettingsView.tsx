@@ -570,12 +570,12 @@ export const SettingsView: React.FC<{ store: AppStore }> = observer(({ store }) 
               <div className="models-list">
                 {store.settings?.models.items.map((item) => (
                   <div key={item.id} className="model-item" onClick={() => openModelEditor(item.id)}>
-                    {/** Active means text probe passed, or fallback /v1/models passed; Stateless means only /v1/models passed. */}
+                    {/** Active: text probe passed. Stateless: text failed but /v1/models passed. */}
                     {(() => {
-                      const isActive = Boolean(item.profile?.ok)
+                      const isActive = Boolean(item.profile?.textOutputs)
                       const supportsImage = Boolean(item.profile?.imageInputs)
                       const isStateless =
-                        isActive &&
+                        Boolean(item.profile?.ok) &&
                         item.profile?.textOutputs === false &&
                         !supportsImage
 
@@ -589,14 +589,13 @@ export const SettingsView: React.FC<{ store: AppStore }> = observer(({ store }) 
                           <div className="model-meta">
                               {isActive ? (
                                   <span className="tag active">Active</span>
+                              ) : isStateless ? (
+                                  <span className="tag warning">Stateless</span>
                               ) : (
                                   <span className="tag inactive">NoActive</span>
                               )}
                               {supportsImage ? (
                                   <span className="tag image"><Image size={10} /> Image</span>
-                              ) : null}
-                              {isStateless ? (
-                                  <span className="tag warning">Stateless</span>
                               ) : null}
                           </div>
                         </>
