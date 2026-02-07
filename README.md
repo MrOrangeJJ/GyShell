@@ -28,11 +28,13 @@ Unlike traditional AI assistants that merely generate scripts or execute one-off
 *   **Real-Time Human Intervention**: You are always in control. You can watch the Agent type in real-time and intervene at any moment. The terminal remains fully interactive even while the Agent is working.
 *   **Multi-Tab Mastery**: A single Agent can orchestrate tasks across **multiple terminal tabs** simultaneously. It can compile code in one tab, check logs in another, and deploy in a third.
 *   **Smart Context Mentions**: Use **@mentions** to instantly provide the Agent with the context of specific terminal tabs, skills, or files.
+*   **Brand New CLI UI**: An immersive command-line style interface designed for developers, seamlessly blending AI collaboration with terminal operations.
 
 ### ⚡ Deep Shell Optimization
 GyShell is built from the ground up to understand the nuances of terminal interaction:
 *   **Intelligent Execution Modes**: The Agent automatically decides whether to **Wait** for a command to finish or run in **No-Wait (Async) Mode** (for servers or interactive UIs).
 *   **Terminal Idle Detection**: The `wait_terminal_idle` tool allows the Agent to wait for terminal output to stabilize before proceeding, perfect for long-running installations.
+*   **Enhanced Execution Control**: Support for manually **Skipping** steps during execution, with a unified status feedback protocol.
 *   **C0 Control Characters & Signals**: Beyond just text, the Agent can send raw **Control Characters** (such as `Ctrl+C`, `ESC`, or `Enter`) to manage interactive programs like `vim` or `top`.
 *   **Clean History Integration**: GyShell tracks command status and environment changes seamlessly without injecting messy wrapper scripts.
 
@@ -69,11 +71,13 @@ GyShell is built from the ground up to understand the nuances of terminal intera
 *   **实时人工介入**：你始终拥有最高控制权。你可以实时观察 Agent 的输入过程，并随时介入操作。即使 Agent 正在工作，终端也保持完全的交互能力。
 *   **多标签页统筹**：单个 Agent 可以同时操控**多个终端标签页**。它可以在一个标签页编译代码，在另一个查看日志，并在第三个进行部署。
 *   **智能上下文提及**：通过 **@提及 (@mentions)** 快速为 Agent 提供特定标签页、技能或文件的上下文信息。
+*   **全新 CLI 风格 UI**：专为开发者设计的沉浸式命令行风格界面，让 AI 协作与终端操作无缝融合。
 
 ### ⚡ 深度 Shell 交互优化
 GyShell 针对终端交互的细微差别进行了底层优化：
 *   **智能执行模式**：Agent 会自动判断是**等待执行完成**，还是以**不等待（异步）模式**运行（适用于启动服务器或交互式 UI）。
 *   **终端空闲检测**：新增 `wait_terminal_idle` 工具，允许 Agent 自动等待终端输出稳定后再继续，完美处理长时间安装或编译任务。
+*   **执行控制增强**：支持在任务执行过程中手动**跳过 (Skip)** 特定步骤，并统一了任务状态反馈协议。
 *   **C0 控制字符与信号**：除了发送文本，Agent 还能发送原始的 **C0 控制字符**（如 `Ctrl+C`、`ESC` 或 `Enter`），从而精准操控 `vim`、`top` 等交互式程序。
 *   **纯净的历史记录集成**：无缝追踪指令状态 and 路径切换，无需在您的终端历史中注入杂乱的包装脚本。
 
