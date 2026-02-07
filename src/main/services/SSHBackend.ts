@@ -487,17 +487,21 @@ Write-Output "__GYSHELL_READY__"
 
         emit('\x1b[36m▹ Opening interactive shell...\x1b[0m\r\n')
         console.log(`[SSH] Opening interactive shell...`)
-        client.shell({ 
-          term: 'xterm-256color', 
-          cols: config.cols, 
-          rows: config.rows,
-          // Fix for Chinese characters rendering issues in packaged apps
-          // Setting LC_ALL and LANG to UTF-8 ensures the remote shell uses UTF-8 encoding
-          env: {
-            LC_ALL: 'en_US.UTF-8',
-            LANG: 'en_US.UTF-8'
-          }
-        }, (err, stream) => {
+        client.shell(
+          { 
+            term: 'xterm-256color', 
+            cols: config.cols, 
+            rows: config.rows,
+          },
+          {
+            // Fix for Chinese characters rendering issues in packaged apps
+            // Setting LC_ALL and LANG to UTF-8 ensures the remote shell uses UTF-8 encoding
+            env: {
+              LC_ALL: 'en_US.UTF-8',
+              LANG: 'en_US.UTF-8'
+            }
+          },
+          (err, stream) => {
           if (err) {
             console.error(`[SSH] Failed to open shell:`, err)
             emit(`\x1b[31m✘ Failed to open shell: ${err.message}\x1b[0m\r\n`)

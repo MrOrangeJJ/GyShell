@@ -157,7 +157,7 @@ export const en = {
       empty: 'No chat history yet',
       messages: 'messages',
       deleteSession: 'Delete session',
-      deleteSelected: 'Delete selected',
+      deleteSelected: 'Delete',
       selectAll: 'Select all',
       confirmDeleteTitle: 'Delete Chat History',
       confirmDeleteMessage: 'Are you sure you want to delete the selected chat history? This action cannot be undone.',

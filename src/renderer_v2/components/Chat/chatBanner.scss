@@ -58,12 +58,18 @@
   }
 
   .alert-body {
-    padding: 0 12px 10px 12px;
+    padding: 10px 12px 12px 12px;
     cursor: pointer;
+
+    .alert-content {
+      font-family: var(--font-mono);
+      font-size: 12px;
+      line-height: 1.5;
+    }
 
     .alert-hint {
       font-size: 11px;
-      margin-top: 6px;
+      margin-top: 8px;
       opacity: 0.6;
       text-decoration: underline;
     }
@@ -118,18 +124,19 @@
 }
 
 .gyshell-modal {
-  background: var(--app-bg);
-  border: 1px solid var(--border);
-  border-radius: 2px;
-  width: 80%;
-  max-width: 800px;
-  max-height: 80vh;
+  background: var(--panel-bg);
+  border: 1px solid var(--border-strong);
+  border-radius: 4px;
+  width: 90%;
+  max-width: 900px;
+  max-height: 85vh;
   display: flex;
   flex-direction: column;
-  box-shadow: 0 20px 40px rgba(0, 0, 0, 0.4);
+  box-shadow: 0 20px 50px rgba(0, 0, 0, 0.5);
 
   .modal-header {
-    padding: 16px 20px;
+    padding: 10px 16px;
+    background: color-mix(in srgb, var(--fg) 5%, transparent);
     border-bottom: 1px solid var(--border);
     display: flex;
     align-items: center;
@@ -137,9 +144,24 @@
 
     h3 {
       margin: 0;
-      font-size: 16px;
-      font-weight: 600;
-      color: var(--fg);
+      font-family: var(--font-mono);
+      font-size: 12px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 1px;
+      color: var(--danger);
+      display: flex;
+      align-items: center;
+      gap: 8px;
+
+      &::before {
+        content: '[';
+        opacity: 0.5;
+      }
+      &::after {
+        content: ']';
+        opacity: 0.5;
+      }
     }
 
     .modal-close-btn {
@@ -156,26 +178,27 @@
 
       &:hover {
         color: var(--fg);
-        background: rgba(var(--fg-rgb), 0.1);
+        background: color-mix(in srgb, var(--fg) 10%, transparent);
       }
     }
   }
 
   .modal-body {
-    padding: 20px;
+    padding: 0;
     overflow-y: auto;
+    background: var(--app-bg);
 
     .error-details-pre {
       margin: 0;
       white-space: pre-wrap;
       word-break: break-all;
       font-family: var(--font-mono);
-      font-size: 13px;
-      line-height: 1.6;
+      font-size: 11px;
+      line-height: 1.5;
       color: var(--fg);
-      background: rgba(0, 0, 0, 0.2);
-      padding: 12px;
-      border-radius: 8px;
+      background: transparent;
+      padding: 16px;
+      border-radius: 0;
     }
   }
 }

@@ -369,9 +369,17 @@ export class ChatStore {
       await window.gyshell.agent.deleteChatSession(sessionId)
       
       runInAction(() => {
+        const wasActive = this.activeSessionId === sessionId
         this.sessions = this.sessions.filter(s => s.id !== sessionId)
-        if (this.activeSessionId === sessionId) {
-          this.activeSessionId = null
+        
+        if (wasActive) {
+          // If we deleted the active session, we need a new active session
+          // But we don't necessarily want to trigger UI navigation if we're in a modal
+          if (this.sessions.length > 0) {
+            this.activeSessionId = this.sessions[0].id
+          } else {
+            this.createSession()
+          }
         }
       })
       this.queue.clearSession(sessionId)

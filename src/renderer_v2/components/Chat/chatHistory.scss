@@ -21,6 +21,16 @@
   display: flex;
   flex-direction: column;
   box-shadow: 0 20px 50px rgba(0, 0, 0, 0.5);
+  position: relative; // For selection box
+  user-select: none; // Prevent text selection during drag
+}
+
+.selection-box {
+  position: fixed;
+  background: color-mix(in srgb, var(--accent) 20%, transparent);
+  border: 1px solid var(--accent);
+  pointer-events: none;
+  z-index: 10000;
 }
 
 .chat-history-header {
@@ -30,6 +40,7 @@
   padding: 12px 16px;
   border-bottom: 1px solid var(--border-strong);
   background: color-mix(in srgb, var(--fg) 5%, transparent);
+  position: relative; // For absolute positioning of actions
 }
 
 .chat-history-title {
@@ -46,28 +57,74 @@
 
 .chat-history-actions {
   display: flex;
+  flex-direction: row-reverse;
   align-items: center;
   gap: 12px;
-  margin-left: auto;
-  margin-right: 12px;
+  position: absolute;
+  right: 48px; // Space for close button
+  top: 50%;
+  transform: translateY(-50%);
+}
+
+.chat-history-mode-toggle {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  font-family: var(--font-mono);
+  text-transform: uppercase;
+  font-weight: 700;
+  color: var(--fg-muted);
+  cursor: pointer;
+  padding: 4px 10px;
+  border-radius: 4px;
+  transition: all 0.15s;
+  border: 1px solid var(--border);
+  background: color-mix(in srgb, var(--fg) 3%, transparent);
+  white-space: nowrap;
+  min-width: 100px;
+  justify-content: center;
+
+  &:hover {
+    background: color-mix(in srgb, var(--fg) 8%, transparent);
+    color: var(--fg);
+    border-color: var(--fg-muted);
+  }
+
+  &.active {
+    background: color-mix(in srgb, var(--accent) 15%, transparent);
+    border-color: var(--accent);
+    color: var(--accent);
+  }
 }
 
 .chat-history-select-all {
   display: flex;
   align-items: center;
   gap: 6px;
-  font-size: 13px;
-  color: var(--text-secondary);
+  font-size: 11px;
+  font-family: var(--font-mono);
+  text-transform: uppercase;
+  font-weight: 700;
+  color: var(--fg-muted);
   cursor: pointer;
   user-select: none;
+  padding: 4px 8px;
+  border-radius: 4px;
+  transition: all 0.15s;
 
-  input[type="checkbox"] {
-    cursor: pointer;
+  svg {
     flex-shrink: 0;
+    opacity: 0.7;
   }
 
   &:hover {
-    color: var(--text-primary);
+    background: color-mix(in srgb, var(--fg) 5%, transparent);
+    color: var(--fg);
+    
+    svg {
+      opacity: 1;
+    }
   }
 }
 
