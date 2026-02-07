@@ -1,5 +1,7 @@
 # <img src="icon.png" width="40" height="40" valign="middle"> GyShell
 
+> **v0.1.3 has been released! [Check out here](./changelogs/v0.1.3.md)**
+
 > **The AI-Native Terminal that Thinks with You.**  
 
 [![License](https://img.shields.io/badge/License-CC_BY--NC_4.0-lightgrey.svg)](https://creativecommons.org/licenses/by-nc/4.0/)
