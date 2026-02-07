@@ -1,5 +1,5 @@
 import React, { useMemo, useState } from 'react'
-import { ArrowLeft, Cpu, Palette, Settings, Plus, Trash2, X, Key, Globe, Box, Tag, Shield, Image, Loader2, Wrench, RefreshCw, BookOpenText, Pencil } from 'lucide-react'
+import { ArrowLeft, Cpu, Palette, Settings, Plus, Trash2, X, Key, Globe, Box, Tag, Shield, Image, Loader2, Wrench, RefreshCw, BookOpenText, Pencil, Info, AlertTriangle } from 'lucide-react'
 import { observer } from 'mobx-react-lite'
 import type { AppStore } from '../../stores/AppStore'
 import type { ModelDefinition } from '../../lib/ipcTypes'
@@ -205,6 +205,11 @@ export const SettingsView: React.FC<{ store: AppStore }> = observer(({ store }) 
   })
 
   const cpLists = useMemo(() => store.commandPolicyLists, [store.commandPolicyLists])
+  const versionInfo = store.versionInfo
+  const formattedCheckedAt =
+    versionInfo?.checkedAt && versionInfo.checkedAt > 0
+      ? new Date(versionInfo.checkedAt).toLocaleString()
+      : '-'
 
   const openModelEditor = (id?: string) => {
       setEditingModelId(id || null)
@@ -325,6 +330,17 @@ export const SettingsView: React.FC<{ store: AppStore }> = observer(({ store }) 
               <BookOpenText size={16} strokeWidth={2} />
             </span>
             <span>{t.settings.skills}</span>
+          </div>
+          <div
+            className={store.settingsSection === 'version' ? 'settings-nav-item is-active' : 'settings-nav-item'}
+            onClick={() => store.setSettingsSection('version')}
+            role="button"
+            tabIndex={0}
+          >
+            <span className="icon">
+              <Info size={16} strokeWidth={2} />
+            </span>
+            <span>{t.settings.version}</span>
           </div>
         </div>
       </div>
@@ -1011,11 +1027,70 @@ export const SettingsView: React.FC<{ store: AppStore }> = observer(({ store }) 
               {store.skills.length === 0 ? <div className="tool-empty">{t.settings.noSkills}</div> : null}
             </>
           ) : null}
+
+          {store.settingsSection === 'version' ? (
+            <>
+              <div className="settings-section-header">
+                <div className="settings-section-title">{t.settings.version}</div>
+                <div className="settings-actions">
+                  <button
+                    className="btn-secondary"
+                    onClick={() => store.checkVersion()}
+                    disabled={store.versionCheckInProgress}
+                  >
+                    {store.versionCheckInProgress ? `${t.settings.checkingVersion}...` : t.settings.checkVersion}
+                  </button>
+                </div>
+              </div>
+
+              <div className="version-grid">
+                <div className="version-item">
+                  <span className="version-label">{t.settings.currentVersion}</span>
+                  <span className="version-value">{versionInfo?.currentVersion || '-'}</span>
+                </div>
+                <div className="version-item">
+                  <span className="version-label">{t.settings.latestVersion}</span>
+                  <span className="version-value">{versionInfo?.latestVersion || '-'}</span>
+                </div>
+                <div className="version-item">
+                  <span className="version-label">{t.settings.versionStatus}</span>
+                  <span className={`version-status version-status-${versionInfo?.status || 'up-to-date'}`}>
+                    {versionInfo?.status === 'update-available'
+                      ? t.settings.updateAvailable
+                      : versionInfo?.status === 'error'
+                      ? t.settings.versionCheckFailed
+                      : t.settings.upToDate}
+                  </span>
+                </div>
+                <div className="version-item">
+                  <span className="version-label">{t.settings.lastCheckedAt}</span>
+                  <span className="version-value">{formattedCheckedAt}</span>
+                </div>
+                <div className="version-item">
+                  <span className="version-label">{t.settings.versionSource}</span>
+                  <span className="version-value">{versionInfo?.sourceUrl || '-'}</span>
+                </div>
+                <div className="version-item">
+                  <span className="version-label">{t.settings.downloadPage}</span>
+                  <span className="version-value">{versionInfo?.downloadUrl || '-'}</span>
+                </div>
+              </div>
+
+              {versionInfo?.status === 'error' && versionInfo.warning ? (
+                <div className="version-warning">
+                  <AlertTriangle size={13} />
+                  <span>{t.settings.versionNetworkWarning(versionInfo.warning)}</span>
+                </div>
+              ) : null}
+
+              <div className="settings-card version-note-card">
+                <div className="version-note-title">{t.settings.versionCheckNoteTitle}</div>
+                <div className="version-note-content">{t.settings.versionCheckNote}</div>
+              </div>
+            </>
+          ) : null}
         </div>
       </div>
     </div>
   )
 })
-
-
-

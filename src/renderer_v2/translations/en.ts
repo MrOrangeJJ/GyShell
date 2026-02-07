@@ -38,6 +38,7 @@ export const en = {
     terminal: 'Terminal',
     tools: 'Tools',
     skills: 'Skills',
+    version: 'Version',
     language: 'Language',
     fontSize: 'Font Size',
     lineHeight: 'Line Height',
@@ -91,6 +92,25 @@ export const en = {
     reloadSkills: 'Reload',
     addSkill: 'Add Skill',
     noSkills: 'No skills found',
+    checkVersion: 'Check Updates',
+    checkingVersion: 'Checking',
+    currentVersion: 'Current Version',
+    latestVersion: 'Latest Version',
+    versionStatus: 'Status',
+    versionSource: 'Source URL',
+    downloadPage: 'Download URL',
+    upToDate: 'Up to Date',
+    updateAvailable: 'Update Available',
+    versionCheckFailed: 'Check Failed',
+    lastCheckedAt: 'Last Checked',
+    goToDownload: 'Open Download Page',
+    versionUpdateTitle: 'Update Available',
+    versionUpdateMessage: (current: string, latest: string) =>
+      `A newer version is available (${current} -> ${latest}). Please manually visit the download page to update.`,
+    versionNetworkWarning: (detail: string) => `Version check failed: ${detail}`,
+    versionCheckNoteTitle: 'Privacy Note',
+    versionCheckNote:
+      'Version checks are sent only to this project GitHub repository (version.json). No third-party websites are contacted. This is the only network request the app may perform automatically in the background.',
     commandPolicyModes: {
       safe: 'Safe',
       standard: 'Standard',
@@ -180,4 +200,3 @@ export const en = {
     },
   },
 }
-

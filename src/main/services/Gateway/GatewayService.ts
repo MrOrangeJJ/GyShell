@@ -13,6 +13,7 @@ import type { SettingsService } from '../SettingsService';
 import type { ModelCapabilityService } from '../ModelCapabilityService';
 import type { McpToolService } from '../McpToolService';
 import type { ThemeService } from '../ThemeService';
+import type { VersionService } from '../VersionService';
 import { BUILTIN_TOOL_INFO } from '../AgentHelper/tools';
 import { resolveTheme } from '../../../renderer_v2/theme/themes';
 
@@ -33,7 +34,8 @@ export class GatewayService extends EventEmitter implements IGateway {
     private settingsService: SettingsService,
     private modelCapabilityService: ModelCapabilityService,
     private mcpToolService: McpToolService,
-    private themeService: ThemeService
+    private themeService: ThemeService,
+    private versionService: VersionService
   ) {
     super();
     // Register default Electron transport
@@ -348,6 +350,15 @@ export class GatewayService extends EventEmitter implements IGateway {
 
     ipcMain.handle('themes:getCustom', async () => {
       return await this.themeService.loadCustomThemes();
+    });
+
+    // --- Version ---
+    ipcMain.handle('version:getState', async () => {
+      return this.versionService.getState();
+    });
+
+    ipcMain.handle('version:check', async () => {
+      return await this.versionService.checkForUpdates();
     });
 
     // --- Terminal ---

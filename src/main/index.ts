@@ -12,6 +12,7 @@ import { SkillService } from './services/SkillService'
 import { UIHistoryService } from './services/UIHistoryService'
 import { GatewayService } from './services/Gateway/GatewayService'
 import { TempFileService } from './services/TempFileService'
+import { VersionService } from './services/VersionService'
 
 let mainWindow: BrowserWindow | null = null
 let settingsService: SettingsService
@@ -25,6 +26,7 @@ let skillService: SkillService
 let uiHistoryService: UIHistoryService
 let gatewayService: GatewayService
 let tempFileService: TempFileService
+let versionService: VersionService
 
 function createWindow(): void {
   const settings = settingsService.getSettings()
@@ -129,6 +131,7 @@ app.whenReady().then(async () => {
   themeService = new ThemeService()
   uiHistoryService = new UIHistoryService()
   tempFileService = new TempFileService()
+  versionService = new VersionService()
   
   // Cleanup old pastes on startup
   void tempFileService.cleanup()
@@ -148,7 +151,8 @@ app.whenReady().then(async () => {
     settingsService,
     modelCapabilityService,
     mcpToolService,
-    themeService
+    themeService,
+    versionService
   )
   // Mount to global for AgentHelper and Gateway (temporary solution)
   ;(global as any).gateway = gatewayService;

@@ -61,6 +61,7 @@
   line-height: 1.45;
   color: var(--fg-muted);
   text-align: center;
+  white-space: pre-line;
 }
 
 .gy-confirm-footer {
@@ -110,5 +111,4 @@
 .gy-btn-danger:hover {
   filter: brightness(1.06);
 }
-
 

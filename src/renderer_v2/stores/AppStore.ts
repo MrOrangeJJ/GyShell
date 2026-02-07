@@ -22,12 +22,13 @@ const removeById = <T extends { id: string }>(list: T[], id: string): T[] =>
   list.filter((x) => x.id !== id)
 
 export type AppView = 'main' | 'settings' | 'connections'
-export type SettingsSection = 'general' | 'theme' | 'models' | 'security' | 'tools' | 'skills'
+export type SettingsSection = 'general' | 'theme' | 'models' | 'security' | 'tools' | 'skills' | 'version'
 
 export type McpToolSummary = Awaited<ReturnType<Window['gyshell']['tools']['getMcp']>>[number]
 export type BuiltInToolSummary = Awaited<ReturnType<Window['gyshell']['tools']['getBuiltIn']>>[number]
 export type SkillSummary = Awaited<ReturnType<Window['gyshell']['skills']['getAll']>>[number]
 export type CommandPolicyLists = Awaited<ReturnType<Window['gyshell']['settings']['getCommandPolicyLists']>>
+export type VersionCheckResult = Awaited<ReturnType<Window['gyshell']['version']['check']>>
 
 export interface TerminalTabModel {
   id: string
@@ -55,6 +56,9 @@ export class AppStore {
   builtInTools: BuiltInToolSummary[] = []
   skills: SkillSummary[] = []
   commandPolicyLists: CommandPolicyLists = { allowlist: [], denylist: [], asklist: [] }
+  versionInfo: VersionCheckResult | null = null
+  versionCheckInProgress = false
+  showVersionUpdateDialog = false
 
   constructor() {
     makeObservable(this, {
@@ -74,6 +78,9 @@ export class AppStore {
       builtInTools: observable,
       skills: observable,
       commandPolicyLists: observable,
+      versionInfo: observable,
+      versionCheckInProgress: observable,
+      showVersionUpdateDialog: observable,
       isSettings: computed,
       isConnections: computed,
       activeTerminal: computed,
@@ -124,7 +131,11 @@ export class AppStore {
       setSkillEnabled: action,
       setRecursionLimit: action,
       sendChatMessage: action,
-      getUniqueTitle: action
+      getUniqueTitle: action,
+      loadVersionState: action,
+      checkVersion: action,
+      closeVersionUpdateDialog: action,
+      openVersionDownload: action
     })
     this.chat.setQueueRunner((sessionId, content) => this.sendChatMessage(sessionId, content, { mode: 'queue' }))
   }
@@ -179,6 +190,49 @@ export class AppStore {
 
   setSettingsSection(section: SettingsSection): void {
     this.settingsSection = section
+  }
+
+  async loadVersionState(): Promise<void> {
+    try {
+      const state = await window.gyshell.version.getState()
+      runInAction(() => {
+        this.versionInfo = state
+      })
+    } catch (err) {
+      console.error('Failed to load version state', err)
+    }
+  }
+
+  async checkVersion(options?: { showPopupOnUpdate?: boolean }): Promise<void> {
+    if (this.versionCheckInProgress) return
+    runInAction(() => {
+      this.versionCheckInProgress = true
+    })
+    try {
+      const result = await window.gyshell.version.check()
+      runInAction(() => {
+        this.versionInfo = result
+        if (result.status === 'update-available' && options?.showPopupOnUpdate) {
+          this.showVersionUpdateDialog = true
+        }
+      })
+    } catch (err) {
+      console.error('Failed to check version', err)
+    } finally {
+      runInAction(() => {
+        this.versionCheckInProgress = false
+      })
+    }
+  }
+
+  closeVersionUpdateDialog(): void {
+    this.showVersionUpdateDialog = false
+  }
+
+  async openVersionDownload(): Promise<void> {
+    const url = this.versionInfo?.downloadUrl
+    if (!url) return
+    await window.gyshell.system.openExternal(url)
   }
 
   async setLanguage(lang: AppLanguage): Promise<void> {
@@ -452,6 +506,8 @@ export class AppStore {
       void this.loadTools()
       void this.loadSkills()
       void this.loadCommandPolicyLists()
+      void this.loadVersionState()
+      void this.checkVersion({ showPopupOnUpdate: true })
     } catch (err) {
       console.error('Failed to bootstrap settings', err)
       runInAction(() => {
@@ -463,6 +519,8 @@ export class AppStore {
       void this.loadTools()
       void this.loadSkills()
       void this.loadCommandPolicyLists()
+      void this.loadVersionState()
+      void this.checkVersion({ showPopupOnUpdate: true })
     }
   }
 

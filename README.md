@@ -49,6 +49,7 @@ GyShell is built from the ground up to understand the nuances of terminal intera
 *   **Context Awareness**: The AI "sees" your terminal output, understands your CWD, and can even process files you've highlighted in the UI.
 *   **Token Management**: Built-in intelligent pruning ensures your long conversations stay within model limits without losing critical context.
 *   **Model Compatibility**: Supports any LLM that provides an **OpenAI-compatible API**.
+*   **GitHub-Only Version Check**: Built-in Version settings page with manual "Check Updates", startup auto-check, and update dialog. The app checks only this repository's `version.json` on GitHub (with ETag cache), with no third-party update endpoint.
 
 ### 🌐 Professional Shell & SSH Client
 *   **Comprehensive Shell Support**: Deeply integrated with **Zsh**, **Bash**, and **PowerShell**.
@@ -92,6 +93,7 @@ GyShell 针对终端交互的细微差别进行了底层优化：
 *   **上下文感知**：AI 能“看见”您的终端输出，理解当前工作目录（CWD），并支持通过 **@提及** 引用资源。
 *   **Token 管理**：内置智能剪裁机制，确保长对话在模型限制内运行，同时不丢失关键上下文。
 *   **模型兼容性**：支持所有提供 **OpenAI 兼容接口** 的大语言模型。
+*   **仅 GitHub 的版本检查**：内置 Version 设置页，支持手动“检查更新”、启动自动检查与更新提示弹窗。应用只会请求本仓库 GitHub 上的 `version.json`（含 ETag 缓存），不使用任何第三方更新接口。
 
 ### 🌐 专业级 Shell 与 SSH
 *   **全方位 Shell 支持**：深度集成 **Zsh**、**Bash** 和 **PowerShell**。

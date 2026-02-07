@@ -7,6 +7,7 @@ import { ChatPanel } from './components/Chat/ChatPanel'
 import { TerminalPanel } from './components/Terminal/TerminalPanel'
 import { SettingsView } from './components/Settings/SettingsView'
 import { ConnectionsView } from './components/Connections/ConnectionsView'
+import { ConfirmDialog } from './components/Common/ConfirmDialog'
 import './styles/app.scss'
 
 const store = new AppStore()
@@ -18,6 +19,7 @@ export const App: React.FC = observer(() => {
 
   const platform = (window as any)?.gyshell?.system?.platform
   const t = store.i18n.t
+  const versionInfo = store.versionInfo
   const panelGroupRef = React.useRef<any>(null)
   const applyingLayoutRef = React.useRef(false)
   const platformClass =
@@ -44,6 +46,19 @@ export const App: React.FC = observer(() => {
 
   return (
     <div className={`gyshell ${platformClass}`}>
+      <ConfirmDialog
+        open={store.showVersionUpdateDialog && !!versionInfo && versionInfo.status === 'update-available'}
+        title={t.settings.versionUpdateTitle}
+        message={`${t.settings.versionUpdateMessage(versionInfo?.currentVersion || '-', versionInfo?.latestVersion || '-')}\n\n${t.settings.versionCheckNote}`}
+        confirmText={t.settings.goToDownload}
+        cancelText={t.common.close}
+        onCancel={() => store.closeVersionUpdateDialog()}
+        onConfirm={() => {
+          void store.openVersionDownload()
+          store.closeVersionUpdateDialog()
+        }}
+      />
+
       <TopBar store={store} />
 
       <div className="gyshell-body">
@@ -127,5 +142,3 @@ export const App: React.FC = observer(() => {
     </div>
   )
 })
-
-

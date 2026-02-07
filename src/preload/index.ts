@@ -174,6 +174,18 @@ interface TerminalColorScheme {
   cursorAccent?: string
 }
 
+interface VersionCheckResult {
+  status: 'up-to-date' | 'update-available' | 'error'
+  currentVersion: string
+  latestVersion?: string
+  downloadUrl: string
+  releaseNotes?: string
+  note: string
+  checkedAt: number
+  sourceUrl: string
+  warning?: string
+}
+
 // Connection Config Types
 export type ConnectionType = 'local' | 'ssh'
 
@@ -305,6 +317,11 @@ export interface GyShellAPI {
     setEnabled: (name: string, enabled: boolean) => Promise<SkillSummary[]>
     onUpdated: (callback: (data: SkillSummary[]) => void) => () => void
   }
+
+  version: {
+    getState: () => Promise<VersionCheckResult>
+    check: () => Promise<VersionCheckResult>
+  }
 }
 
 const api: GyShellAPI = {
@@ -419,6 +436,10 @@ const api: GyShellAPI = {
       ipcRenderer.on('skills:updated', handler)
       return () => ipcRenderer.off('skills:updated', handler)
     }
+  },
+  version: {
+    getState: () => ipcRenderer.invoke('version:getState'),
+    check: () => ipcRenderer.invoke('version:check')
   }
 }
 
