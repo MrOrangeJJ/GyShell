@@ -27,15 +27,6 @@ interface RingBuffer {
   offset: number
 }
 
-interface TaskObserver {
-  terminalId: string
-  onFinished: (result: CommandResult) => void
-  onError: (error: Error) => void
-  timeoutTimer?: NodeJS.Timeout
-  abortSignal?: AbortSignal
-  abortListener?: () => void
-}
-
 export class TerminalService {
   private backends: Map<ConnectionType, TerminalBackend> = new Map()
   private terminals: Map<string, TerminalTab> = new Map()
@@ -44,8 +35,8 @@ export class TerminalService {
   private selectionByTerminal: Map<string, string> = new Map()
   private tasksByTerminal: Map<string, Record<string, CommandTask>> = new Map()
   private activeTaskByTerminal: Map<string, string> = new Map()
-  private waitersByTaskId: Map<string, TaskObserver> = new Map()
   private oscParseBufByTerminal: Map<string, string> = new Map()
+  private onTaskFinishedCallbacks: Map<string, (result: CommandResult) => void> = new Map()
 
   constructor() {
     this.backends.set('local', new NodePtyBackend())
@@ -226,11 +217,7 @@ export class TerminalService {
         task.exitCode = typeof code === 'number' ? code : -1
       }
       this.activeTaskByTerminal.delete(terminalId)
-      const observer = this.waitersByTaskId.get(activeTaskId)
-      if (observer) {
-        this.cleanupWaiter(activeTaskId)
-        observer.onError(new Error('Terminal exited while command was running.'))
-      }
+      this.onTaskFinishedCallbacks.delete(activeTaskId)
     }
 
     // If terminal was still initializing, we do NOT delete it from the map.
@@ -498,81 +485,67 @@ export class TerminalService {
     return { found: matches }
   }
 
-  async runCommandNoWait(terminalId: string, command: string): Promise<string> {
-    const taskId = await this.executeCommandInternal(terminalId, command, 'nowait', {
-      terminalId,
-      onFinished: () => {
-        /* nowait: just let it finish in background */
-      },
-      onError: (err) => {
-        console.error(`[TerminalService] Async command "${command}" failed:`, err)
-      }
-    })
+  async runCommandNoWait(terminalId: string, command: string, onFinished?: (result: CommandResult) => void): Promise<string> {
+    const taskId = await this.executeCommandInternal(terminalId, command, 'nowait', onFinished)
     return taskId
   }
 
   async runCommandAndWait(
     terminalId: string,
     command: string,
+    opts?: { signal?: AbortSignal; interruptOnAbort?: boolean; onFinished?: (result: CommandResult) => void }
+  ): Promise<CommandResult> {
+    const taskId = await this.executeCommandInternal(terminalId, command, 'wait', opts?.onFinished)
+    return this.waitForTask(terminalId, taskId, opts)
+  }
+
+  async waitForTask(
+    terminalId: string,
+    taskId: string,
     opts?: { signal?: AbortSignal; interruptOnAbort?: boolean }
   ): Promise<CommandResult> {
-    return new Promise<CommandResult>((resolve, reject) => {
-      const observer: TaskObserver = {
-        terminalId,
-        onFinished: resolve,
-        onError: reject,
-        abortSignal: opts?.signal
+    const startTime = Date.now()
+    const timeoutMs = 120_000
+
+    while (true) {
+      if (opts?.signal?.aborted) {
+        if (opts.interruptOnAbort !== false) {
+          this.interrupt(terminalId)
+          this.markTaskAborted(terminalId, taskId)
+        }
+        return { stdoutDelta: 'Command aborted by user.', exitCode: -2, history_command_match_id: taskId }
       }
 
-      // Only 'wait' commands have a timeout
-      observer.timeoutTimer = setTimeout(() => {
-        const taskId = this.activeTaskByTerminal.get(terminalId)
-        if (taskId) {
-          this.markTaskTimeout(terminalId, taskId)
-          this.cleanupWaiter(taskId)
-        }
-        resolve({ stdoutDelta: 'Command timed out (120s).', exitCode: -1, history_command_match_id: taskId || '' })
-      }, 120_000)
-
-      if (opts?.signal) {
-        const onAbort = () => {
-          const taskId = this.activeTaskByTerminal.get(terminalId)
-          if (opts.interruptOnAbort !== false) {
-            this.interrupt(terminalId)
-            if (taskId) {
-              this.markTaskAborted(terminalId, taskId)
-              this.cleanupWaiter(taskId)
-            }
-          } else {
-            // If we don't interrupt, we just detach the waiter (Promise)
-            // but keep the task in activeTaskByTerminal so the watch dog
-            // continues to monitor for OSC markers.
-            if (taskId) {
-              this.cleanupWaiter(taskId)
-            }
-          }
-          resolve({ stdoutDelta: 'Command aborted by user.', exitCode: -2, history_command_match_id: taskId || '' })
-        }
-        observer.abortListener = onAbort
-        if (opts.signal.aborted) {
-          onAbort()
-          return
-        }
-        opts.signal.addEventListener('abort', onAbort, { once: true })
+      const task = this.getTaskMap(terminalId)[taskId]
+      if (!task) {
+        throw new Error(`Task ${taskId} not found.`)
       }
 
-      this.executeCommandInternal(terminalId, command, 'wait', observer).catch((err) => {
-        if (observer.timeoutTimer) clearTimeout(observer.timeoutTimer)
-        reject(err)
-      })
-    })
+      if (task.status === 'finished') {
+        return {
+          stdoutDelta: task.output || '',
+          exitCode: task.exitCode ?? -1,
+          history_command_match_id: taskId
+        }
+      }
+
+      if (Date.now() - startTime > timeoutMs) {
+        return {
+          stdoutDelta: 'Command timed out (120s). The process is still running in the background.',
+          exitCode: -1,
+          history_command_match_id: taskId
+        }
+      }
+
+      await new Promise((resolve) => setTimeout(resolve, 500))
+    }
   }
 
   private async executeCommandInternal(
     terminalId: string,
     command: string,
     type: 'wait' | 'nowait',
-    observer: TaskObserver
+    onFinished?: (result: CommandResult) => void
   ): Promise<string> {
     const terminal = this.terminals.get(terminalId)
     if (!terminal) {
@@ -607,12 +580,18 @@ export class TerminalService {
     const taskMap = this.getTaskMap(terminalId)
     taskMap[taskId] = task
     this.activeTaskByTerminal.set(terminalId, taskId)
-    this.waitersByTaskId.set(taskId, observer)
+    if (onFinished) {
+      this.onTaskFinishedCallbacks.set(taskId, onFinished)
+    }
 
     const backend = this.getBackend(terminal.type)
     const eol = terminal.remoteOs === 'windows' ? '\r' : '\n'
     backend.write(terminal.ptyId, `${command}${eol}`)
     return taskId
+  }
+
+  getActiveTaskId(terminalId: string): string | undefined {
+    return this.activeTaskByTerminal.get(terminalId)
   }
 
   private getTaskMap(terminalId: string): Record<string, CommandTask> {
@@ -636,7 +615,7 @@ export class TerminalService {
     const taskId = this.activeTaskByTerminal.get(terminalId)
     if (!taskId) return
     const task = this.getTaskMap(terminalId)[taskId]
-    if (!task || task.status !== 'running') return
+    if (!task || (task.status !== 'running' && task.status !== 'timeout')) return
 
     // Scheme 1: Extract rendered text from headless xterm buffer
     const headless = this.headlessPtys.get(terminalId)
@@ -663,21 +642,11 @@ export class TerminalService {
 
     this.activeTaskByTerminal.delete(terminalId)
 
-    const observer = this.waitersByTaskId.get(taskId)
-    if (observer) {
-      this.cleanupWaiter(taskId)
-      observer.onFinished({ stdoutDelta: task.output, exitCode, history_command_match_id: taskId })
+    const callback = this.onTaskFinishedCallbacks.get(taskId)
+    if (callback) {
+      this.onTaskFinishedCallbacks.delete(taskId)
+      callback({ stdoutDelta: task.output, exitCode, history_command_match_id: taskId })
     }
-  }
-
-  private markTaskTimeout(terminalId: string, taskId: string): void {
-    const task = this.getTaskMap(terminalId)[taskId]
-    if (!task || task.status !== 'running') return
-    task.status = 'timeout'
-    task.endTime = Date.now()
-    task.exitCode = -1
-    task.endOffset = task.startOffset + (task.output?.length || 0)
-    this.activeTaskByTerminal.delete(terminalId)
   }
 
   private markTaskAborted(terminalId: string, taskId: string): void {
@@ -688,16 +657,7 @@ export class TerminalService {
     task.exitCode = -2
     task.endOffset = task.startOffset + (task.output?.length || 0)
     this.activeTaskByTerminal.delete(terminalId)
-  }
-
-  private cleanupWaiter(taskId: string): void {
-    const waiter = this.waitersByTaskId.get(taskId)
-    if (!waiter) return
-    if (waiter.timeoutTimer) clearTimeout(waiter.timeoutTimer)
-    if (waiter.abortSignal && waiter.abortListener) {
-      waiter.abortSignal.removeEventListener('abort', waiter.abortListener)
-    }
-    this.waitersByTaskId.delete(taskId)
+    this.onTaskFinishedCallbacks.delete(taskId)
   }
 
   private stripEchoedCommand(output: string, command: string): string {

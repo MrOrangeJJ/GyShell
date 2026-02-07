@@ -36,6 +36,10 @@ export const waitTerminalIdleSchema = z.object({
   tabIdOrName: z.string().describe('The ID or Name of the terminal tab to monitor')
 })
 
+export const waitCommandEndSchema = z.object({
+  tabIdOrName: z.string().describe('The ID or Name of the terminal tab to wait for the current command to end')
+})
+
 // --- Constants ---
 
 export const C0_NAMES = [
@@ -117,6 +121,15 @@ export async function runCommand(args: z.infer<typeof execCommandSchema>, contex
     })
     const historyCommandMatchId = result.history_command_match_id
     const truncatedOutput = truncateCommandOutput(result.stdoutDelta || '', historyCommandMatchId, bestMatch.id)
+    
+    let finalResult = ''
+    if (result.exitCode === -1 && result.stdoutDelta?.includes('timed out')) {
+      finalResult = `The command "${command}" is still running, but the wait has timed out (120s). You can use read_command_output to check its current progress, or call wait_command_end again if you believe it needs more time to finish. history_command_match_id=${historyCommandMatchId}, terminalId=${bestMatch.id}`
+    } else {
+      finalResult = `The command "${command}" has finished executing. The following is the output (history_command_match_id=${historyCommandMatchId}):
+${truncatedOutput}`
+    }
+
     context.sendEvent(sessionId, { 
       messageId,
       type: 'command_finished', 
@@ -124,9 +137,9 @@ export async function runCommand(args: z.infer<typeof execCommandSchema>, contex
       commandId: messageId,
       tabName: bestMatch.title || bestMatch.id,
       exitCode: result.exitCode,
-      outputDelta: truncatedOutput
+      outputDelta: finalResult
     })
-    return truncatedOutput || `Command executed with exit code ${result.exitCode}`
+    return finalResult
   } catch (error) {
     if (isAbortError(error)) {
       throw error
@@ -136,12 +149,13 @@ export async function runCommand(args: z.infer<typeof execCommandSchema>, contex
     // If it's a "command running" error, append the last terminal output
     if (errorMessage.includes('There is a running exec_command')) {
       const recentOutput = terminalService.getRecentOutput(bestMatch.id) || '(No recent output available)'
+      const activeTaskId = terminalService.getActiveTaskId(bestMatch.id)
       errorMessage = `Error: ${errorMessage}\n\nThe current visible state of the terminal tab "${bestMatch.title || bestMatch.id}" is:
 ================================================================================
 <terminal_content>
 ${recentOutput}
 </terminal_content>
-================================================================================\n\nIf you think you need to exit the current command, use send_char.`
+================================================================================\n\nIf you think you need to exit the current command, use send_char. If you want to wait for it to finish, use wait_command_end.${activeTaskId ? ` history_command_match_id=${activeTaskId}, terminalId=${bestMatch.id}` : ''}`
     }
 
     context.sendEvent(sessionId, { 
@@ -205,19 +219,20 @@ export async function runCommandNowait(args: z.infer<typeof execCommandSchema>, 
 
   try {
     const historyCommandMatchId = await terminalService.runCommandNoWait(bestMatch.id, command)
-    return `Command started in background. Use read_command_output to view output and status(finished or running), history_command_match_id=${historyCommandMatchId}, terminalId=${bestMatch.id}.`
+    return `Command started in background. Use read_command_output to view output and status(finished or running), or use wait_command_end to wait for it to finish. history_command_match_id=${historyCommandMatchId}, terminalId=${bestMatch.id}.`
   } catch (error) {
     let errorMessage = error instanceof Error ? error.message : String(error)
 
     // If it's a "command running" error, append the last terminal output
     if (errorMessage.includes('There is a running exec_command')) {
       const recentOutput = terminalService.getRecentOutput(bestMatch.id) || '(No recent output available)'
+      const activeTaskId = terminalService.getActiveTaskId(bestMatch.id)
       errorMessage = `Error: ${errorMessage}\n\nThe current visible state of the terminal tab "${bestMatch.title || bestMatch.id}" is:
 ================================================================================
 <terminal_content>
 ${recentOutput}
 </terminal_content>
-================================================================================\n\nIf you think you need to exit the current command, use send_char.`
+================================================================================\n\nIf you think you need to exit the current command, use send_char. If you want to wait for it to finish, use wait_command_end.${activeTaskId ? ` history_command_match_id=${activeTaskId}, terminalId=${bestMatch.id}` : ''}`
     }
 
     context.sendEvent(sessionId, { 
@@ -531,6 +546,84 @@ ${currentOutput}
   })
 
   return timeoutMsg
+}
+
+export async function waitCommandEnd(
+  args: z.infer<typeof waitCommandEndSchema>,
+  context: ToolExecutionContext
+): Promise<string> {
+  const { tabIdOrName } = args
+  const { terminalService, sessionId, messageId, sendEvent } = context
+
+  abortIfNeeded(context.signal)
+  const { found, bestMatch } = terminalService.resolveTerminal(tabIdOrName)
+  if (!bestMatch) {
+    return found.length > 1
+      ? `Error: Multiple terminal tabs found with name "${tabIdOrName}".`
+      : `Error: Terminal tab "${tabIdOrName}" not found.`
+  }
+
+  const taskId = terminalService.getActiveTaskId(bestMatch.id)
+  if (!taskId) {
+    return `No running command found in terminal tab "${bestMatch.title || bestMatch.id}".`
+  }
+
+  sendEvent(sessionId, {
+    messageId,
+    type: 'sub_tool_started',
+    toolName: 'wait_command_end',
+    title: `Waiting for command to end in ${bestMatch.title || bestMatch.id}`,
+    hint: ''
+  })
+
+  try {
+    const result = await terminalService.waitForTask(bestMatch.id, taskId, {
+      signal: context.signal,
+      interruptOnAbort: false
+    })
+
+    const task = terminalService.getCommandTask(bestMatch.id, taskId)
+    const commandName = task?.command || 'Unknown command'
+    const historyCommandMatchId = result.history_command_match_id
+    const truncatedOutput = truncateCommandOutput(result.stdoutDelta || '', historyCommandMatchId, bestMatch.id)
+    
+    let finalResult = ''
+    if (result.exitCode === -1 && result.stdoutDelta?.includes('timed out')) {
+      finalResult = `The command "${commandName}" is still running, but the wait has timed out (120s). You can use read_command_output to check its current progress, or call wait_command_end again if you believe it needs more time to finish. history_command_match_id=${historyCommandMatchId}, terminalId=${bestMatch.id}`
+    } else {
+      finalResult = `The command "${commandName}" has finished executing. The following is the output (history_command_match_id=${historyCommandMatchId}):
+${truncatedOutput}`
+    }
+
+    sendEvent(sessionId, {
+      messageId,
+      type: 'sub_tool_delta',
+      outputDelta: finalResult
+    })
+    
+    sendEvent(sessionId, {
+      messageId,
+      type: 'sub_tool_finished'
+    })
+
+    return finalResult
+  } catch (error) {
+    if (isAbortError(error)) throw error
+    const errorMessage = error instanceof Error ? error.message : String(error)
+    
+    sendEvent(sessionId, {
+      messageId,
+      type: 'sub_tool_delta',
+      outputDelta: errorMessage
+    })
+    
+    sendEvent(sessionId, {
+      messageId,
+      type: 'sub_tool_finished'
+    })
+    
+    return errorMessage
+  }
 }
 
 // --- Internal Helpers ---

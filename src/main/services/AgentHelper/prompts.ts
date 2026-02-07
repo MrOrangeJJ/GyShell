@@ -91,8 +91,9 @@ export const READ_COMMAND_OUTPUT_DESCRIPTION =
   'Read historical output of a specific command by history_command_match_id and terminal tab. Supports offset/limit for paging large outputs.'
 export const READ_FILE_DESCRIPTION = 'Read a file from a specific terminal tab.'
 export const THINK_TOOL_DESCRIPTION = 'Use this tool to perform deep thinking, complex planning, or detailed analysis. When you encounter a difficult problem, need to coordinate multiple steps, or want to reflect on an error, call this tool. Write your detailed thoughts in the "thought" parameter. This tool helps you organize your internal reasoning before taking further actions.'
-export const WAIT_TOOL_DESCRIPTION = 'Wait for a specified number of seconds (5-60). Use this when you need to pause execution to wait for a background process to finish or a state to stabilize. If you are waiting for a terminal command to finish or output to stabilize, prioritize using wait_terminal_idle instead.'
-export const WAIT_TERMINAL_IDLE_DESCRIPTION = 'Wait until the terminal output becomes stable (no changes for a few seconds) or a timeout (120s) is reached. Use this tool when you expect a command to take some time and want to wait for it to finish or reach a steady state before proceeding. It is much more efficient than the "wait" tool for terminal tasks.'
+export const WAIT_TOOL_DESCRIPTION = 'Pause execution for a specified number of seconds (5-60). Use this for short, fixed-duration pauses when you need to wait for an external event that doesn\'t affect the terminal (e.g., waiting for a web server to start up).'
+export const WAIT_TERMINAL_IDLE_DESCRIPTION = 'Wait until the terminal output becomes stable (no changes for a few seconds) or a timeout (120s) is reached. Use this for commands that don\'t emit standard OSC exit markers but eventually stop printing text (e.g., some build tools or log watchers).'
+export const WAIT_COMMAND_END_DESCRIPTION = 'Wait for the currently running command in the terminal tab to finish based on shell integration markers. This is the most reliable way to wait for a command that was started with nowait. Use this when you need the command\'s exit code and final output to proceed.'
 
 export const BUILTIN_TOOL_INFO = [
   {
@@ -126,6 +127,10 @@ export const BUILTIN_TOOL_INFO = [
   {
     name: 'wait_terminal_idle',
     description: WAIT_TERMINAL_IDLE_DESCRIPTION
+  },
+  {
+    name: 'wait_command_end',
+    description: WAIT_COMMAND_END_DESCRIPTION
   },
   {
     name: 'think',
@@ -226,6 +231,12 @@ export function createBaseSystemPrompt(): SystemMessage {
       '- **Verification**: After executing a command, you MUST check the output or the state of the system to confirm it worked as expected. Never assume success without verification.',
       '- **Strict Adherence**: Follow user instructions precisely. If the user specifies a particular tool, path, or method, you must respect that.',
       '- **Command Output Limits**: Command outputs may be truncated in exec_command. Use read_command_output with history_command_match_id and terminalId to read full output.',
+      '',
+      '# Waiting Strategies',
+      'You have three tools for waiting, each with a specific use case:',
+      '1. **wait_command_end**: The **GOLD STANDARD** for waiting. Use this when you started a command with `nowait` and need to wait for it to finish. It relies on shell integration markers and is the most reliable way to get the exit code and final output.',
+      '2. **wait_terminal_idle**: Use this for commands that don\'t support shell integration markers or for "leaky" processes that keep printing logs but have reached a "ready" state. It waits for the output to stop changing for a few seconds.',
+      '3. **wait**: Use this ONLY for short, fixed-duration pauses (e.g., waiting 5s for a background service to initialize) where you don\'t need to monitor terminal output.',
       '',
       '# Environment Awareness & Pre-flight Checks',
       '- **No Assumptions**: You must NEVER assume the state of a terminal environment. Do not assume a command is installed, a path exists, or internet access is available.',

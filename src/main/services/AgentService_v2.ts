@@ -22,8 +22,9 @@ import {
   sendCharSchema,
   writeAndEditSchema,
   waitSchema,
-  thinkSchema,
+  thinkSchema, 
   waitTerminalIdleSchema,
+  waitCommandEndSchema,
 
   toolImplementations,
   buildSkillToolDescription
@@ -700,6 +701,15 @@ ${recent}
             result = await toolImplementations.waitTerminalIdle(validatedArgs, executionContext)
           } catch (err) {
             result = `Parameter validation error for wait_terminal_idle: ${(err as Error).message}`
+          }
+          break
+        }
+        case 'wait_command_end': {
+          try {
+            const validatedArgs = waitCommandEndSchema.parse(toolCall.args || {})
+            result = await toolImplementations.waitCommandEnd(validatedArgs, executionContext)
+          } catch (err) {
+            result = `Parameter validation error for wait_command_end: ${(err as Error).message}`
           }
           break
         }

@@ -7,12 +7,14 @@ import {
   readCommandOutputSchema,
   sendCharSchema, 
   waitTerminalIdleSchema,
+  waitCommandEndSchema,
   runCommand, 
   runCommandNowait, 
   readTerminalTab, 
   readCommandOutput,
   sendChar,
-  waitTerminalIdle
+  waitTerminalIdle,
+  waitCommandEnd
 } from './terminal_tools'
 import { 
   BUILTIN_TOOL_INFO, 
@@ -39,7 +41,8 @@ export {
   readTerminalTabSchema, 
   readCommandOutputSchema,
   sendCharSchema,
-  waitTerminalIdleSchema
+  waitTerminalIdleSchema,
+  waitCommandEndSchema
 } from './terminal_tools'
 
 export { readFileSchema } from './read_tools'
@@ -104,6 +107,11 @@ export function buildToolsForModel(readFileSupport: ReadFileSupport) {
       schema: waitTerminalIdleSchema
     },
     {
+      name: 'wait_command_end',
+      description: 'Wait for the currently running command in the terminal tab to finish. Use this when you started a command with nowait but now need its output or exit code to proceed.',
+      schema: waitCommandEndSchema
+    },
+    {
       name: 'think',
       description: BUILTIN_TOOL_INFO.find((t) => t.name === 'think')?.description ?? '',
       schema: thinkSchema
@@ -123,5 +131,6 @@ export const toolImplementations = {
   waitTerminalIdle,
   writeAndEdit,
   runReadFile,
-  runCreateSkillTool
+  runCreateSkillTool,
+  waitCommandEnd
 }
