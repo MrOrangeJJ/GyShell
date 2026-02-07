@@ -17,6 +17,7 @@ export interface ModelDefinition {
   /** Cached capability profile detected by backend */
   profile?: {
     imageInputs?: boolean
+    textOutputs?: boolean
     testedAt?: number
     ok?: boolean
     error?: string

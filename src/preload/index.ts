@@ -20,6 +20,7 @@ interface AppSettings {
       maxTokens: number
       profile?: {
         imageInputs?: boolean
+        textOutputs?: boolean
         testedAt?: number
         ok?: boolean
         error?: string
@@ -283,6 +284,7 @@ export interface GyShellAPI {
   models: {
     probe: (model: AppSettings['models']['items'][number]) => Promise<{
       imageInputs: boolean
+      textOutputs: boolean
       testedAt: number
       ok: boolean
       error?: string

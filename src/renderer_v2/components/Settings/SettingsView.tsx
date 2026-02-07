@@ -570,21 +570,38 @@ export const SettingsView: React.FC<{ store: AppStore }> = observer(({ store }) 
               <div className="models-list">
                 {store.settings?.models.items.map((item) => (
                   <div key={item.id} className="model-item" onClick={() => openModelEditor(item.id)}>
-                    <div className="model-icon"><Box size={16} /></div>
-                    <div className="model-info">
-                        <div className="model-name">{item.name}</div>
-                        <div className="model-id">{item.model}</div>
-                    </div>
-                    <div className="model-meta">
-                        {item.profile?.ok ? (
-                            <span className="tag active">Active</span>
-                        ) : (
-                            <span className="tag inactive">NoActive</span>
-                        )}
-                        {item.profile?.imageInputs ? (
-                            <span className="tag image"><Image size={10} /> Image</span>
-                        ) : null}
-                    </div>
+                    {/** Active means text probe passed, or fallback /v1/models passed; Stateless means only /v1/models passed. */}
+                    {(() => {
+                      const isActive = Boolean(item.profile?.ok)
+                      const supportsImage = Boolean(item.profile?.imageInputs)
+                      const isStateless =
+                        isActive &&
+                        item.profile?.textOutputs === false &&
+                        !supportsImage
+
+                      return (
+                        <>
+                          <div className="model-icon"><Box size={16} /></div>
+                          <div className="model-info">
+                              <div className="model-name">{item.name}</div>
+                              <div className="model-id">{item.model}</div>
+                          </div>
+                          <div className="model-meta">
+                              {isActive ? (
+                                  <span className="tag active">Active</span>
+                              ) : (
+                                  <span className="tag inactive">NoActive</span>
+                              )}
+                              {supportsImage ? (
+                                  <span className="tag image"><Image size={10} /> Image</span>
+                              ) : null}
+                              {isStateless ? (
+                                  <span className="tag warning">Stateless</span>
+                              ) : null}
+                          </div>
+                        </>
+                      )
+                    })()}
                     <button 
                         className="model-delete-btn"
                         onClick={(e) => { e.stopPropagation(); setDeleteConfirm({ kind: 'model', id: item.id }) }}

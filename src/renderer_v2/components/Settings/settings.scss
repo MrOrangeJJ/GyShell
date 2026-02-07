@@ -560,7 +560,7 @@
 
 .model-meta {
   display: grid;
-  grid-template-columns: 60px 60px; /* More compact */
+  grid-template-columns: repeat(3, minmax(60px, auto));
   gap: 6px;
   align-items: center;
 }
@@ -597,6 +597,11 @@
     border: 1px solid color-mix(in srgb, var(--accent) 15%, transparent);
     gap: 4px; 
     border-radius: 1px;
+}
+.tag.warning {
+    color: var(--warning);
+    background: color-mix(in srgb, var(--warning) 10%, transparent);
+    border: 1px solid color-mix(in srgb, var(--warning) 15%, transparent);
 }
 
 .spin {

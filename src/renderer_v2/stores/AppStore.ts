@@ -618,6 +618,7 @@ export class AppStore {
     }
     let nextProfile: ModelDefinition['profile'] = {
       imageInputs: false,
+      textOutputs: false,
       testedAt: Date.now(),
       ok: false,
       error: 'Probe failed'
@@ -626,6 +627,7 @@ export class AppStore {
       const probeResult = await window.gyshell.models.probe(plainModel)
       nextProfile = {
         imageInputs: probeResult.imageInputs,
+        textOutputs: probeResult.textOutputs,
         testedAt: probeResult.testedAt,
         ok: probeResult.ok,
         error: probeResult.error
@@ -633,6 +635,7 @@ export class AppStore {
     } catch (err) {
       nextProfile = {
         imageInputs: false,
+        textOutputs: false,
         testedAt: Date.now(),
         ok: false,
         error: err instanceof Error ? err.message : String(err)
