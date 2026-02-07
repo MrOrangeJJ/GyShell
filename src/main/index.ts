@@ -140,6 +140,7 @@ app.whenReady().then(async () => {
   skillService = new SkillService(settingsService)
   void skillService.reload()
 
+  modelCapabilityService = new ModelCapabilityService()
   agentService = new AgentService_v2(terminalService, commandPolicyService, mcpToolService, skillService, uiHistoryService)
   gatewayService = new GatewayService(
     terminalService, 
@@ -157,7 +158,6 @@ app.whenReady().then(async () => {
   // Mount to global for AgentHelper and Gateway (temporary solution)
   ;(global as any).gateway = gatewayService;
   ;(global as any).settingsService = settingsService;
-  modelCapabilityService = new ModelCapabilityService()
 
   // Load MCP tools (best-effort)
   void mcpToolService.reloadAll()

@@ -293,6 +293,9 @@ export class GatewayService extends EventEmitter implements IGateway {
     });
 
     ipcMain.handle('models:probe', async (_evt: any, model: any) => {
+      if (!this.modelCapabilityService) {
+        throw new Error('Model capability service is not initialized')
+      }
       return await this.modelCapabilityService.probe(model);
     });
 
