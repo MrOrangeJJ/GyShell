@@ -1082,9 +1082,9 @@
 
   &:hover {
     background: color-mix(in srgb, var(--fg) 8%, transparent);
-    color: var(--fg);
+  color: var(--fg);
     border-color: color-mix(in srgb, var(--fg) 15%, transparent);
-  }
+}
 }
 
 /* Common small icon button for add/edit etc - using global style */

@@ -188,8 +188,8 @@
   }
 
   &.role-user::before {
-    background: var(--accent);
-  }
+      background: var(--accent);
+    }
 
   &.role-assistant::before {
     background: color-mix(in srgb, var(--fg) 25%, transparent);
@@ -229,7 +229,7 @@
   color: var(--accent);
 }
 
-.message-text.user {
+  .message-text.user {
   flex: 1;
   background: transparent;
   padding: 0;
@@ -240,15 +240,18 @@
   font-size: 13px;
 
   .plain-text {
-    display: flex;
-    align-items: flex-start;
-    gap: 8px;
+    display: block;
+    position: relative;
+    padding-left: 16px;
+    line-height: 1.5;
 
     &::before {
       content: '❯';
+      position: absolute;
+      left: 0;
+      top: 0;
       color: var(--accent);
       font-weight: bold;
-      flex-shrink: 0;
     }
   }
 
@@ -264,18 +267,15 @@
     background: color-mix(in srgb, var(--accent-2) 15%, transparent);
     color: var(--accent-2);
     border: 1px solid color-mix(in srgb, var(--accent-2) 30%, transparent);
-    height: 18px;
+    height: 1.4em; /* Use relative height */
     line-height: 1;
     text-transform: uppercase;
     letter-spacing: 0.5px;
-
-    &::before {
-      content: '@';
-      opacity: 0.7;
-      margin-right: 1px;
-    }
+    vertical-align: middle;
+    position: relative;
+    top: -1px; /* Fine-tune alignment */
   }
-}
+  }
 
 .message-text.assistant {
   width: 100%;
@@ -382,7 +382,7 @@
 /* Chat Input Area */
 .chat-input-area {
   padding: 0;
-  background: transparent;
+  background: transparent; 
   border-top: 1px solid var(--border);
 }
 
@@ -522,7 +522,7 @@
   .icon-btn-sm.primary,
   .icon-btn-sm.danger {
     width: 42px;
-    height: 28px;
+  height: 28px;
   }
 }
 
