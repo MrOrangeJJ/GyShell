@@ -43,7 +43,7 @@ export function QueueCard(props: {
       </div>
       <div className="queue-card-content">{renderMentionContent(item.content)}</div>
       <button
-        className="queue-card-action"
+        className="icon-btn-sm queue-card-action"
         onClick={onEdit}
         disabled={isRunning}
         title={editLabel}

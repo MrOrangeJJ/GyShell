@@ -89,6 +89,11 @@ export const ChatPanel: React.FC<{ store: AppStore }> = observer(({ store }) => 
   const richInputRef = useRef<RichInputHandle>(null)
   const profileSelectRef = useRef<SelectHandle>(null)
   const [inputEmpty, setInputEmpty] = useState(true)
+
+  const checkInputEmpty = useCallback(() => {
+    const val = richInputRef.current?.getValue() || ''
+    setInputEmpty(!val.trim())
+  }, [])
   const [showHistory, setShowHistory] = useState(false)
   const [shouldAutoScroll, setShouldAutoScroll] = useState(true)
   const [rollbackTarget, setRollbackTarget] = useState<ChatMessage | null>(null)
@@ -99,6 +104,7 @@ export const ChatPanel: React.FC<{ store: AppStore }> = observer(({ store }) => 
   
   // Get active session
   const activeSession = store.chat.activeSession
+  const isOverlayOpen = store.view !== 'main'
   const messageIds = activeSession?.messageIds || []
   const isThinking = activeSession?.isThinking || false
   const activeSessionId = store.chat.activeSessionId
@@ -451,6 +457,7 @@ export const ChatPanel: React.FC<{ store: AppStore }> = observer(({ store }) => 
               store={store}
               placeholder={t.chat.placeholder}
               onSend={isQueueMode ? handleQueueAdd : handleSendNormal}
+              onInput={checkInputEmpty}
               disabled={isThinking}
             />
             
@@ -542,7 +549,7 @@ export const ChatPanel: React.FC<{ store: AppStore }> = observer(({ store }) => 
                 />
               </div>
             )}
-            {mousePos && (
+            {mousePos && !isOverlayOpen && (
               <TokenTooltip 
                 mouseX={mousePos.x}
                 mouseY={mousePos.y}

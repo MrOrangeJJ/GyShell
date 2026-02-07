@@ -19,44 +19,58 @@
   position: relative;
   display: flex;
   align-items: center;
-  gap: 8px;
-  padding: 6px 10px;
-  background: color-mix(in srgb, var(--panel-bg) 60%, var(--app-bg));
+  gap: 12px;
+  padding: 8px 12px;
+  background: color-mix(in srgb, var(--fg) 3%, var(--panel-bg));
   border: 1px solid var(--border);
-  border-radius: 10px;
+  border-radius: 4px;
   cursor: grab;
-  transition: border-color 0.15s ease, background 0.15s ease;
-}
+  transition: all 0.15s ease;
 
-.queue-card.is-hidden {
-  opacity: 0;
-  visibility: hidden;
+  &::before {
+    content: '';
+    position: absolute;
+    left: 0;
+    top: 0;
+    bottom: 0;
+    width: 3px;
+    background: color-mix(in srgb, var(--fg) 15%, transparent);
+  }
 }
 
 .queue-card:hover {
   z-index: 200;
-  border-color: var(--border-strong);
-  background: var(--panel-bg-2);
-}
-
-.queue-card-handle {
-  display: flex;
-  align-items: center;
-  color: var(--fg-faint);
+  border-color: var(--fg-muted);
+  background: color-mix(in srgb, var(--fg) 6%, var(--panel-bg));
+  
+  &::before {
+    background: var(--accent);
+  }
 }
 
 .queue-card-content {
   flex: 1;
-  font-size: 13px;
-  line-height: 1.45;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1.5;
   color: var(--fg);
-  max-height: 20px;
+  max-height: 18px;
   overflow: hidden;
   white-space: nowrap;
   text-overflow: ellipsis;
   transition: max-height 0.2s ease, white-space 0.2s ease;
   user-select: none;
   -webkit-user-select: none;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+
+  &::before {
+    content: '$';
+    color: var(--accent);
+    opacity: 0.7;
+    font-weight: bold;
+  }
 
   .mention-badge {
     display: inline-flex;
@@ -90,26 +104,7 @@
 }
 
 .queue-card-action {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  height: 24px;
-  width: 24px;
-  border-radius: 6px;
-  border: none;
-  background: var(--control-bg);
-  color: var(--fg-muted);
-  cursor: pointer;
-}
-
-.queue-card-action:hover:not(:disabled) {
-  background: var(--control-bg-hover);
-  color: var(--fg);
-}
-
-.queue-card-action:disabled {
-  cursor: not-allowed;
-  opacity: 0.4;
+  /* Using global icon-btn-sm style via className */
 }
 
 .queue-mode-btn {
@@ -129,7 +124,7 @@
 
 .queue-drop-line {
   height: 2px;
-  border-radius: 999px;
+  border-radius: 1px;
   background: var(--accent);
   margin: 6px 8px;
   pointer-events: none;
@@ -150,5 +145,5 @@
 
 .queue-stack::-webkit-scrollbar-thumb {
   background: var(--border);
-  border-radius: 999px;
+  border-radius: 3px;
 }

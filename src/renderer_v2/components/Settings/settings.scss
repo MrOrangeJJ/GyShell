@@ -4,24 +4,26 @@
   grid-template-columns: 180px 1fr;
   min-height: 0;
   background: var(--app-bg);
+  position: relative;
+  z-index: 1000; /* Ensure settings view is above chat panel */
 }
 
 .settings-sidebar {
   border-right: 1px solid var(--border);
-  background: rgba(255, 255, 255, 0.02);
-  padding: 10px;
+  background: color-mix(in srgb, var(--fg) 2%, transparent);
+  padding: 12px;
   display: flex;
   flex-direction: column;
-  gap: 12px;
+  gap: 16px;
 }
 
 .settings-back-btn {
-  height: 30px;
-  width: 30px;
-  border-radius: 9px;
-  border: 1px solid transparent;
-  background: transparent;
-  color: var(--fg-muted);
+  height: 28px;
+  width: 28px;
+  border-radius: 4px;
+  border: 1px solid var(--border);
+  background: color-mix(in srgb, var(--fg) 5%, transparent);
+  color: var(--fg);
   cursor: pointer;
   display: grid;
   place-items: center;
@@ -30,39 +32,55 @@
 }
 
 .settings-back-btn:hover {
-  background: var(--control-bg-hover);
-  color: var(--fg);
-  border-color: var(--border);
+  background: color-mix(in srgb, var(--fg) 10%, transparent);
+  border-color: var(--fg-muted);
 }
 
 .settings-nav {
   display: flex;
   flex-direction: column;
-  gap: 4px;
+  gap: 2px;
 }
 
 .settings-nav-item {
-  height: 30px;
-  border-radius: 7px;
+  height: 32px;
+  border-radius: 4px;
   display: flex;
   align-items: center;
-  padding: 0 10px;
-  gap: 8px;
+  padding: 0 12px;
+  gap: 10px;
   color: var(--fg-muted);
   background: transparent;
-  border: 1px solid transparent;
+  border: none;
   cursor: pointer;
-  font-size: 12px;
-  transition: all 0.15s;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  transition: all 0.1s;
 }
 
 .settings-nav-item:hover {
-  background: rgba(255, 255, 255, 0.04);
+  background: color-mix(in srgb, var(--fg) 5%, transparent);
+  color: var(--fg);
 }
 
 .settings-nav-item.is-active {
-  background: color-mix(in srgb, var(--accent) 10%, transparent);
+  background: color-mix(in srgb, var(--accent) 15%, transparent);
   color: var(--accent);
+  position: relative;
+
+  &::before {
+    content: '';
+    position: absolute;
+    left: 0;
+    top: 6px;
+    bottom: 6px;
+    width: 3px;
+    background: var(--accent);
+    border-radius: 0 2px 2px 0;
+  }
 }
 
 .settings-nav-item .icon {
@@ -74,6 +92,12 @@
   min-height: 0;
   overflow: auto;
   padding: 18px 20px;
+  position: relative;
+  z-index: 1;
+
+  .win-select-menu {
+    z-index: 10002 !important; /* Higher than any overlay */
+  }
 }
 
 .settings-section-header {
@@ -103,43 +127,39 @@
 
 .theme-tile {
   height: 62px;
-  border-radius: 12px;
+  border-radius: 4px;
   border: 1px solid var(--border);
-  background: color-mix(in srgb, var(--control-bg) 55%, transparent);
+  background: color-mix(in srgb, var(--fg) 3%, transparent);
   color: var(--fg);
   cursor: pointer;
   display: flex;
   align-items: center;
   gap: 10px;
   padding: 0 10px;
-  transition: background 0.15s, border-color 0.15s, transform 0.08s;
+  transition: all 0.1s;
   overflow: hidden;
 }
 
 .theme-tile:hover {
-  background: var(--control-bg-hover);
-  border-color: var(--border);
-}
-
-.theme-tile:active {
-  transform: translateY(1px);
+  background: color-mix(in srgb, var(--fg) 8%, transparent);
+  border-color: var(--fg-muted);
 }
 
 .theme-tile.is-active {
-  border-color: color-mix(in srgb, var(--accent) 55%, transparent);
-  background: color-mix(in srgb, var(--accent) 10%, rgba(255, 255, 255, 0.02));
+  border-color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 10%, transparent);
+  box-shadow: 0 0 10px color-mix(in srgb, var(--accent) 15%, transparent);
 }
 
 .theme-preview {
   width: 72px;
   height: 36px;
-  border-radius: 8px;
-  border: 1px solid rgba(128, 128, 128, 0.25);
+  border-radius: 3px;
+  border: 1px solid color-mix(in srgb, var(--fg) 15%, transparent);
   position: relative;
   overflow: hidden;
   flex-shrink: 0;
   padding: 6px;
-  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.1);
   display: flex;
   align-items: flex-end;
 }
@@ -249,7 +269,7 @@
 .skill-type-tag {
   font-size: 10px;
   padding: 1px 6px;
-  border-radius: 4px;
+  border-radius: 1px;
   background: color-mix(in srgb, var(--accent) 15%, transparent);
   color: var(--accent);
   margin-left: 8px;
@@ -275,27 +295,33 @@
 }
 
 .settings-rows {
-  /* Subtle container (full width) so rows don't look "floating" */
   display: flex;
   flex-direction: column;
   width: 100%;
   border: 1px solid var(--border);
-  background: rgba(255, 255, 255, 0.02);
-  border-radius: 12px;
-  padding: 6px 12px;
+  background: color-mix(in srgb, var(--fg) 2%, transparent);
+  border-radius: 2px;
+  padding: 0 12px;
 }
 
 .settings-inline-input {
-  height: 28px;
-  border-radius: 10px;
+  height: 32px;
+  border-radius: 2px;
   border: 1px solid var(--border);
-  background: var(--control-bg);
+  background: color-mix(in srgb, var(--fg) 5%, transparent);
   color: var(--fg);
-  padding: 0 10px;
+  padding: 0 12px;
+  font-family: var(--font-mono);
   font-size: 13px;
   outline: none;
   width: 100%;
   max-width: 520px;
+  transition: all 0.2s;
+
+  &:focus {
+    border-color: var(--accent);
+    background: color-mix(in srgb, var(--fg) 8%, transparent);
+  }
 }
 
 .settings-inline-input::placeholder {
@@ -332,22 +358,31 @@
 
 .cp-chip {
   position: relative;
-  height: 24px;
-  width: 118px; /* uniform size */
-  border-radius: 10px;
-  border: 1px solid transparent;
-  background: color-mix(in srgb, var(--control-bg) 62%, transparent);
+  height: 26px;
+  width: auto;
+  min-width: 100px;
+  border-radius: 4px;
+  border: 1px solid var(--border);
+  background: color-mix(in srgb, var(--fg) 5%, transparent);
   color: var(--fg);
   display: inline-flex;
   align-items: center;
   gap: 8px;
-  padding: 0 6px 0 10px;
-  transition: all 0.12s;
+  padding: 0 8px;
+  transition: all 0.1s;
+  font-family: var(--font-mono);
+  font-size: 11px;
+
+  &::before {
+    content: '$';
+    color: var(--accent);
+    opacity: 0.7;
+  }
 }
 
 .cp-chip:hover {
-  background: var(--control-bg-hover);
-  border-color: var(--border);
+  background: color-mix(in srgb, var(--fg) 10%, transparent);
+  border-color: var(--fg-muted);
 }
 
 .cp-chip-text {
@@ -365,7 +400,7 @@
 .cp-chip-delete {
   height: 20px;
   width: 20px;
-  border-radius: 8px;
+  border-radius: 2px;
   border: 1px solid transparent;
   background: transparent;
   color: var(--fg-muted);
@@ -403,15 +438,18 @@
   color: var(--fg);
   background: var(--panel-bg);
   border: 1px solid var(--border);
-  border-radius: 6px;
+  border-radius: 2px;
   box-shadow: 0 4px 12px rgba(0,0,0,0.2);
   opacity: 0;
   pointer-events: none;
-  z-index: 20;
+  z-index: 10005 !important;
+  visibility: hidden; /* Use visibility to ensure it's truly gone */
+  transition: opacity 0.1s, visibility 0.1s;
 }
 
 .cp-chip:hover::after {
   opacity: 1;
+  visibility: visible;
 }
 
 .cp-expand {
@@ -420,15 +458,21 @@
   border: 1px solid var(--border);
   color: var(--fg);
   height: 28px;
-  border-radius: 8px;
-  padding: 0 10px;
-  font-size: 12px;
+  border-radius: 2px;
+  padding: 0 12px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
   cursor: pointer;
-  transition: all 0.15s;
-}
+  transition: all 0.1s;
 
-.cp-expand:hover {
-  background: var(--control-bg-hover);
+  &:hover {
+    background: color-mix(in srgb, var(--fg) 5%, transparent);
+    border-color: var(--accent);
+    box-shadow: 0 0 10px color-mix(in srgb, var(--accent) 15%, transparent);
+  }
 }
 
 /* Models Section (New Layout) */
@@ -442,76 +486,101 @@
 .models-list {
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: 4px; /* Reduced from 8px */
 }
 
-.model-item {
+.model-item, .skill-item, .tool-item {
   display: grid;
-  grid-template-columns: 32px 1fr auto 32px;
+  grid-template-columns: 24px 1fr auto 24px; /* Smaller icon and delete btn columns */
   align-items: center;
-  gap: 12px;
-  padding: 8px 12px;
-  border-radius: 8px;
-  background: color-mix(in srgb, var(--control-bg) 50%, transparent);
-  border: 1px solid transparent;
+  gap: 8px; /* Reduced from 12px */
+  padding: 2px 10px; /* Ultra compact */
+  min-height: 32px; /* Even more compact */
+  border-radius: 1px;
+  background: color-mix(in srgb, var(--fg) 2%, transparent);
+  border: 1px solid var(--border);
   cursor: pointer;
   transition: all 0.1s;
+  position: relative;
+
+  &::before {
+    content: '';
+    position: absolute;
+    left: 0;
+    top: 0;
+    bottom: 0;
+    width: 2px;
+    background: transparent;
+  }
+
+  &:hover {
+    background: color-mix(in srgb, var(--fg) 4%, transparent);
+    border-color: var(--accent);
+    box-shadow: 0 0 15px color-mix(in srgb, var(--accent) 10%, transparent);
+    
+    &::before {
+      background: var(--accent);
+    }
+  }
 }
 
-.model-item:hover {
-  background: var(--control-bg-hover);
-  border-color: var(--border);
+.tool-item {
+  grid-template-columns: 1fr auto;
 }
 
 .model-icon {
-  width: 32px;
-  height: 32px;
+  width: 22px; /* Even smaller */
+  height: 22px;
   background: color-mix(in srgb, var(--accent) 10%, transparent);
-  border-radius: 6px;
+  border-radius: 1px;
   display: grid;
   place-items: center;
   color: var(--accent);
+  border: 1px solid color-mix(in srgb, var(--accent) 20%, transparent);
 }
 
 .model-info {
   display: flex;
   flex-direction: column;
-  gap: 2px;
+  gap: 0; /* No gap */
   overflow: hidden;
 }
 
 .model-name {
-  font-size: 13px;
-  font-weight: 500;
+  font-size: 12px; /* Smaller */
+  font-weight: 600;
   color: var(--fg);
 }
 
 .model-id {
-  font-size: 11px;
-  color: var(--fg-muted);
+  font-size: 10px; /* Smaller */
+  color: var(--fg-faint);
   font-family: var(--font-mono);
 }
 
 .model-meta {
   display: grid;
-  grid-template-columns: 75px 75px;
-  gap: 8px;
+  grid-template-columns: 60px 60px; /* More compact */
+  gap: 6px;
   align-items: center;
 }
 
 .tag {
-  font-size: 10px;
-  padding: 2px 0;
-  width: 100%;
+  font-family: var(--font-mono);
+  font-size: 9px;
+  padding: 1px 4px;
+  width: auto;
+  min-width: 60px;
   text-align: center;
-  border-radius: 4px;
-  background: var(--control-bg-active);
+  border-radius: 2px;
+  background: color-mix(in srgb, var(--fg) 8%, transparent);
   color: var(--fg-muted);
   text-transform: uppercase;
-  font-weight: 600;
+  font-weight: 700;
   display: inline-flex;
   align-items: center;
   justify-content: center;
+  border: 1px solid color-mix(in srgb, var(--fg) 15%, transparent);
 }
 
 .tag.active { 
@@ -527,6 +596,7 @@
     background: color-mix(in srgb, var(--accent) 8%, transparent); 
     border: 1px solid color-mix(in srgb, var(--accent) 15%, transparent);
     gap: 4px; 
+    border-radius: 1px;
 }
 
 .spin {
@@ -539,9 +609,9 @@
 }
 
 .model-delete-btn {
-  height: 28px;
-  width: 28px;
-  border-radius: 6px;
+  height: 24px;
+  width: 24px;
+  border-radius: 1px;
   border: 1px solid transparent;
   background: transparent;
   color: var(--fg-muted);
@@ -571,27 +641,48 @@
 }
 
 .profile-card {
-  background: color-mix(in srgb, var(--panel-bg) 50%, transparent);
+  background: color-mix(in srgb, var(--fg) 2%, var(--panel-bg));
   border: 1px solid var(--border);
-  border-radius: 10px;
+  border-radius: 2px;
   overflow: hidden;
-  transition: border-color 0.2s;
+  transition: all 0.2s;
   display: flex;
   flex-direction: column;
+  position: relative;
+
+  &::before {
+    content: '';
+    position: absolute;
+    left: 0;
+    top: 0;
+    bottom: 0;
+    width: 3px;
+    background: transparent;
+  }
+
+  &:hover {
+    background: color-mix(in srgb, var(--fg) 4%, transparent);
+    border-color: var(--fg-muted);
+  }
 }
 
 .profile-card.active {
   border-color: var(--accent);
-  background: color-mix(in srgb, var(--accent) 5%, var(--panel-bg));
+  background: color-mix(in srgb, var(--accent) 4%, var(--panel-bg));
+  box-shadow: 0 0 20px color-mix(in srgb, var(--accent) 15%, transparent);
+  
+  &::before {
+    background: var(--accent);
+  }
 }
 
 .profile-header {
-  padding: 10px 12px;
+  padding: 6px 12px;
   display: flex;
   align-items: center;
   gap: 10px;
   border-bottom: 1px solid var(--border);
-  background: rgba(0,0,0,0.05);
+  background: color-mix(in srgb, var(--fg) 5%, transparent);
 }
 
 .radio-check {
@@ -628,41 +719,65 @@
 }
 
 .profile-body {
-  padding: 12px;
+  padding: 8px 12px;
   display: flex;
   flex-direction: column;
-  gap: 10px;
+  gap: 6px;
 }
 
 .profile-field {
   display: flex;
   flex-direction: column;
-  gap: 4px;
+  gap: 2px;
+  position: relative; /* Ensure dropdowns anchor correctly */
+
+  .win-select-trigger {
+    background: color-mix(in srgb, var(--fg) 5%, transparent);
+    border: 1px solid var(--border);
+    border-radius: 2px;
+    padding: 0 8px;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--fg);
+    height: 28px;
+    width: 100%;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    cursor: pointer;
+    transition: all 0.1s;
+
+    &:hover {
+      background: color-mix(in srgb, var(--fg) 8%, transparent);
+      border-color: var(--fg-muted);
+    }
+  }
+
+  .win-select-menu {
+    z-index: 3000 !important; /* Ensure it's above everything */
+  }
 }
 
 .profile-field label {
-  font-size: 11px;
+  font-family: var(--font-mono);
+  font-size: 10px;
   color: var(--fg-muted);
-  font-weight: 500;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  opacity: 0.8;
 }
 
 .profile-field select {
-  background: var(--control-bg);
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  padding: 4px 8px;
-  font-size: 12px;
-  color: var(--fg);
-  outline: none;
-  width: 100%;
+  display: none; /* Replaced by Select component */
 }
 
 .add-profile-btn {
   height: 100%;
-  min-height: 140px;
+  min-height: 120px; /* More compact */
   background: transparent;
   border: 1px dashed var(--border);
-  border-radius: 10px;
+  border-radius: 2px; /* Sharper */
   color: var(--fg-muted);
   display: flex;
   flex-direction: column;
@@ -670,12 +785,18 @@
   justify-content: center;
   gap: 8px;
   cursor: pointer;
-  font-size: 13px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  transition: all 0.1s;
 }
 
 .add-profile-btn:hover {
-  background: var(--control-bg-hover);
+  background: color-mix(in srgb, var(--fg) 5%, transparent);
   color: var(--fg);
+  border-color: var(--accent);
   border-style: solid;
 }
 
@@ -695,30 +816,35 @@
   width: 100%;
   max-width: 450px;
   background: var(--panel-bg);
-  border: 1px solid var(--border);
-  border-radius: 12px;
-  box-shadow: 0 10px 30px rgba(0,0,0,0.3);
+  border: 1px solid var(--border-strong);
+  border-radius: 4px; /* Sharper */
+  box-shadow: 0 30px 60px rgba(0,0,0,0.5);
   display: flex;
   flex-direction: column;
   overflow: hidden;
 }
 
 .editor-header {
-  padding: 16px 20px;
+  padding: 12px 16px; /* More compact */
   border-bottom: 1px solid var(--border);
   display: flex;
   align-items: center;
   justify-content: space-between;
+  background: color-mix(in srgb, var(--fg) 5%, transparent);
 }
 
 .editor-header h3 {
   margin: 0;
-  font-size: 16px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 1px;
   color: var(--fg);
 }
 
 .editor-body {
-  padding: 20px;
+  padding: 16px; /* More compact */
   display: flex;
   flex-direction: column;
   gap: 10px;
@@ -727,7 +853,7 @@
 .editor-input {
   background: var(--control-bg);
   border: 1px solid var(--border);
-  border-radius: 6px;
+  border-radius: 2px;
   padding: 8px 10px;
   font-size: 13px;
   color: var(--fg);
@@ -747,32 +873,71 @@
 /* Reuse SSH-like compact row style for model editor */
 .editor-row {
   height: 34px;
-  border-radius: 10px;
+  border-radius: 2px;
   border: 1px solid var(--border);
   background: var(--control-bg);
-  display: grid;
-  grid-template-columns: 34px 1fr;
+  display: flex; /* Switch to flex */
   align-items: center;
-  overflow: hidden;
+  overflow: visible; /* Allow portal-based menu to be visible */
   position: relative;
 
   &::after {
-    content: '';
-    position: absolute;
-    right: 10px;
-    top: 50%;
-    transform: translateY(-50%);
-    width: 0;
-    height: 0;
-    border-left: 4px solid transparent;
-    border-right: 4px solid transparent;
-    border-top: 4px solid var(--fg-muted);
-    pointer-events: none;
-    display: none;
+    display: none !important; /* Remove duplicate native arrow */
   }
 
-  &:has(.editor-select)::after {
-    display: block;
+  .editor-icon {
+    width: 34px;
+    height: 34px;
+    flex-shrink: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: var(--fg-muted);
+    line-height: 0;
+  }
+
+  .editor-input,
+  .editor-select,
+  .win-select {
+    flex: 1;
+    height: 100%;
+    min-width: 0;
+  }
+
+  .editor-input,
+  .editor-select {
+    border: none;
+    outline: none;
+    background: transparent;
+    color: var(--fg);
+    padding: 0 10px;
+    display: flex;
+    align-items: center;
+    line-height: 1;
+    font-size: 13px;
+    width: 100%;
+    appearance: none;
+    -webkit-appearance: none;
+  }
+
+  .win-select-trigger {
+    height: 100%;
+    border: none;
+    border-radius: 0;
+    padding: 0 10px;
+    font-family: inherit;
+    font-size: 13px;
+    background: transparent;
+    color: var(--fg);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    width: 100%;
+    cursor: pointer;
+
+    &:hover {
+      background: color-mix(in srgb, var(--fg) 5%, transparent);
+    }
   }
 }
 
@@ -823,8 +988,8 @@
 }
 
 .editor-footer {
-  padding: 16px 20px;
-  background: var(--app-bg); /* darker footer */
+  padding: 12px 16px; /* More compact */
+  background: color-mix(in srgb, var(--fg) 2%, var(--panel-bg));
   border-top: 1px solid var(--border);
   display: flex;
   justify-content: flex-end;
@@ -832,17 +997,20 @@
 }
 
 .btn-secondary, .btn-primary {
-  height: 29px; /* Force consistent height across all settings buttons */
+  height: 30px;
   padding: 0 16px;
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  border-radius: 6px;
-  font-size: 13px;
-  font-weight: 500;
+  border-radius: 4px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 1px;
   cursor: pointer;
   border: 1px solid transparent;
-  transition: all 0.15s;
+  transition: all 0.1s;
   box-sizing: border-box;
 }
 
@@ -872,12 +1040,23 @@
 
 .settings-card {
   border: 1px solid var(--border);
-  background: rgba(255, 255, 255, 0.02);
-  border-radius: 12px;
-  padding: 10px;
+  background: color-mix(in srgb, var(--fg) 2%, transparent);
+  border-radius: 4px;
+  padding: 12px;
   color: var(--fg-muted);
-  line-height: 1.45;
+  line-height: 1.5;
   max-width: 760px;
+  position: relative;
+
+  &::before {
+    content: '';
+    position: absolute;
+    left: 0;
+    top: 0;
+    bottom: 0;
+    width: 3px;
+    background: color-mix(in srgb, var(--fg) 10%, transparent);
+  }
 }
 
 .settings-actions {
@@ -887,60 +1066,28 @@
 }
 
 .btn-icon-reload {
-  height: 29px;
-  width: 29px;
-  border-radius: 6px;
-  border: 1px solid var(--border);
-  background: transparent;
-  color: var(--fg); /* Matches btn-secondary text color */
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  cursor: pointer;
-  transition: all 0.15s;
-  padding: 0;
-  box-sizing: border-box;
-}
-
-.btn-icon-reload:hover {
-  background: var(--control-bg-hover);
-  border-color: var(--border);
-}
-
-/* Common small icon button for add/edit etc */
-.icon-btn-sm {
-  height: 26px;
-  width: 26px;
-  border-radius: 9px;
+  height: 24px; /* Unified with icon-btn-sm */
+  width: 24px;
+  border-radius: 2px;
   border: 1px solid transparent;
-  background: var(--control-bg);
+  background: transparent;
   color: var(--fg-muted);
   display: flex;
   align-items: center;
   justify-content: center;
   cursor: pointer;
-  transition: all 0.15s;
-  line-height: 0;
+  transition: all 0.1s;
   padding: 0;
+  box-sizing: border-box;
+
+  &:hover {
+    background: color-mix(in srgb, var(--fg) 8%, transparent);
+    color: var(--fg);
+    border-color: color-mix(in srgb, var(--fg) 15%, transparent);
+  }
 }
 
-.icon-btn-sm:hover {
-  background: var(--control-bg-hover);
-  color: var(--fg);
-  border-color: var(--border);
-}
-
-.icon-btn-sm:active {
-  background: var(--control-bg-active);
-}
-
-.icon-btn-sm.danger {
-  color: var(--danger);
-}
-
-.icon-btn-sm.danger:hover {
-  background: color-mix(in srgb, var(--danger) 10%, transparent);
-}
+/* Common small icon button for add/edit etc - using global style */
 
 .tools-list {
   display: flex;
@@ -951,13 +1098,35 @@
 
 .tool-item {
   display: flex;
-  align-items: center;
   justify-content: space-between;
-  gap: 12px;
-  padding: 8px 10px;
-  border-radius: 8px;
-  background: color-mix(in srgb, var(--control-bg) 50%, transparent);
-  border: 1px solid transparent;
+  align-items: center;
+  padding: 6px 12px;
+  border-radius: 2px;
+  background: color-mix(in srgb, var(--fg) 2%, transparent);
+  border: 1px solid var(--border);
+  cursor: pointer;
+  transition: all 0.1s;
+  position: relative;
+
+  &::before {
+    content: '';
+    position: absolute;
+    left: 0;
+    top: 0;
+    bottom: 0;
+    width: 3px;
+    background: transparent;
+  }
+
+  &:hover {
+    background: color-mix(in srgb, var(--fg) 5%, transparent);
+    border-color: var(--accent);
+    box-shadow: 0 0 15px color-mix(in srgb, var(--accent) 10%, transparent);
+    
+    &::before {
+      background: var(--accent);
+    }
+  }
 }
 
 .tool-info {
@@ -1000,7 +1169,7 @@
 .status-dot {
   width: 8px;
   height: 8px;
-  border-radius: 50%;
+  border-radius: 1px; /* Square status dots */
   background: var(--fg-muted);
 }
 
@@ -1040,8 +1209,8 @@
   left: 0;
   right: 0;
   bottom: 0;
-  background: var(--control-bg);
-  border-radius: 10px;
+  background: color-mix(in srgb, var(--fg) 10%, transparent);
+  border-radius: 2px;
   border: 1px solid var(--border);
   transition: all 0.2s;
 }
@@ -1053,14 +1222,14 @@
   width: 14px;
   left: 2px;
   top: 1px;
-  background: var(--fg);
-  border-radius: 50%;
+  background: var(--fg-muted);
+  border-radius: 1px;
   transition: all 0.2s;
 }
 
 .switch input:checked + .switch-slider {
-  background: color-mix(in srgb, var(--accent) 35%, var(--control-bg));
-  border-color: color-mix(in srgb, var(--accent) 35%, var(--border));
+  background: color-mix(in srgb, var(--accent) 20%, transparent);
+  border-color: var(--accent);
 }
 
 .switch input:checked + .switch-slider::before {
@@ -1072,9 +1241,9 @@
   display: flex;
   justify-content: space-between;
   align-items: center;
-  padding: 0;
-  min-height: 50px;
-  border-bottom: 1px solid var(--border);
+  padding: 0 12px;
+  height: 48px; /* Fixed height for consistency */
+  border-bottom: 1px solid color-mix(in srgb, var(--fg) 5%, transparent);
 
   &:last-child {
     border-bottom: none;
@@ -1098,13 +1267,14 @@
 }
 
 .settings-row select {
-  background: var(--control-bg);
+  background: color-mix(in srgb, var(--fg) 5%, transparent);
   color: var(--fg);
   border: 1px solid var(--border);
-  border-radius: 6px;
+  border-radius: 2px;
   padding: 4px 8px;
   outline: none;
-  font-size: 13px;
+  font-family: var(--font-mono);
+  font-size: 12px;
 }
 
 .settings-radio-group {
@@ -1117,18 +1287,29 @@
 .settings-radio-item {
   display: inline-flex;
   align-items: center;
-  gap: 6px;
-  font-size: 12px;
-  color: var(--fg);
+  gap: 8px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  color: var(--fg-muted);
   cursor: pointer;
-  min-width: 85px;
+  min-width: 90px;
   justify-content: flex-start;
-  padding: 4px 8px;
-  border-radius: 6px;
-  transition: background 0.15s;
+  padding: 6px 10px;
+  border-radius: 4px;
+  border: 1px solid transparent;
+  transition: all 0.1s;
 
   &:hover {
-    background: rgba(255, 255, 255, 0.04);
+    background: color-mix(in srgb, var(--fg) 5%, transparent);
+    color: var(--fg);
+  }
+
+  &:has(.radio-check.checked) {
+    background: color-mix(in srgb, var(--accent) 10%, transparent);
+    border-color: color-mix(in srgb, var(--accent) 20%, transparent);
+    color: var(--accent);
   }
 }
 
@@ -1157,28 +1338,26 @@
   flex: 1;
   -webkit-appearance: none;
   appearance: none;
-  height: 4px;
-  border-radius: 2px;
-  background: var(--border);
+  height: 2px;
+  background: color-mix(in srgb, var(--fg) 15%, transparent);
   outline: none;
   cursor: pointer;
 
   &::-webkit-slider-thumb {
     -webkit-appearance: none;
     appearance: none;
-    width: 14px;
-    height: 14px;
-    border-radius: 50%;
+    width: 12px;
+    height: 12px;
+    border-radius: 2px;
     background: var(--accent);
     cursor: pointer;
-    transition: all 0.15s;
-    border: 2px solid var(--app-bg);
-    box-shadow: 0 0 0 1px var(--border);
+    transition: all 0.1s;
+    border: none;
   }
 
   &::-webkit-slider-thumb:hover {
-    transform: scale(1.1);
-    filter: brightness(1.1);
+    transform: scale(1.2);
+    box-shadow: 0 0 10px color-mix(in srgb, var(--accent) 40%, transparent);
   }
 }
 

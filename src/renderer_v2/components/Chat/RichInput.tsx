@@ -15,6 +15,7 @@ interface RichInputProps {
   store: AppStore;
   placeholder?: string;
   onSend: (value: string) => void;
+  onInput?: () => void;
   disabled?: boolean;
 }
 
@@ -22,6 +23,7 @@ export const RichInput = observer(forwardRef<RichInputHandle, RichInputProps>(({
   store, 
   placeholder, 
   onSend, 
+  onInput,
   disabled 
 }, ref) => {
   const editorRef = useRef<HTMLDivElement>(null);
@@ -343,7 +345,15 @@ export const RichInput = observer(forwardRef<RichInputHandle, RichInputProps>(({
 
   const handleInput = () => {
     updateSuggestions();
+    onInput?.();
   };
+
+  // Close suggestions when disabled or when overlay opens
+  React.useEffect(() => {
+    if (disabled || store.view !== 'main') {
+      setShowSuggestions(false);
+    }
+  }, [disabled, store.view]);
 
   const handlePaste = async (e: React.ClipboardEvent) => {
     e.preventDefault();

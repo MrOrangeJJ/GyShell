@@ -14,25 +14,26 @@
   width: 100%;
   max-width: 420px;
   background: var(--panel-bg);
-  border: 1px solid var(--border);
-  border-radius: 12px;
-  box-shadow: 0 18px 40px rgba(0, 0, 0, 0.35);
+  border: 1px solid var(--border-strong);
+  border-radius: 4px;
+  box-shadow: 0 20px 50px rgba(0, 0, 0, 0.5);
   overflow: hidden;
 }
 
 .gy-confirm-header {
-  height: 44px;
-  padding: 0 14px;
+  height: 40px;
+  padding: 0 12px;
   display: flex;
   align-items: center;
   justify-content: space-between;
   border-bottom: 1px solid var(--border);
+  background: color-mix(in srgb, var(--fg) 5%, transparent);
 
   .icon-btn-sm {
     color: var(--fg-muted);
     
     &:hover {
-      background: var(--control-bg-hover);
+      background: color-mix(in srgb, var(--fg) 8%, transparent);
       color: var(--fg);
     }
 
@@ -43,8 +44,11 @@
 }
 
 .gy-confirm-title {
-  font-size: 13px;
-  font-weight: 600;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 1px;
   color: var(--fg);
 }
 
@@ -69,13 +73,17 @@
 }
 
 .gy-btn {
-  height: 32px;
-  padding: 0 14px;
-  border-radius: 9px;
+  height: 30px;
+  padding: 0 16px;
+  border-radius: 4px;
   border: 1px solid transparent;
-  font-size: 13px;
-  font-weight: 600;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 1px;
   cursor: pointer;
+  transition: all 0.1s;
 }
 
 .gy-btn-secondary {

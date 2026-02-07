@@ -13,7 +13,10 @@ export function QueueModeSwitch(props: {
   return (
     <button
       className={`icon-btn-sm secondary queue-mode-btn ${enabled ? 'is-active' : ''}`}
-      onClick={onToggle}
+      onClick={(e) => {
+        e.currentTarget.classList.toggle('is-active', !enabled);
+        onToggle();
+      }}
       disabled={disabled}
       title={enabled ? labelOn : labelOff}
       type="button"

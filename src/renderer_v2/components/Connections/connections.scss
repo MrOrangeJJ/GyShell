@@ -4,24 +4,26 @@
   grid-template-columns: 180px 1fr;
   min-height: 0;
   background: var(--app-bg);
+  position: relative;
+  z-index: 1000; /* Ensure connections view is above chat panel */
 }
 
 .connections-sidebar {
   border-right: 1px solid var(--border);
-  background: color-mix(in srgb, var(--panel-bg) 92%, transparent);
-  padding: 10px;
+  background: color-mix(in srgb, var(--fg) 2%, transparent);
+  padding: 12px;
   display: flex;
   flex-direction: column;
-  gap: 12px;
+  gap: 16px;
 }
 
 .connections-back-btn {
-  height: 30px;
-  width: 30px;
-  border-radius: 9px;
-  border: 1px solid transparent;
-  background: transparent;
-  color: var(--fg-muted);
+  height: 28px;
+  width: 28px;
+  border-radius: 4px;
+  border: 1px solid var(--border);
+  background: color-mix(in srgb, var(--fg) 5%, transparent);
+  color: var(--fg);
   cursor: pointer;
   display: grid;
   place-items: center;
@@ -32,39 +34,55 @@
 }
 
 .connections-back-btn:hover {
-  background: var(--control-bg-hover);
-  color: var(--fg);
-  border-color: var(--border);
+  background: color-mix(in srgb, var(--fg) 10%, transparent);
+  border-color: var(--fg-muted);
 }
 
 .connections-nav {
   display: flex;
   flex-direction: column;
-  gap: 4px;
+  gap: 2px;
 }
 
 .connections-nav-item {
-  height: 30px;
-  border-radius: 7px;
+  height: 32px;
+  border-radius: 4px;
   display: flex;
   align-items: center;
-  padding: 0 10px;
-  gap: 8px;
+  padding: 0 12px;
+  gap: 10px;
   color: var(--fg-muted);
   background: transparent;
-  border: 1px solid transparent;
+  border: none;
   cursor: pointer;
-  font-size: 12px;
-  transition: all 0.15s;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  transition: all 0.1s;
 }
 
 .connections-nav-item:hover {
-  background: var(--control-bg-hover);
+  background: color-mix(in srgb, var(--fg) 5%, transparent);
+  color: var(--fg);
 }
 
 .connections-nav-item.is-active {
-  background: color-mix(in srgb, var(--accent) 10%, transparent);
+  background: color-mix(in srgb, var(--accent) 15%, transparent);
   color: var(--accent);
+  position: relative;
+
+  &::before {
+    content: '';
+    position: absolute;
+    left: 0;
+    top: 6px;
+    bottom: 6px;
+    width: 3px;
+    background: var(--accent);
+    border-radius: 0 2px 2px 0;
+  }
 }
 
 .connections-nav-item .icon {
@@ -76,6 +94,12 @@
   min-height: 0;
   overflow: auto;
   padding: 18px 20px;
+  position: relative;
+  z-index: 1;
+
+  .win-select-menu {
+    z-index: 10002 !important;
+  }
 }
 
 .connections-header {
@@ -91,34 +115,7 @@
   gap: 6px;
 }
 
-.icon-btn-sm {
-  height: 26px;
-  width: 26px;
-  border-radius: 9px;
-  border: 1px solid transparent;
-  background: var(--control-bg);
-  color: var(--fg-muted);
-  display: grid;
-  place-items: center;
-  cursor: pointer;
-  transition: all 0.15s;
-  line-height: 0;
-  padding: 0;
-}
-
-.icon-btn-sm:hover {
-  background: var(--control-bg-hover);
-  color: var(--fg);
-  border-color: var(--border);
-}
-
-.icon-btn-sm:active {
-  background: var(--control-bg-active);
-}
-
-.icon-btn-sm.danger {
-  color: var(--danger);
-}
+/* Icon buttons - using global style */
 
 .connections-split {
   display: grid;
@@ -136,9 +133,9 @@
 
 .connections-table {
   border: 1px solid var(--border);
-  border-radius: 12px;
+  border-radius: 4px;
   overflow: hidden;
-  background: color-mix(in srgb, var(--panel-bg) 80%, transparent);
+  background: color-mix(in srgb, var(--fg) 2%, var(--panel-bg));
 }
 
 .connections-row {
@@ -156,8 +153,12 @@
 .connections-row.header {
   cursor: default;
   color: var(--fg-muted);
-  background: color-mix(in srgb, var(--control-bg) 80%, transparent);
-  font-size: 12px;
+  background: color-mix(in srgb, var(--fg) 5%, transparent);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
 }
 
 .connections-row.header .connections-row-main {
@@ -226,50 +227,90 @@
 
 .editor-empty {
   border: 1px dashed var(--border);
-  border-radius: 12px;
-  padding: 10px;
+  border-radius: 4px;
+  padding: 12px;
   color: var(--fg-muted);
-  background: color-mix(in srgb, var(--panel-bg) 70%, transparent);
+  background: color-mix(in srgb, var(--fg) 2%, transparent);
 }
 
 .editor-card {
   border: 1px solid var(--border);
-  border-radius: 12px;
-  padding: 10px;
-  background: color-mix(in srgb, var(--panel-bg) 85%, transparent);
+  border-radius: 4px;
+  padding: 12px;
+  background: color-mix(in srgb, var(--fg) 3%, var(--panel-bg));
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: 10px;
 }
 
 .editor-row {
   height: 34px;
-  border-radius: 10px;
+  border-radius: 2px; /* Sharper */
   border: 1px solid var(--border);
-  background: var(--control-bg);
-  display: grid;
-  grid-template-columns: 34px 1fr;
+  background: color-mix(in srgb, var(--fg) 5%, transparent);
+  display: flex; /* Switch to flex to ensure select trigger fills space */
   align-items: center;
-  overflow: hidden;
+  overflow: visible; /* Allow portal-based menu to be visible if needed, though it uses fixed pos */
   position: relative;
 
   &::after {
-    content: '';
-    position: absolute;
-    right: 10px;
-    top: 50%;
-    transform: translateY(-50%);
-    width: 0;
-    height: 0;
-    border-left: 4px solid transparent;
-    border-right: 4px solid transparent;
-    border-top: 4px solid var(--fg-muted);
-    pointer-events: none;
-    display: none; /* Only show for selects */
+    display: none !important; /* Remove duplicate native arrow */
   }
 
-  &:has(.editor-select)::after {
-    display: block;
+  .editor-icon {
+    width: 34px;
+    height: 34px;
+    flex-shrink: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: var(--fg-muted);
+    line-height: 0;
+    padding: 0;
+  }
+
+  .editor-input,
+  .editor-select,
+  .win-select {
+    flex: 1;
+    height: 100%;
+    min-width: 0;
+  }
+
+  .editor-input,
+  .editor-select {
+    border: none;
+    outline: none;
+    background: transparent;
+    color: var(--fg);
+    padding: 0 10px;
+    display: flex;
+    align-items: center;
+    line-height: 1;
+    font-size: 13px;
+    width: 100%;
+    appearance: none;
+    -webkit-appearance: none;
+  }
+
+  .win-select-trigger {
+    height: 100%;
+    border: none;
+    border-radius: 0;
+    padding: 0 10px;
+    font-family: inherit;
+    font-size: 13px;
+    background: transparent;
+    color: var(--fg);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    width: 100%;
+    cursor: pointer;
+
+    &:hover {
+      background: color-mix(in srgb, var(--fg) 5%, transparent);
+    }
   }
 }
 

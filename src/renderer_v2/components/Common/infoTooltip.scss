@@ -22,11 +22,12 @@
   background: var(--panel-bg);
   color: var(--fg);
   padding: 10px 14px;
-  border-radius: 8px;
+  border-radius: 2px; /* Sharper */
   font-size: 12px;
   line-height: 1.5;
   max-width: 300px;
-  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4), 0 0 0 1px var(--border);
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5);
+  border: 1px solid var(--border-strong);
   pointer-events: none;
   white-space: pre-wrap;
   word-break: break-word;

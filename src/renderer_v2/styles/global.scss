@@ -70,7 +70,7 @@ input[type="radio"] {
 }
 
 input[type="checkbox"] {
-  border-radius: 4px;
+  border-radius: 2px;
   width: 14px;
   height: 14px;
 }
@@ -140,10 +140,66 @@ select,
 textarea {
   font: inherit;
   color: inherit;
+  border-radius: 2px; /* Set a sharp base radius */
 }
 
-::selection {
-  background: rgba(78, 161, 255, 0.35);
+.icon-btn-sm {
+  height: 24px;
+  width: 24px;
+  border-radius: 2px !important;
+  border: 1px solid transparent !important;
+  background: transparent !important;
+  color: var(--fg-muted) !important;
+  display: flex !important;
+  align-items: center !important;
+  justify-content: center !important;
+  cursor: pointer !important;
+  transition: all 0.1s !important;
+  padding: 0 !important;
+  flex-shrink: 0 !important;
+
+  &:hover:not(:disabled) {
+    background: color-mix(in srgb, var(--fg) 8%, transparent) !important;
+    color: var(--fg) !important;
+    border-color: color-mix(in srgb, var(--fg) 15%, transparent) !important;
+  }
+
+  &.primary {
+    background: color-mix(in srgb, var(--accent) 15%, transparent) !important;
+    color: var(--fg) !important;
+    border-color: color-mix(in srgb, var(--accent) 30%, transparent) !important;
+    
+    &:hover:not(:disabled) {
+      background: color-mix(in srgb, var(--accent) 25%, transparent) !important;
+      border-color: var(--accent) !important;
+    }
+  }
+
+  &.danger {
+    color: var(--danger) !important;
+    &:hover:not(:disabled) {
+      background: color-mix(in srgb, var(--danger) 10%, transparent) !important;
+      color: var(--danger) !important;
+      border-color: color-mix(in srgb, var(--danger) 20%, transparent) !important;
+    }
+  }
+
+  &.secondary {
+    background: transparent !important;
+    color: var(--fg-muted) !important;
+  }
+
+  &.is-active {
+    background: color-mix(in srgb, var(--accent) 15%, transparent) !important;
+    color: var(--accent) !important;
+    border-color: color-mix(in srgb, var(--accent) 30%, transparent) !important;
+  }
+
+  &:disabled {
+    opacity: 0.3 !important;
+    cursor: not-allowed !important;
+    filter: grayscale(1) !important;
+  }
 }
 
 @import './components/select.scss';

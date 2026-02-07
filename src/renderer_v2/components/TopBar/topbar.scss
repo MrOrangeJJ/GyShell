@@ -1,12 +1,10 @@
 .topbar {
-  height: 38px;
+  height: 38px; /* Restored original height */
   display: flex;
   align-items: center;
   justify-content: space-between;
   padding: 0 12px;
-  /* Use theme background for modern feel */
-  background: color-mix(in srgb, var(--app-bg) 86%, transparent);
-  backdrop-filter: blur(10px);
+  background: var(--panel-bg);
   border-bottom: 1px solid var(--border);
   -webkit-app-region: drag;
 }
@@ -20,10 +18,13 @@
 }
 
 .topbar-title {
-  font-size: 12px;
-  letter-spacing: 0.3px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 1px;
   color: var(--fg);
-  opacity: 0.92;
+  opacity: 0.6;
   user-select: none;
 }
 
@@ -37,24 +38,26 @@
 .icon-btn {
   height: 26px;
   width: 26px;
-  border-radius: 7px;
+  border-radius: 4px;
   border: 1px solid transparent;
-  background: var(--control-bg);
+  background: transparent;
+  color: var(--fg-muted);
   display: grid;
   place-items: center;
   cursor: pointer;
+  transition: all 0.1s;
   line-height: 0;
   padding: 0;
 }
 
 .icon-btn:hover {
-  background: var(--control-bg-hover);
-  border-color: var(--border);
+  background: color-mix(in srgb, var(--fg) 8%, transparent);
+  color: var(--fg);
+  border-color: color-mix(in srgb, var(--fg) 15%, transparent);
 }
 
 .icon-btn:active {
-  background: var(--control-bg-active);
-  border-color: var(--border-strong);
+  background: color-mix(in srgb, var(--fg) 12%, transparent);
 }
 
 

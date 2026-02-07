@@ -612,38 +612,33 @@ export const SettingsView: React.FC<{ store: AppStore }> = observer(({ store }) 
                       <div className="profile-body">
                         <div className="profile-field">
                           <label>{t.settings.globalModel}</label>
-                          <select
+                          <Select
                             value={p.globalModelId}
-                            onChange={(e) => store.saveProfile({ ...p, globalModelId: e.target.value })}
-                          >
-                            {store.settings?.models.items.map((m) => (
-                              <option key={m.id} value={m.id}>{m.name}</option>
-                            ))}
-                          </select>
+                            onChange={(id) => store.saveProfile({ ...p, globalModelId: id })}
+                            options={store.settings?.models.items.map((m) => ({ value: m.id, label: m.name })) || []}
+                          />
                         </div>
                         <div className="profile-field">
                           <label>{t.settings.actionModel}</label>
-                          <select
+                          <Select
                             value={p.actionModelId || ''}
-                            onChange={(e) => store.saveProfile({ ...p, actionModelId: e.target.value || undefined })}
-                          >
-                            <option value="">(None)</option>
-                            {store.settings?.models.items.map((m) => (
-                              <option key={m.id} value={m.id}>{m.name}</option>
-                            ))}
-                          </select>
+                            onChange={(id) => store.saveProfile({ ...p, actionModelId: id || undefined })}
+                            options={[
+                              { value: '', label: '(None)' },
+                              ...(store.settings?.models.items.map((m) => ({ value: m.id, label: m.name })) || [])
+                            ]}
+                          />
                         </div>
                         <div className="profile-field">
                           <label>{t.settings.thinkingModel}</label>
-                          <select
+                          <Select
                             value={p.thinkingModelId || ''}
-                            onChange={(e) => store.saveProfile({ ...p, thinkingModelId: e.target.value || undefined })}
-                          >
-                            <option value="">(None)</option>
-                            {store.settings?.models.items.map((m) => (
-                              <option key={m.id} value={m.id}>{m.name}</option>
-                            ))}
-                          </select>
+                            onChange={(id) => store.saveProfile({ ...p, thinkingModelId: id || undefined })}
+                            options={[
+                              { value: '', label: '(None)' },
+                              ...(store.settings?.models.items.map((m) => ({ value: m.id, label: m.name })) || [])
+                            ]}
+                          />
                         </div>
                       </div>
                     </div>

@@ -13,31 +13,35 @@
 
 .chat-history-panel {
   background: var(--panel-bg);
-  border: 1px solid var(--border-color);
-  border-radius: 8px;
+  border: 1px solid var(--border-strong);
+  border-radius: 4px;
   width: 600px;
   max-width: 90vw;
   max-height: 80vh;
   display: flex;
   flex-direction: column;
-  box-shadow: 0 4px 20px rgba(0, 0, 0, 0.3);
+  box-shadow: 0 20px 50px rgba(0, 0, 0, 0.5);
 }
 
 .chat-history-header {
   display: flex;
   justify-content: space-between;
   align-items: center;
-  padding: 16px 20px;
-  border-bottom: 1px solid var(--border-color);
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--border-strong);
+  background: color-mix(in srgb, var(--fg) 5%, transparent);
 }
 
 .chat-history-title {
   display: flex;
   align-items: center;
   gap: 8px;
-  font-weight: 600;
-  font-size: 16px;
-  color: var(--text-primary);
+  font-family: var(--font-mono);
+  font-weight: 700;
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  color: var(--fg);
 }
 
 .chat-history-actions {
@@ -69,45 +73,48 @@
 
 .chat-history-bulk-delete {
   background: transparent;
-  border: 1px solid var(--danger-color);
-  color: var(--danger-color);
-  font-size: 12px;
-  font-weight: 500;
-  padding: 4px 10px;
+  border: 1px solid var(--danger);
+  color: var(--danger);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  padding: 4px 12px;
   border-radius: 4px;
   cursor: pointer;
   display: flex;
   align-items: center;
-  gap: 4px;
-  transition: all 0.2s ease;
+  gap: 6px;
+  transition: all 0.1s;
 
   &:hover:not(:disabled) {
-    background: var(--danger-color);
-    color: white;
+    background: color-mix(in srgb, var(--danger) 10%, transparent);
   }
 
   &:disabled {
     opacity: 0.5;
     cursor: not-allowed;
-    border-color: var(--border-color);
-    color: var(--text-tertiary);
+    border-color: var(--border);
+    color: var(--fg-muted);
   }
 }
 
 .chat-history-close {
   background: transparent;
   border: none;
-  color: var(--text-secondary);
+  color: var(--fg-muted);
   cursor: pointer;
   padding: 4px;
   border-radius: 4px;
   display: flex;
   align-items: center;
   justify-content: center;
+  transition: all 0.1s;
 
   &:hover {
-    background: var(--hover-bg);
-    color: var(--text-primary);
+    background: color-mix(in srgb, var(--fg) 8%, transparent);
+    color: var(--fg);
   }
 }
 
@@ -142,25 +149,40 @@
   display: flex;
   align-items: center;
   gap: 12px;
-  padding: 12px 16px;
-  background: var(--card-bg);
-  border: 1px solid var(--border-color);
-  border-radius: 6px;
+  padding: 10px 14px;
+  background: color-mix(in srgb, var(--fg) 2%, transparent);
+  border: 1px solid var(--border);
+  border-radius: 4px;
   cursor: pointer;
-  transition: all 0.2s ease;
+  transition: all 0.1s;
+  position: relative;
+
+  &::before {
+    content: '';
+    position: absolute;
+    left: 0;
+    top: 0;
+    bottom: 0;
+    width: 3px;
+    background: transparent;
+  }
 
   &:hover {
-    background: var(--hover-bg);
-    border-color: var(--accent-color);
+    background: color-mix(in srgb, var(--fg) 5%, transparent);
+    border-color: var(--fg-muted);
+    
+    &::before {
+      background: var(--accent);
+    }
   }
 
   &.selected {
-    border-color: var(--accent-color);
-    background: color-mix(in srgb, var(--accent-color) 10%, transparent);
-  }
-
-  &:active {
-    transform: translateY(1px);
+    border-color: var(--accent);
+    background: color-mix(in srgb, var(--accent) 8%, transparent);
+    
+    &::before {
+      background: var(--accent);
+    }
   }
 }
 
@@ -188,9 +210,11 @@
 }
 
 .chat-history-item-title {
-  font-weight: 500;
-  color: var(--text-primary);
-  margin-bottom: 4px;
+  font-family: var(--font-mono);
+  font-weight: 600;
+  font-size: 12px;
+  color: var(--fg);
+  margin-bottom: 2px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -199,12 +223,15 @@
 .chat-history-item-meta {
   display: flex;
   align-items: center;
-  gap: 6px;
-  font-size: 12px;
-  color: var(--text-secondary);
+  gap: 8px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--fg-muted);
+  opacity: 0.8;
 
   svg {
     flex-shrink: 0;
+    opacity: 0.6;
   }
 }
 
@@ -216,7 +243,7 @@
 .chat-history-item-delete {
   background: transparent;
   border: none;
-  color: var(--text-secondary);
+  color: var(--fg-muted);
   cursor: pointer;
   padding: 6px;
   border-radius: 4px;
@@ -225,14 +252,10 @@
   justify-content: center;
   margin-left: 8px;
   flex-shrink: 0;
-  transition: all 0.2s ease;
+  transition: all 0.1s;
 
   &:hover {
-    background: var(--danger-bg);
-    color: var(--danger-color);
-  }
-
-  &:active {
-    transform: scale(0.95);
+    background: color-mix(in srgb, var(--danger) 10%, transparent);
+    color: var(--danger);
   }
 }

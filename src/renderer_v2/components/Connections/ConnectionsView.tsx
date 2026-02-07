@@ -6,6 +6,8 @@ import { PortForwardType, type TunnelEntry } from '../../lib/ipcTypes'
 import './connections.scss'
 import { ConfirmDialog } from '../Common/ConfirmDialog'
 
+import { Select } from '../../platform/Select'
+
 export type ConnectionsSection = 'ssh' | 'proxies' | 'tunnels'
 
 export const ConnectionsView: React.FC<{ store: AppStore }> = observer(({ store }) => {
@@ -275,30 +277,32 @@ export const ConnectionsView: React.FC<{ store: AppStore }> = observer(({ store 
                       <span className="editor-icon">
                         <KeyRound size={16} strokeWidth={2} />
                       </span>
-                      <select
+                      <Select
                         className="editor-select"
                         value={draft.authMethod ?? 'password'}
-                        onChange={(e) => setDraft({ ...draft, authMethod: e.target.value })}
-                      >
-                        <option value="password">Password</option>
-                        <option value="privateKey">Private Key</option>
-                      </select>
+                        onChange={(val) => setDraft({ ...draft, authMethod: val })}
+                        options={[
+                          { value: 'password', label: 'Password' },
+                          { value: 'privateKey', label: 'Private Key' }
+                        ]}
+                      />
                     </div>
 
                     {/* Default pwd, but all fields supported: show key/path/passphrase in key mode */}
                     {(draft.authMethod ?? 'password') === 'password' ? (
-                      <div className="editor-row">
-                        <span className="editor-icon">
-                          <LockKeyhole size={16} strokeWidth={2} />
-                        </span>
-                        <input
-                          type="password"
-                          className="editor-input"
-                          placeholder={t.common.password}
-                          value={draft.password ?? ''}
-                          onChange={(e) => setDraft({ ...draft, password: e.target.value })}
-                        />
-                      </div>
+                    <div className="editor-row">
+                      <span className="editor-icon">
+                        <LockKeyhole size={16} strokeWidth={2} />
+                      </span>
+                      <input
+                        type="password"
+                        className="editor-input"
+                        placeholder={t.common.password}
+                        autoComplete="new-password"
+                        value={draft.password ?? ''}
+                        onChange={(e) => setDraft({ ...draft, password: e.target.value })}
+                      />
+                    </div>
                     ) : (
                       <>
                         <div className="editor-row">
@@ -341,25 +345,25 @@ export const ConnectionsView: React.FC<{ store: AppStore }> = observer(({ store 
                       <span className="editor-icon">
                         <Shield size={16} strokeWidth={2} />
                       </span>
-                      <select
+                      <Select
                         className="editor-select"
                         value={draft.proxyId ?? ''}
-                        onChange={(e) => setDraft({ ...draft, proxyId: e.target.value || undefined })}
-                      >
-                        <option value="">{t.connections.proxy}: None</option>
-                        {proxies.map(p => <option key={p.id} value={p.id}>{p.name}</option>)}
-                      </select>
+                        onChange={(id) => setDraft({ ...draft, proxyId: id || undefined })}
+                        options={[
+                          { value: '', label: `${t.connections.proxy}: None` },
+                          ...proxies.map(p => ({ value: p.id, label: p.name }))
+                        ]}
+                      />
                     </div>
 
                     <div className="editor-row">
                       <span className="editor-icon">
                         <Waypoints size={16} strokeWidth={2} />
                       </span>
-                      <select
+                      <Select
                         className="editor-select"
                         value={draft.jumpHost?.id ?? ''}
-                        onChange={(e) => {
-                          const selectedId = e.target.value
+                        onChange={(selectedId) => {
                           if (!selectedId) {
                             const { jumpHost, ...rest } = draft
                             setDraft(rest)
@@ -370,12 +374,11 @@ export const ConnectionsView: React.FC<{ store: AppStore }> = observer(({ store 
                             }
                           }
                         }}
-                      >
-                        <option value="">{t.connections.jumpHost}: None</option>
-                        {ssh.filter(s => s.id !== draft.id).map(s => (
-                          <option key={s.id} value={s.id}>{s.name || s.host}</option>
-                        ))}
-                      </select>
+                        options={[
+                          { value: '', label: `${t.connections.jumpHost}: None` },
+                          ...ssh.filter(s => s.id !== draft.id).map(s => ({ value: s.id, label: s.name || s.host }))
+                        ]}
+                      />
                     </div>
 
                     <div className="editor-row" style={{ height: 'auto', alignItems: 'flex-start', padding: '8px 0' }}>
@@ -473,14 +476,15 @@ export const ConnectionsView: React.FC<{ store: AppStore }> = observer(({ store 
                     </div>
                     <div className="editor-row">
                       <span className="editor-icon"><Server size={16} /></span>
-                      <select
+                      <Select
                         className="editor-select"
                         value={draft.type ?? 'socks5'}
-                        onChange={(e) => setDraft({ ...draft, type: e.target.value })}
-                      >
-                        <option value="socks5">SOCKS5</option>
-                        <option value="http">HTTP</option>
-                      </select>
+                        onChange={(val) => setDraft({ ...draft, type: val })}
+                        options={[
+                          { value: 'socks5', label: 'SOCKS5' },
+                          { value: 'http', label: 'HTTP' }
+                        ]}
+                      />
                     </div>
                     <div className="editor-row">
                       <span className="editor-icon"><Server size={16} /></span>
@@ -515,6 +519,7 @@ export const ConnectionsView: React.FC<{ store: AppStore }> = observer(({ store 
                         type="password"
                         className="editor-input"
                         placeholder={t.common.password}
+                        autoComplete="new-password"
                         value={draft.password ?? ''}
                         onChange={(e) => setDraft({ ...draft, password: e.target.value })}
                       />
@@ -583,15 +588,16 @@ export const ConnectionsView: React.FC<{ store: AppStore }> = observer(({ store 
 
                     <div className="editor-row">
                       <span className="editor-icon"><Server size={16} /></span>
-                      <select
+                      <Select
                         className="editor-select"
                         value={draft.type ?? PortForwardType.Local}
-                        onChange={(e) => setDraft({ ...draft, type: e.target.value as PortForwardType })}
-                      >
-                        <option value={PortForwardType.Local}>Local</option>
-                        <option value={PortForwardType.Remote}>Remote</option>
-                        <option value={PortForwardType.Dynamic}>Dynamic</option>
-                      </select>
+                        onChange={(val) => setDraft({ ...draft, type: val as PortForwardType })}
+                        options={[
+                          { value: PortForwardType.Local, label: 'Local' },
+                          { value: PortForwardType.Remote, label: 'Remote' },
+                          { value: PortForwardType.Dynamic, label: 'Dynamic' }
+                        ]}
+                      />
                     </div>
 
                     <div className="editor-row">

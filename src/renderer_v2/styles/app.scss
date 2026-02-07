@@ -75,7 +75,7 @@
     transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
     background: transparent;
     border: 2px dashed transparent;
-    border-radius: 8px;
+    border-radius: 4px; /* Sharper */
     box-sizing: border-box;
     min-width: 0;
 
@@ -99,7 +99,7 @@
   .drag-hint {
     background: var(--panel-bg);
     border: 1px solid var(--border-strong);
-    border-radius: 999px;
+    border-radius: 2px;
     padding: 8px 14px;
     color: var(--fg);
     box-shadow: var(--shadow);

@@ -47,35 +47,35 @@ export const MessageRow: React.FC<MessageRowProps> = observer(({
   }
   if (msg.type === 'command') {
     return (
-      <div>
+      <div className="message-row-container role-assistant">
         <CommandBanner msg={msg} />
       </div>
     )
   }
   if (msg.type === 'tool_call') {
     return (
-      <div>
+      <div className="message-row-container role-assistant">
         <ToolCallBanner msg={msg} />
       </div>
     )
   }
   if (msg.type === 'file_edit') {
     return (
-      <div>
+      <div className="message-row-container role-assistant">
         <FileEditBanner msg={msg} />
       </div>
     )
   }
   if (msg.type === 'sub_tool') {
     return (
-      <div>
+      <div className="message-row-container role-assistant">
         <SubToolBanner msg={msg} />
       </div>
     )
   }
   if (msg.type === 'ask') {
     return (
-      <div>
+      <div className="message-row-container role-assistant">
         <AskBanner 
           msg={msg} 
           onDecision={(messageId, decision) => onAskDecision(messageId, decision)} 
@@ -86,7 +86,7 @@ export const MessageRow: React.FC<MessageRowProps> = observer(({
   }
   if (msg.type === 'alert' || msg.type === 'error') {
     return (
-      <div>
+      <div className="message-row-container role-assistant">
         <AlertBanner 
           msg={msg} 
           onRemove={() => store.chat.removeMessage(msg.id, sessionId)}
@@ -101,43 +101,48 @@ export const MessageRow: React.FC<MessageRowProps> = observer(({
 
   if (isUser) {
     return (
-      <div className="message-user-row">
-        <button
-          className="message-rollback-btn"
-          title="Rollback and re-edit"
-          onClick={() => onRollback(msg)}
-          disabled={!canRollback}
-        >
-          <CornerUpLeft size={14} />
-        </button>
-        <div className={`message-text ${msg.role}`}>
-          <div className="plain-text">
-            {renderMentionContent(msg.content)}
-            {msg.streaming && <span className="cursor-blink" />}
+      <div className="message-row-container role-user">
+        <div className="message-role-label user">USER</div>
+        <div className="message-user-row">
+          <div className={`message-text ${msg.role}`}>
+            <div className="plain-text">
+              {renderMentionContent(msg.content)}
+              {msg.streaming && <span className="cursor-blink" />}
+            </div>
           </div>
+          <button
+            className="message-rollback-btn"
+            title="Rollback and re-edit"
+            onClick={() => onRollback(msg)}
+            disabled={!canRollback}
+          >
+            <CornerUpLeft size={14} />
+          </button>
         </div>
       </div>
     )
   }
 
   return (
-    <div className={`message-text ${msg.role}`}>
-      {msg.role === 'assistant' && <div className="message-role-icon"><div className="avatar-ai" /></div>}
-      <div className={msg.role === 'assistant' ? "markdown-body" : "plain-text"}>
-        {msg.role === 'assistant' ? (
-          <ReactMarkdown
-            components={{
-              a: ({ node, ...props }) => (
-                <a {...props} target="_blank" rel="noopener noreferrer" />
-              )
-            }}
-          >
-            {msg.content}
-          </ReactMarkdown>
-        ) : (
-          msg.content
-        )}
-        {msg.streaming && <span className="cursor-blink" />}
+    <div className="message-row-container role-assistant">
+      <div className="message-role-label assistant">ASSISTANT</div>
+      <div className={`message-text ${msg.role}`}>
+        <div className={msg.role === 'assistant' ? "markdown-body" : "plain-text"}>
+          {msg.role === 'assistant' ? (
+            <ReactMarkdown
+              components={{
+                a: ({ node, ...props }) => (
+                  <a {...props} target="_blank" rel="noopener noreferrer" />
+                )
+              }}
+            >
+              {msg.content}
+            </ReactMarkdown>
+          ) : (
+            msg.content
+          )}
+          {msg.streaming && <span className="cursor-blink" />}
+        </div>
       </div>
     </div>
   )

@@ -8,13 +8,13 @@
 .rich-input-editor {
   background: transparent;
   border: none;
-  padding: 10px 12px;
+  padding: 12px 16px;
   color: var(--fg);
   outline: none;
-  font-family: inherit;
+  font-family: var(--font-mono);
   font-size: 13px;
-  min-height: 40px;
-  max-height: 150px;
+  min-height: 44px;
+  max-height: 200px;
   line-height: 1.5;
   width: 100%;
   overflow-y: auto;
@@ -24,7 +24,7 @@
   &:empty::before {
     content: attr(data-placeholder);
     color: var(--fg-muted);
-    opacity: 0.5;
+    opacity: 0.4;
     pointer-events: none;
   }
 
@@ -37,29 +37,32 @@
     display: inline-flex;
     align-items: center;
     background: color-mix(in srgb, var(--accent-2) 15%, transparent);
-    color: var(--fg); // Use normal text color from theme
+    color: var(--accent-2);
     padding: 0 6px;
-    border-radius: 6px;
+    border-radius: 4px;
     margin: 0 1px;
-    font-weight: 500;
+    font-weight: 700;
+    font-family: var(--font-mono);
     border: 1px solid color-mix(in srgb, var(--accent-2) 30%, transparent);
     user-select: none;
     cursor: default;
-    font-size: 12px;
-    height: 22px;
+    font-size: 11px;
+    height: 20px;
     line-height: 1;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
   }
 }
 
 .mention-suggestions {
   background: var(--panel-bg);
   border: 1px solid var(--border-strong);
-  border-radius: 8px;
+  border-radius: 2px;
   box-shadow: 0 10px 30px rgba(0, 0, 0, 0.4), 0 0 0 1px rgba(255, 255, 255, 0.05);
   min-width: 180px;
   max-height: 200px;
   overflow-y: auto;
-  z-index: 10001;
+  z-index: 10001 !important; /* Ensure it's above settings/connections overlays */
   padding: 2px;
   margin-bottom: 4px;
 
@@ -67,7 +70,7 @@
     display: flex;
     align-items: center;
     padding: 4px 8px;
-    border-radius: 6px;
+    border-radius: 2px;
     cursor: pointer;
     font-size: 12px;
     color: var(--fg-muted);
@@ -92,15 +95,16 @@
     }
 
     .item-type {
-      font-size: 10px;
+      font-size: 9px;
+      font-family: var(--font-mono);
       text-transform: uppercase;
       padding: 1px 0;
       width: 100%;
       text-align: center;
-      border-radius: 4px;
-      font-weight: 600;
+      border-radius: 3px;
+      font-weight: 700;
       background: color-mix(in srgb, var(--accent-2) 15%, transparent);
-      color: var(--fg); // Use normal text color from theme
+      color: var(--accent-2);
     }
 
     .item-name {
