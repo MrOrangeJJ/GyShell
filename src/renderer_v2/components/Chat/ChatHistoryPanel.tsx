@@ -33,88 +33,16 @@ export const ChatHistoryPanel: React.FC<ChatHistoryPanelProps> = observer(({ sto
   const [lastSelectedIndex, setLastSelectedIndex] = useState<number | null>(null)
   const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null)
   const [showBulkDeleteConfirm, setShowBulkDeleteConfirm] = useState(false)
+  const [isDeletingSingle, setIsDeletingSingle] = useState(false)
+  const [isDeletingBulk, setIsDeletingBulk] = useState(false)
   const [editingId, setEditingId] = useState<string | null>(null)
   const [editingTitle, setEditingTitle] = useState('')
-  
-  // Selection box state
-  const [isDragging, setIsDragging] = useState(false)
-  const [dragStart, setDragStart] = useState<{ x: number, y: number } | null>(null)
-  const [dragEnd, setDragEnd] = useState<{ x: number, y: number } | null>(null)
-  const listRef = React.useRef<HTMLDivElement>(null)
 
   const t = store.i18n.t
 
   useEffect(() => {
     loadHistory()
   }, [])
-
-  // Handle selection box logic
-  useEffect(() => {
-    if (!isDragging || !dragStart || !dragEnd || !listRef.current) return
-
-    const selectionRect = {
-      left: Math.min(dragStart.x, dragEnd.x),
-      top: Math.min(dragStart.y, dragEnd.y),
-      right: Math.max(dragStart.x, dragEnd.x),
-      bottom: Math.max(dragStart.y, dragEnd.y)
-    }
-
-    const items = listRef.current.querySelectorAll('.chat-history-item')
-    const newSelected = new Set<string>()
-    
-    items.forEach((item, index) => {
-      const itemRect = item.getBoundingClientRect()
-      const isOverlapping = !(
-        itemRect.right < selectionRect.left ||
-        itemRect.left > selectionRect.right ||
-        itemRect.bottom < selectionRect.top ||
-        itemRect.top > selectionRect.bottom
-      )
-
-      if (isOverlapping) {
-        const id = history[index]?.id
-        if (id) newSelected.add(id)
-      }
-    })
-
-    setSelectedIds(newSelected)
-  }, [dragEnd, isDragging])
-
-  const handleMouseDown = (e: React.MouseEvent) => {
-    if (!isSelectionMode || (e.target as HTMLElement).closest('.chat-history-item-delete') || (e.target as HTMLElement).closest('.chat-history-select-all')) return
-    
-    // If clicking on an item, let handleItemClick handle it
-    const item = (e.target as HTMLElement).closest('.chat-history-item')
-    if (item) {
-      // If holding shift/cmd, don't start drag selection
-      if (e.shiftKey || e.metaKey || e.ctrlKey) return
-      
-      // If clicking directly on an item without modifiers, we might want to start a drag
-      // but let's only start drag if we move the mouse a bit, or start from whitespace.
-      // For simplicity, let's allow drag from anywhere in selection mode.
-    }
-
-    setIsDragging(true)
-    setDragStart({ x: e.clientX, y: e.clientY })
-    setDragEnd({ x: e.clientX, y: e.clientY })
-    
-    // Do NOT clear selection here, allow additive selection if needed later
-    // or clear only if not clicking an item
-    if (!item && !e.shiftKey && !e.metaKey && !e.ctrlKey) {
-      setSelectedIds(new Set())
-    }
-  }
-
-  const handleMouseMove = (e: React.MouseEvent) => {
-    if (!isDragging) return
-    setDragEnd({ x: e.clientX, y: e.clientY })
-  }
-
-  const handleMouseUp = () => {
-    setIsDragging(false)
-    setDragStart(null)
-    setDragEnd(null)
-  }
 
   const loadHistory = async (showLoading = true) => {
     if (showLoading) setLoading(true)
@@ -204,6 +132,8 @@ export const ChatHistoryPanel: React.FC<ChatHistoryPanelProps> = observer(({ sto
   }
 
   const handleDeleteSession = async (sessionId: string) => {
+    if (isDeletingSingle) return
+    setIsDeletingSingle(true)
     try {
       // Optimistic update
       setHistory(prev => prev.filter(s => s.id !== sessionId))
@@ -224,12 +154,16 @@ export const ChatHistoryPanel: React.FC<ChatHistoryPanelProps> = observer(({ sto
       // Rollback on error
       await loadHistory(true)
     } finally {
+      setIsDeletingSingle(false)
       setConfirmDeleteId(null)
     }
   }
 
   const handleBulkDelete = async () => {
+    if (isDeletingBulk) return
     const idsToDelete = Array.from(selectedIds)
+    if (idsToDelete.length === 0) return
+    setIsDeletingBulk(true)
     try {
       // Optimistic update
       setHistory(prev => prev.filter(s => !selectedIds.has(s.id)))
@@ -243,13 +177,14 @@ export const ChatHistoryPanel: React.FC<ChatHistoryPanelProps> = observer(({ sto
       // Rollback on error
       await loadHistory(true)
     } finally {
+      setIsDeletingBulk(false)
       setShowBulkDeleteConfirm(false)
     }
   }
 
   const toggleSelectAll = (e: React.MouseEvent) => {
     e.stopPropagation()
-    e.preventDefault() // Prevent triggering underlying mousedown/drag logic
+    e.preventDefault()
     if (selectedIds.size === history.length && history.length > 0) {
       setSelectedIds(new Set())
     } else {
@@ -286,8 +221,12 @@ export const ChatHistoryPanel: React.FC<ChatHistoryPanelProps> = observer(({ sto
         confirmText={t.common.delete}
         cancelText={t.common.cancel}
         danger
+        loading={isDeletingSingle}
         onConfirm={() => confirmDeleteId && handleDeleteSession(confirmDeleteId)}
-        onCancel={() => setConfirmDeleteId(null)}
+        onCancel={() => {
+          if (isDeletingSingle) return
+          setConfirmDeleteId(null)
+        }}
       />
 
       <ConfirmDialog
@@ -297,30 +236,15 @@ export const ChatHistoryPanel: React.FC<ChatHistoryPanelProps> = observer(({ sto
         confirmText={t.common.delete}
         cancelText={t.common.cancel}
         danger
+        loading={isDeletingBulk}
         onConfirm={handleBulkDelete}
-        onCancel={() => setShowBulkDeleteConfirm(false)}
+        onCancel={() => {
+          if (isDeletingBulk) return
+          setShowBulkDeleteConfirm(false)
+        }}
       />
 
-      <div 
-        className={`chat-history-panel ${isSelectionMode ? 'selection-mode' : ''}`} 
-        onClick={(e) => e.stopPropagation()}
-        onMouseDown={handleMouseDown}
-        onMouseMove={handleMouseMove}
-        onMouseUp={handleMouseUp}
-        onMouseLeave={handleMouseUp}
-      >
-        {isDragging && dragStart && dragEnd && (
-          <div 
-            className="selection-box"
-            style={{
-              left: Math.min(dragStart.x, dragEnd.x),
-              top: Math.min(dragStart.y, dragEnd.y),
-              width: Math.abs(dragStart.x - dragEnd.x),
-              height: Math.abs(dragStart.y - dragEnd.y)
-            }}
-          />
-        )}
-
+      <div className="chat-history-panel" onClick={(e) => e.stopPropagation()}>
         <div className="chat-history-header">
           <div className="chat-history-title">
             <History size={18} />
@@ -367,7 +291,7 @@ export const ChatHistoryPanel: React.FC<ChatHistoryPanelProps> = observer(({ sto
           </button>
         </div>
 
-        <div className="chat-history-content" ref={listRef}>
+        <div className="chat-history-content">
           {loading ? (
             <div className="chat-history-loading">{t.chat.history.loading}</div>
           ) : history.length === 0 ? (
