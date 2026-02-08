@@ -12,3 +12,5 @@ about_mcp.md
 mcp.json
 .cursorignore
 demo.md
+build.sh
+*.tsbuildinfo
