@@ -269,13 +269,21 @@ export const ChatPanel: React.FC<{ store: AppStore }> = observer(({ store }) => 
   )
 
   // --- Drag & Drop Layout Logic ---
-  const dragTimerRef = useRef<NodeJS.Timeout | null>(null)
+  const dragTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+
+  const setSelectionSuppressed = useCallback((suppressed: boolean) => {
+    const body = document.body
+    if (!body) return
+    body.classList.toggle('chat-drag-selection-suppressed', suppressed)
+  }, [])
   
   const handleTabMouseDown = useCallback((e: React.MouseEvent) => {
+    if (e.button !== 0) return
     // Only allow dragging from the tab area background, not buttons
     if ((e.target as HTMLElement).closest('button')) return
     
     const startX = e.clientX
+    setSelectionSuppressed(true)
     
     dragTimerRef.current = setTimeout(() => {
       store.layout.setDragging(true)
@@ -304,6 +312,7 @@ export const ChatPanel: React.FC<{ store: AppStore }> = observer(({ store }) => 
         clearTimeout(dragTimerRef.current)
         dragTimerRef.current = null
       }
+      setSelectionSuppressed(false)
       
       if (store.layout.isDragging) {
         const indicator = store.layout.dropIndicator
@@ -323,7 +332,17 @@ export const ChatPanel: React.FC<{ store: AppStore }> = observer(({ store }) => 
 
     window.addEventListener('mousemove', handleMouseMove)
     window.addEventListener('mouseup', handleMouseUp)
-  }, [store.layout])
+  }, [setSelectionSuppressed, store.layout])
+
+  useEffect(() => {
+    return () => {
+      if (dragTimerRef.current) {
+        clearTimeout(dragTimerRef.current)
+        dragTimerRef.current = null
+      }
+      setSelectionSuppressed(false)
+    }
+  }, [setSelectionSuppressed])
 
   const profiles = store.settings?.models.profiles || []
   const activeProfileId = store.settings?.models.activeProfileId
@@ -473,7 +492,12 @@ export const ChatPanel: React.FC<{ store: AppStore }> = observer(({ store }) => 
       className={`panel panel-chat${store.layout.isDragging ? ' is-dragging-source' : ''}`} 
       ref={panelRef}
     >
-      <div className="panel-header-minimal" onMouseDown={handleTabMouseDown}>
+      <div
+        className="panel-header-minimal is-draggable"
+        onMouseDown={handleTabMouseDown}
+        title={t.chat.dragHint}
+        aria-label={t.chat.dragHint}
+      >
         <div className="chat-tabs">
             {store.chat.sessions.map(s => (
                 <div 
@@ -615,7 +639,7 @@ export const ChatPanel: React.FC<{ store: AppStore }> = observer(({ store }) => 
                     className="chat-profile-selector" 
                     onClick={() => profileSelectRef.current?.toggle()}
                   >
-                      <Bot size={14} className="profile-icon"/>
+                      <Bot size={14} className="profile-icon" />
                       <Select
                         ref={profileSelectRef}
                         className="profile-dropdown"

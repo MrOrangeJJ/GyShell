@@ -22,6 +22,20 @@
   border-bottom: 1px solid var(--border);
 }
 
+.panel-header-minimal.is-draggable {
+  cursor: grab;
+  user-select: none;
+}
+
+.panel-chat.is-dragging-source .panel-header-minimal.is-draggable {
+  cursor: grabbing;
+}
+
+body.chat-drag-selection-suppressed,
+body.chat-drag-selection-suppressed * {
+  user-select: none !important;
+}
+
 /* Chat Tabs */
 .chat-tabs {
   display: flex;
@@ -503,16 +517,19 @@
   color: var(--accent);
   flex-shrink: 0;
   display: block;
-  /* Use negative margin to offset transparent edges in SVG */
-  margin-left: -2px; 
+  margin-left: 0;
 }
 
 .profile-dropdown {
   background: transparent;
   border: none;
   color: var(--fg-muted);
+  font-family: var(--font-mono);
   font-size: 11px;
-  font-weight: 500;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  line-height: 1.4;
   outline: none;
   cursor: pointer;
   appearance: none;

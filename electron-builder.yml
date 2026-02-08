@@ -13,7 +13,7 @@ files:
 asarUnpack:
   - '**/*.node'
 mac:
-  icon: icon.icns
+  icon: materials/icon.icns
   identity: "-"
   hardenedRuntime: false
   gatekeeperAssess: false
@@ -26,7 +26,7 @@ mac:
         - arm64
   category: public.app-category.developer-tools
 win:
-  icon: icon.ico
+  icon: materials/icon.ico
   target:
     - target: nsis
       arch:
