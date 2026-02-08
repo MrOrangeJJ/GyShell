@@ -1,6 +1,6 @@
 # GyShell
 
-> **v0.1.4-beta1 has been released! [Check out here**](./changelogs/v0.1.4-beta1.md)
+> **v0.1.4-beta3 has been released! [Check out here](./changelogs/v0.1.4-beta3.md)**
 
 > **The AI-Native Terminal that Thinks with You.**  
 

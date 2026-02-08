@@ -36,6 +36,7 @@ export class TerminalService {
   private activeTaskByTerminal: Map<string, string> = new Map()
   private oscParseBufByTerminal: Map<string, string> = new Map()
   private onTaskFinishedCallbacks: Map<string, (result: CommandResult) => void> = new Map()
+  private hasPrintedBanner = false
 
   constructor() {
     this.backends.set('local', new NodePtyBackend())
@@ -48,6 +49,22 @@ export class TerminalService {
       throw new Error(`No backend found for connection type: ${type}`)
     }
     return backend
+  }
+
+  private async printBanner(terminalId: string): Promise<void> {
+    if (this.hasPrintedBanner) return
+    this.hasPrintedBanner = true
+
+    // ANSI Shadow font for "GyShell"
+    // Using \x1b[36m for Cyan color
+    const banner = `\r\n\x1b[36m  ____         ____  _          _ _ \r\n / ___|_   _  / ___|| |__   ___| | |\r\n| |  _| | | | \\___ \\| '_ \\ / _ \\ | |\r\n| |_| | |_| |  ___) | | | |  __/ | |\r\n \\____|\\__, | |____/|_| |_|\\___|_|_|\r\n       |___/                        \x1b[0m\r\n`
+
+    // Small delay to ensure shell is ready
+    setTimeout(() => {
+      // Use handleData to inject the banner directly into the UI and headless terminal
+      // without sending it as a command to the underlying PTY process.
+      this.handleData(terminalId, banner)
+    }, 500)
   }
 
   async createTerminal(config: TerminalConfig): Promise<TerminalTab> {
@@ -102,6 +119,11 @@ export class TerminalService {
     backend.onExit(ptyId, (code: number) => {
       this.handleExit(config.id, code)
     })
+
+    // Print banner for the first local terminal
+    if (config.type === 'local') {
+      this.printBanner(config.id)
+    }
 
     return tab
   }
