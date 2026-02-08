@@ -1,9 +1,5 @@
 # <img src="./demo_imgs/icon.png" width="40" height="40" align="center" style="margin-right: 10px;"> GyShell
 
-<p align="center">
-  <img src="./demo_imgs/demo.png" width="100%">
-</p>
-
 > **v0.1.4-beta3 has been released! [Check out here](./changelogs/v0.1.4-beta3.md)**
 
 > **The AI-Native Terminal that Thinks with You.**  
@@ -14,6 +10,10 @@
 
 > [!WARNING]
 > **Active Development Phase**: This project is in a high-speed development stage. Compatibility of chat history data between versions is not guaranteed. If significant breaking changes occur, they will be clearly marked in the Release notes with a major version jump. Currently, versions remain compatible.
+
+<p align="center">
+  <img src="./demo_imgs/demo.png" width="100%">
+</p>
 
 ---
 
