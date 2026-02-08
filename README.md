@@ -1,12 +1,16 @@
-# GyShell
+# <img src="./demo_imgs/icon.png" width="40" height="40" align="center" style="margin-right: 10px;"> GyShell
+
+<p align="center">
+  <img src="./demo_imgs/demo.png" width="100%">
+</p>
 
 > **v0.1.4-beta3 has been released! [Check out here](./changelogs/v0.1.4-beta3.md)**
 
 > **The AI-Native Terminal that Thinks with You.**  
 
-[License](https://creativecommons.org/licenses/by-nc/4.0/)
-[Platform](#-multi-platform-desktop-app--多平台桌面应用)
-[Shell](#-comprehensive-shell-support--全方位-shell-支持)
+[![License](https://img.shields.io/badge/License-CC%20BY--NC%204.0-lightgrey.svg)](https://creativecommons.org/licenses/by-nc/4.0/)
+[![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20macOS%20%7C%20Linux-blue)](#-multi-platform-desktop-app--多平台桌面应用)
+[![Shell](https://img.shields.io/badge/Shell-Zsh%20%7C%20Bash%20%7C%20PowerShell-orange)](#-comprehensive-shell-support--全方位-shell-支持)
 
 > [!WARNING]
 > **Active Development Phase**: This project is in a high-speed development stage. Compatibility of chat history data between versions is not guaranteed. If significant breaking changes occur, they will be clearly marked in the Release notes with a major version jump. Currently, versions remain compatible.
