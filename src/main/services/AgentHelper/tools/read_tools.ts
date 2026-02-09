@@ -1,7 +1,7 @@
 import { z } from 'zod'
 import path from 'path'
 import { HumanMessage, AIMessage } from '@langchain/core/messages'
-import type { ToolExecutionContext, ReadFileSupport } from './types'
+import type { ToolExecutionContext, ReadFileSupport } from '../types'
 
 export const DEFAULT_READ_LIMIT = 2000
 export const MAX_LINE_LENGTH = 2000

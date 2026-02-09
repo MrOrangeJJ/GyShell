@@ -130,6 +130,7 @@ export class AppStore {
       setBuiltInToolEnabled: action,
       setSkillEnabled: action,
       setRecursionLimit: action,
+      setDebugMode: action,
       sendChatMessage: action,
       getUniqueTitle: action,
       loadVersionState: action,
@@ -433,6 +434,15 @@ export class AppStore {
       }
     })
     await window.gyshell.settings.set({ recursionLimit: limit })
+  }
+
+  async setDebugMode(enabled: boolean): Promise<void> {
+    runInAction(() => {
+      if (this.settings) {
+        this.settings.debugMode = enabled
+      }
+    })
+    await window.gyshell.settings.set({ debugMode: enabled })
   }
 
   async openCustomThemeFile(): Promise<void> {

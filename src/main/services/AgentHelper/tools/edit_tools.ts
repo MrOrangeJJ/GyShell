@@ -1,8 +1,8 @@
 import { z } from 'zod'
 import { createTwoFilesPatch } from 'diff'
-import type { TerminalService } from '../TerminalService'
-import type { TerminalTab } from '../../types'
-import type { ToolExecutionContext } from './types'
+import type { TerminalService } from '../../TerminalService'
+import type { TerminalTab } from '../../../types'
+import type { ToolExecutionContext } from '../types'
 
 export const editFileSchema = z.object({
   tabIdOrName: z.string().describe('The ID or Name of the terminal tab'),

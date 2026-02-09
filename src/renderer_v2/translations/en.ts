@@ -49,6 +49,7 @@ export const en = {
     cursorBlink: 'Cursor Blink',
     recursionLimit: 'Agent Recursion Limit',
     recursionLimitInf: 'Infinite',
+    debugMode: 'Debug Mode',
     cursorStyles: {
       block: 'Block',
       underline: 'Underline',
@@ -135,6 +136,7 @@ export const en = {
       cursorStyle: 'The visual appearance of the terminal cursor.',
       cursorBlink: 'Whether the terminal cursor should blink.',
       recursionLimit: 'The maximum number of steps the Agent can take in a single task. Increase this if you encounter "Recursion limit reached" errors. Setting to maximum enables infinite steps.',
+      debugMode: 'Enable debug-oriented persistence and diagnostics. Currently this keeps additional_kwargs.__raw_response in backend exported messages; outgoing model inputs still strip raw payloads.',
       themeCustom: 'Open the JSON configuration file for custom themes. You can define your own color schemes here.',
       themeReload: 'Manually reload the custom theme file to apply your latest JSON changes.',
       modelAdd: 'Configure AI model providers. Currently, only [OpenAI API Compatible] interfaces are supported (e.g., DeepSeek, Claude, Local LLMs).',

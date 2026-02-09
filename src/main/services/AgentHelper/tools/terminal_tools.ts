@@ -1,5 +1,5 @@
 import { z } from 'zod'
-import type { ToolExecutionContext } from './types'
+import type { ToolExecutionContext } from '../types'
 
 // --- Schemas ---
 

@@ -1,6 +1,6 @@
 import { z } from 'zod'
-import type { SkillInfo, SkillService } from '../SkillService'
-import { USEFUL_SKILL_TAG } from './prompts'
+import type { SkillInfo, SkillService } from '../../SkillService'
+import { USEFUL_SKILL_TAG } from '../prompts'
 
 export const skillToolSchema = z.object({
   name: z.string().describe('The skill identifier from available_skills')

@@ -2,7 +2,7 @@ import fs from 'fs/promises';
 import { SkillService } from '../SkillService';
 import { TerminalService } from '../TerminalService';
 import { USEFUL_SKILL_TAG, USER_INPUT_TAGS, FILE_CONTENT_TAG, TERMINAL_CONTENT_TAG } from './prompts';
-import { detectFileKind } from './read_tools';
+import { detectFileKind } from './tools/read_tools';
 
 /**
  * Helper to parse user input for special labels like skills, terminal tabs, and pastes.

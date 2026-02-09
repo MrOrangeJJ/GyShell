@@ -45,7 +45,8 @@ const DEFAULT_SETTINGS: AppSettings = {
     panelSizes: [30, 70],
     panelOrder: ['chat', 'terminal']
   },
-  recursionLimit: 200
+  recursionLimit: 200,
+  debugMode: false
 }
 
 function isObject(x: unknown): x is Record<string, any> {
@@ -104,9 +105,14 @@ export class SettingsService {
       }
     }
 
+    const debugMode = typeof (normalized as any).debugMode === 'boolean'
+      ? Boolean((normalized as any).debugMode)
+      : false
+
     const fixed = {
       ...normalized,
       model: effectiveModel,
+      debugMode,
       schemaVersion: 2
     }
     this.store.store = fixed as any
@@ -162,4 +168,3 @@ export class SettingsService {
     this.store.store = next as any
   }
 }
-

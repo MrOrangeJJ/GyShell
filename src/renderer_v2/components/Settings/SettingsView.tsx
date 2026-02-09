@@ -392,6 +392,20 @@ export const SettingsView: React.FC<{ store: AppStore }> = observer(({ store }) 
                     </span>
                   </div>
                 </div>
+                <div className="settings-row">
+                  <div className="settings-row-label-with-info">
+                    <label>{t.settings.debugMode}</label>
+                    <InfoTooltip content={t.settings.tooltips.debugMode} />
+                  </div>
+                  <label className="switch">
+                    <input
+                      type="checkbox"
+                      checked={store.settings?.debugMode ?? false}
+                      onChange={(e) => store.setDebugMode(e.target.checked)}
+                    />
+                    <span className="switch-slider" />
+                  </label>
+                </div>
               </div>
 
               <div className="settings-section-header" style={{ marginTop: 24 }}>

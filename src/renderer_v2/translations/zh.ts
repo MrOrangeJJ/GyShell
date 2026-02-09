@@ -49,6 +49,7 @@ export const zh = {
     cursorBlink: '光标闪烁',
     recursionLimit: 'Agent 递归上限',
     recursionLimitInf: '无限制',
+    debugMode: '调试模式',
     cursorStyles: {
       block: '方块',
       underline: '下划线',
@@ -135,6 +136,7 @@ export const zh = {
       cursorStyle: '选择终端光标的视觉样式。',
       cursorBlink: '终端光标是否以动画形式闪烁。',
       recursionLimit: 'Agent 在单个任务中允许执行的最大步数。如果经常遇到“递归上限”错误，请调高此值。拉到最右侧为无限制。',
+      debugMode: '开启调试相关的持久化与诊断能力。目前会在后端导出消息中保留 additional_kwargs.__raw_response；但发送给模型前仍会自动剥离这些原始字段。',
       themeCustom: '点击打开自定义主题的 JSON 配置文件。你可以按照现有格式添加自己的配色方案。',
       themeReload: '手动重新加载自定义主题文件，使最新的 JSON 修改生效。',
       modelAdd: '配置 AI 模型供应商。目前仅支持【OpenAI API 兼容】的接口格式（如 DeepSeek, Claude, Local LLM 等）。',

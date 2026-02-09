@@ -154,6 +154,8 @@ export interface AppSettings {
   }
   /** Agent recursion limit */
   recursionLimit?: number
+  /** Debug mode switch for backend debug payload persistence and related diagnostics */
+  debugMode?: boolean
 }
 
 // ============ Terminal Types ============

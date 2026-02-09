@@ -31,6 +31,10 @@ import {
 } from './AgentHelper/tools'
 import type { ToolExecutionContext } from './AgentHelper/types'
 import { AgentHelpers } from './AgentHelper/helpers'
+import { ActionModelFallbackHelper } from './AgentHelper/utils/action_model_fallback'
+import { buildDebugRawResponse, captureRawResponseChunk } from './AgentHelper/utils/raw_response'
+import { invokeWithRetryAndSanitizedInput, stripRawResponseFromStoredMessages } from './AgentHelper/utils/model_messages'
+import { createStreamReasoningExtractor } from './AgentHelper/utils/stream_reasoning_extractor'
 import {
   USEFUL_SKILL_TAG,
   USER_INSERTED_INPUT_TAG,
@@ -43,7 +47,7 @@ import {
   createCommandPolicyUserPrompt,
   createSendCharPolicyUserPrompt,
 } from './AgentHelper/prompts'
-import { runSkillTool } from './AgentHelper/skill_tools'
+import { runSkillTool } from './AgentHelper/tools/skill_tools'
 import { TokenManager } from './AgentHelper/TokenManager'
 import { InputParseHelper } from './AgentHelper/InputParseHelper'
 
@@ -106,6 +110,9 @@ const StateAnnotation = Ann.Root({
   })
 })
 
+const MODEL_RETRY_MAX = 4
+const MODEL_RETRY_DELAYS_MS = [1000, 2000, 4000, 6000]
+
 export class AgentService_v2 {
   private terminalService: TerminalService
   private chatHistoryService: ChatHistoryService
@@ -127,6 +134,7 @@ export class AgentService_v2 {
   private builtInToolEnabled: Record<string, boolean> = {}
   private readFileSupport = { image: false }
   private lastAbortedMessage: BaseMessage | null = null
+  private actionModelFallbackHelper = new ActionModelFallbackHelper()
 
   constructor(
     terminalService: TerminalService,
@@ -451,50 +459,123 @@ ${recent}
       const messageId = uuidv4()
       
       let partialText = ''
-      const fullResponse = await this.helpers.invokeWithRetry(async (attempt) => {
-        if (attempt > 0) {
-          this.helpers.sendEvent(sessionId, {
-            type: 'alert',
-            message: `Retrying (${attempt}/4)...`,
-            level: 'info',
-            messageId: `retry-${messageId}-${attempt}`
+      let reasoningContent = ''
+      let debugRawChunks: any[] = []
+      const fullResponse = await invokeWithRetryAndSanitizedInput({
+        helpers: this.helpers,
+        messages: state.messages as BaseMessage[],
+        signal: config?.signal,
+        operation: async (streamInputMessages) => {
+          const stream = await modelWithTools.stream(streamInputMessages, {
+            signal: config?.signal
           })
-        }
 
-        const stream = await modelWithTools.stream(state.messages, {
-          signal: config?.signal
-        })
+          let response: any = null
+          const streamReasoningExtractor = createStreamReasoningExtractor()
+          const attemptDebugRawChunks: any[] = []
+          let activeReasoningBannerId: string | null = null
 
-        let response: any = null
-        try {
-          for await (const chunk of stream) {
-            response = response ? response.concat(chunk) : chunk
-            const delta = this.helpers.extractText(chunk.content)
-            if (delta) {
-              partialText += delta
+          const startReasoningBanner = () => {
+            if (activeReasoningBannerId) return
+            activeReasoningBannerId = uuidv4()
+            this.helpers.sendEvent(sessionId, {
+              messageId: activeReasoningBannerId,
+              type: 'sub_tool_started',
+              title: 'Reasoning...',
+              hint: ''
+            })
+          }
+
+          const appendReasoningDelta = (delta: string) => {
+            if (!delta) return
+            startReasoningBanner()
+            this.helpers.sendEvent(sessionId, {
+              messageId: activeReasoningBannerId as string,
+              type: 'sub_tool_delta',
+              outputDelta: delta
+            })
+          }
+
+          const finishReasoningBanner = () => {
+            if (!activeReasoningBannerId) return
+            this.helpers.sendEvent(sessionId, {
+              messageId: activeReasoningBannerId,
+              type: 'sub_tool_finished'
+            })
+            activeReasoningBannerId = null
+          }
+          try {
+            for await (const chunk of stream) {
+              const rawChunk = captureRawResponseChunk(chunk as any, attemptDebugRawChunks)
+              const extracted = streamReasoningExtractor.processChunk(chunk as any, rawChunk)
+              response = response ? response.concat(chunk) : chunk
+              const rawDelta = this.helpers.extractText(chunk.content)
+              if (rawDelta) {
+                partialText += rawDelta
+              }
+              if (extracted.reasoning) {
+                appendReasoningDelta(extracted.reasoning)
+              } else {
+                finishReasoningBanner()
+              }
+              if (extracted.content) {
+                this.helpers.sendEvent(sessionId, {
+                  messageId,
+                  type: 'say',
+                  content: extracted.content
+                })
+              }
+            }
+            const pendingContent = streamReasoningExtractor.flushPendingContent()
+            if (pendingContent) {
               this.helpers.sendEvent(sessionId, {
                 messageId,
                 type: 'say',
-                content: delta
+                content: pendingContent
               })
             }
+            finishReasoningBanner()
+          } catch (err) {
+            finishReasoningBanner()
+            if (partialText.trim()) {
+              this.lastAbortedMessage = new AIMessage({
+                content: partialText,
+                additional_kwargs: { _gyshellMessageId: messageId, _gyshellAborted: true }
+              })
+              console.log('[AgentService_v2] Captured partial message from error/abort in instance variable.')
+            }
+            throw err
           }
-        } catch (err) {
-          if (partialText.trim()) {
-            this.lastAbortedMessage = new AIMessage({
-              content: partialText,
-              additional_kwargs: { _gyshellMessageId: messageId, _gyshellAborted: true }
-            })
-            console.log('[AgentService_v2] Captured partial message from error/abort in instance variable.')
-          }
-          throw err
-        }
-        return response
-      }, 4, [1000, 2000, 4000, 6000], config?.signal)
+          reasoningContent = streamReasoningExtractor.getReasoningContent()
+          debugRawChunks = attemptDebugRawChunks
+          return response
+        },
+        onRetry: (attempt) => {
+          this.helpers.sendEvent(sessionId, {
+            type: 'alert',
+            message: `Retrying (${attempt}/${MODEL_RETRY_MAX})...`,
+            level: 'info',
+            messageId: `retry-${messageId}-${attempt}`
+          })
+        },
+        maxRetries: MODEL_RETRY_MAX,
+        delaysMs: MODEL_RETRY_DELAYS_MS
+      })
 
       fullResponse.additional_kwargs = {
         ...(fullResponse.additional_kwargs || {}),
         _gyshellMessageId: messageId
+      }
+      if (reasoningContent) {
+        fullResponse.additional_kwargs.reasoning_content = reasoningContent
+      }
+      if (this.shouldKeepDebugPayloadInPersistence()) {
+        const persistedRawResponse = buildDebugRawResponse(debugRawChunks)
+        if (typeof persistedRawResponse !== 'undefined') {
+          fullResponse.additional_kwargs.__raw_response = persistedRawResponse
+        }
+      } else if (fullResponse.additional_kwargs?.__raw_response) {
+        delete fullResponse.additional_kwargs.__raw_response
       }
 
       // Extract usage metadata if available
@@ -694,13 +775,13 @@ ${recent}
 
               let decision: z.infer<typeof SEND_CHAR_POLICY_DECISION_SCHEMA>
               try {
-                const structuredModel = this.actionModel.withStructuredOutput(SEND_CHAR_POLICY_DECISION_SCHEMA)
-                decision = await this.helpers.invokeWithRetry(async (attempt) => {
-                  if (attempt > 0) {
-                    console.log(`[AgentService_v2] Retrying action model decision for send_char (attempt ${attempt + 1})...`)
-                  }
-                  return await structuredModel.invoke(finalMessagesForActionModel, { signal: config?.signal }) as any
-                }, 4, [1000, 2000, 4000, 6000], config?.signal)
+                decision = await this.getActionModelPolicyDecision(
+                  sessionId,
+                  finalMessagesForActionModel,
+                  SEND_CHAR_POLICY_DECISION_SCHEMA,
+                  config?.signal,
+                  'send_char'
+                )
               } catch (err: any) {
                 console.warn('[AgentService_v2] Action model decision for send_char failed after retries, falling back to allow:', err)
                 decision = { decision: 'allow', reason: 'Action model error' }
@@ -878,21 +959,16 @@ ${recent}
 
       let decision: z.infer<typeof COMMAND_POLICY_DECISION_SCHEMA>
       try {
-        const structuredModel = this.actionModel.withStructuredOutput(COMMAND_POLICY_DECISION_SCHEMA)
-        decision = await this.helpers.invokeWithRetry(async (attempt) => {
-          if (attempt > 0) {
-            console.log(`[AgentService_v2] Retrying action model decision for exec_command (attempt ${attempt + 1})...`)
-          }
-          return await structuredModel.invoke(finalMessagesForActionModel, { signal: config?.signal }) as any
-        }, 4, [1000, 2000, 4000, 6000], config?.signal)
+        decision = await this.getActionModelPolicyDecision(
+          sessionId,
+          finalMessagesForActionModel,
+          COMMAND_POLICY_DECISION_SCHEMA,
+          config?.signal,
+          'exec_command'
+        )
       } catch (err: any) {
-        toolMessage.content = `Action model decision failed after retries: ${err?.message || String(err)}`
-        return { 
-            messages: [...state.messages, toolMessage], 
-            full_messages: [...fullHistory, toolMessage],
-            sessionId, 
-            pendingToolCalls: queue.slice(1) 
-        }
+        console.warn('[AgentService_v2] Action model decision for exec_command failed after retries, falling back to wait:', err)
+        decision = { decision: 'wait', reason: 'Action model error' }
       }
 
       let resultText = ''
@@ -1147,6 +1223,75 @@ ${recent}
     }
   }
 
+  private shouldKeepDebugPayloadInPersistence(): boolean {
+    return this.settings?.debugMode === true
+  }
+
+  private async getActionModelPolicyDecision<T extends z.ZodTypeAny>(
+    sessionId: string,
+    messages: BaseMessage[],
+    schema: T,
+    signal: AbortSignal | undefined,
+    decisionName: string
+  ): Promise<z.infer<T>> {
+    if (!this.actionModel) {
+      throw new Error('Action model not initialized')
+    }
+
+    return await this.actionModelFallbackHelper.runWithSessionFallback({
+      sessionId,
+      invokeStructured: async () => {
+        const structuredModel = this.actionModel!.withStructuredOutput(schema)
+        return await invokeWithRetryAndSanitizedInput({
+          helpers: this.helpers,
+          messages,
+          signal,
+          operation: async (sanitizedMessages) => {
+            return await structuredModel.invoke(sanitizedMessages, { signal }) as any
+          },
+          onRetry: (attempt) => {
+            console.log(`[AgentService_v2] Retrying action model decision for ${decisionName} (attempt ${attempt + 1})...`)
+          },
+          maxRetries: MODEL_RETRY_MAX,
+          delaysMs: MODEL_RETRY_DELAYS_MS
+        })
+      },
+      invokePseudoSchema: async () => {
+        return await this.invokeActionModelPolicyDecisionWithoutSchema(messages, schema, signal, decisionName)
+      },
+      onFallbackTriggered: (error) => {
+        console.warn(`[AgentService_v2] Structured action-model output failed for ${decisionName}. Enabling per-session pseudo-schema fallback.`, error)
+      }
+    })
+  }
+
+  private async invokeActionModelPolicyDecisionWithoutSchema<T extends z.ZodTypeAny>(
+    messages: BaseMessage[],
+    schema: T,
+    signal: AbortSignal | undefined,
+    decisionName: string
+  ): Promise<z.infer<T>> {
+    if (!this.actionModel) {
+      throw new Error('Action model not initialized')
+    }
+    const result = await invokeWithRetryAndSanitizedInput({
+      helpers: this.helpers,
+      messages,
+      signal,
+      operation: async (sanitizedMessages) => {
+        return await this.actionModel!.invoke(sanitizedMessages, { signal })
+      },
+      onRetry: (attempt) => {
+        console.log(`[AgentService_v2] Retrying pseudo-schema action model decision for ${decisionName} (attempt ${attempt + 1})...`)
+      },
+      maxRetries: MODEL_RETRY_MAX,
+      delaysMs: MODEL_RETRY_DELAYS_MS
+    })
+    const contentText = this.helpers.extractText((result as any)?.content)
+    const parsed = this.helpers.parseStrictJsonObject(contentText)
+    return schema.parse(parsed)
+  }
+
   // --- Execution Core ---
 
   async run(context: any, input: string, signal: AbortSignal, startMode: 'normal' | 'inserted' = 'normal'): Promise<void> {
@@ -1154,6 +1299,7 @@ ${recent}
 
     this.lastAbortedMessage = null
     const { sessionId, boundTerminalId } = context
+    this.actionModelFallbackHelper.beginSession(sessionId)
     const recursionLimit = this.settings?.recursionLimit ?? 200
     const loadedSession = this.chatHistoryService.loadSession(sessionId)
     const baseMessages = loadedSession ? mapStoredMessagesToChatMessages(Array.from(loadedSession.messages.values())) : []
@@ -1214,6 +1360,7 @@ ${recent}
 
         throw err // Throw to Gateway for UI notification
       } finally {
+      this.actionModelFallbackHelper.clearSession(sessionId)
       await this.clearCheckpoint(sessionId)
     }
   }
@@ -1273,6 +1420,9 @@ ${recent}
     // }
 
     const storedMessages = mapChatMessagesToStoredMessages(persisted)
+    if (!this.shouldKeepDebugPayloadInPersistence()) {
+      stripRawResponseFromStoredMessages(storedMessages as any[])
+    }
     const newMessagesMap = new Map<string, typeof storedMessages[0]>()
 
     for (const msg of storedMessages) {

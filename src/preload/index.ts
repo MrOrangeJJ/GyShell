@@ -87,6 +87,7 @@ interface AppSettings {
     panelOrder?: string[]
   }
   recursionLimit?: number
+  debugMode?: boolean
 }
 
 interface CommandPolicyLists {

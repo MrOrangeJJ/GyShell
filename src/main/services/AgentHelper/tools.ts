@@ -1,6 +1,6 @@
 import { convertToOpenAITool } from '@langchain/core/utils/function_calling'
-import { writeAndEditSchema, writeAndEdit } from './edit_tools'
-import { readFileSchema, runReadFile } from './read_tools'
+import { writeAndEditSchema, writeAndEdit } from './tools/edit_tools'
+import { readFileSchema, runReadFile } from './tools/read_tools'
 import { 
   execCommandSchema, 
   readTerminalTabSchema, 
@@ -15,26 +15,26 @@ import {
   sendChar,
   waitTerminalIdle,
   waitCommandEnd
-} from './terminal_tools'
+} from './tools/terminal_tools'
 import { 
   BUILTIN_TOOL_INFO, 
   buildReadFileDescription,
   WAIT_TERMINAL_IDLE_DESCRIPTION
 } from './prompts'
 import type { ReadFileSupport } from './types'
-import { waitSchema, thinkSchema } from './thinking_tools'
+import { waitSchema, thinkSchema } from './tools/thinking_tools'
 import { 
   skillToolSchema, 
   buildSkillToolDescription,
   createSkillSchema,
   runCreateSkillTool
-} from './skill_tools'
+} from './tools/skill_tools'
 
 // Re-export schemas for AgentService to use
 export { 
   editFileSchema, 
   writeAndEditSchema 
-} from './edit_tools'
+} from './tools/edit_tools'
 
 export { 
   execCommandSchema, 
@@ -43,11 +43,11 @@ export {
   sendCharSchema,
   waitTerminalIdleSchema,
   waitCommandEndSchema
-} from './terminal_tools'
+} from './tools/terminal_tools'
 
-export { readFileSchema } from './read_tools'
-export { waitSchema, thinkSchema } from './thinking_tools'
-export { skillToolSchema, createSkillSchema, buildSkillToolDescription } from './skill_tools'
+export { readFileSchema } from './tools/read_tools'
+export { waitSchema, thinkSchema } from './tools/thinking_tools'
+export { skillToolSchema, createSkillSchema, buildSkillToolDescription } from './tools/skill_tools'
 
 export { BUILTIN_TOOL_INFO } from './prompts'
 
