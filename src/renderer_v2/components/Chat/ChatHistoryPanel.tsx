@@ -1,9 +1,10 @@
 import React, { useEffect, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { observer } from 'mobx-react-lite'
-import { Clock, Trash2, X, History, CheckSquare, Square, Edit2, Check, X as Close } from 'lucide-react'
+import { Clock, Trash2, X, History, CheckSquare, Square, Edit2, Check, X as Close, Search } from 'lucide-react'
 import type { AppStore } from '../../stores/AppStore'
 import { ConfirmDialog } from '../Common/ConfirmDialog'
+import { formatChatHistorySessionTitle, normalizeSessionTitleText } from '../../lib/sessionTitleDisplay'
 import './chatHistory.scss'
 
 interface StoredChatSession {
@@ -37,12 +38,18 @@ export const ChatHistoryPanel: React.FC<ChatHistoryPanelProps> = observer(({ sto
   const [isDeletingBulk, setIsDeletingBulk] = useState(false)
   const [editingId, setEditingId] = useState<string | null>(null)
   const [editingTitle, setEditingTitle] = useState('')
+  const [searchQuery, setSearchQuery] = useState('')
 
   const t = store.i18n.t
 
   useEffect(() => {
     loadHistory()
   }, [])
+
+  const normalizedSearchQuery = searchQuery.trim().toLowerCase()
+  const filteredHistory = normalizedSearchQuery
+    ? history.filter((session) => normalizeSessionTitleText(session.title).toLowerCase().includes(normalizedSearchQuery))
+    : history
 
   const loadHistory = async (showLoading = true) => {
     if (showLoading) setLoading(true)
@@ -56,8 +63,8 @@ export const ChatHistoryPanel: React.FC<ChatHistoryPanelProps> = observer(({ sto
     }
   }
 
-  const handleItemClick = (e: React.MouseEvent, index: number) => {
-    const session = history[index]
+  const handleItemClick = (e: React.MouseEvent, index: number, list: StoredChatSession[]) => {
+    const session = list[index]
     if (!session || editingId === session.id) return
 
     if (!isSelectionMode) {
@@ -73,7 +80,7 @@ export const ChatHistoryPanel: React.FC<ChatHistoryPanelProps> = observer(({ sto
       const start = Math.min(lastSelectedIndex, index)
       const end = Math.max(lastSelectedIndex, index)
       for (let i = start; i <= end; i++) {
-        newSelected.add(history[i].id)
+        newSelected.add(list[i].id)
       }
     } else if (e.metaKey || e.ctrlKey) {
       // Toggle selection
@@ -102,7 +109,7 @@ export const ChatHistoryPanel: React.FC<ChatHistoryPanelProps> = observer(({ sto
   const handleStartRename = (e: React.MouseEvent, session: StoredChatSession) => {
     e.stopPropagation()
     setEditingId(session.id)
-    setEditingTitle(session.title)
+    setEditingTitle(normalizeSessionTitleText(session.title))
   }
 
   const handleConfirmRename = async (e: React.MouseEvent | React.KeyboardEvent) => {
@@ -185,11 +192,115 @@ export const ChatHistoryPanel: React.FC<ChatHistoryPanelProps> = observer(({ sto
   const toggleSelectAll = (e: React.MouseEvent) => {
     e.stopPropagation()
     e.preventDefault()
-    if (selectedIds.size === history.length && history.length > 0) {
-      setSelectedIds(new Set())
+    const visibleIds = filteredHistory.map(s => s.id)
+    const allVisibleSelected = visibleIds.length > 0 && visibleIds.every(id => selectedIds.has(id))
+    const nextSelected = new Set(selectedIds)
+    if (allVisibleSelected) {
+      visibleIds.forEach(id => nextSelected.delete(id))
     } else {
-      setSelectedIds(new Set(history.map(s => s.id)))
+      visibleIds.forEach(id => nextSelected.add(id))
     }
+    setSelectedIds(nextSelected)
+  }
+
+  const clearSearch = () => {
+    setSearchQuery('')
+  }
+
+  useEffect(() => {
+    setSelectedIds(new Set())
+    setLastSelectedIndex(null)
+  }, [normalizedSearchQuery, isSelectionMode])
+
+  const isSearchActive = normalizedSearchQuery.length > 0
+  const hasSearchResult = filteredHistory.length > 0
+  const allVisibleSelected = filteredHistory.length > 0 && filteredHistory.every(session => selectedIds.has(session.id))
+
+  const renderContent = () => {
+    if (loading) {
+      return <div className="chat-history-loading">{t.chat.history.loading}</div>
+    }
+    if (history.length === 0) {
+      return (
+        <div className="chat-history-empty">
+          <History size={48} />
+          <p>{t.chat.history.empty}</p>
+        </div>
+      )
+    }
+    if (!hasSearchResult) {
+      return (
+        <div className="chat-history-empty">
+          <Search size={40} />
+          <p>{t.chat.history.searchNoResults}</p>
+        </div>
+      )
+    }
+
+    return (
+      <div className="chat-history-list">
+        {filteredHistory.map((session, index) => (
+          <div
+            key={session.id}
+            className={`chat-history-item ${selectedIds.has(session.id) ? 'selected' : ''}`}
+            onClick={(e) => handleItemClick(e, index, filteredHistory)}
+          >
+            <div className="chat-history-item-main">
+              {editingId === session.id ? (
+                <div className="chat-history-item-edit-wrapper" onClick={e => e.stopPropagation()}>
+                  <input
+                    autoFocus
+                    className="chat-history-item-edit-input"
+                    value={editingTitle}
+                    onChange={e => setEditingTitle(e.target.value)}
+                    onKeyDown={e => {
+                      if (e.key === 'Enter') handleConfirmRename(e)
+                      if (e.key === 'Escape') handleCancelRename(e as any)
+                    }}
+                  />
+                  <div className="chat-history-item-edit-actions">
+                    <button className="confirm" onClick={handleConfirmRename}>
+                      <Check size={14} />
+                    </button>
+                    <button className="cancel" onClick={handleCancelRename}>
+                      <Close size={14} />
+                    </button>
+                  </div>
+                </div>
+              ) : (
+                <div className="chat-history-item-title">{formatChatHistorySessionTitle(session.title)}</div>
+              )}
+              <div className="chat-history-item-meta">
+                <Clock size={12} />
+                <span>{formatDate(session.updatedAt)}</span>
+                <span className="chat-history-item-messages">
+                  {session.messages.length} {t.chat.history.messages}
+                </span>
+              </div>
+            </div>
+            <button
+              className="chat-history-item-delete"
+              onClick={(e) => {
+                e.stopPropagation()
+                setConfirmDeleteId(session.id)
+              }}
+              title={t.chat.history.deleteSession}
+            >
+              <Trash2 size={14} />
+            </button>
+            {!isSelectionMode && editingId !== session.id && (
+              <button
+                className="chat-history-item-rename"
+                onClick={(e) => handleStartRename(e, session)}
+                title={t.chat.history.renameSession}
+              >
+                <Edit2 size={14} />
+              </button>
+            )}
+          </div>
+        ))}
+      </div>
+    )
   }
 
   const formatDate = (timestamp: number) => {
@@ -266,7 +377,7 @@ export const ChatHistoryPanel: React.FC<ChatHistoryPanelProps> = observer(({ sto
               {isSelectionMode && (
                 <>
                   <div className="chat-history-select-all" onClick={toggleSelectAll}>
-                    {selectedIds.size === history.length && history.length > 0 ? (
+                    {allVisibleSelected ? (
                       <CheckSquare size={14} />
                     ) : (
                       <Square size={14} />
@@ -292,77 +403,30 @@ export const ChatHistoryPanel: React.FC<ChatHistoryPanelProps> = observer(({ sto
         </div>
 
         <div className="chat-history-content">
-          {loading ? (
-            <div className="chat-history-loading">{t.chat.history.loading}</div>
-          ) : history.length === 0 ? (
-            <div className="chat-history-empty">
-              <History size={48} />
-              <p>{t.chat.history.empty}</p>
-            </div>
-          ) : (
-            <div className="chat-history-list">
-              {history.map((session, index) => (
-                <div
-                  key={session.id}
-                  className={`chat-history-item ${selectedIds.has(session.id) ? 'selected' : ''}`}
-                  onClick={(e) => handleItemClick(e, index)}
+          {history.length > 0 && (
+            <div className="chat-history-search">
+              <Search size={14} />
+              <input
+                type="text"
+                value={searchQuery}
+                onChange={(e) => setSearchQuery(e.target.value)}
+                placeholder={t.chat.history.searchPlaceholder}
+                aria-label={t.chat.history.searchPlaceholder}
+              />
+              {isSearchActive && (
+                <button
+                  type="button"
+                  className="chat-history-search-clear"
+                  onClick={clearSearch}
+                  aria-label={t.chat.history.clearSearch}
+                  title={t.chat.history.clearSearch}
                 >
-                  <div className="chat-history-item-main">
-                    {editingId === session.id ? (
-                      <div className="chat-history-item-edit-wrapper" onClick={e => e.stopPropagation()}>
-                        <input
-                          autoFocus
-                          className="chat-history-item-edit-input"
-                          value={editingTitle}
-                          onChange={e => setEditingTitle(e.target.value)}
-                          onKeyDown={e => {
-                            if (e.key === 'Enter') handleConfirmRename(e)
-                            if (e.key === 'Escape') handleCancelRename(e as any)
-                          }}
-                        />
-                        <div className="chat-history-item-edit-actions">
-                          <button className="confirm" onClick={handleConfirmRename}>
-                            <Check size={14} />
-                          </button>
-                          <button className="cancel" onClick={handleCancelRename}>
-                            <Close size={14} />
-                          </button>
-                        </div>
-                      </div>
-                    ) : (
-                      <div className="chat-history-item-title">{session.title}</div>
-                    )}
-                    <div className="chat-history-item-meta">
-                      <Clock size={12} />
-                      <span>{formatDate(session.updatedAt)}</span>
-                      <span className="chat-history-item-messages">
-                        {session.messages.length} {t.chat.history.messages}
-                      </span>
-                    </div>
-                  </div>
-                  <button
-                    className="chat-history-item-delete"
-                    onClick={(e) => {
-                      e.stopPropagation()
-                      setConfirmDeleteId(session.id)
-                    }}
-                    title={t.chat.history.deleteSession}
-                  >
-                    <Trash2 size={14} />
-                  </button>
-                  {!isSelectionMode && editingId !== session.id && (
-                    <button
-                      className="chat-history-item-rename"
-                      onClick={(e) => handleStartRename(e, session)}
-                      title={t.chat.history.renameSession}
-                    >
-                      <Edit2 size={14} />
-                    </button>
-                  )}
-                </div>
-              ))}
+                  <Close size={12} />
+                </button>
+              )}
             </div>
           )}
+          {renderContent()}
         </div>
       </div>
     </div>,

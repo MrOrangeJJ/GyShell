@@ -2,6 +2,11 @@ import { makeObservable, observable, action, runInAction, computed, ObservableMa
 import { v4 as uuidv4 } from 'uuid'
 import { ChatQueueStore, type QueueItem } from './ChatQueueStore'
 
+const buildAutoSessionTitle = (content: string): string => {
+  const normalized = String(content || '').replace(/\s+/g, ' ').trim()
+  return normalized || 'New Chat'
+}
+
 export type MessageType = 'text' | 'command' | 'tool_call' | 'file_edit' | 'sub_tool' | 'alert' | 'error' | 'ask' | 'tokens_count'
 
 export interface ChatMessage {
@@ -179,7 +184,7 @@ export class ChatStore {
             return m && m.role === 'user'
           }).length
           if (userMsgCount === 1) {
-            session.title = msg.content.slice(0, 20) + (msg.content.length > 20 ? '...' : '')
+            session.title = buildAutoSessionTitle(msg.content)
           }
         }
       }
@@ -255,7 +260,7 @@ export class ChatStore {
               return m && m.role === 'user'
             }).length
             if (userMsgCount === 1) {
-              session.title = msg.content.slice(0, 20) + (msg.content.length > 20 ? '...' : '')
+              session.title = buildAutoSessionTitle(msg.content)
             }
           }
           break

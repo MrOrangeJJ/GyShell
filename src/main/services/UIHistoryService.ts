@@ -3,6 +3,11 @@ import { v4 as uuidv4 } from 'uuid'
 import type { AgentEvent, AgentEventType } from '../types'
 import type { ChatMessage, UIChatSession, UIUpdateAction } from '../types/ui-chat'
 
+const buildAutoSessionTitle = (content: string): string => {
+  const normalized = String(content || '').replace(/\s+/g, ' ').trim()
+  return normalized || 'New Chat'
+}
+
 export type HistoryExportMode = 'simple' | 'detailed'
 
 interface StoredUIHistory {
@@ -37,8 +42,29 @@ export class UIHistoryService {
           }
         }
       })
+      this.restoreLegacyAutoTitleIfTruncated(session)
     })
     return sanitized
+  }
+
+  private restoreLegacyAutoTitleIfTruncated(session: UIChatSession): void {
+    const firstUserText = session.messages.find((m) => m.role === 'user')?.content
+    if (!firstUserText) return
+
+    const fullAutoTitle = buildAutoSessionTitle(firstUserText)
+    const currentTitle = String(session.title || '').trim()
+    if (!currentTitle || currentTitle === 'New Chat') {
+      session.title = fullAutoTitle
+      return
+    }
+
+    // Backward-compatible migration for historical truncated titles like "xxxxx..."
+    if (currentTitle.endsWith('...')) {
+      const prefix = currentTitle.slice(0, -3)
+      if (prefix && fullAutoTitle.startsWith(prefix)) {
+        session.title = fullAutoTitle
+      }
+    }
   }
 
   private saveSessions(sessions: Record<string, UIChatSession>): void {
@@ -369,7 +395,7 @@ export class UIHistoryService {
 
   private checkAutoTitle(session: UIChatSession, role: string, content: string): void {
     if (role === 'user' && session.messages.filter((m) => m.role === 'user').length === 1) {
-      session.title = content.slice(0, 20) + (content.length > 20 ? '...' : '')
+      session.title = buildAutoSessionTitle(content)
     }
   }
 

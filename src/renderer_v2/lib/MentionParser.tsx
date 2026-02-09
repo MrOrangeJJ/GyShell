@@ -1,59 +1,108 @@
 import React from 'react';
 
 /**
+ * Shared by:
+ * 1) Chat message/queue mention rendering (`components/Chat/MessageRow.tsx`, `components/Chat/Queue/QueueCard.tsx`)
+ * 2) Session-title text normalization (`lib/sessionTitleDisplay.ts`)
+ */
+const MENTION_TOKEN_REGEX = /(\[MENTION_(?:SKILL|TAB|FILE|USER_PASTE):#.+?#(?:#.+?#)?\])/g;
+
+const getFileDisplayName = (path: string): string => {
+  return path.split(/[/\\]/).pop() || path;
+};
+
+const mentionTokenToText = (token: string): string | null => {
+  const skillMatch = token.match(/^\[MENTION_SKILL:#(.+?)#\]$/);
+  if (skillMatch) {
+    return `@${skillMatch[1]}`;
+  }
+
+  const terminalMatch = token.match(/^\[MENTION_TAB:#(.+?)##(.+?)#\]$/);
+  if (terminalMatch) {
+    return `@${terminalMatch[1]}`;
+  }
+
+  const fileMatch = token.match(/^\[MENTION_FILE:#(.+?)#\]$/);
+  if (fileMatch) {
+    return getFileDisplayName(fileMatch[1]);
+  }
+
+  const pasteMatch = token.match(/^\[MENTION_USER_PASTE:#(.+?)##(.+?)#\]$/);
+  if (pasteMatch) {
+    return pasteMatch[2];
+  }
+
+  return null;
+};
+
+/**
+ * Convert mention labels to plain display text.
+ * This is intended for places like session titles where we only need text,
+ * not badge-like styled labels.
+ */
+export const renderMentionText = (content: string): string => {
+  if (!content) return '';
+
+  let text = content
+    .split(MENTION_TOKEN_REGEX)
+    .map((part) => mentionTokenToText(part) ?? part)
+    .join('');
+
+  // Session titles can be truncated (e.g. first 20 chars), leaving incomplete tags.
+  // Fallback to the same visible text rule for dangling mention patterns.
+  text = text
+    .replace(/\[MENTION_TAB:#([^#\]\r\n]+)(?:##[^#\]\r\n]*)?(?:#\])?/g, (_m, name: string) => `@${name}`)
+    .replace(/\[MENTION_SKILL:#([^#\]\r\n]+)(?:#\])?/g, (_m, name: string) => `@${name}`)
+    .replace(/\[MENTION_FILE:#([^#\]\r\n]+)(?:##[^#\]\r\n]*)?(?:#\])?/g, (_m, path: string) => getFileDisplayName(path))
+    .replace(/\[MENTION_USER_PASTE:#([^#\]\r\n]+)##([^#\]\r\n]+)(?:#\])?/g, (_m, _path: string, preview: string) => preview);
+
+  return text;
+};
+
+/**
  * Unified logic for parsing and rendering Mention tags.
  * Converts text in the format [MENTION_XXX:#...#] into an array of React nodes.
  */
 export const renderMentionContent = (content: string): (string | React.ReactElement)[] => {
   if (!content) return [];
 
-  // Match all types of MENTION tags
-  const regex = /(\[MENTION_(?:SKILL|TAB|FILE|USER_PASTE):#.+?#(?:#.+?#)?\])/g;
-  const parts = content.split(regex);
+  const parts = content.split(MENTION_TOKEN_REGEX);
 
   return parts.map((part, i) => {
-    // 1. Skill tag: [MENTION_SKILL:#name#]
-    const skillMatch = part.match(/\[MENTION_SKILL:#(.+?)#\]/);
-    if (skillMatch) {
+    const mentionText = mentionTokenToText(part);
+    if (!mentionText) {
+      return part;
+    }
+
+    if (mentionText.startsWith('@')) {
+      const cls = part.startsWith('[MENTION_TAB:')
+        ? 'terminal'
+        : part.startsWith('[MENTION_SKILL:')
+          ? 'skill'
+          : 'terminal';
       return (
-        <span key={`skill-${i}`} className="mention-badge skill">
-          @{skillMatch[1]}
+        <span key={`mention-${i}`} className={`mention-badge ${cls}`}>
+          {mentionText}
         </span>
       );
     }
 
-    // 2. Terminal Tab tag: [MENTION_TAB:#name##id#]
-    const terminalMatch = part.match(/\[MENTION_TAB:#(.+?)##(.+?)#\]/);
-    if (terminalMatch) {
+    if (part.startsWith('[MENTION_FILE:')) {
       return (
-        <span key={`terminal-${i}`} className="mention-badge terminal">
-          @{terminalMatch[1]}
+        <span key={`mention-${i}`} className="mention-badge file">
+          {mentionText}
         </span>
       );
     }
 
-    // 3. File tag: [MENTION_FILE:#path#]
-    const fileMatch = part.match(/\[MENTION_FILE:#(.+?)#\]/);
-    if (fileMatch) {
-      const fileName = fileMatch[1].split(/[/\\]/).pop() || fileMatch[1];
+    if (part.startsWith('[MENTION_USER_PASTE:')) {
       return (
-        <span key={`file-${i}`} className="mention-badge file">
-          {fileName}
+        <span key={`mention-${i}`} className="mention-badge paste">
+          {mentionText}
         </span>
       );
     }
 
-    // 4. User Paste tag: [MENTION_USER_PASTE:#path##preview#]
-    const pasteMatch = part.match(/\[MENTION_USER_PASTE:#(.+?)##(.+?)#\]/);
-    if (pasteMatch) {
-      return (
-        <span key={`paste-${i}`} className="mention-badge paste">
-          {pasteMatch[2]}
-        </span>
-      );
-    }
-
-    // Plain text
     return part;
   });
 };

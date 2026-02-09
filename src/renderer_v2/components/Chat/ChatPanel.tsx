@@ -12,6 +12,7 @@ import { QueueManager } from './Queue/QueueManager'
 import { QueueModeSwitch } from './Queue/QueueModeSwitch'
 import type { QueueItem } from '../../stores/ChatQueueStore'
 import { RichInput, type RichInputHandle } from './RichInput'
+import { CHAT_PANEL_SESSION_TITLE_CHAR_LIMIT, formatChatPanelSessionTitle } from '../../lib/sessionTitleDisplay'
 import './chat.scss'
 
 import { createPortal } from 'react-dom'
@@ -503,9 +504,10 @@ export const ChatPanel: React.FC<{ store: AppStore }> = observer(({ store }) => 
                 <div 
                     key={s.id} 
                     className={`chat-tab ${s.id === store.chat.activeSessionId ? 'active' : ''}`}
+                    style={{ maxWidth: `${CHAT_PANEL_SESSION_TITLE_CHAR_LIMIT + 8}ch` }}
                     onClick={() => store.chat.setActiveSession(s.id)}
                 >
-                    <span className="chat-tab-title">{s.title}</span>
+                    <span className="chat-tab-title">{formatChatPanelSessionTitle(s.title)}</span>
                     <button 
                         className="chat-tab-close"
                         onClick={(e) => {
