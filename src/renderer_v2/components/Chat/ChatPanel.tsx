@@ -347,6 +347,9 @@ export const ChatPanel: React.FC<{ store: AppStore }> = observer(({ store }) => 
 
   const profiles = store.settings?.models.profiles || []
   const activeProfileId = store.settings?.models.activeProfileId
+  const lockedProfileId = activeSession?.lockedProfileId || null
+  const profileSelectorValue = lockedProfileId || activeProfileId || ''
+  const profileSelectorDisabled = Boolean(activeSession?.isSessionBusy && lockedProfileId)
 
   const handleAskDecision = async (messageId: string, decision: 'allow' | 'deny') => {
     const sessionId = activeSession?.id
@@ -638,15 +641,20 @@ export const ChatPanel: React.FC<{ store: AppStore }> = observer(({ store }) => 
             <div className="input-footer">
                 <div className="input-left-tools">
                   <div 
-                    className="chat-profile-selector" 
-                    onClick={() => profileSelectRef.current?.toggle()}
+                    className={`chat-profile-selector ${profileSelectorDisabled ? 'is-disabled' : ''}`}
+                    onClick={() => {
+                      if (!profileSelectorDisabled) {
+                        profileSelectRef.current?.toggle()
+                      }
+                    }}
                   >
                       <Bot size={14} className="profile-icon" />
                       <Select
                         ref={profileSelectRef}
                         className="profile-dropdown"
-                        value={activeProfileId || ''}
+                        value={profileSelectorValue}
                         options={profiles.map((p) => ({ value: p.id, label: p.name }))}
+                        disabled={profileSelectorDisabled}
                         onChange={(id) => store.setActiveProfile(id)}
                         // Keep the mac-style "text-only" look for this compact selector
                         hideArrow

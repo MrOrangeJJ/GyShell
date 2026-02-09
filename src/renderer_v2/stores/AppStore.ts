@@ -841,6 +841,10 @@ export class AppStore {
 
     this.chat.setThinking(true, targetSessionId)
     this.chat.setSessionBusy(true, targetSessionId)
+    if (!wasBusy) {
+      const activeProfileId = this.settings?.models.activeProfileId || ''
+      this.chat.setSessionLockedProfile(targetSessionId, activeProfileId || null)
+    }
 
     const selectionText = this.getTerminalSelection(activeTabId)
     window.gyshell.terminal.setSelection(activeTabId, selectionText).catch(() => {

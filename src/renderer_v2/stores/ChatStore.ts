@@ -49,6 +49,7 @@ export interface ChatSession {
   messageIds: string[]
   isThinking: boolean
   isSessionBusy: boolean
+  lockedProfileId: string | null
 }
 
 export class ChatStore {
@@ -78,6 +79,7 @@ export class ChatStore {
       deleteChatSession: action,
       renameChatSession: action,
       rollbackToMessage: action,
+      setSessionLockedProfile: action,
       setQueueRunner: action,
       setQueueMode: action,
       startQueue: action,
@@ -129,7 +131,8 @@ export class ChatStore {
       messagesById: observable.map<string, ChatMessage>(),
       messageIds: [],
       isThinking: false,
-      isSessionBusy: false
+      isSessionBusy: false,
+      lockedProfileId: null
     }
     runInAction(() => {
       this.sessions.push(session)
@@ -231,6 +234,14 @@ export class ChatStore {
     }
   }
 
+  setSessionLockedProfile(sessionId: string, profileId: string | null) {
+    const session = this.sessions.find(s => s.id === sessionId)
+    if (!session) return
+    runInAction(() => {
+      session.lockedProfileId = profileId
+    })
+  }
+
   clear() {
     if (!this.activeSessionId) return
     const session = this.sessions.find(s => s.id === this.activeSessionId)
@@ -296,6 +307,7 @@ export class ChatStore {
           break
         case 'SESSION_READY':
           session.isSessionBusy = false
+          session.lockedProfileId = null
           if (this.queue.shouldDispatchNextOnSessionReady(sessionId)) {
             this.runNextQueueItem(sessionId)
           }
@@ -352,7 +364,8 @@ export class ChatStore {
             messagesById,
             messageIds,
             isThinking: false,
-            isSessionBusy: false
+            isSessionBusy: false,
+            lockedProfileId: null
           })
         }
 

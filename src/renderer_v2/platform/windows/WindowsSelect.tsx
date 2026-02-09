@@ -17,6 +17,7 @@ interface WindowsSelectProps {
   value: string
   options: SelectOption[]
   onChange: (next: string) => void
+  disabled?: boolean
   widthCh?: number
   className?: string
   hideArrow?: boolean
@@ -26,6 +27,7 @@ export const WindowsSelect = forwardRef<SelectHandle, WindowsSelectProps>(({
   value,
   options,
   onChange,
+  disabled,
   widthCh,
   className,
   hideArrow
@@ -38,10 +40,16 @@ export const WindowsSelect = forwardRef<SelectHandle, WindowsSelectProps>(({
   const active = options.find((o) => o.value === value)
 
   useImperativeHandle(ref, () => ({
-    toggle: () => setOpen(v => !v),
-    open: () => setOpen(true),
+    toggle: () => {
+      if (disabled) return
+      setOpen(v => !v)
+    },
+    open: () => {
+      if (disabled) return
+      setOpen(true)
+    },
     close: () => setOpen(false)
-  }))
+  }), [disabled])
 
   const recomputeMenuPosition = React.useCallback(() => {
     const trigger = triggerRef.current
@@ -134,7 +142,9 @@ export const WindowsSelect = forwardRef<SelectHandle, WindowsSelectProps>(({
       <button
         type="button"
         className={className ? `${className} win-select-trigger` : 'win-select-trigger'}
+        disabled={disabled}
         onClick={(e) => {
+            if (disabled) return
             e.stopPropagation() // Issue 1 fix: Prevent double-toggle when clicked via parent wrapper
             setOpen((v) => !v)
         }}
@@ -147,7 +157,7 @@ export const WindowsSelect = forwardRef<SelectHandle, WindowsSelectProps>(({
         {!hideArrow && <ChevronDown size={12} />}
       </button>
 
-      {open && (
+      {open && !disabled && (
         createPortal(
           <div
             ref={menuRef}
@@ -178,4 +188,3 @@ export const WindowsSelect = forwardRef<SelectHandle, WindowsSelectProps>(({
     </div>
   )
 })
-

@@ -13,7 +13,6 @@ import type { UIHistoryService } from './UIHistoryService'
 import { v4 as uuidv4 } from 'uuid'
 import type { z } from 'zod'
 import {
-  TOOLS_FOR_MODEL,
   buildToolsForModel,
   execCommandSchema,
   readTerminalTabSchema,
@@ -121,6 +120,17 @@ const StateAnnotation = Ann.Root({
 const MODEL_RETRY_MAX = 4
 const MODEL_RETRY_DELAYS_MS = [1000, 2000, 4000, 6000]
 
+interface SessionModelBinding {
+  profileId: string
+  model: ChatOpenAI
+  actionModel: ChatOpenAI
+  thinkingModel: ChatOpenAI
+  readFileSupport: { image: boolean }
+  toolsForModel: any[]
+  globalMaxTokens: number
+  thinkingMaxTokens: number
+}
+
 export class AgentService_v2 {
   private terminalService: TerminalService
   private chatHistoryService: ChatHistoryService
@@ -128,21 +138,15 @@ export class AgentService_v2 {
   private mcpToolService: McpToolService
   private skillService: SkillService
   private uiHistoryService: UIHistoryService
-  private model: ChatOpenAI | null = null
-  private actionModel: ChatOpenAI | null = null
-  private thinkingModel: ChatOpenAI | null = null
   private settings: AppSettings | null = null
 
-  // @ts-ignore - Reserved for future use
-  private unusedThinkingModel = this.thinkingModel;
   private graph: any = null
   private helpers: AgentHelpers
   private checkpointer: MemorySaver
-  private toolsForModel = TOOLS_FOR_MODEL
   private builtInToolEnabled: Record<string, boolean> = {}
-  private readFileSupport = { image: false }
   private lastAbortedMessage: BaseMessage | null = null
   private actionModelFallbackHelper = new ActionModelFallbackHelper()
+  private sessionModelBindings: Map<string, SessionModelBinding> = new Map()
 
   constructor(
     terminalService: TerminalService,
@@ -165,72 +169,10 @@ export class AgentService_v2 {
   updateSettings(settings: AppSettings): void {
     this.settings = settings
     this.builtInToolEnabled = settings.tools?.builtIn ?? {}
-    
-    const activeProfileId = settings.models.activeProfileId
-    
-    if (!activeProfileId) {
-      this.resetModels()
-      return
-    }
-
-    const activeProfile = settings.models.profiles.find((p) => p.id === activeProfileId)
-    if (!activeProfile) {
-      console.warn('[AgentService_v2] Active profile not found:', activeProfileId)
-      this.resetModels()
-      return
-    }
-
-    const globalModelId = activeProfile.globalModelId
-    const modelItem = settings.models.items.find((m) => m.id === globalModelId)
-    
-    if (!modelItem) {
-      console.warn('[AgentService_v2] Active profile references a missing model item:', {
-        activeProfileId,
-        globalModelId
-      })
-      this.resetModels()
-      return
-    }
-
-    if (!modelItem.apiKey) {
-      console.warn('[AgentService_v2] Model item referenced but has no API Key.')
-      this.resetModels()
-      return
-    }
-
-    const globalModel = this.helpers.createChatModel(modelItem, 0.7)
-    this.model = globalModel
-
-    const actionModelItem = activeProfile.actionModelId
-      ? settings.models.items.find((m) => m.id === activeProfile.actionModelId)
-      : undefined
-    this.actionModel = actionModelItem?.apiKey ? this.helpers.createChatModel(actionModelItem, 0.1) : globalModel
-
-    const thinkingModelItem = activeProfile.thinkingModelId
-      ? settings.models.items.find((m) => m.id === activeProfile.thinkingModelId)
-      : undefined
-    this.thinkingModel = thinkingModelItem?.apiKey ? this.helpers.createChatModel(thinkingModelItem, 0.2) : globalModel
-
-    this.readFileSupport = this.helpers.computeReadFileSupport(modelItem.profile, thinkingModelItem?.profile ?? modelItem.profile)
-    this.toolsForModel = buildToolsForModel(this.readFileSupport)
-    this.initializeGraph()
-  }
-
-  private resetModels() {
-    this.model = null
-    this.actionModel = null
-    this.thinkingModel = null
-    this.toolsForModel = TOOLS_FOR_MODEL
-    this.readFileSupport = { image: false }
     this.initializeGraph()
   }
 
   private initializeGraph(): void {
-    if (!this.model) {
-      this.graph = null
-      return
-    }
-
     const workflow = new StateGraph(StateAnnotation) as any
 
     workflow.addNode('startup_message_builder', this.createStartupMessageBuilderNode())
@@ -299,6 +241,83 @@ export class AgentService_v2 {
     this.graph = workflow.compile({ checkpointer: this.checkpointer })
   }
 
+  private buildModelBindingFromProfileId(profileId: string): SessionModelBinding | null {
+    const settings = this.settings
+    if (!settings) return null
+
+    const profile = settings.models.profiles.find((p) => p.id === profileId)
+    if (!profile) {
+      console.warn('[AgentService_v2] Profile not found for session binding:', profileId)
+      return null
+    }
+
+    const globalItem = settings.models.items.find((m) => m.id === profile.globalModelId)
+    if (!globalItem || !globalItem.apiKey) {
+      console.warn('[AgentService_v2] Global model is invalid for session binding:', {
+        profileId,
+        globalModelId: profile.globalModelId
+      })
+      return null
+    }
+
+    const actionItem = profile.actionModelId
+      ? settings.models.items.find((m) => m.id === profile.actionModelId)
+      : undefined
+    const thinkingItem = profile.thinkingModelId
+      ? settings.models.items.find((m) => m.id === profile.thinkingModelId)
+      : undefined
+
+    const model = this.helpers.createChatModel(globalItem, 0.7)
+    const actionModel = actionItem?.apiKey ? this.helpers.createChatModel(actionItem, 0.1) : model
+    const thinkingModel = thinkingItem?.apiKey ? this.helpers.createChatModel(thinkingItem, 0.2) : model
+    const readFileSupport = this.helpers.computeReadFileSupport(
+      globalItem.profile,
+      thinkingItem?.profile ?? globalItem.profile
+    )
+    const toolsForModel = buildToolsForModel(readFileSupport)
+
+    return {
+      profileId,
+      model,
+      actionModel,
+      thinkingModel,
+      readFileSupport,
+      toolsForModel,
+      globalMaxTokens: typeof globalItem.maxTokens === 'number' ? globalItem.maxTokens : 200000,
+      thinkingMaxTokens: typeof thinkingItem?.maxTokens === 'number'
+        ? thinkingItem.maxTokens
+        : (typeof globalItem.maxTokens === 'number' ? globalItem.maxTokens : 200000)
+    }
+  }
+
+  private ensureSessionModelBinding(sessionId: string, profileId: string): SessionModelBinding {
+    const existing = this.sessionModelBindings.get(sessionId)
+    if (existing && existing.profileId === profileId) {
+      return existing
+    }
+
+    const next = this.buildModelBindingFromProfileId(profileId)
+    if (!next) {
+      throw new Error(`Cannot initialize session model binding for profile: ${profileId}`)
+    }
+
+    this.sessionModelBindings.set(sessionId, next)
+    return next
+  }
+
+  private getSessionModelBinding(sessionId: string): SessionModelBinding {
+    const binding = this.sessionModelBindings.get(sessionId)
+    if (!binding) {
+      throw new Error(`Session model binding not found for session: ${sessionId}`)
+    }
+    return binding
+  }
+
+  releaseSessionModelBinding(sessionId: string): void {
+    this.sessionModelBindings.delete(sessionId)
+    this.actionModelFallbackHelper.clearSession(sessionId)
+  }
+
   // --- Graph Nodes ---
   
   private createTokenManagerNode() {
@@ -326,6 +345,7 @@ export class AgentService_v2 {
     return RunnableLambda.from(async (state: any) => {
       const sessionId = state.sessionId
       if (!sessionId) return state
+      const sessionBinding = this.getSessionModelBinding(sessionId)
 
       const startupInput = String(state.startup_input || '')
       const startupMode: 'normal' | 'inserted' = state.startup_mode === 'inserted' ? 'inserted' : 'normal'
@@ -409,24 +429,7 @@ ${recent}
         fullUserLast
       ]
 
-      let globalMax = 200000
-      let thinkingMax = 200000
-      if (this.settings?.models) {
-        const activeProfile = this.settings.models.profiles.find(
-          (p) => p.id === this.settings?.models.activeProfileId
-        )
-        const globalModelId = activeProfile?.globalModelId
-        const thinkingModelId = activeProfile?.thinkingModelId ?? activeProfile?.globalModelId
-        const globalItem = globalModelId
-          ? this.settings.models.items.find((m) => m.id === globalModelId)
-          : undefined
-        const thinkingItem = thinkingModelId
-          ? this.settings.models.items.find((m) => m.id === thinkingModelId)
-          : undefined
-        if (typeof globalItem?.maxTokens === 'number') globalMax = globalItem.maxTokens
-        if (typeof thinkingItem?.maxTokens === 'number') thinkingMax = thinkingItem.maxTokens
-      }
-      const maxTokens = Math.min(globalMax, thinkingMax)
+      const maxTokens = Math.min(sessionBinding.globalMaxTokens, sessionBinding.thinkingMaxTokens)
 
       let currentTokens = 0
       for (let i = newFullMessages.length - 1; i >= 0; i--) {
@@ -451,16 +454,16 @@ ${recent}
 
   private createModelRequestNode() {
     return RunnableLambda.from(async (state: any, config: any) => {
-      if (!this.model) throw new Error('Model not initialized')
       const sessionId = state.sessionId;
       if (!sessionId) throw new Error('No session ID in state');
+      const sessionBinding = this.getSessionModelBinding(sessionId)
 
       // Ensure we get the freshest list from disk
       await this.skillService.reload()
       const skills = await this.skillService.getEnabledSkills()
       
       // Filter built-in tools based on the latest enabled status
-      const builtInTools = this.helpers.getEnabledBuiltInTools(this.toolsForModel, this.builtInToolEnabled)
+      const builtInTools = this.helpers.getEnabledBuiltInTools(sessionBinding.toolsForModel, this.builtInToolEnabled)
       
       // Update skill tool description with latest skills
       const skillToolIndex = builtInTools.findIndex(t => t.function.name === 'skill')
@@ -469,7 +472,7 @@ ${recent}
       }
 
       const mcpTools = this.mcpToolService.getActiveTools()
-      const modelWithTools = this.model.bindTools([...builtInTools, ...mcpTools])
+      const modelWithTools = sessionBinding.model.bindTools([...builtInTools, ...mcpTools])
 
       const messageId = uuidv4()
       
@@ -599,7 +602,9 @@ ${recent}
       
       if (usage) {
         currentTokens = usage.total_tokens || usage.totalTokens || 0
-        const modelName = (fullResponse as any).response_metadata?.model_name || (this.model as any)?.modelName || 'unknown'
+        const modelName = (fullResponse as any).response_metadata?.model_name
+          || (sessionBinding.model as any)?.modelName
+          || 'unknown'
         this.helpers.sendEvent(sessionId, {
           type: 'tokens_count',
           modelName,
@@ -684,6 +689,7 @@ ${recent}
     return RunnableLambda.from(async (state: any, config: any) => {
       const sessionId = state.sessionId;
       if (!sessionId) throw new Error('No session ID in state')
+      const sessionBinding = this.getSessionModelBinding(sessionId)
 
       const queue: any[] = Array.isArray(state.pendingToolCalls) ? state.pendingToolCalls : []
       const toolCall = queue[0]
@@ -780,7 +786,7 @@ ${recent}
             const validatedArgs = writeStdinSchema.parse(toolCall.args || {})
             // const messageId = toolMessage.additional_kwargs._gyshellMessageId as string
 
-            if (this.actionModel) {
+            if (sessionBinding.actionModel) {
               // Build temporary history for action model
               const finalActionMessages = this.helpers.buildActionModelHistory(state.full_messages as BaseMessage[])
 
@@ -903,16 +909,6 @@ ${recent}
 
       const recent = this.terminalService.getRecentOutput(bestMatch.id) || ''
 
-      if (!this.actionModel) {
-        toolMessage.content = 'Action model not initialized.'
-        return { 
-            messages: [...state.messages, toolMessage], 
-            full_messages: [...fullHistory, toolMessage],
-            sessionId, 
-            pendingToolCalls: queue.slice(1) 
-        }
-      }
-
       // Build context for Action Model
       const finalActionMessages = this.helpers.buildActionModelHistory(state.full_messages as BaseMessage[])
 
@@ -993,6 +989,7 @@ ${recent}
     return RunnableLambda.from(async (state: any, config: any) => {
       const sessionId = state.sessionId
       if (!sessionId) throw new Error('No session ID in state')
+      const sessionBinding = this.getSessionModelBinding(sessionId)
 
       const queue: any[] = Array.isArray(state.pendingToolCalls) ? state.pendingToolCalls : []
       const toolCall = queue[0]
@@ -1009,7 +1006,11 @@ ${recent}
 
       try {
         const validatedArgs = readFileSchema.parse(toolCall.args || {})
-        const result = await toolImplementations.runReadFile(validatedArgs, executionContext, this.readFileSupport)
+        const result = await toolImplementations.runReadFile(
+          validatedArgs,
+          executionContext,
+          sessionBinding.readFileSupport
+        )
         resultText = result.resultText
         imageMessage = result.imageMessage ?? null
         meaningLessAIMessage = result.meaningLessAIMessage ?? null
@@ -1315,14 +1316,13 @@ ${recent}
     signal: AbortSignal | undefined,
     decisionName: string
   ): Promise<z.infer<T>> {
-    if (!this.actionModel) {
-      throw new Error('Action model not initialized')
-    }
+    const sessionBinding = this.getSessionModelBinding(sessionId)
+    const actionModel = sessionBinding.actionModel
 
     return await this.actionModelFallbackHelper.runWithSessionFallback({
       sessionId,
       invokeStructured: async () => {
-        const structuredModel = this.actionModel!.withStructuredOutput(schema)
+        const structuredModel = actionModel.withStructuredOutput(schema)
         return await invokeWithRetryAndSanitizedInput({
           helpers: this.helpers,
           messages,
@@ -1338,7 +1338,13 @@ ${recent}
         })
       },
       invokePseudoSchema: async () => {
-        return await this.invokeActionModelPolicyDecisionWithoutSchema(messages, schema, signal, decisionName)
+        return await this.invokeActionModelPolicyDecisionWithoutSchema(
+          sessionId,
+          messages,
+          schema,
+          signal,
+          decisionName
+        )
       },
       onFallbackTriggered: (error) => {
         console.warn(`[AgentService_v2] Structured action-model output failed for ${decisionName}. Enabling per-session pseudo-schema fallback.`, error)
@@ -1347,20 +1353,20 @@ ${recent}
   }
 
   private async invokeActionModelPolicyDecisionWithoutSchema<T extends z.ZodTypeAny>(
+    sessionId: string,
     messages: BaseMessage[],
     schema: T,
     signal: AbortSignal | undefined,
     decisionName: string
   ): Promise<z.infer<T>> {
-    if (!this.actionModel) {
-      throw new Error('Action model not initialized')
-    }
+    const sessionBinding = this.getSessionModelBinding(sessionId)
+    const actionModel = sessionBinding.actionModel
     const result = await invokeWithRetryAndSanitizedInput({
       helpers: this.helpers,
       messages,
       signal,
       operation: async (sanitizedMessages) => {
-        return await this.actionModel!.invoke(sanitizedMessages, { signal })
+        return await actionModel.invoke(sanitizedMessages, { signal })
       },
       onRetry: (attempt) => {
         console.log(`[AgentService_v2] Retrying pseudo-schema action model decision for ${decisionName} (attempt ${attempt + 1})...`)
@@ -1380,8 +1386,8 @@ ${recent}
     signal: AbortSignal | undefined,
     decisionName: string
   ): Promise<z.infer<T>> {
-    const model = this.thinkingModel || this.model
-    if (!model) throw new Error('Thinking model not initialized')
+    const sessionBinding = this.getSessionModelBinding(sessionId)
+    const model = sessionBinding.thinkingModel || sessionBinding.model
 
     return await this.actionModelFallbackHelper.runWithSessionFallback({
       sessionId,
@@ -1435,6 +1441,11 @@ ${recent}
 
     this.lastAbortedMessage = null
     const { sessionId, boundTerminalId } = context
+    const lockedProfileId = String(context.lockedProfileId || '')
+    if (!lockedProfileId) {
+      throw new Error(`Missing locked profile for session ${sessionId}`)
+    }
+    this.ensureSessionModelBinding(sessionId, lockedProfileId)
     this.actionModelFallbackHelper.beginSession(sessionId)
     const recursionLimit = this.settings?.recursionLimit ?? 200
     const loadedSession = this.chatHistoryService.loadSession(sessionId)
@@ -1577,6 +1588,7 @@ ${recent}
   }
 
   deleteChatSession(sessionId: string): void {
+    this.releaseSessionModelBinding(sessionId)
     this.chatHistoryService.deleteSession(sessionId)
     this.uiHistoryService.deleteSession(sessionId)
   }

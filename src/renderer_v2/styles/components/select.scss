@@ -34,6 +34,11 @@
   min-width: 0;
 }
 
+.win-select-trigger:disabled {
+  cursor: not-allowed;
+  opacity: 0.7;
+}
+
 .win-select-label {
   overflow: hidden;
   text-overflow: ellipsis;
@@ -123,4 +128,3 @@
   transform: translateY(0.5px);
   box-shadow: none;
 }
-

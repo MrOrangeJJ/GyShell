@@ -5,6 +5,7 @@ export interface SelectProps {
   value: string
   options: SelectOption[]
   onChange: (next: string) => void
+  disabled?: boolean
   widthCh?: number
   /** Keep existing trigger look by passing the original className used on <select>. */
   className?: string
@@ -16,6 +17,7 @@ export const Select = forwardRef<SelectHandle, SelectProps>(({
   value,
   options,
   onChange,
+  disabled,
   widthCh,
   className,
   hideArrow
@@ -28,10 +30,10 @@ export const Select = forwardRef<SelectHandle, SelectProps>(({
       value={value}
       options={options}
       onChange={onChange}
+      disabled={disabled}
       widthCh={widthCh}
       className={className}
       hideArrow={hideArrow}
     />
   )
 })
-

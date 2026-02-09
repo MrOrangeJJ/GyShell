@@ -512,6 +512,14 @@ body.chat-drag-selection-suppressed * {
   background: var(--control-bg-hover);
 }
 
+.chat-profile-selector.is-disabled {
+  cursor: not-allowed;
+}
+
+.chat-profile-selector.is-disabled:hover {
+  background: transparent;
+}
+
 .profile-icon {
   color: var(--accent);
   flex-shrink: 0;

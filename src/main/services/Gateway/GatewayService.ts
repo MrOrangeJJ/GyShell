@@ -439,6 +439,7 @@ export class GatewayService extends EventEmitter implements IGateway {
       sessionId,
       boundTerminalId: terminalId,
       activeRunId: null,
+      lockedProfileId: null,
       abortController: null,
       status: 'idle',
       metadata: {}
@@ -459,6 +460,7 @@ export class GatewayService extends EventEmitter implements IGateway {
         sessionId,
         boundTerminalId: tid,
         activeRunId: null,
+        lockedProfileId: null,
         abortController: null,
         status: 'idle',
         metadata: {}
@@ -466,8 +468,16 @@ export class GatewayService extends EventEmitter implements IGateway {
       this.sessions.set(sessionId, context);
     }
 
+    if (!context.lockedProfileId) {
+      const activeProfileId = this.settingsService.getSettings().models.activeProfileId || '';
+      context.lockedProfileId = activeProfileId;
+    }
+
     if (context.status !== 'idle') {
-      await this.stopTask(sessionId, { waitForCompletion: true });
+      await this.stopTask(sessionId, {
+        waitForCompletion: true,
+        preserveProfileLock: true
+      });
     } else {
       // Handle race: status already idle but previous run finalization not finished yet.
       await this.waitForRunCompletionIfAny(sessionId);
@@ -507,6 +517,7 @@ export class GatewayService extends EventEmitter implements IGateway {
       if (context.activeRunId === runId) {
         // Unified cleanup of run state
         this.clearRunState(context);
+        this.releaseSessionProfileLock(context);
         // 1. Send DONE action (for UI state like isThinking)
         this.broadcast({ type: 'agent:event', sessionId, payload: { type: 'done' } });
         // 2. Send SESSION_READY action (for admission control and queue scheduling)
@@ -517,18 +528,26 @@ export class GatewayService extends EventEmitter implements IGateway {
     }
   }
 
-  async stopTask(sessionId: string, options?: { waitForCompletion?: boolean }): Promise<void> {
+  async stopTask(
+    sessionId: string,
+    options?: { waitForCompletion?: boolean; preserveProfileLock?: boolean }
+  ): Promise<void> {
     const context = this.sessions.get(sessionId);
     if (context && context.abortController) {
       const runCompletion = context.metadata.runCompletion as Promise<void> | undefined;
       context.abortController.abort();
       this.clearRunState(context);
-      // Sync UI and disk immediately when manually stopped
-      this.broadcast({ type: 'agent:event', sessionId, payload: { type: 'done' } });
-      
-      this.transports.forEach(t => t.sendUIUpdate({ type: 'SESSION_READY', sessionId }));
-      
-      this.uiHistoryService.flush(sessionId);
+      if (!options?.preserveProfileLock) {
+        this.releaseSessionProfileLock(context);
+      }
+      // Sync UI and disk immediately on a real stop.
+      // For inserted-message restart flow, dispatchTask will continue with a new run immediately,
+      // so we intentionally avoid emitting SESSION_READY here.
+      if (!options?.preserveProfileLock) {
+        this.broadcast({ type: 'agent:event', sessionId, payload: { type: 'done' } });
+        this.transports.forEach(t => t.sendUIUpdate({ type: 'SESSION_READY', sessionId }));
+        this.uiHistoryService.flush(sessionId);
+      }
       if (options?.waitForCompletion && runCompletion) {
         await runCompletion.catch(() => undefined);
       }
@@ -558,6 +577,13 @@ export class GatewayService extends EventEmitter implements IGateway {
     // Clean up cache for this session's messages if any remain
     // (In a real scenario, we might need a way to map messageId to sessionId here,
     // but for now, the cache is self-cleaning on read)
+  }
+
+  private releaseSessionProfileLock(context: SessionContext) {
+    if (context.lockedProfileId) {
+      this.agentService.releaseSessionModelBinding(context.sessionId);
+    }
+    context.lockedProfileId = null;
   }
 
   async pauseTask(sessionId: string): Promise<void> {
