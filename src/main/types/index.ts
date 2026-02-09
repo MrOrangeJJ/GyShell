@@ -266,6 +266,7 @@ export interface ChatSession {
 // ============ Agent Events (Main → Renderer) ============
 export type AgentEventType =
   | 'say'
+  | 'remove_message'
   | 'command_started'
   | 'command_finished'
   | 'command_ask'

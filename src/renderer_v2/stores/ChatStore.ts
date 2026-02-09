@@ -265,6 +265,11 @@ export class ChatStore {
           }
           break
         }
+        case 'REMOVE_MESSAGE': {
+          session.messagesById.delete(update.messageId)
+          session.messageIds = session.messageIds.filter((id) => id !== update.messageId)
+          break
+        }
         case 'APPEND_CONTENT': {
           const msg = session.messagesById.get(update.messageId)
           if (msg) {

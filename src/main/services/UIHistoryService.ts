@@ -311,6 +311,16 @@ export class UIHistoryService {
         msg.streaming = false
         actions.push({ type: 'UPDATE_MESSAGE', sessionId, messageId: msg.id, patch: { streaming: false } })
       }
+    } else if (type === 'remove_message') {
+      const msg = event.messageId
+        ? [...session.messages]
+            .reverse()
+            .find((m) => m.backendMessageId === event.messageId && m.role === 'assistant')
+        : [...session.messages].reverse().find((m) => m.role === 'assistant')
+      if (msg) {
+        session.messages = session.messages.filter((m) => m.id !== msg.id)
+        actions.push({ type: 'REMOVE_MESSAGE', sessionId, messageId: msg.id })
+      }
     } else if (type === 'done') {
       const stopAction = this.stopLatestStreaming(session, sessionId)
       if (stopAction) actions.push(stopAction)

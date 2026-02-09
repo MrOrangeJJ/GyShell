@@ -98,6 +98,7 @@ interface CommandPolicyLists {
 
 type AgentEventType =
   | 'say'
+  | 'remove_message'
   | 'command_started'
   | 'command_finished'
   | 'command_ask'

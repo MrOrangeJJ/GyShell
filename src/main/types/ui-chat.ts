@@ -52,6 +52,7 @@ export interface UIChatSession {
 
 export type UIUpdateAction =
   | { type: 'ADD_MESSAGE'; sessionId: string; message: ChatMessage }
+  | { type: 'REMOVE_MESSAGE'; sessionId: string; messageId: string }
   | { type: 'APPEND_CONTENT'; sessionId: string; messageId: string; content: string }
   | { type: 'APPEND_OUTPUT'; sessionId: string; messageId: string; outputDelta: string }
   | { type: 'UPDATE_MESSAGE'; sessionId: string; messageId: string; patch: Partial<ChatMessage> }

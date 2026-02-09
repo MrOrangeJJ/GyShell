@@ -35,6 +35,7 @@ import { buildDebugRawResponse, captureRawResponseChunk } from './AgentHelper/ut
 import { invokeWithRetryAndSanitizedInput, stripRawResponseFromStoredMessages } from './AgentHelper/utils/model_messages'
 import { createStreamReasoningExtractor } from './AgentHelper/utils/stream_reasoning_extractor'
 import {
+  CONTINUE_INSTRUCTION_TAG,
   USEFUL_SKILL_TAG,
   USER_INSERTED_INPUT_TAG,
   USER_INSERTED_INPUT_INSTRUCTION,
@@ -43,7 +44,11 @@ import {
   createTabContextPrompt,
   COMMAND_POLICY_DECISION_SCHEMA,
   WRITE_STDIN_POLICY_DECISION_SCHEMA,
+  TASK_COMPLETION_DECISION_SCHEMA,
+  TASK_CONTINUE_INSTRUCTION_SCHEMA,
   createCommandPolicyUserPrompt,
+  createTaskCompletionDecisionUserPrompt,
+  createTaskContinueInstructionUserPrompt,
   createWriteStdinPolicyUserPrompt,
 } from './AgentHelper/prompts'
 import { runSkillTool } from './AgentHelper/tools/skill_tools'
@@ -106,6 +111,10 @@ const StateAnnotation = Ann.Root({
       return x
     },
     default: () => []
+  }),
+  completionGuardDecision: Ann({
+    reducer: (x: 'end' | 'continue', y?: 'end' | 'continue') => y ?? x,
+    default: () => 'end'
   })
 })
 
@@ -231,6 +240,7 @@ export class AgentService_v2 {
     
     workflow.addNode('model_request', this.createModelRequestNode())
     workflow.addNode('batch_toolcall_executor', this.createBatchToolcallExecutorNode())
+    workflow.addNode('task_completion_guard', this.createTaskCompletionGuardNode())
     workflow.addNode('tools', this.createToolsNode())
     workflow.addNode('command_tools', this.createCommandToolsNode())
     workflow.addNode('file_tools', this.createFileToolsNode())
@@ -248,7 +258,13 @@ export class AgentService_v2 {
     workflow.addConditionalEdges(
       'batch_toolcall_executor',
       this.routeModelOutput,
-      ['tools', 'command_tools', 'file_tools', 'read_file', 'mcp_tools', 'final_output']
+      ['tools', 'command_tools', 'file_tools', 'read_file', 'mcp_tools', 'task_completion_guard']
+    )
+
+    workflow.addConditionalEdges(
+      'task_completion_guard',
+      this.routeCompletionGuardOutput,
+      ['token_pruner_runtime', 'final_output']
     )
     
     // Tools route back to runtime pruner before model request
@@ -1073,6 +1089,114 @@ ${recent}
     })
   }
 
+  private createTaskCompletionGuardNode() {
+    return RunnableLambda.from(async (state: any, config: any) => {
+      const sessionId = state.sessionId
+      if (!sessionId) throw new Error('No session ID in state')
+
+      const messages: BaseMessage[] = [...state.messages]
+      const fullMessages: BaseMessage[] = [...state.full_messages]
+      const lastMessage = messages[messages.length - 1]
+
+      if (!AIMessage.isInstance(lastMessage)) {
+        return {
+          messages,
+          full_messages: fullMessages,
+          sessionId,
+          pendingToolCalls: [],
+          completionGuardDecision: 'end' as const
+        }
+      }
+
+      const toolCalls: any[] = Array.isArray((lastMessage as any).tool_calls) ? (lastMessage as any).tool_calls : []
+      if (toolCalls.length > 0) {
+        return {
+          messages,
+          full_messages: fullMessages,
+          sessionId,
+          pendingToolCalls: [],
+          completionGuardDecision: 'continue' as const
+        }
+      }
+
+      let completionDecision: z.infer<typeof TASK_COMPLETION_DECISION_SCHEMA>
+      try {
+        completionDecision = await this.getThinkingModelDecision(
+          sessionId,
+          [...messages, createTaskCompletionDecisionUserPrompt()],
+          TASK_COMPLETION_DECISION_SCHEMA,
+          config?.signal,
+          'task_completion_guard'
+        )
+      } catch (err) {
+        console.warn('[AgentService_v2] Completion guard failed, fallback to end:', err)
+        completionDecision = {
+          is_fully_completed: true,
+          reason: 'Completion guard model error'
+        }
+      }
+
+      if (completionDecision.is_fully_completed) {
+        return {
+          messages,
+          full_messages: fullMessages,
+          sessionId,
+          pendingToolCalls: [],
+          completionGuardDecision: 'end' as const
+        }
+      }
+
+      let continueInstruction: z.infer<typeof TASK_CONTINUE_INSTRUCTION_SCHEMA>
+      try {
+        continueInstruction = await this.getThinkingModelDecision(
+          sessionId,
+          [
+            ...messages,
+            createTaskCompletionDecisionUserPrompt(),
+            new AIMessage({
+              content: JSON.stringify(completionDecision)
+            }),
+            createTaskContinueInstructionUserPrompt({ completionReason: completionDecision.reason })
+          ],
+          TASK_CONTINUE_INSTRUCTION_SCHEMA,
+          config?.signal,
+          'task_continue_instruction'
+        )
+      } catch (err) {
+        console.warn('[AgentService_v2] Continue-instruction generation failed, fallback to generic instruction:', err)
+        continueInstruction = {
+          continue_instruction:
+            'Continue the task. Re-check unmet requirements, choose the next best tool/approach, execute it, and verify result.'
+        }
+      }
+
+      const removedBackendMessageId = (lastMessage as any)?.additional_kwargs?._gyshellMessageId as string | undefined
+
+      if (removedBackendMessageId) {
+        this.helpers.sendEvent(sessionId, {
+          type: 'remove_message',
+          messageId: removedBackendMessageId
+        })
+      }
+
+      const continueMessage = new HumanMessage(
+        `${CONTINUE_INSTRUCTION_TAG}${continueInstruction.continue_instruction}`
+      )
+      ;(continueMessage as any).additional_kwargs = {
+        _gyshellMessageId: uuidv4(),
+        input_kind: 'continue_instruction'
+      }
+
+      return {
+        messages: [...messages, continueMessage],
+        full_messages: [...fullMessages, continueMessage],
+        sessionId,
+        pendingToolCalls: [],
+        completionGuardDecision: 'continue' as const
+      }
+    })
+  }
+
 
   private createFinalOutputNode() {
     return RunnableLambda.from(async (state: any) => {
@@ -1140,7 +1264,11 @@ ${recent}
       return 'tools'
     }
 
-    return 'final_output'
+    return 'task_completion_guard'
+  }
+
+  private routeCompletionGuardOutput = (state: any): string => {
+    return state.completionGuardDecision === 'continue' ? 'token_pruner_runtime' : 'final_output'
   }
 
   private routeAfterToolCall = (state: any): string => {
@@ -1243,6 +1371,61 @@ ${recent}
     const contentText = this.helpers.extractText((result as any)?.content)
     const parsed = this.helpers.parseStrictJsonObject(contentText)
     return schema.parse(parsed)
+  }
+
+  private async getThinkingModelDecision<T extends z.ZodTypeAny>(
+    sessionId: string,
+    messages: BaseMessage[],
+    schema: T,
+    signal: AbortSignal | undefined,
+    decisionName: string
+  ): Promise<z.infer<T>> {
+    const model = this.thinkingModel || this.model
+    if (!model) throw new Error('Thinking model not initialized')
+
+    return await this.actionModelFallbackHelper.runWithSessionFallback({
+      sessionId,
+      invokeStructured: async () => {
+        const structuredModel = model.withStructuredOutput(schema)
+        return await invokeWithRetryAndSanitizedInput({
+          helpers: this.helpers,
+          messages,
+          signal,
+          operation: async (sanitizedMessages) => {
+            return await structuredModel.invoke(sanitizedMessages, { signal }) as any
+          },
+          onRetry: (attempt) => {
+            console.log(`[AgentService_v2] Retrying thinking model decision for ${decisionName} (attempt ${attempt + 1})...`)
+          },
+          maxRetries: MODEL_RETRY_MAX,
+          delaysMs: MODEL_RETRY_DELAYS_MS
+        })
+      },
+      invokePseudoSchema: async () => {
+        const raw = await invokeWithRetryAndSanitizedInput({
+          helpers: this.helpers,
+          messages,
+          signal,
+          operation: async (sanitizedMessages) => {
+            return await model.invoke(sanitizedMessages, { signal })
+          },
+          onRetry: (attempt) => {
+            console.log(`[AgentService_v2] Retrying pseudo-schema thinking decision for ${decisionName} (attempt ${attempt + 1})...`)
+          },
+          maxRetries: MODEL_RETRY_MAX,
+          delaysMs: MODEL_RETRY_DELAYS_MS
+        })
+        const contentText = this.helpers.extractText((raw as any)?.content)
+        const parsed = this.helpers.parseStrictJsonObject(contentText)
+        return schema.parse(parsed)
+      },
+      onFallbackTriggered: (error) => {
+        console.warn(
+          `[AgentService_v2] Structured thinking-model output failed for ${decisionName}. Enabling per-session pseudo-schema fallback.`,
+          error
+        )
+      }
+    })
   }
 
   // --- Execution Core ---
