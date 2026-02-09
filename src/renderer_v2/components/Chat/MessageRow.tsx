@@ -5,7 +5,7 @@ import ReactMarkdown from 'react-markdown'
 import type { AppStore } from '../../stores/AppStore'
 import type { ChatMessage } from '../../stores/ChatStore'
 import { renderMentionContent } from '../../lib/MentionParser'
-import { CommandBanner, ToolCallBanner, FileEditBanner, SubToolBanner, AskBanner, AlertBanner } from './ChatBanner'
+import { CommandBanner, ToolCallBanner, FileEditBanner, SubToolBanner, ReasoningBanner, AskBanner, AlertBanner } from './ChatBanner'
 
 interface MessageRowProps {
   store: AppStore
@@ -40,6 +40,9 @@ export const MessageRow: React.FC<MessageRowProps> = observer(({
   if (isRetryHint && !isLastMessage) {
     return null
   }
+  if (msg.type === 'reasoning' && !isLastMessage) {
+    return null
+  }
 
   // Handle special message types
   if (msg.type === 'tokens_count') {
@@ -70,6 +73,13 @@ export const MessageRow: React.FC<MessageRowProps> = observer(({
     return (
       <div className="message-row-container role-assistant">
         <SubToolBanner msg={msg} />
+      </div>
+    )
+  }
+  if (msg.type === 'reasoning') {
+    return (
+      <div className="message-row-container role-assistant">
+        <ReasoningBanner msg={msg} />
       </div>
     )
   }

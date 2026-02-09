@@ -33,7 +33,7 @@ export const USER_PASTE_CONTENT_TAG = FILE_CONTENT_TAG
 
 // --- Tool Descriptions ---
 
-export const SEND_CHAR_TOOL_DESCRIPTION = [
+export const WRITE_STDIN_TOOL_DESCRIPTION = [
   'Send characters to a specific terminal tab WITHOUT a trailing newline.',
   'This is a specialized, advanced tool for control/interactive programs (e.g. vim, tmux, REPLs) and for sending C0 control characters like Ctrl+C.',
   'For normal commands, always use exec_command/run_command instead.',
@@ -100,12 +100,11 @@ export const CREATE_OR_EDIT_TOOL_DESCRIPTION = [
 ].join('\n')
 
 export const EXEC_COMMAND_DESCRIPTION =
-  'Execute a shell command in a specific terminal tab. This appends a trailing "\\n" to run the command automatically. If you do NOT want auto-execute, use send_char instead. The system will decide whether to wait for completion. Command output may be truncated; use read_command_output with history_command_match_id and terminalId to read full output.'
+  'Execute a shell command in a specific terminal tab. This appends a trailing "\\n" to run the command automatically. If you do NOT want auto-execute, use write_stdin instead. The system will decide whether to wait for completion. Command output may be truncated; use read_command_output with history_command_match_id and terminalId to read full output.'
 export const READ_TERMINAL_TAB_DESCRIPTION = 'Read the recent visible output of a specific terminal tab.'
 export const READ_COMMAND_OUTPUT_DESCRIPTION =
   'Read historical output of a specific command by history_command_match_id and terminal tab. Supports offset/limit for paging large outputs.'
 export const READ_FILE_DESCRIPTION = 'Read a file from a specific terminal tab.'
-export const THINK_TOOL_DESCRIPTION = 'Use this tool to perform deep thinking, complex planning, or detailed analysis. When you encounter a difficult problem, need to coordinate multiple steps, or want to reflect on an error, call this tool. Write your detailed thoughts in the "thought" parameter. This tool helps you organize your internal reasoning before taking further actions.'
 export const WAIT_TOOL_DESCRIPTION = 'Pause execution for a specified number of seconds (5-60). Use this for short, fixed-duration pauses when you need to wait for an external event that doesn\'t affect the terminal (e.g., waiting for a web server to start up).'
 export const WAIT_TERMINAL_IDLE_DESCRIPTION = 'Wait until the terminal output becomes stable (no changes for a few seconds) or a timeout (120s) is reached. Use this for commands that don\'t emit standard OSC exit markers but eventually stop printing text (e.g., some build tools or log watchers).'
 export const WAIT_COMMAND_END_DESCRIPTION = 'Wait for the currently running command in the terminal tab to finish based on shell integration markers. This is the most reliable way to wait for a command that was started with nowait. Use this when you need the command\'s exit code and final output to proceed.'
@@ -128,8 +127,8 @@ export const BUILTIN_TOOL_INFO = [
     description: READ_FILE_DESCRIPTION
   },
   {
-    name: 'send_char',
-    description: SEND_CHAR_TOOL_DESCRIPTION
+    name: 'write_stdin',
+    description: WRITE_STDIN_TOOL_DESCRIPTION
   },
   {
     name: 'create_or_edit',
@@ -146,10 +145,6 @@ export const BUILTIN_TOOL_INFO = [
   {
     name: 'wait_command_end',
     description: WAIT_COMMAND_END_DESCRIPTION
-  },
-  {
-    name: 'think',
-    description: THINK_TOOL_DESCRIPTION
   }
 ]
 
@@ -175,9 +170,9 @@ export const COMMAND_POLICY_DECISION_SCHEMA = z.object({
 })
 
 /**
- * Action model decision schema for send_char.
+ * Action model decision schema for write_stdin.
  */
-export const SEND_CHAR_POLICY_DECISION_SCHEMA = z.object({
+export const WRITE_STDIN_POLICY_DECISION_SCHEMA = z.object({
   decision: z.enum(['allow', 'block']),
   reason: z.string()
 })
@@ -323,21 +318,21 @@ export function createCommandPolicyUserPrompt(opts: {
 }
 
 /**
- * User prompt for the action model that checks send_char inputs.
+ * User prompt for the action model that checks write_stdin inputs.
  */
-export function createSendCharPolicyUserPrompt(opts: {
+export function createWriteStdinPolicyUserPrompt(opts: {
   chars: any[]
 }): HumanMessage {
   return new HumanMessage(
     [
-      '# Send Char Execution Policy Request',
-      'You are acting as a specialized auditor for terminal input. Your task is to check if the `send_char` tool call is correctly formatted, especially regarding C0 control characters.',
+      '# Write Stdin Execution Policy Request',
+      'You are acting as a specialized auditor for terminal input. Your task is to check if the `write_stdin` tool call is correctly formatted, especially regarding C0 control characters.',
       '',
       '## Context:',
       'The main agent is often confused and might try to send literal strings like "Ctrl+C" or "^C" when it actually intends to send a C0 control character. This tool REQUIRES using specific C0 names as separate list items.',
       '',
       '## Correct Usage (from tool description):',
-      SEND_CHAR_TOOL_DESCRIPTION,
+      WRITE_STDIN_TOOL_DESCRIPTION,
       '',
       '## Current Request:',
       `Input chars: ${JSON.stringify(opts.chars)}`,

@@ -1,6 +1,6 @@
 # <img src="./demo_imgs/icon.png" width="40" height="40" align="center" style="margin-right: 10px;"> GyShell
 
-> **v0.1.4-beta3 has been released! [Check out here](./changelogs/v0.1.4-beta3.md)**
+> **v0.1.5 has been released! [Check out here](./changelogs/v0.1.5.md)**
 
 > **The AI-Native Terminal that Thinks with You.**  
 

@@ -273,10 +273,11 @@ export class UIHistoryService {
     } else if (type === 'sub_tool_started') {
       const stopAction = this.stopLatestStreaming(session, sessionId)
       if (stopAction) actions.push(stopAction)
+      const isReasoning = this.isReasoningSubToolEvent(event)
 
       const message = this.createMessage({
         role: 'assistant',
-        type: 'sub_tool',
+        type: isReasoning ? 'reasoning' : 'sub_tool',
         content: '',
         metadata: {
           subToolTitle: event.title || event.toolName || 'Sub Tool',
@@ -391,6 +392,11 @@ export class UIHistoryService {
       id: uuidv4(),
       timestamp: Date.now()
     }
+  }
+
+  private isReasoningSubToolEvent(event: AgentEvent): boolean {
+    const rawTitle = String(event.title || event.toolName || '').trim().toLowerCase()
+    return rawTitle.startsWith('reasoning')
   }
 
   private checkAutoTitle(session: UIChatSession, role: string, content: string): void {

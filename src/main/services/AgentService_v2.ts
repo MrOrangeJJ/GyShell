@@ -19,10 +19,9 @@ import {
   readTerminalTabSchema,
   readCommandOutputSchema,
   readFileSchema,
-  sendCharSchema,
+  writeStdinSchema,
   writeAndEditSchema,
   waitSchema,
-  thinkSchema, 
   waitTerminalIdleSchema,
   waitCommandEndSchema,
 
@@ -43,9 +42,9 @@ import {
   createSystemInfoPrompt,
   createTabContextPrompt,
   COMMAND_POLICY_DECISION_SCHEMA,
-  SEND_CHAR_POLICY_DECISION_SCHEMA,
+  WRITE_STDIN_POLICY_DECISION_SCHEMA,
   createCommandPolicyUserPrompt,
-  createSendCharPolicyUserPrompt,
+  createWriteStdinPolicyUserPrompt,
 } from './AgentHelper/prompts'
 import { runSkillTool } from './AgentHelper/tools/skill_tools'
 import { TokenManager } from './AgentHelper/TokenManager'
@@ -760,36 +759,36 @@ ${recent}
           }
           break
         }
-        case 'send_char': {
+        case 'write_stdin': {
           try {
-            const validatedArgs = sendCharSchema.parse(toolCall.args || {})
+            const validatedArgs = writeStdinSchema.parse(toolCall.args || {})
             // const messageId = toolMessage.additional_kwargs._gyshellMessageId as string
 
             if (this.actionModel) {
               // Build temporary history for action model
               const finalActionMessages = this.helpers.buildActionModelHistory(state.full_messages as BaseMessage[])
 
-              // Call action model for send_char policy check
-              const user = createSendCharPolicyUserPrompt({ chars: validatedArgs.sequence ?? [] })
+              // Call action model for write_stdin policy check
+              const user = createWriteStdinPolicyUserPrompt({ chars: validatedArgs.sequence ?? [] })
               const finalMessagesForActionModel = [...finalActionMessages, user]
 
-              let decision: z.infer<typeof SEND_CHAR_POLICY_DECISION_SCHEMA>
+              let decision: z.infer<typeof WRITE_STDIN_POLICY_DECISION_SCHEMA>
               try {
                 decision = await this.getActionModelPolicyDecision(
                   sessionId,
                   finalMessagesForActionModel,
-                  SEND_CHAR_POLICY_DECISION_SCHEMA,
+                  WRITE_STDIN_POLICY_DECISION_SCHEMA,
                   config?.signal,
-                  'send_char'
+                  'write_stdin'
                 )
               } catch (err: any) {
-                console.warn('[AgentService_v2] Action model decision for send_char failed after retries, falling back to allow:', err)
+                console.warn('[AgentService_v2] Action model decision for write_stdin failed after retries, falling back to allow:', err)
                 decision = { decision: 'allow', reason: 'Action model error' }
               }
 
               if (decision.decision === 'block') {
-                const blockReason = `This call was blocked because the auditor found issues: ${decision.reason}\n\nActually, your intention might be different. Please re-read the description of the send_char tool to confirm what you really want to do, and then call send_char again with the correct parameters.`
-                console.log('[AgentService_v2] Action model decision for send_char blocked:', blockReason)
+                const blockReason = `This call was blocked because the auditor found issues: ${decision.reason}\n\nActually, your intention might be different. Please re-read the description of the write_stdin tool to confirm what you really want to do, and then call write_stdin again with the correct parameters.`
+                console.log('[AgentService_v2] Action model decision for write_stdin blocked:', blockReason)
                 toolMessage.content = blockReason
                 return {
                   messages: [...state.messages, toolMessage],
@@ -800,29 +799,16 @@ ${recent}
               }
             }
 
-            result = await toolImplementations.sendChar(validatedArgs, executionContext)
+            result = await toolImplementations.writeStdin(validatedArgs, executionContext)
           } catch (err) {
-            result = `Parameter validation error for send_char: ${(err as Error).message}`
+            result = `Parameter validation error for write_stdin: ${(err as Error).message}`
           }
           break
         }
         case 'wait': {
           try {
             const validatedArgs = waitSchema.parse(toolCall.args || {})
-            const messageId = toolMessage.additional_kwargs._gyshellMessageId as string
-            this.helpers.sendEvent(sessionId, {
-              messageId,
-              type: 'sub_tool_started',
-              title: 'Wait',
-              hint: `Waiting for ${validatedArgs.seconds}s...`,
-              input: JSON.stringify(validatedArgs)
-            })
-            await new Promise((resolve) => setTimeout(resolve, validatedArgs.seconds * 1000))
-            result = `Waited for ${validatedArgs.seconds} seconds.`
-            this.helpers.sendEvent(sessionId, {
-              messageId,
-              type: 'sub_tool_finished'
-            })
+            result = await toolImplementations.wait(validatedArgs, executionContext)
           } catch (err) {
             result = `Parameter validation error for wait: ${(err as Error).message}`
           }
@@ -843,39 +829,6 @@ ${recent}
             result = await toolImplementations.waitCommandEnd(validatedArgs, executionContext)
           } catch (err) {
             result = `Parameter validation error for wait_command_end: ${(err as Error).message}`
-          }
-          break
-        }
-        case 'think': {
-          try {
-            const validatedArgs = thinkSchema.parse(toolCall.args || {})
-            const messageId = toolMessage.additional_kwargs._gyshellMessageId as string
-            
-            // Send event to frontend to show "Thinking" banner
-            this.helpers.sendEvent(sessionId, {
-              messageId,
-              type: 'sub_tool_started',
-              title: 'Thinking',
-              hint: 'Analyzing and planning...',
-              input: JSON.stringify(validatedArgs)
-            })
-
-            // Stream the thought content to the banner
-            this.helpers.sendEvent(sessionId, {
-              messageId,
-              type: 'sub_tool_delta',
-              outputDelta: validatedArgs.thought
-            })
-
-            // Finish the tool call
-            this.helpers.sendEvent(sessionId, {
-              messageId,
-              type: 'sub_tool_finished'
-            })
-
-            result = 'Thinking process recorded.'
-          } catch (err) {
-            result = `Parameter validation error for think: ${(err as Error).message}`
           }
           break
         }

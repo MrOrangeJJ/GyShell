@@ -5,16 +5,12 @@ import {
   execCommandSchema, 
   readTerminalTabSchema, 
   readCommandOutputSchema,
-  sendCharSchema, 
-  waitTerminalIdleSchema,
-  waitCommandEndSchema,
+  writeStdinSchema,
   runCommand, 
   runCommandNowait, 
   readTerminalTab, 
   readCommandOutput,
-  sendChar,
-  waitTerminalIdle,
-  waitCommandEnd
+  writeStdin
 } from './tools/terminal_tools'
 import { 
   BUILTIN_TOOL_INFO, 
@@ -22,7 +18,7 @@ import {
   WAIT_TERMINAL_IDLE_DESCRIPTION
 } from './prompts'
 import type { ReadFileSupport } from './types'
-import { waitSchema, thinkSchema } from './tools/thinking_tools'
+import { waitSchema, waitTerminalIdleSchema, waitCommandEndSchema, wait, waitTerminalIdle, waitCommandEnd } from './tools/wait_tools'
 import { 
   skillToolSchema, 
   buildSkillToolDescription,
@@ -40,13 +36,11 @@ export {
   execCommandSchema, 
   readTerminalTabSchema, 
   readCommandOutputSchema,
-  sendCharSchema,
-  waitTerminalIdleSchema,
-  waitCommandEndSchema
+  writeStdinSchema
 } from './tools/terminal_tools'
 
 export { readFileSchema } from './tools/read_tools'
-export { waitSchema, thinkSchema } from './tools/thinking_tools'
+export { waitSchema, waitTerminalIdleSchema, waitCommandEndSchema } from './tools/wait_tools'
 export { skillToolSchema, createSkillSchema, buildSkillToolDescription } from './tools/skill_tools'
 
 export { BUILTIN_TOOL_INFO } from './prompts'
@@ -77,9 +71,9 @@ export function buildToolsForModel(readFileSupport: ReadFileSupport) {
       schema: readFileSchema,
     },
     {
-      name: 'send_char',
-      description: BUILTIN_TOOL_INFO.find((t) => t.name === 'send_char')?.description ?? '',
-      schema: sendCharSchema
+      name: 'write_stdin',
+      description: BUILTIN_TOOL_INFO.find((t) => t.name === 'write_stdin')?.description ?? '',
+      schema: writeStdinSchema
     },
     {
       name: 'create_or_edit',
@@ -110,11 +104,6 @@ export function buildToolsForModel(readFileSupport: ReadFileSupport) {
       name: 'wait_command_end',
       description: 'Wait for the currently running command in the terminal tab to finish. Use this when you started a command with nowait but now need its output or exit code to proceed.',
       schema: waitCommandEndSchema
-    },
-    {
-      name: 'think',
-      description: BUILTIN_TOOL_INFO.find((t) => t.name === 'think')?.description ?? '',
-      schema: thinkSchema
     }
   ].map((tool) => convertToOpenAITool(tool))
 }
@@ -127,7 +116,8 @@ export const toolImplementations = {
   runCommandNowait,
   readTerminalTab,
   readCommandOutput,
-  sendChar,
+  writeStdin,
+  wait,
   waitTerminalIdle,
   writeAndEdit,
   runReadFile,

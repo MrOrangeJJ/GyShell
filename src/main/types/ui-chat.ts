@@ -4,6 +4,7 @@ export type MessageType =
   | 'tool_call'
   | 'file_edit'
   | 'sub_tool'
+  | 'reasoning'
   | 'alert'
   | 'error'
   | 'ask'

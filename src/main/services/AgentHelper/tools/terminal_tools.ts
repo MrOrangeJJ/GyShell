@@ -20,7 +20,7 @@ export const readCommandOutputSchema = z.object({
   limit: z.number().optional().describe('The number of lines to read (defaults to 2000).')
 })
 
-export const sendCharSchema = z
+export const writeStdinSchema = z
   .object({
     tabIdOrName: z.string().describe('The ID or Name of the terminal tab'),
     sequence: z
@@ -31,14 +31,6 @@ export const sendCharSchema = z
   .refine((val) => !!val.sequence && val.sequence.length > 0, {
     message: 'Provide a non-empty sequence list.'
   })
-
-export const waitTerminalIdleSchema = z.object({
-  tabIdOrName: z.string().describe('The ID or Name of the terminal tab to monitor')
-})
-
-export const waitCommandEndSchema = z.object({
-  tabIdOrName: z.string().describe('The ID or Name of the terminal tab to wait for the current command to end')
-})
 
 // --- Constants ---
 
@@ -186,7 +178,7 @@ ${truncatedOutput}
 <terminal_content>
 ${recentOutput}
 </terminal_content>
-================================================================================\n\nIf you think you need to exit the current command, use send_char. If you want to wait for it to finish, use wait_command_end.${activeTaskId ? ` history_command_match_id=${activeTaskId}, terminalId=${bestMatch.id}` : ''}`
+================================================================================\n\nIf you think you need to exit the current command, use write_stdin. If you want to wait for it to finish, use wait_command_end.${activeTaskId ? ` history_command_match_id=${activeTaskId}, terminalId=${bestMatch.id}` : ''}`
     }
 
     context.sendEvent(sessionId, { 
@@ -263,7 +255,7 @@ export async function runCommandNowait(args: z.infer<typeof execCommandSchema>, 
 <terminal_content>
 ${recentOutput}
 </terminal_content>
-================================================================================\n\nIf you think you need to exit the current command, use send_char. If you want to wait for it to finish, use wait_command_end.${activeTaskId ? ` history_command_match_id=${activeTaskId}, terminalId=${bestMatch.id}` : ''}`
+================================================================================\n\nIf you think you need to exit the current command, use write_stdin. If you want to wait for it to finish, use wait_command_end.${activeTaskId ? ` history_command_match_id=${activeTaskId}, terminalId=${bestMatch.id}` : ''}`
     }
 
     context.sendEvent(sessionId, { 
@@ -419,7 +411,7 @@ ${result}
   return finalOutput
 }
 
-export async function sendChar(args: z.infer<typeof sendCharSchema>, context: ToolExecutionContext): Promise<string> {
+export async function writeStdin(args: z.infer<typeof writeStdinSchema>, context: ToolExecutionContext): Promise<string> {
   const { tabIdOrName, sequence } = args
   const { terminalService, sessionId, messageId, sendEvent } = context
 
@@ -433,7 +425,7 @@ export async function sendChar(args: z.infer<typeof sendCharSchema>, context: To
     sendEvent(sessionId, {
       messageId,
       type: 'tool_call',
-      toolName: 'send_char',
+      toolName: 'write_stdin',
       input: JSON.stringify(sequence ?? []),
       output: errorText
     })
@@ -441,13 +433,13 @@ export async function sendChar(args: z.infer<typeof sendCharSchema>, context: To
   }
 
   const commandText = (sequence ?? []).join('')
-  const allowed = await checkCommandPolicy(commandText, 'send_char', context)
+  const allowed = await checkCommandPolicy(commandText, 'write_stdin', context)
   if (!allowed.allowed) {
     abortIfNeeded(context.signal)
     sendEvent(sessionId, {
       messageId,
       type: 'tool_call',
-      toolName: 'send_char',
+      toolName: 'write_stdin',
       input: JSON.stringify(sequence ?? []),
       output: allowed.message
     })
@@ -485,7 +477,7 @@ ${output}
   sendEvent(sessionId, {
     messageId,
     type: 'tool_call',
-    toolName: 'send_char',
+    toolName: 'write_stdin',
     input: JSON.stringify(sequence ?? []),
     output: resultHint
   })
@@ -493,200 +485,6 @@ ${output}
   return resultHint
 }
 
-export async function waitTerminalIdle(
-  args: z.infer<typeof waitTerminalIdleSchema>,
-  context: ToolExecutionContext
-): Promise<string> {
-  const { tabIdOrName } = args
-  const { terminalService, sessionId, messageId, sendEvent } = context
-
-  abortIfNeeded(context.signal)
-  const { found, bestMatch } = terminalService.resolveTerminal(tabIdOrName)
-  if (!bestMatch) {
-    return found.length > 1
-      ? `Error: Multiple terminal tabs found with name "${tabIdOrName}".`
-      : `Error: Terminal tab "${tabIdOrName}" not found.`
-  }
-
-  sendEvent(sessionId, {
-    messageId,
-    type: 'sub_tool_started',
-    toolName: 'wait_terminal_idle',
-    title: `Waiting on ${bestMatch.title || bestMatch.id}`,
-    hint: ''
-  })
-
-  let lastContent = ''
-  let stableCount = 0
-  const maxWaitSeconds = 120
-  let elapsed = 0
-
-  while (elapsed < maxWaitSeconds) {
-    abortIfNeeded(context.signal)
-    
-    // Read current visible area
-    const currentContent = terminalService.getRecentOutput(bestMatch.id)
-    
-    if (currentContent === lastContent && currentContent !== '') {
-      stableCount++
-    } else {
-      stableCount = 0
-      lastContent = currentContent
-    }
-
-    if (stableCount >= 4) {
-      const finalOutput = terminalService.getRecentOutput(bestMatch.id)
-      const successMsg = `The terminal has stabilized. The following is the current visible state of the terminal tab "${bestMatch.title || bestMatch.id}":
-================================================================================
-<terminal_content>
-${finalOutput}
-</terminal_content>
-================================================================================`
-      sendEvent(sessionId, {
-        messageId,
-        type: 'sub_tool_delta',
-        outputDelta: successMsg
-      })
-      sendEvent(sessionId, {
-        messageId,
-        type: 'sub_tool_finished'
-      })
-      return successMsg
-    }
-
-    await waitWithSignal(1000, context.signal)
-    elapsed++
-  }
-
-  const currentOutput = terminalService.getRecentOutput(bestMatch.id)
-  const timeoutMsg = `Wait timeout: The terminal has been running for over 120s and is still not idle. Please check if the task is still running correctly. If you need to continue waiting, run this tool again. If you need to stop it, use send_char (e.g., Ctrl+C). The following is the current visible state of the terminal tab "${bestMatch.title || bestMatch.id}":
-================================================================================
-<terminal_content>
-${currentOutput}
-</terminal_content>
-================================================================================`
-  sendEvent(sessionId, {
-    messageId,
-    type: 'sub_tool_delta',
-    outputDelta: timeoutMsg
-  })
-
-  sendEvent(sessionId, {
-    messageId,
-    type: 'sub_tool_finished'
-  })
-
-  return timeoutMsg
-}
-
-export async function waitCommandEnd(
-  args: z.infer<typeof waitCommandEndSchema>,
-  context: ToolExecutionContext
-): Promise<string> {
-  const { tabIdOrName } = args
-  const { terminalService, sessionId, messageId, sendEvent } = context
-
-  abortIfNeeded(context.signal)
-  const { found, bestMatch } = terminalService.resolveTerminal(tabIdOrName)
-  if (!bestMatch) {
-    return found.length > 1
-      ? `Error: Multiple terminal tabs found with name "${tabIdOrName}".`
-      : `Error: Terminal tab "${tabIdOrName}" not found.`
-  }
-
-  const taskId = terminalService.getActiveTaskId(bestMatch.id)
-  if (!taskId) {
-    return `No running command found in terminal tab "${bestMatch.title || bestMatch.id}".`
-  }
-
-  sendEvent(sessionId, {
-    messageId,
-    type: 'sub_tool_started',
-    toolName: 'wait_command_end',
-    title: `Waiting for command to end in ${bestMatch.title || bestMatch.id}`,
-    hint: ''
-  })
-
-  try {
-    // Subscribe to skip wait feedback for this message
-    let userSkipped = false
-    const gateway = (global as any).gateway
-    if (gateway) {
-      gateway.waitForFeedback(messageId).then((payload: any) => {
-        if (payload?.type === 'SKIP_WAIT') {
-          userSkipped = true
-        }
-      })
-    }
-
-    const result = await terminalService.waitForTask(bestMatch.id, taskId, {
-      signal: context.signal,
-      interruptOnAbort: false,
-      shouldSkip: () => userSkipped
-    })
-
-    const task = terminalService.getCommandTask(bestMatch.id, taskId)
-    const commandName = task?.command || 'Unknown command'
-    const historyCommandMatchId = result.history_command_match_id
-    const truncatedOutput = truncateCommandOutput(result.stdoutDelta || '', historyCommandMatchId, bestMatch.id)
-    
-    let finalResult = ''
-    if (result.exitCode === -3 || result.stdoutDelta === 'USER_SKIPPED_WAIT') {
-      finalResult = `The user has chosen to run the command "${commandName}" asynchronously. The command is currently running in the background. You can use read_command_output to check its progress if needed. history_command_match_id=${historyCommandMatchId}, terminalId=${bestMatch.id}`
-      
-      // Update the finished event to mark it as isNowait: true so the UI banner switches to Async style
-      sendEvent(sessionId, { 
-        messageId,
-        type: 'command_finished', 
-        command: commandName, 
-        commandId: messageId,
-        tabName: bestMatch.title || bestMatch.id,
-        exitCode: result.exitCode,
-        outputDelta: finalResult,
-        isNowait: true // Force UI to switch to Async style
-      })
-      return finalResult
-    } else if (result.exitCode === -1 && result.stdoutDelta?.includes('timed out')) {
-      finalResult = `The command "${commandName}" is still running, but the wait has timed out (120s). You can use read_command_output to check its current progress, or call wait_command_end again if you believe it needs more time to finish. history_command_match_id=${historyCommandMatchId}, terminalId=${bestMatch.id}`
-    } else {
-      finalResult = `The command "${commandName}" has finished executing. The following is the output (history_command_match_id=${historyCommandMatchId}):
-================================================================================
-<terminal_content>
-${truncatedOutput}
-</terminal_content>
-================================================================================`
-    }
-
-    sendEvent(sessionId, {
-      messageId,
-      type: 'sub_tool_delta',
-      outputDelta: finalResult
-    })
-    
-    sendEvent(sessionId, {
-      messageId,
-      type: 'sub_tool_finished'
-    })
-
-    return finalResult
-  } catch (error) {
-    if (isAbortError(error)) throw error
-    const errorMessage = error instanceof Error ? error.message : String(error)
-    
-    sendEvent(sessionId, {
-      messageId,
-      type: 'sub_tool_delta',
-      outputDelta: errorMessage
-    })
-    
-    sendEvent(sessionId, {
-      messageId,
-      type: 'sub_tool_finished'
-    })
-    
-    return errorMessage
-  }
-}
 
 // --- Internal Helpers ---
 
@@ -754,7 +552,7 @@ function waitWithSignal(ms: number, signal?: AbortSignal): Promise<void> {
   })
 }
 
-function truncateCommandOutput(output: string, historyCommandMatchId: string, terminalId: string): string {
+export function truncateCommandOutput(output: string, historyCommandMatchId: string, terminalId: string): string {
   const normalized = String(output || '').replace(/\r\n/g, '\n')
   const lines = normalized.split('\n').map((line) => {
     if (line.length <= COMMAND_OUTPUT_MAX_LINE_LENGTH) return line

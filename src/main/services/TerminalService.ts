@@ -601,7 +601,7 @@ export class TerminalService {
       const activeTask = this.getTaskMap(terminalId)[activeTaskId]
       const commandName = activeTask ? activeTask.command : 'unknown'
       throw new Error(
-        `There is a running exec_command in the terminal tab: "${commandName}". If you need to end the previous command, use send_char to end it, otherwise wait until it finishes.`
+        `There is a running exec_command in the terminal tab: "${commandName}". If you need to end the previous command, use write_stdin to end it, otherwise wait until it finishes.`
       )
     }
 

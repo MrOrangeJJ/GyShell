@@ -119,8 +119,12 @@ export class SettingsService {
   }
 
   private normalizeTools(settings: AppSettings): AppSettings {
-    const builtIn = settings.tools?.builtIn ?? {}
+    const builtIn = { ...(settings.tools?.builtIn ?? {}) } as Record<string, boolean>
     const skills = settings.tools?.skills ?? {}
+    if (builtIn.send_char !== undefined && builtIn.write_stdin === undefined) {
+      builtIn.write_stdin = builtIn.send_char
+    }
+    delete builtIn.send_char
     const normalizedBuiltIn = { ...DEFAULT_BUILTIN_TOOLS, ...builtIn }
     return {
       ...settings,

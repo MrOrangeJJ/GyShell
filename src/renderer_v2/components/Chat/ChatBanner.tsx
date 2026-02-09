@@ -231,8 +231,14 @@ export const FileEditBanner = observer(({ msg }: { msg: ChatMessage }) => {
   )
 })
 
-export const SubToolBanner = observer(({ msg }: { msg: ChatMessage }) => {
-  const [expanded, setExpanded] = React.useState(false)
+interface SubToolBannerProps {
+  msg: ChatMessage
+  forceExpanded?: boolean
+  lockExpanded?: boolean
+}
+
+export const SubToolBanner = observer(({ msg, forceExpanded = false, lockExpanded = false }: SubToolBannerProps) => {
+  const [expanded, setExpanded] = React.useState(forceExpanded)
   const fullTitle = msg.metadata?.subToolTitle || 'Sub Tool'
   const maxLen = 40
   const renderTitle = (text: string) => {
@@ -257,6 +263,17 @@ export const SubToolBanner = observer(({ msg }: { msg: ChatMessage }) => {
   const hint = msg.metadata?.subToolHint
   const level = msg.metadata?.subToolLevel || 'info'
   const { ref, isSelected, setSelected } = useBannerSelection<HTMLDivElement>()
+
+  React.useEffect(() => {
+    if (forceExpanded) setExpanded(true)
+  }, [forceExpanded])
+
+  const handleHeaderClick = () => {
+    setSelected(true)
+    if (lockExpanded) return
+    setExpanded(!expanded)
+  }
+
   return (
     <div
       ref={ref}
@@ -266,10 +283,7 @@ export const SubToolBanner = observer(({ msg }: { msg: ChatMessage }) => {
     >
       <div
         className="banner-header subtool-header"
-        onClick={() => {
-          setSelected(true)
-          setExpanded(!expanded)
-        }}
+        onClick={handleHeaderClick}
       >
         <div className="banner-title subtool-title">
           <span className="banner-type">{title}</span>
@@ -286,6 +300,11 @@ export const SubToolBanner = observer(({ msg }: { msg: ChatMessage }) => {
       )}
     </div>
   )
+})
+
+export const ReasoningBanner = observer(({ msg }: { msg: ChatMessage }) => {
+  const isStreaming = !!msg.streaming
+  return <SubToolBanner msg={msg} forceExpanded={isStreaming} lockExpanded={isStreaming} />
 })
 
 export const AskBanner = observer(
