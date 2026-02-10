@@ -408,8 +408,10 @@ export const SettingsView: React.FC<{ store: AppStore }> = observer(({ store }) 
                 </div>
               </div>
 
-              <div className="settings-divider settings-divider-spaced">
-                <span>{t.settings.experimentalFeatures}</span>
+              <div className="settings-section-header" style={{ marginTop: 24 }}>
+                <div className="settings-section-title">
+                  {t.settings.experimentalFeatures}
+                </div>
               </div>
               <div className="settings-rows">
                 <div className="settings-row">
