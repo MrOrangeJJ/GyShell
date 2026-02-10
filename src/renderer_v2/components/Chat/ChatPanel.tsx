@@ -1,5 +1,5 @@
 import React, { useEffect, useRef, useState, useLayoutEffect, useCallback } from 'react'
-import { Square, Plus, X, History, Bot, CornerDownLeft, Play, MoreVertical } from 'lucide-react'
+import { Square, Plus, X, History, CornerDownLeft, Play, MoreVertical } from 'lucide-react'
 import { observer } from 'mobx-react-lite'
 import type { AppStore } from '../../stores/AppStore'
 import type { ChatMessage } from '../../stores/ChatStore'
@@ -648,7 +648,9 @@ export const ChatPanel: React.FC<{ store: AppStore }> = observer(({ store }) => 
                       }
                     }}
                   >
-                      <Bot size={14} className="profile-icon" />
+                      <span className="profile-icon profile-icon-terminal" aria-hidden="true">
+                        ❯_
+                      </span>
                       <Select
                         ref={profileSelectRef}
                         className="profile-dropdown"

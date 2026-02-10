@@ -521,10 +521,20 @@ body.chat-drag-selection-suppressed * {
 }
 
 .profile-icon {
-  color: var(--accent);
   flex-shrink: 0;
-  display: block;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
   margin-left: 0;
+  color: var(--accent);
+}
+
+.profile-icon-terminal {
+  font-family: var(--font-mono);
+  font-size: 13px;
+  font-weight: 700;
+  line-height: 1;
+  letter-spacing: -0.5px;
 }
 
 .profile-dropdown {
