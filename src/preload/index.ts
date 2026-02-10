@@ -88,6 +88,10 @@ interface AppSettings {
   }
   recursionLimit?: number
   debugMode?: boolean
+  experimental?: {
+    runtimeThinkingCorrectionEnabled: boolean
+    taskFinishGuardEnabled: boolean
+  }
 }
 
 interface CommandPolicyLists {

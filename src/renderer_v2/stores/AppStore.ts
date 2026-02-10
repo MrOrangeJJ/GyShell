@@ -131,6 +131,8 @@ export class AppStore {
       setSkillEnabled: action,
       setRecursionLimit: action,
       setDebugMode: action,
+      setRuntimeThinkingCorrectionEnabled: action,
+      setTaskFinishGuardEnabled: action,
       sendChatMessage: action,
       getUniqueTitle: action,
       loadVersionState: action,
@@ -443,6 +445,43 @@ export class AppStore {
       }
     })
     await window.gyshell.settings.set({ debugMode: enabled })
+  }
+
+  async setRuntimeThinkingCorrectionEnabled(enabled: boolean): Promise<void> {
+    const taskFinishGuardEnabled = this.settings?.experimental?.taskFinishGuardEnabled !== false
+    runInAction(() => {
+      if (this.settings) {
+        this.settings.experimental = {
+          runtimeThinkingCorrectionEnabled: enabled,
+          taskFinishGuardEnabled
+        }
+      }
+    })
+    await window.gyshell.settings.set({
+      experimental: {
+        runtimeThinkingCorrectionEnabled: enabled,
+        taskFinishGuardEnabled
+      }
+    })
+  }
+
+  async setTaskFinishGuardEnabled(enabled: boolean): Promise<void> {
+    const runtimeThinkingCorrectionEnabled =
+      this.settings?.experimental?.runtimeThinkingCorrectionEnabled !== false
+    runInAction(() => {
+      if (this.settings) {
+        this.settings.experimental = {
+          runtimeThinkingCorrectionEnabled,
+          taskFinishGuardEnabled: enabled
+        }
+      }
+    })
+    await window.gyshell.settings.set({
+      experimental: {
+        runtimeThinkingCorrectionEnabled,
+        taskFinishGuardEnabled: enabled
+      }
+    })
   }
 
   async openCustomThemeFile(): Promise<void> {

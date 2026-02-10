@@ -408,6 +408,40 @@ export const SettingsView: React.FC<{ store: AppStore }> = observer(({ store }) 
                 </div>
               </div>
 
+              <div className="settings-divider settings-divider-spaced">
+                <span>{t.settings.experimentalFeatures}</span>
+              </div>
+              <div className="settings-rows">
+                <div className="settings-row">
+                  <div className="settings-row-label-with-info">
+                    <label>{t.settings.runtimeThinkingCorrection}</label>
+                    <InfoTooltip content={t.settings.tooltips.runtimeThinkingCorrection} />
+                  </div>
+                  <label className="switch">
+                    <input
+                      type="checkbox"
+                      checked={store.settings?.experimental?.runtimeThinkingCorrectionEnabled !== false}
+                      onChange={(e) => store.setRuntimeThinkingCorrectionEnabled(e.target.checked)}
+                    />
+                    <span className="switch-slider" />
+                  </label>
+                </div>
+                <div className="settings-row">
+                  <div className="settings-row-label-with-info">
+                    <label>{t.settings.taskFinishGuard}</label>
+                    <InfoTooltip content={t.settings.tooltips.taskFinishGuard} />
+                  </div>
+                  <label className="switch">
+                    <input
+                      type="checkbox"
+                      checked={store.settings?.experimental?.taskFinishGuardEnabled !== false}
+                      onChange={(e) => store.setTaskFinishGuardEnabled(e.target.checked)}
+                    />
+                    <span className="switch-slider" />
+                  </label>
+                </div>
+              </div>
+
               <div className="settings-section-header" style={{ marginTop: 24 }}>
                 <div className="settings-section-title">
                   {t.settings.terminal}

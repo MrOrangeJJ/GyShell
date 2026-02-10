@@ -33,8 +33,11 @@ import { ActionModelFallbackHelper } from './AgentHelper/utils/action_model_fall
 import { buildDebugRawResponse, captureRawResponseChunk } from './AgentHelper/utils/raw_response'
 import { invokeWithRetryAndSanitizedInput, stripRawResponseFromStoredMessages } from './AgentHelper/utils/model_messages'
 import { createStreamReasoningExtractor } from './AgentHelper/utils/stream_reasoning_extractor'
+import { resolveRunExperimentalFlags } from './AgentHelper/utils/experimental_flags'
+import { SelfCorrectionRuntimeManager } from './AgentHelper/utils/self_correction_runtime'
 import {
   CONTINUE_INSTRUCTION_TAG,
+  SELF_CORRECTION_INPUT_TAG,
   USEFUL_SKILL_TAG,
   USER_INSERTED_INPUT_TAG,
   USER_INSERTED_INPUT_INSTRUCTION,
@@ -45,7 +48,11 @@ import {
   WRITE_STDIN_POLICY_DECISION_SCHEMA,
   TASK_COMPLETION_DECISION_SCHEMA,
   TASK_CONTINUE_INSTRUCTION_SCHEMA,
+  SELF_CORRECTION_AUDIT_DECISION_SCHEMA,
+  SELF_CORRECTION_INSTRUCTION_SCHEMA,
   createCommandPolicyUserPrompt,
+  createSelfCorrectionAuditDecisionUserPrompt,
+  createSelfCorrectionInstructionUserPrompt,
   createTaskCompletionDecisionUserPrompt,
   createTaskContinueInstructionUserPrompt,
   createWriteStdinPolicyUserPrompt,
@@ -114,6 +121,18 @@ const StateAnnotation = Ann.Root({
   completionGuardDecision: Ann({
     reducer: (x: 'end' | 'continue', y?: 'end' | 'continue') => y ?? x,
     default: () => 'end'
+  }),
+  modelRequestPassCount: Ann({
+    reducer: (x: number, y?: number) => (typeof y === 'number' ? y : x),
+    default: () => 0
+  }),
+  runtimeThinkingCorrectionEnabled: Ann({
+    reducer: (x: boolean, y?: boolean) => (typeof y === 'boolean' ? y : x),
+    default: () => true
+  }),
+  taskFinishGuardEnabled: Ann({
+    reducer: (x: boolean, y?: boolean) => (typeof y === 'boolean' ? y : x),
+    default: () => true
   })
 })
 
@@ -147,6 +166,7 @@ export class AgentService_v2 {
   private lastAbortedMessage: BaseMessage | null = null
   private actionModelFallbackHelper = new ActionModelFallbackHelper()
   private sessionModelBindings: Map<string, SessionModelBinding> = new Map()
+  private selfCorrectionRuntimeManager = new SelfCorrectionRuntimeManager()
 
   constructor(
     terminalService: TerminalService,
@@ -200,7 +220,7 @@ export class AgentService_v2 {
     workflow.addConditionalEdges(
       'batch_toolcall_executor',
       this.routeModelOutput,
-      ['tools', 'command_tools', 'file_tools', 'read_file', 'mcp_tools', 'task_completion_guard']
+      ['tools', 'command_tools', 'file_tools', 'read_file', 'mcp_tools', 'task_completion_guard', 'final_output']
     )
 
     workflow.addConditionalEdges(
@@ -316,6 +336,7 @@ export class AgentService_v2 {
   releaseSessionModelBinding(sessionId: string): void {
     this.sessionModelBindings.delete(sessionId)
     this.actionModelFallbackHelper.clearSession(sessionId)
+    this.selfCorrectionRuntimeManager.clearSession(sessionId)
   }
 
   // --- Graph Nodes ---
@@ -454,9 +475,32 @@ ${recent}
 
   private createModelRequestNode() {
     return RunnableLambda.from(async (state: any, config: any) => {
-      const sessionId = state.sessionId;
-      if (!sessionId) throw new Error('No session ID in state');
+      const sessionId = state.sessionId
+      if (!sessionId) throw new Error('No session ID in state')
       const sessionBinding = this.getSessionModelBinding(sessionId)
+      const runtimeThinkingCorrectionEnabled = state.runtimeThinkingCorrectionEnabled !== false
+
+      let modelInputMessages: BaseMessage[] = [...(state.messages as BaseMessage[])]
+      let fullHistoryMessages: BaseMessage[] = [...(state.full_messages as BaseMessage[])]
+
+      const pendingInstruction = this.selfCorrectionRuntimeManager.consumePendingInstruction(sessionId)
+      if (pendingInstruction && runtimeThinkingCorrectionEnabled) {
+        const selfCorrectionMessage = new HumanMessage(
+          `${SELF_CORRECTION_INPUT_TAG}${pendingInstruction.instruction}`
+        )
+        ;(selfCorrectionMessage as any).additional_kwargs = {
+          _gyshellMessageId: uuidv4(),
+          input_kind: 'self_correction'
+        }
+        modelInputMessages = [...modelInputMessages, selfCorrectionMessage]
+        fullHistoryMessages = [...fullHistoryMessages, selfCorrectionMessage]
+      }
+
+      const prevPassCount = typeof state.modelRequestPassCount === 'number' ? state.modelRequestPassCount : 0
+      const nextPassCount = prevPassCount + 1
+      if (runtimeThinkingCorrectionEnabled && nextPassCount % 8 === 0) {
+        this.spawnSelfCorrectionAudit(sessionId, modelInputMessages, config?.signal, nextPassCount)
+      }
 
       // Ensure we get the freshest list from disk
       await this.skillService.reload()
@@ -481,7 +525,7 @@ ${recent}
       let debugRawChunks: any[] = []
       const fullResponse = await invokeWithRetryAndSanitizedInput({
         helpers: this.helpers,
-        messages: state.messages as BaseMessage[],
+        messages: modelInputMessages,
         signal: config?.signal,
         operation: async (streamInputMessages) => {
           const stream = await modelWithTools.stream(streamInputMessages, {
@@ -614,13 +658,13 @@ ${recent}
       }
 
       // Always reset pendingToolCalls here to avoid stale queue influencing routing.
-      const fullHistory: BaseMessage[] = state.full_messages
       return { 
-          messages: [...state.messages, fullResponse],
-          full_messages: [...fullHistory, fullResponse],
+          messages: [...modelInputMessages, fullResponse],
+          full_messages: [...fullHistoryMessages, fullResponse],
           token_state: { current_tokens: currentTokens },
-          sessionId, 
-          pendingToolCalls: [] 
+          sessionId,
+          pendingToolCalls: [],
+          modelRequestPassCount: nextPassCount
       }
     })
   }
@@ -1245,6 +1289,67 @@ ${recent}
     }
   }
 
+  private spawnSelfCorrectionAudit(
+    sessionId: string,
+    messages: BaseMessage[],
+    parentSignal: AbortSignal | undefined,
+    passCount: number
+  ): void {
+    const controller = new AbortController()
+    this.selfCorrectionRuntimeManager.addController(sessionId, controller)
+
+    const forwardAbort = () => controller.abort()
+    if (parentSignal) {
+      if (parentSignal.aborted) {
+        controller.abort()
+      } else {
+        parentSignal.addEventListener('abort', forwardAbort, { once: true })
+      }
+    }
+
+    void (async () => {
+      const auditDecision = await this.getThinkingModelDecision(
+        sessionId,
+        [...messages, createSelfCorrectionAuditDecisionUserPrompt()],
+        SELF_CORRECTION_AUDIT_DECISION_SCHEMA,
+        controller.signal,
+        'self_correction_audit'
+      )
+      if (auditDecision.is_on_reasonable_path) return
+
+      const correctionInstruction = await this.getThinkingModelDecision(
+        sessionId,
+        [
+          ...messages,
+          createSelfCorrectionAuditDecisionUserPrompt(),
+          new AIMessage({ content: JSON.stringify(auditDecision) }),
+          createSelfCorrectionInstructionUserPrompt({ auditReason: auditDecision.reason })
+        ],
+        SELF_CORRECTION_INSTRUCTION_SCHEMA,
+        controller.signal,
+        'self_correction_instruction'
+      )
+
+      const instructionText = String(correctionInstruction.correction_instruction || '').trim()
+      if (!instructionText) return
+
+      this.selfCorrectionRuntimeManager.setPendingInstruction(sessionId, {
+        passCount,
+        instruction: instructionText
+      })
+    })()
+      .catch((err) => {
+        if (this.helpers.isAbortError(err) || controller.signal.aborted) return
+        console.warn('[AgentService_v2] Self-correction audit failed, skip this round:', err)
+      })
+      .finally(() => {
+        this.selfCorrectionRuntimeManager.removeController(sessionId, controller)
+        if (parentSignal) {
+          parentSignal.removeEventListener('abort', forwardAbort)
+        }
+      })
+  }
+
   private routeModelOutput = (state: any): string => {
     const queue: any[] = Array.isArray(state.pendingToolCalls) ? state.pendingToolCalls : []
     const first = queue[0]
@@ -1265,7 +1370,10 @@ ${recent}
       return 'tools'
     }
 
-    return 'task_completion_guard'
+    if (state.taskFinishGuardEnabled !== false) {
+      return 'task_completion_guard'
+    }
+    return 'final_output'
   }
 
   private routeCompletionGuardOutput = (state: any): string => {
@@ -1445,11 +1553,13 @@ ${recent}
     if (!lockedProfileId) {
       throw new Error(`Missing locked profile for session ${sessionId}`)
     }
+    this.selfCorrectionRuntimeManager.clearSession(sessionId)
     this.ensureSessionModelBinding(sessionId, lockedProfileId)
     this.actionModelFallbackHelper.beginSession(sessionId)
     const recursionLimit = this.settings?.recursionLimit ?? 200
     const loadedSession = this.chatHistoryService.loadSession(sessionId)
     const baseMessages = loadedSession ? mapStoredMessagesToChatMessages(Array.from(loadedSession.messages.values())) : []
+    const runExperimentalFlags = resolveRunExperimentalFlags(context, this.settings)
 
     const initialState = {
       messages: [...baseMessages],
@@ -1457,56 +1567,59 @@ ${recent}
       sessionId: sessionId,
       boundTerminalId: boundTerminalId,
       startup_input: input,
-      startup_mode: startMode
+      startup_mode: startMode,
+      runtimeThinkingCorrectionEnabled: runExperimentalFlags.runtimeThinkingCorrectionEnabled,
+      taskFinishGuardEnabled: runExperimentalFlags.taskFinishGuardEnabled
     }
 
-      try {
-        const result = await this.graph.invoke(initialState, {
-          recursionLimit: recursionLimit,
-          signal,
-          configurable: { thread_id: sessionId }
-        })
+    try {
+      const result = await this.graph.invoke(initialState, {
+        recursionLimit: recursionLimit,
+        signal,
+        configurable: { thread_id: sessionId }
+      })
 
-        // Persistence
-        if (result && (result.full_messages || result.messages)) {
-          const finalMessages = result.full_messages || result.messages
-          const sessionToSave = loadedSession || {
-            id: sessionId,
-            title: 'New Session',
-            boundTerminalTabId: boundTerminalId,
-            messages: new Map(),
-            lastCheckpointOffset: 0
-          }
-          this.updateSessionFromMessages(sessionToSave, finalMessages as BaseMessage[])
-          this.chatHistoryService.saveSession(sessionToSave)
+      // Persistence
+      if (result && (result.full_messages || result.messages)) {
+        const finalMessages = result.full_messages || result.messages
+        const sessionToSave = loadedSession || {
+          id: sessionId,
+          title: 'New Session',
+          boundTerminalTabId: boundTerminalId,
+          messages: new Map(),
+          lastCheckpointOffset: 0
         }
-      } catch (err: any) {
-        console.error(`[AgentService_v2] Run task failed (sessionId=${sessionId}):`, err)
-        
-        // Use our new detail extraction helper
-        const errorDetails = this.helpers.extractErrorDetails(err)
-        const errorMessage = err.message || String(err)
+        this.updateSessionFromMessages(sessionToSave, finalMessages as BaseMessage[])
+        this.chatHistoryService.saveSession(sessionToSave)
+      }
+    } catch (err: any) {
+      console.error(`[AgentService_v2] Run task failed (sessionId=${sessionId}):`, err)
+      
+      // Use our new detail extraction helper
+      const errorDetails = this.helpers.extractErrorDetails(err)
+      const errorMessage = err.message || String(err)
 
-        // For any error (Abort or internal Error), try to save all history in the current Checkpoint
-        await this.trySaveSessionFromCheckpoint(sessionId, boundTerminalId)
-        
-        if (this.helpers.isAbortError(err)) {
-          return
+      // For any error (Abort or internal Error), try to save all history in the current Checkpoint
+      await this.trySaveSessionFromCheckpoint(sessionId, boundTerminalId)
+      
+      if (this.helpers.isAbortError(err)) {
+        return
+      }
+      
+      // Broadcast with full details
+      ;(global as any).gateway.broadcast({
+        type: 'agent:event',
+        sessionId,
+        payload: { 
+          type: 'error', 
+          message: errorMessage,
+          details: errorDetails
         }
-        
-        // Broadcast with full details
-        ;(global as any).gateway.broadcast({
-          type: 'agent:event',
-          sessionId,
-          payload: { 
-            type: 'error', 
-            message: errorMessage,
-            details: errorDetails
-          }
-        })
+      })
 
-        throw err // Throw to Gateway for UI notification
-      } finally {
+      throw err // Throw to Gateway for UI notification
+    } finally {
+      this.selfCorrectionRuntimeManager.clearSession(sessionId)
       this.actionModelFallbackHelper.clearSession(sessionId)
       await this.clearCheckpoint(sessionId)
     }

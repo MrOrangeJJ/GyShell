@@ -48,6 +48,8 @@ export interface SessionContext {
   boundTerminalId: string;
   activeRunId: string | null;      // Currently active Agent run ID
   lockedProfileId: string | null;  // Profile locked for the current busy session window
+  lockedRuntimeThinkingCorrectionEnabled: boolean | null;
+  lockedTaskFinishGuardEnabled: boolean | null;
   abortController: AbortController | null;
   status: 'idle' | 'thinking' | 'running' | 'paused';
   metadata: Record<string, any>;

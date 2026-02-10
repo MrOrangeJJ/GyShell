@@ -46,7 +46,11 @@ const DEFAULT_SETTINGS: AppSettings = {
     panelOrder: ['chat', 'terminal']
   },
   recursionLimit: 200,
-  debugMode: false
+  debugMode: false,
+  experimental: {
+    runtimeThinkingCorrectionEnabled: true,
+    taskFinishGuardEnabled: true
+  }
 }
 
 function isObject(x: unknown): x is Record<string, any> {
@@ -113,6 +117,11 @@ export class SettingsService {
       ...normalized,
       model: effectiveModel,
       debugMode,
+      experimental: {
+        runtimeThinkingCorrectionEnabled:
+          normalized.experimental?.runtimeThinkingCorrectionEnabled !== false,
+        taskFinishGuardEnabled: normalized.experimental?.taskFinishGuardEnabled !== false
+      },
       schemaVersion: 2
     }
     this.store.store = fixed as any

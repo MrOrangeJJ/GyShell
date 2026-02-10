@@ -156,6 +156,11 @@ export interface AppSettings {
   recursionLimit?: number
   /** Debug mode switch for backend debug payload persistence and related diagnostics */
   debugMode?: boolean
+  /** Experimental feature switches */
+  experimental?: {
+    runtimeThinkingCorrectionEnabled: boolean
+    taskFinishGuardEnabled: boolean
+  }
 }
 
 // ============ Terminal Types ============

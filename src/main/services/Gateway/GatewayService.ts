@@ -440,6 +440,8 @@ export class GatewayService extends EventEmitter implements IGateway {
       boundTerminalId: terminalId,
       activeRunId: null,
       lockedProfileId: null,
+      lockedRuntimeThinkingCorrectionEnabled: null,
+      lockedTaskFinishGuardEnabled: null,
       abortController: null,
       status: 'idle',
       metadata: {}
@@ -461,6 +463,8 @@ export class GatewayService extends EventEmitter implements IGateway {
         boundTerminalId: tid,
         activeRunId: null,
         lockedProfileId: null,
+        lockedRuntimeThinkingCorrectionEnabled: null,
+        lockedTaskFinishGuardEnabled: null,
         abortController: null,
         status: 'idle',
         metadata: {}
@@ -469,8 +473,13 @@ export class GatewayService extends EventEmitter implements IGateway {
     }
 
     if (!context.lockedProfileId) {
-      const activeProfileId = this.settingsService.getSettings().models.activeProfileId || '';
+      const settings = this.settingsService.getSettings();
+      const activeProfileId = settings.models.activeProfileId || '';
       context.lockedProfileId = activeProfileId;
+      context.lockedRuntimeThinkingCorrectionEnabled =
+        settings.experimental?.runtimeThinkingCorrectionEnabled !== false;
+      context.lockedTaskFinishGuardEnabled =
+        settings.experimental?.taskFinishGuardEnabled !== false;
     }
 
     if (context.status !== 'idle') {
@@ -584,6 +593,8 @@ export class GatewayService extends EventEmitter implements IGateway {
       this.agentService.releaseSessionModelBinding(context.sessionId);
     }
     context.lockedProfileId = null;
+    context.lockedRuntimeThinkingCorrectionEnabled = null;
+    context.lockedTaskFinishGuardEnabled = null;
   }
 
   async pauseTask(sessionId: string): Promise<void> {

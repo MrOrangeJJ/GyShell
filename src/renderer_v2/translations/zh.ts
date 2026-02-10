@@ -50,6 +50,9 @@ export const zh = {
     recursionLimit: 'Agent 递归上限',
     recursionLimitInf: '无限制',
     debugMode: '调试模式',
+    experimentalFeatures: '试验性功能',
+    runtimeThinkingCorrection: '运行时思考反思纠正',
+    taskFinishGuard: '任务结束守卫',
     cursorStyles: {
       block: '方块',
       underline: '下划线',
@@ -137,6 +140,8 @@ export const zh = {
       cursorBlink: '终端光标是否以动画形式闪烁。',
       recursionLimit: 'Agent 在单个任务中允许执行的最大步数。如果经常遇到“递归上限”错误，请调高此值。拉到最右侧为无限制。',
       debugMode: '开启调试相关的持久化与诊断能力。目前会在后端导出消息中保留 additional_kwargs.__raw_response；但发送给模型前仍会自动剥离这些原始字段。',
+      runtimeThinkingCorrection: '每 8 次 model 循环在后台运行一次思考模型审计。若判断路径偏离，会在后续一次模型请求前注入纠正约束。',
+      taskFinishGuard: '在结束前执行严格完成度审计，确认任务确实完成。关闭后，当没有工具调用时可直接结束。',
       themeCustom: '点击打开自定义主题的 JSON 配置文件。你可以按照现有格式添加自己的配色方案。',
       themeReload: '手动重新加载自定义主题文件，使最新的 JSON 修改生效。',
       modelAdd: '配置 AI 模型供应商。目前仅支持【OpenAI API 兼容】的接口格式（如 DeepSeek, Claude, Local LLM 等）。',
