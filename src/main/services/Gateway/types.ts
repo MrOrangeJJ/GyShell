@@ -1,4 +1,5 @@
 import type { AgentEvent } from '../../types';
+import type { ExperimentalFlags } from '../../types';
 
 /**
  * Core event definitions, all frontend-backend communication happens through these events
@@ -48,8 +49,7 @@ export interface SessionContext {
   boundTerminalId: string;
   activeRunId: string | null;      // Currently active Agent run ID
   lockedProfileId: string | null;  // Profile locked for the current busy session window
-  lockedRuntimeThinkingCorrectionEnabled: boolean | null;
-  lockedTaskFinishGuardEnabled: boolean | null;
+  lockedExperimentalFlags: ExperimentalFlags | null;
   abortController: AbortController | null;
   status: 'idle' | 'thinking' | 'running' | 'paused';
   metadata: Record<string, any>;

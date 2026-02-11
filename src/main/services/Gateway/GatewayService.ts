@@ -15,6 +15,7 @@ import type { McpToolService } from '../McpToolService';
 import type { ThemeService } from '../ThemeService';
 import type { VersionService } from '../VersionService';
 import { BUILTIN_TOOL_INFO } from '../AgentHelper/tools';
+import { getRunExperimentalFlagsFromSettings } from '../AgentHelper/utils/experimental_flags';
 import { resolveTheme } from '../../../renderer_v2/theme/themes';
 
 export class GatewayService extends EventEmitter implements IGateway {
@@ -435,17 +436,7 @@ export class GatewayService extends EventEmitter implements IGateway {
 
   async createSession(terminalId: string): Promise<string> {
     const sessionId = uuidv4();
-    const context: SessionContext = {
-      sessionId,
-      boundTerminalId: terminalId,
-      activeRunId: null,
-      lockedProfileId: null,
-      lockedRuntimeThinkingCorrectionEnabled: null,
-      lockedTaskFinishGuardEnabled: null,
-      abortController: null,
-      status: 'idle',
-      metadata: {}
-    };
+    const context = this.createEmptySessionContext(sessionId, terminalId);
     this.sessions.set(sessionId, context);
     return sessionId;
   }
@@ -458,29 +449,11 @@ export class GatewayService extends EventEmitter implements IGateway {
     let context = this.sessions.get(sessionId);
     if (!context) {
       const tid = terminalId || this.terminalService.getAllTerminals()[0]?.id || '';
-      context = {
-        sessionId,
-        boundTerminalId: tid,
-        activeRunId: null,
-        lockedProfileId: null,
-        lockedRuntimeThinkingCorrectionEnabled: null,
-        lockedTaskFinishGuardEnabled: null,
-        abortController: null,
-        status: 'idle',
-        metadata: {}
-      };
+      context = this.createEmptySessionContext(sessionId, tid);
       this.sessions.set(sessionId, context);
     }
 
-    if (!context.lockedProfileId) {
-      const settings = this.settingsService.getSettings();
-      const activeProfileId = settings.models.activeProfileId || '';
-      context.lockedProfileId = activeProfileId;
-      context.lockedRuntimeThinkingCorrectionEnabled =
-        settings.experimental?.runtimeThinkingCorrectionEnabled !== false;
-      context.lockedTaskFinishGuardEnabled =
-        settings.experimental?.taskFinishGuardEnabled !== false;
-    }
+    this.ensureSessionProfileLock(context);
 
     if (context.status !== 'idle') {
       await this.stopTask(sessionId, {
@@ -593,8 +566,27 @@ export class GatewayService extends EventEmitter implements IGateway {
       this.agentService.releaseSessionModelBinding(context.sessionId);
     }
     context.lockedProfileId = null;
-    context.lockedRuntimeThinkingCorrectionEnabled = null;
-    context.lockedTaskFinishGuardEnabled = null;
+    context.lockedExperimentalFlags = null;
+  }
+
+  private createEmptySessionContext(sessionId: string, boundTerminalId: string): SessionContext {
+    return {
+      sessionId,
+      boundTerminalId,
+      activeRunId: null,
+      lockedProfileId: null,
+      lockedExperimentalFlags: null,
+      abortController: null,
+      status: 'idle',
+      metadata: {}
+    };
+  }
+
+  private ensureSessionProfileLock(context: SessionContext): void {
+    if (context.lockedProfileId) return;
+    const settings = this.settingsService.getSettings();
+    context.lockedProfileId = settings.models.activeProfileId || '';
+    context.lockedExperimentalFlags = getRunExperimentalFlagsFromSettings(settings);
   }
 
   async pauseTask(sessionId: string): Promise<void> {

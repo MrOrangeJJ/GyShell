@@ -133,6 +133,10 @@ const StateAnnotation = Ann.Root({
   taskFinishGuardEnabled: Ann({
     reducer: (x: boolean, y?: boolean) => (typeof y === 'boolean' ? y : x),
     default: () => true
+  }),
+  firstTurnThinkingModelEnabled: Ann({
+    reducer: (x: boolean, y?: boolean) => (typeof y === 'boolean' ? y : x),
+    default: () => false
   })
 })
 
@@ -516,7 +520,12 @@ ${recent}
       }
 
       const mcpTools = this.mcpToolService.getActiveTools()
-      const modelWithTools = sessionBinding.model.bindTools([...builtInTools, ...mcpTools])
+      const shouldUseThinkingModelOnThisPass =
+        state.firstTurnThinkingModelEnabled === true && nextPassCount === 1
+      const baseModel = shouldUseThinkingModelOnThisPass
+        ? (sessionBinding.thinkingModel || sessionBinding.model)
+        : sessionBinding.model
+      const modelWithTools = baseModel.bindTools([...builtInTools, ...mcpTools])
 
       const messageId = uuidv4()
       
@@ -647,7 +656,7 @@ ${recent}
       if (usage) {
         currentTokens = usage.total_tokens || usage.totalTokens || 0
         const modelName = (fullResponse as any).response_metadata?.model_name
-          || (sessionBinding.model as any)?.modelName
+          || (baseModel as any)?.modelName
           || 'unknown'
         this.helpers.sendEvent(sessionId, {
           type: 'tokens_count',
@@ -1569,7 +1578,8 @@ ${recent}
       startup_input: input,
       startup_mode: startMode,
       runtimeThinkingCorrectionEnabled: runExperimentalFlags.runtimeThinkingCorrectionEnabled,
-      taskFinishGuardEnabled: runExperimentalFlags.taskFinishGuardEnabled
+      taskFinishGuardEnabled: runExperimentalFlags.taskFinishGuardEnabled,
+      firstTurnThinkingModelEnabled: runExperimentalFlags.firstTurnThinkingModelEnabled
     }
 
     try {

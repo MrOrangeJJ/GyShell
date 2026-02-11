@@ -53,6 +53,7 @@ export const zh = {
     experimentalFeatures: '试验性功能',
     runtimeThinkingCorrection: '运行时思考反思纠正',
     taskFinishGuard: '任务结束守卫',
+    firstTurnThinkingModel: '首轮使用思考模型',
     cursorStyles: {
       block: '方块',
       underline: '下划线',
@@ -142,6 +143,7 @@ export const zh = {
       debugMode: '开启调试相关的持久化与诊断能力。目前会在后端导出消息中保留 additional_kwargs.__raw_response；但发送给模型前仍会自动剥离这些原始字段。',
       runtimeThinkingCorrection: '每 8 次 model 循环在后台运行一次思考模型审计。若判断路径偏离，会在后续一次模型请求前注入纠正约束。',
       taskFinishGuard: '在结束前执行严格完成度审计，确认任务确实完成。关闭后，当没有工具调用时可直接结束。',
+      firstTurnThinkingModel: '开启后，每次 run 的第一次 model_request 会使用 Thinking 模型，后续 model_request 自动回归 Global 模型。',
       themeCustom: '点击打开自定义主题的 JSON 配置文件。你可以按照现有格式添加自己的配色方案。',
       themeReload: '手动重新加载自定义主题文件，使最新的 JSON 修改生效。',
       modelAdd: '配置 AI 模型供应商。目前仅支持【OpenAI API 兼容】的接口格式（如 DeepSeek, Claude, Local LLM 等）。',

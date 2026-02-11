@@ -133,6 +133,7 @@ export class AppStore {
       setDebugMode: action,
       setRuntimeThinkingCorrectionEnabled: action,
       setTaskFinishGuardEnabled: action,
+      setFirstTurnThinkingModelEnabled: action,
       sendChatMessage: action,
       getUniqueTitle: action,
       loadVersionState: action,
@@ -447,40 +448,47 @@ export class AppStore {
     await window.gyshell.settings.set({ debugMode: enabled })
   }
 
-  async setRuntimeThinkingCorrectionEnabled(enabled: boolean): Promise<void> {
-    const taskFinishGuardEnabled = this.settings?.experimental?.taskFinishGuardEnabled !== false
+  private getExperimentalSettingsSnapshot(): NonNullable<AppSettings['experimental']> {
+    return {
+      runtimeThinkingCorrectionEnabled:
+        this.settings?.experimental?.runtimeThinkingCorrectionEnabled !== false,
+      taskFinishGuardEnabled: this.settings?.experimental?.taskFinishGuardEnabled !== false,
+      firstTurnThinkingModelEnabled: this.settings?.experimental?.firstTurnThinkingModelEnabled === true
+    }
+  }
+
+  private async updateExperimentalSettings(
+    patch: Partial<NonNullable<AppSettings['experimental']>>
+  ): Promise<void> {
+    const next = {
+      ...this.getExperimentalSettingsSnapshot(),
+      ...patch
+    }
     runInAction(() => {
       if (this.settings) {
-        this.settings.experimental = {
-          runtimeThinkingCorrectionEnabled: enabled,
-          taskFinishGuardEnabled
-        }
+        this.settings.experimental = next
       }
     })
     await window.gyshell.settings.set({
-      experimental: {
-        runtimeThinkingCorrectionEnabled: enabled,
-        taskFinishGuardEnabled
-      }
+      experimental: next
+    })
+  }
+
+  async setRuntimeThinkingCorrectionEnabled(enabled: boolean): Promise<void> {
+    await this.updateExperimentalSettings({
+      runtimeThinkingCorrectionEnabled: enabled
     })
   }
 
   async setTaskFinishGuardEnabled(enabled: boolean): Promise<void> {
-    const runtimeThinkingCorrectionEnabled =
-      this.settings?.experimental?.runtimeThinkingCorrectionEnabled !== false
-    runInAction(() => {
-      if (this.settings) {
-        this.settings.experimental = {
-          runtimeThinkingCorrectionEnabled,
-          taskFinishGuardEnabled: enabled
-        }
-      }
+    await this.updateExperimentalSettings({
+      taskFinishGuardEnabled: enabled
     })
-    await window.gyshell.settings.set({
-      experimental: {
-        runtimeThinkingCorrectionEnabled,
-        taskFinishGuardEnabled: enabled
-      }
+  }
+
+  async setFirstTurnThinkingModelEnabled(enabled: boolean): Promise<void> {
+    await this.updateExperimentalSettings({
+      firstTurnThinkingModelEnabled: enabled
     })
   }
 

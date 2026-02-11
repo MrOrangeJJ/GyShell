@@ -91,6 +91,7 @@ interface AppSettings {
   experimental?: {
     runtimeThinkingCorrectionEnabled: boolean
     taskFinishGuardEnabled: boolean
+    firstTurnThinkingModelEnabled: boolean
   }
 }
 

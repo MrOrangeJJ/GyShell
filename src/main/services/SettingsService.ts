@@ -49,7 +49,8 @@ const DEFAULT_SETTINGS: AppSettings = {
   debugMode: false,
   experimental: {
     runtimeThinkingCorrectionEnabled: true,
-    taskFinishGuardEnabled: true
+    taskFinishGuardEnabled: true,
+    firstTurnThinkingModelEnabled: false
   }
 }
 
@@ -120,7 +121,8 @@ export class SettingsService {
       experimental: {
         runtimeThinkingCorrectionEnabled:
           normalized.experimental?.runtimeThinkingCorrectionEnabled !== false,
-        taskFinishGuardEnabled: normalized.experimental?.taskFinishGuardEnabled !== false
+        taskFinishGuardEnabled: normalized.experimental?.taskFinishGuardEnabled !== false,
+        firstTurnThinkingModelEnabled: normalized.experimental?.firstTurnThinkingModelEnabled === true
       },
       schemaVersion: 2
     }

@@ -442,6 +442,20 @@ export const SettingsView: React.FC<{ store: AppStore }> = observer(({ store }) 
                     <span className="switch-slider" />
                   </label>
                 </div>
+                <div className="settings-row">
+                  <div className="settings-row-label-with-info">
+                    <label>{t.settings.firstTurnThinkingModel}</label>
+                    <InfoTooltip content={t.settings.tooltips.firstTurnThinkingModel} />
+                  </div>
+                  <label className="switch">
+                    <input
+                      type="checkbox"
+                      checked={store.settings?.experimental?.firstTurnThinkingModelEnabled === true}
+                      onChange={(e) => store.setFirstTurnThinkingModelEnabled(e.target.checked)}
+                    />
+                    <span className="switch-slider" />
+                  </label>
+                </div>
               </div>
 
               <div className="settings-section-header" style={{ marginTop: 24 }}>

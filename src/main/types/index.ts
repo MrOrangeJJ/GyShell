@@ -37,6 +37,12 @@ export interface ModelProfile {
   thinkingModelId?: string
 }
 
+export interface ExperimentalFlags {
+  runtimeThinkingCorrectionEnabled: boolean
+  taskFinishGuardEnabled: boolean
+  firstTurnThinkingModelEnabled: boolean
+}
+
 export interface SSHConnectionEntry {
   id: string
   name: string
@@ -157,10 +163,7 @@ export interface AppSettings {
   /** Debug mode switch for backend debug payload persistence and related diagnostics */
   debugMode?: boolean
   /** Experimental feature switches */
-  experimental?: {
-    runtimeThinkingCorrectionEnabled: boolean
-    taskFinishGuardEnabled: boolean
-  }
+  experimental?: ExperimentalFlags
 }
 
 // ============ Terminal Types ============

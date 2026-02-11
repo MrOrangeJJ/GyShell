@@ -53,6 +53,7 @@ export const en = {
     experimentalFeatures: 'Experimental Features',
     runtimeThinkingCorrection: 'Runtime Thinking Reflection Correction',
     taskFinishGuard: 'Task Finish Guard',
+    firstTurnThinkingModel: 'First-Turn Thinking Model',
     cursorStyles: {
       block: 'Block',
       underline: 'Underline',
@@ -142,6 +143,7 @@ export const en = {
       debugMode: 'Enable debug-oriented persistence and diagnostics. Currently this keeps additional_kwargs.__raw_response in backend exported messages; outgoing model inputs still strip raw payloads.',
       runtimeThinkingCorrection: 'Run a background thinking-model audit every 8 model loops. If it detects the trajectory is off-track, it injects a correction constraint before a later model request.',
       taskFinishGuard: 'Before ending, run a strict completion audit to verify the task is truly finished. If disabled, the agent can end immediately when no tool call is produced.',
+      firstTurnThinkingModel: 'If enabled, the first model_request in each run uses the Thinking model, then all later model_request steps revert to the Global model.',
       themeCustom: 'Open the JSON configuration file for custom themes. You can define your own color schemes here.',
       themeReload: 'Manually reload the custom theme file to apply your latest JSON changes.',
       modelAdd: 'Configure AI model providers. Currently, only [OpenAI API Compatible] interfaces are supported (e.g., DeepSeek, Claude, Local LLMs).',
