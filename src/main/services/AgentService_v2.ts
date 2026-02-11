@@ -781,7 +781,7 @@ ${recent}
           })
           break
         }
-        case 'create_skill': {
+        case 'create_or_rewrite_skill': {
           let args: any = toolCall.args || {}
           if (typeof args === 'string') {
             try {
@@ -791,7 +791,7 @@ ${recent}
             }
           }
           const messageId = toolMessage.additional_kwargs._gyshellMessageId as string
-          const outcome = await toolImplementations.runCreateSkillTool(args, this.skillService, config?.signal)
+          const outcome = await toolImplementations.runCreateOrRewriteSkillTool(args, this.skillService, config?.signal)
           result = outcome.message
           
           // Force a reload of the graph to pick up the new tool definition if needed,
@@ -801,7 +801,7 @@ ${recent}
           this.helpers.sendEvent(sessionId, {
             messageId,
             type: 'tool_call',
-            toolName: 'create_skill',
+            toolName: 'create_or_rewrite_skill',
             input: JSON.stringify(args),
             output: result
           })
@@ -1362,7 +1362,7 @@ ${recent}
         return 'final_output'
       }
 
-      if (first.name === 'skill' || first.name === 'create_skill') return 'tools'
+      if (first.name === 'skill' || first.name === 'create_or_rewrite_skill') return 'tools'
       if (this.mcpToolService.isMcpToolName(first.name)) return 'mcp_tools'
       if (first.name === 'exec_command') return 'command_tools'
       if (first.name === 'create_or_edit') return 'file_tools'
@@ -1391,7 +1391,7 @@ ${recent}
       if (first.name === 'exec_command') return 'command_tools'
       if (first.name === 'create_or_edit') return 'file_tools'
       if (first.name === 'read_file') return 'read_file'
-      if (first.name === 'skill' || first.name === 'create_skill') return 'tools'
+      if (first.name === 'skill' || first.name === 'create_or_rewrite_skill') return 'tools'
       return 'tools'
     }
     return 'token_pruner_runtime'

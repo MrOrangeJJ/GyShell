@@ -6,10 +6,10 @@ export const skillToolSchema = z.object({
   name: z.string().describe('The skill identifier from available_skills')
 })
 
-export const createSkillSchema = z.object({
+export const createOrRewriteSkillSchema = z.object({
   name: z.string().describe('The display name of the skill (e.g. "React Component Generator")'),
   description: z.string().describe('A clear description of what this skill does and when to use it.'),
-  content: z.string().describe('The detailed instructions, steps, and rules for this skill in Markdown format.')
+  content: z.string().describe('The complete new skill content in Markdown format. For rewrites, provide the full replacement content.')
 })
 
 export function buildSkillToolDescription(skills: SkillInfo[]): string {
@@ -81,7 +81,7 @@ export async function runSkillTool(
   }
 }
 
-export async function runCreateSkillTool(
+export async function runCreateOrRewriteSkillTool(
   args: unknown,
   skillService: SkillService,
   signal?: AbortSignal
@@ -91,26 +91,30 @@ export async function runCreateSkillTool(
   }
   if (signal?.aborted) throw new Error('AbortError')
 
-  const validated = createSkillSchema.safeParse(args)
+  const validated = createOrRewriteSkillSchema.safeParse(args)
   if (!validated.success) {
     return { 
       kind: 'error', 
-      message: `Error: Invalid parameters for create_skill: ${validated.error.message}` 
+      message: `Error: Invalid parameters for create_or_rewrite_skill: ${validated.error.message}` 
     }
   }
 
   const { name, description, content } = validated.data
 
   try {
-    const skill = await skillService.createSkill(name, description, content)
+    const { skill, action } = await skillService.createOrRewriteSkill(name, description, content)
+    const actionMessage =
+      action === 'rewritten'
+        ? 'Successfully rewrote existing skill'
+        : 'Successfully created and added new skill'
     return {
       kind: 'text',
-      message: `Successfully created and added new skill: "${skill.name}". You can now see it in the available skills list and use it with the "skill" tool.`
+      message: `${actionMessage}: "${skill.name}". You can now see it in the available skills list and use it with the "skill" tool.`
     }
   } catch (err) {
     return {
       kind: 'error',
-      message: `Error: Failed to create skill: ${err instanceof Error ? err.message : String(err)}`
+      message: `Error: Failed to create or rewrite skill: ${err instanceof Error ? err.message : String(err)}`
     }
   }
 }

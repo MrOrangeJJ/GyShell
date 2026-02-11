@@ -16,6 +16,10 @@ export const SkillInfoSchema = z.object({
 })
 
 export type SkillInfo = z.infer<typeof SkillInfoSchema>
+export type CreateOrRewriteSkillResult = {
+  skill: SkillInfo
+  action: 'created' | 'rewritten'
+}
 
 type ParsedMarkdown = {
   frontmatter: Record<string, string>
@@ -215,15 +219,14 @@ export class SkillService {
     throw new Error(`Skill file "${fileName}" not found`)
   }
 
-  async createSkill(name: string, description: string, content: string): Promise<SkillInfo> {
+  async createOrRewriteSkill(
+    name: string,
+    description: string,
+    content: string
+  ): Promise<CreateOrRewriteSkillResult> {
     const primaryDir = this.getSkillsDirs()[0]
     await fs.mkdir(primaryDir, { recursive: true })
-    
-    // Convert name to a safe file name (e.g., "My Skill" -> "my-skill.md")
-    const safeBaseName = name.toLowerCase().replace(/[^a-z0-9]/g, '-')
-    const fileName = `${safeBaseName}-${Date.now()}.md`
-    const filePath = path.join(primaryDir, fileName)
-    
+
     const fullContent = [
       '---',
       `name: ${name}`,
@@ -233,19 +236,48 @@ export class SkillService {
       content
     ].join('\n')
 
+    await this.reload()
+
+    const existingInPrimary = this.cache.find(
+      (s) => s.name === name && s.scanRoot === primaryDir
+    )
+
+    if (existingInPrimary) {
+      await fs.writeFile(existingInPrimary.filePath, fullContent, 'utf-8')
+      await this.reload()
+      const rewritten = this.cache.find((s) => s.filePath === existingInPrimary.filePath)
+      if (rewritten) {
+        return { skill: rewritten, action: 'rewritten' }
+      }
+      return {
+        skill: {
+          ...existingInPrimary,
+          description
+        },
+        action: 'rewritten'
+      }
+    }
+
+    // Convert name to a safe file name (e.g., "My Skill" -> "my-skill-123.md")
+    const safeBaseName = name.toLowerCase().replace(/[^a-z0-9]/g, '-')
+    const fileName = `${safeBaseName}-${Date.now()}.md`
+    const filePath = path.join(primaryDir, fileName)
     await fs.writeFile(filePath, fullContent, 'utf-8')
     await this.reload()
-    
+
     const created = this.cache.find((s) => s.fileName === fileName)
-    if (created) return created
+    if (created) return { skill: created, action: 'created' }
     return {
-      name,
-      description,
-      fileName,
-      filePath,
-      baseDir: primaryDir,
-      scanRoot: primaryDir,
-      isNested: false
+      skill: {
+        name,
+        description,
+        fileName,
+        filePath,
+        baseDir: primaryDir,
+        scanRoot: primaryDir,
+        isNested: false
+      },
+      action: 'created'
     }
   }
 
@@ -400,4 +432,3 @@ export class SkillService {
     return { info: match, content: enrichedContent }
   }
 }
-
