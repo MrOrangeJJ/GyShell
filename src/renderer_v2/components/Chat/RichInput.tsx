@@ -310,7 +310,61 @@ export const RichInput = observer(forwardRef<RichInputHandle, RichInputProps>(({
     }
   }));
 
+  const removeReselectedMentionTag = (targetTag: HTMLElement) => {
+    const parent = targetTag.parentNode;
+    if (!parent) return;
+
+    let nextSibling: Node | null = targetTag.nextSibling;
+    if (nextSibling?.nodeType === Node.TEXT_NODE) {
+      const textNode = nextSibling as Text;
+      const text = textNode.textContent || '';
+      if (text.startsWith('\uFEFF')) {
+        const nextText = text.slice(1);
+        if (nextText.length > 0) {
+          textNode.textContent = nextText;
+        } else {
+          const after = textNode.nextSibling;
+          parent.removeChild(textNode);
+          nextSibling = after;
+        }
+      }
+    }
+
+    parent.removeChild(targetTag);
+
+    const selection = window.getSelection();
+    if (!selection) return;
+
+    const range = document.createRange();
+    if (nextSibling && nextSibling.parentNode === parent) {
+      if (nextSibling.nodeType === Node.TEXT_NODE) {
+        range.setStart(nextSibling, 0);
+      } else {
+        const idx = Array.from(parent.childNodes).indexOf(nextSibling as ChildNode);
+        range.setStart(parent, idx >= 0 ? idx : parent.childNodes.length);
+      }
+    } else {
+      range.selectNodeContents(parent);
+      range.collapse(false);
+    }
+    range.collapse(true);
+    selection.removeAllRanges();
+    selection.addRange(range);
+  };
+
   const handleKeyDown = (e: React.KeyboardEvent) => {
+    if (e.key === 'Backspace' && showSuggestions) {
+      const info = getMentionInfo() as any;
+      if (info?.isReSelect && info.targetTag instanceof HTMLElement) {
+        e.preventDefault();
+        removeReselectedMentionTag(info.targetTag);
+        setShowSuggestions(false);
+        updateSuggestions();
+        onInput?.();
+        return;
+      }
+    }
+
     if (showSuggestions) {
       if (e.key === 'ArrowDown') {
         e.preventDefault();
