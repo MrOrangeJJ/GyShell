@@ -31,6 +31,8 @@ export const RichInput = observer(forwardRef<RichInputHandle, RichInputProps>(({
   const [suggestions, setSuggestions] = useState<{ type: 'skill' | 'terminal' | 'file' | 'paste'; name: string; id?: string; preview?: string }[]>([]);
   const [selectedIndex, setSelectedIndex] = useState(0);
   const [suggestionPos, setSuggestionPos] = useState({ top: 0, left: 0 });
+  const pendingMentionDeleteRef = useRef<HTMLElement | null>(null);
+  const cursorMarker = '\uFEFF';
 
   const getMentionInfo = () => {
     const selection = window.getSelection();
@@ -56,6 +58,16 @@ export const RichInput = observer(forwardRef<RichInputHandle, RichInputProps>(({
     // Check if we are at the beginning of a text node that follows a tag
     const siblingBefore = textNode.previousSibling;
     if (range.startOffset === 0 && siblingBefore instanceof HTMLElement && siblingBefore.classList.contains('mention-tag')) {
+      return { query: siblingBefore.dataset.name || '', index: 0, isReSelect: true, targetTag: siblingBefore };
+    }
+
+    // If cursor is after one or more marker chars right after a mention tag, still treat as re-select.
+    if (
+      siblingBefore instanceof HTMLElement &&
+      siblingBefore.classList.contains('mention-tag') &&
+      textBefore.length > 0 &&
+      new RegExp(`^${cursorMarker}+$`).test(textBefore)
+    ) {
       return { query: siblingBefore.dataset.name || '', index: 0, isReSelect: true, targetTag: siblingBefore };
     }
 
@@ -114,94 +126,94 @@ export const RichInput = observer(forwardRef<RichInputHandle, RichInputProps>(({
     }
   }, [store.skills, store.terminalTabs]);
 
+  const buildMentionHtml = (
+    item: { type: 'skill' | 'terminal' | 'file' | 'paste'; name: string; id?: string; preview?: string },
+    uid: string
+  ): string => {
+    const fileName = item.name.split(/[/\\]/).pop() || item.name;
+    const displayText = item.type === 'file' ? fileName : (item.type === 'paste' ? (item.preview || '') : `@${item.name}`);
+    return `<span class="mention-tag" contenteditable="false" data-insert-id="${uid}" data-type="${item.type}" data-name="${item.name}" ${item.id ? `data-id="${item.id}"` : ''} ${item.preview ? `data-preview="${item.preview}"` : ''}>${displayText}</span>${cursorMarker}`;
+  };
+
+  const setSelectionRange = (range: Range) => {
+    const selection = window.getSelection();
+    if (!selection) return;
+    selection.removeAllRanges();
+    selection.addRange(range);
+  };
+
+  const placeCaretAfterInsertedTag = (tag: HTMLElement) => {
+    const selection = window.getSelection();
+    if (!selection) return;
+
+    const range = document.createRange();
+    const nextSibling = tag.nextSibling;
+    if (nextSibling?.nodeType === Node.TEXT_NODE) {
+      const textNode = nextSibling as Text;
+      const text = textNode.textContent || '';
+      let markerLen = 0;
+      while (markerLen < text.length && text[markerLen] === cursorMarker) markerLen++;
+      range.setStart(textNode, markerLen);
+    } else {
+      range.setStartAfter(tag);
+    }
+    range.collapse(true);
+    selection.removeAllRanges();
+    selection.addRange(range);
+  };
+
   const insertMention = (item: { type: 'skill' | 'terminal' | 'file' | 'paste'; name: string; id?: string; preview?: string }) => {
     const selection = window.getSelection();
     if (!selection || selection.rangeCount === 0) return;
     const range = selection.getRangeAt(0);
     
     const info = getMentionInfo() as any;
+    const replacementRange = document.createRange();
 
     // 1. Handle the re-select case where we have a direct targetTag
     if (info?.isReSelect && info.targetTag) {
-      // Create mention HTML
-      const fileName = item.name.split(/[/\\]/).pop() || item.name;
-      const displayText = item.type === 'file' ? fileName : (item.type === 'paste' ? (item.preview || '') : `@${item.name}`);
-      
-      const html = `<span class="mention-tag" contenteditable="false" 
-                    data-type="${item.type}" data-name="${item.name}" 
-                    ${item.id ? `data-id="${item.id}"` : ''}
-                    ${item.preview ? `data-preview="${item.preview}"` : ''}>${displayText}</span>\uFEFF`;
-
-      // Select the target tag to replace it
-      const newRange = document.createRange();
-      newRange.selectNode(info.targetTag);
-      selection.removeAllRanges();
-      selection.addRange(newRange);
-      
-      // Use insertHTML to replace selection and keep undo stack
-      document.execCommand('insertHTML', false, html);
-      
-      // Force cursor to move after the zero-width non-break space
-      selection.modify('move', 'forward', 'character');
-      
-      setShowSuggestions(false);
-      editorRef.current?.focus();
-      return;
-    }
-
-    // 2. Standard insertion case (triggered by '@')
-    if (info && !info.isReSelect) {
+      replacementRange.setStartBefore(info.targetTag);
+      const nextSibling = info.targetTag.nextSibling;
+      if (nextSibling?.nodeType === Node.TEXT_NODE) {
+        const nextText = (nextSibling as Text).textContent || '';
+        const markerMatch = nextText.match(/^\uFEFF+/);
+        if (markerMatch && markerMatch[0].length > 0) {
+          replacementRange.setEnd(nextSibling, markerMatch[0].length);
+        } else {
+          replacementRange.setEndAfter(info.targetTag);
+        }
+      } else {
+        replacementRange.setEndAfter(info.targetTag);
+      }
+    } else if (info && !info.isReSelect) {
+      // 2. Standard insertion case (triggered by '@')
       const textNode = range.startContainer;
-      if (textNode.nodeType === Node.TEXT_NODE) {
-        // Select the "@query" part to replace it
-        const newRange = document.createRange();
-        newRange.setStart(textNode, info.index);
-        newRange.setEnd(textNode, range.startOffset);
-        selection.removeAllRanges();
-        selection.addRange(newRange);
-
-        const fileName = item.name.split(/[/\\]/).pop() || item.name;
-        const displayText = item.type === 'file' ? fileName : (item.type === 'paste' ? (item.preview || '') : `@${item.name}`);
-        
-        const html = `<span class="mention-tag" contenteditable="false" 
-                      data-type="${item.type}" data-name="${item.name}" 
-                      ${item.id ? `data-id="${item.id}"` : ''}
-                      ${item.preview ? `data-preview="${item.preview}"` : ''}>${displayText}</span>\uFEFF`;
-
-        document.execCommand('insertHTML', false, html);
-
-        // Force cursor to move after the zero-width non-break space
-        selection.modify('move', 'forward', 'character');
-        
-        setShowSuggestions(false);
-        editorRef.current?.focus();
-        return;
+      if (textNode.nodeType !== Node.TEXT_NODE) return;
+      replacementRange.setStart(textNode, info.index);
+      replacementRange.setEnd(textNode, range.startOffset);
+    } else {
+      // 3. Fallback for file drops or pastes (no '@' context)
+      replacementRange.setStart(range.startContainer, range.startOffset);
+      replacementRange.setEnd(range.startContainer, range.startOffset);
+      if (editorRef.current && !editorRef.current.contains(range.commonAncestorContainer)) {
+        replacementRange.selectNodeContents(editorRef.current);
+        replacementRange.collapse(false);
       }
     }
 
-    // 3. Fallback for file drops or pastes (no '@' context)
-    const fileName = item.name.split(/[/\\]/).pop() || item.name;
-    const displayText = item.type === 'file' ? fileName : (item.preview || '');
-    
-    const html = `<span class="mention-tag" contenteditable="false" 
-                  data-type="${item.type}" data-name="${item.name}" 
-                  ${item.preview ? `data-preview="${item.preview}"` : ''}>${displayText}</span>\uFEFF`;
-
-    // Ensure range is inside editor
-    if (editorRef.current && !editorRef.current.contains(range.commonAncestorContainer)) {
-      const newRange = document.createRange();
-      newRange.selectNodeContents(editorRef.current);
-      newRange.collapse(false);
-      selection.removeAllRanges();
-      selection.addRange(newRange);
+    setSelectionRange(replacementRange);
+    const insertId = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const html = buildMentionHtml(item, insertId);
+    document.execCommand('insertHTML', false, html);
+    const insertedTag = editorRef.current?.querySelector(`.mention-tag[data-insert-id="${insertId}"]`) as HTMLElement | null;
+    if (insertedTag) {
+      insertedTag.removeAttribute('data-insert-id');
+      placeCaretAfterInsertedTag(insertedTag);
     }
 
-    document.execCommand('insertHTML', false, html);
-    
-    // Force cursor to move after the zero-width non-break space
-    selection.modify('move', 'forward', 'character');
-
     editorRef.current?.focus();
+    pendingMentionDeleteRef.current = null;
+    setShowSuggestions(false);
   };
 
   const serialize = (): string => {
@@ -209,7 +221,7 @@ export const RichInput = observer(forwardRef<RichInputHandle, RichInputProps>(({
     let result = '';
     const walk = (node: Node) => {
       if (node.nodeType === Node.TEXT_NODE) {
-        result += node.textContent?.replace(/\u00A0/g, ' ') || '';
+        result += node.textContent?.replace(/\u00A0/g, ' ').replace(/\uFEFF/g, '') || '';
       } else if (node.nodeType === Node.ELEMENT_NODE) {
         const el = node as HTMLElement;
         if (el.classList.contains('mention-tag')) {
@@ -300,7 +312,7 @@ export const RichInput = observer(forwardRef<RichInputHandle, RichInputProps>(({
               editorRef.current?.appendChild(span);
             }
           } else if (part) {
-            editorRef.current?.appendChild(document.createTextNode(part.replace(/\u00A0/g, ' ')));
+            editorRef.current?.appendChild(document.createTextNode(part.replace(/\u00A0/g, ' ').replace(/\uFEFF/g, '')));
           }
         });
       }
@@ -311,58 +323,41 @@ export const RichInput = observer(forwardRef<RichInputHandle, RichInputProps>(({
   }));
 
   const removeReselectedMentionTag = (targetTag: HTMLElement) => {
-    const parent = targetTag.parentNode;
-    if (!parent) return;
-
-    let nextSibling: Node | null = targetTag.nextSibling;
-    if (nextSibling?.nodeType === Node.TEXT_NODE) {
-      const textNode = nextSibling as Text;
-      const text = textNode.textContent || '';
-      if (text.startsWith('\uFEFF')) {
-        const nextText = text.slice(1);
-        if (nextText.length > 0) {
-          textNode.textContent = nextText;
-        } else {
-          const after = textNode.nextSibling;
-          parent.removeChild(textNode);
-          nextSibling = after;
-        }
-      }
-    }
-
-    parent.removeChild(targetTag);
-
-    const selection = window.getSelection();
-    if (!selection) return;
-
     const range = document.createRange();
-    if (nextSibling && nextSibling.parentNode === parent) {
-      if (nextSibling.nodeType === Node.TEXT_NODE) {
-        range.setStart(nextSibling, 0);
+    range.setStartBefore(targetTag);
+    const nextSibling = targetTag.nextSibling;
+    if (nextSibling?.nodeType === Node.TEXT_NODE) {
+      const nextText = (nextSibling as Text).textContent || '';
+      const markerMatch = nextText.match(/^\uFEFF+/);
+      if (markerMatch && markerMatch[0].length > 0) {
+        range.setEnd(nextSibling, markerMatch[0].length);
       } else {
-        const idx = Array.from(parent.childNodes).indexOf(nextSibling as ChildNode);
-        range.setStart(parent, idx >= 0 ? idx : parent.childNodes.length);
+        range.setEndAfter(targetTag);
       }
     } else {
-      range.selectNodeContents(parent);
-      range.collapse(false);
+      range.setEndAfter(targetTag);
     }
-    range.collapse(true);
-    selection.removeAllRanges();
-    selection.addRange(range);
+    setSelectionRange(range);
+    document.execCommand('delete');
   };
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
-    if (e.key === 'Backspace' && showSuggestions) {
+    if (e.key === 'Backspace') {
       const info = getMentionInfo() as any;
       if (info?.isReSelect && info.targetTag instanceof HTMLElement) {
         e.preventDefault();
-        removeReselectedMentionTag(info.targetTag);
-        setShowSuggestions(false);
-        updateSuggestions();
-        onInput?.();
+        if (pendingMentionDeleteRef.current === info.targetTag) {
+          removeReselectedMentionTag(info.targetTag);
+          pendingMentionDeleteRef.current = null;
+          setShowSuggestions(false);
+          onInput?.();
+        } else {
+          pendingMentionDeleteRef.current = info.targetTag;
+          updateSuggestions();
+        }
         return;
       }
+      pendingMentionDeleteRef.current = null;
     }
 
     if (showSuggestions) {
@@ -383,6 +378,7 @@ export const RichInput = observer(forwardRef<RichInputHandle, RichInputProps>(({
       }
       if (e.key === 'Escape') {
         e.preventDefault();
+        pendingMentionDeleteRef.current = null;
         setShowSuggestions(false);
         return;
       }
@@ -396,6 +392,7 @@ export const RichInput = observer(forwardRef<RichInputHandle, RichInputProps>(({
   };
 
   const handleInput = () => {
+    pendingMentionDeleteRef.current = null;
     updateSuggestions();
     onInput?.();
   };
