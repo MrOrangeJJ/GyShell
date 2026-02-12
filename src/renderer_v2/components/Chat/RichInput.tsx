@@ -62,8 +62,6 @@ export const RichInput = observer(forwardRef<RichInputHandle, RichInputProps>(({
     const lastAtIdx = textBefore.lastIndexOf('@');
     if (lastAtIdx === -1) return null;
     
-    if (lastAtIdx > 0 && textBefore[lastAtIdx - 1] !== ' ' && textBefore[lastAtIdx - 1] !== '\u00A0') return null;
-    
     return { query: textBefore.slice(lastAtIdx + 1), index: lastAtIdx };
   };
 
