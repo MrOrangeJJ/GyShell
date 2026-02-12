@@ -141,6 +141,7 @@ interface AgentEvent {
   outputDelta?: string
   summary?: string
   message?: string
+  details?: string
   history?: any[]
   modelName?: string
   totalTokens?: number

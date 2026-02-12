@@ -6,6 +6,7 @@ export interface ToolExecutionContext {
   messageId: string
   terminalService: TerminalService
   sendEvent: (sessionId: string, event: any) => void
+  waitForFeedback?: (messageId: string, timeoutMs?: number) => Promise<any | null>
   commandPolicyService: CommandPolicyService
   commandPolicyMode: CommandPolicyMode
   signal?: AbortSignal

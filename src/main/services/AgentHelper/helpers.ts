@@ -2,7 +2,7 @@ import { ChatOpenAI } from '@langchain/openai'
 import type { BaseMessage } from '@langchain/core/messages'
 import type { AgentEvent, ModelDefinition, AppSettings } from '../../types'
 import { buildActionModelHistory } from './utils/action_model_history'
-import { sendAgentEvent, extractText, parseStrictJsonObject, isEphemeral, markEphemeral } from './utils/common'
+import { extractText, parseStrictJsonObject, isEphemeral, markEphemeral } from './utils/common'
 import { createChatModel, getMaxTokensForModel, computeReadFileSupport, getEnabledBuiltInTools } from './utils/model_config'
 import { invokeWithRetry, isAbortError, isRetryableError, extractErrorDetails } from './utils/runtime'
 
@@ -11,7 +11,13 @@ import { invokeWithRetry, isAbortError, isRetryableError, extractErrorDetails } 
  */
 
 export class AgentHelpers {
+  private eventPublisher: ((sessionId: string, event: AgentEvent) => void) | null = null
+
   constructor() {}
+
+  setEventPublisher(publisher: (sessionId: string, event: AgentEvent) => void): void {
+    this.eventPublisher = publisher
+  }
 
   /**
    * Build a temporary history for the action model to make decisions.
@@ -33,7 +39,10 @@ export class AgentHelpers {
    * The Gateway will handle UI history recording and frontend distribution.
    */
   sendEvent(sessionId: string, event: AgentEvent): void {
-    sendAgentEvent(sessionId, event)
+    if (!this.eventPublisher) {
+      throw new Error('Agent event publisher is not initialized')
+    }
+    this.eventPublisher(sessionId, event)
   }
 
   /**

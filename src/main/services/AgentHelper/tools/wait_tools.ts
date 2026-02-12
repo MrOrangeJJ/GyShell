@@ -150,9 +150,8 @@ export async function waitCommandEnd(
 
   try {
     let userSkipped = false
-    const gateway = (global as any).gateway
-    if (gateway) {
-      gateway.waitForFeedback(messageId).then((payload: any) => {
+    if (context.waitForFeedback) {
+      context.waitForFeedback(messageId).then((payload: any) => {
         if (payload?.type === 'SKIP_WAIT') {
           userSkipped = true
         }

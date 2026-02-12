@@ -313,6 +313,7 @@ export interface AgentEvent {
   outputDelta?: string
   summary?: string
   message?: string
+  details?: string
   history?: any[] // Raw LangChain message history
   modelName?: string
   totalTokens?: number

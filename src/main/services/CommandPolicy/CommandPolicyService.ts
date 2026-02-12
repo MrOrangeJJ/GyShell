@@ -30,6 +30,12 @@ const DEFAULT_POLICY_FILE_CONTENT = {
 }
 
 export class CommandPolicyService {
+  private feedbackWaiter: ((messageId: string, timeoutMs?: number) => Promise<any | null>) | null = null
+
+  setFeedbackWaiter(waiter: (messageId: string, timeoutMs?: number) => Promise<any | null>): void {
+    this.feedbackWaiter = waiter
+  }
+
   getPolicyFilePath(): string {
     const baseDir = app.getPath('userData')
     return path.join(baseDir, 'command-policy.json')
@@ -190,10 +196,10 @@ export class CommandPolicyService {
     sendEvent: (sessionId: string, event: any) => void
     signal?: AbortSignal
   }): Promise<boolean> {
-    const gateway = (global as any).gateway
-    if (!gateway) {
-      throw new Error('Gateway not initialized')
+    if (!this.feedbackWaiter) {
+      throw new Error('Feedback waiter is not initialized')
     }
+    const feedbackWaiter = this.feedbackWaiter
 
     return new Promise<boolean>(async (resolve, reject) => {
       const onAbort = () => {
@@ -219,7 +225,7 @@ export class CommandPolicyService {
 
       try {
         console.log(`[CommandPolicyService] Waiting for feedback on messageId=${params.messageId} (backendMessageId)`);
-        const feedback = await (gateway as any).waitForFeedback(params.messageId)
+        const feedback = await feedbackWaiter(params.messageId)
         console.log(`[CommandPolicyService] Received feedback for messageId=${params.messageId}:`, feedback);
         if (params.signal) {
           params.signal.removeEventListener('abort', onAbort)

@@ -26,6 +26,8 @@ interface RingBuffer {
   offset: number
 }
 
+type RawEventPublisher = (channel: string, data: unknown) => void
+
 export class TerminalService {
   private backends: Map<ConnectionType, TerminalBackend> = new Map()
   private terminals: Map<string, TerminalTab> = new Map()
@@ -37,10 +39,15 @@ export class TerminalService {
   private oscParseBufByTerminal: Map<string, string> = new Map()
   private onTaskFinishedCallbacks: Map<string, (result: CommandResult) => void> = new Map()
   private hasPrintedBanner = false
+  private rawEventPublisher: RawEventPublisher | null = null
 
   constructor() {
     this.backends.set('local', new NodePtyBackend())
     this.backends.set('ssh', new SSHBackend())
+  }
+
+  setRawEventPublisher(publisher: RawEventPublisher): void {
+    this.rawEventPublisher = publisher
   }
 
   private getBackend(type: ConnectionType): TerminalBackend {
@@ -715,14 +722,10 @@ export class TerminalService {
   }
 
   private sendToRenderer(channel: string, data: unknown): void {
-    if ((global as any).gateway) {
-      (global as any).gateway.broadcastRaw(channel, data);
-    } else {
-      const { BrowserWindow } = require('electron');
-      const windows = BrowserWindow.getAllWindows()
-      windows.forEach((window: any) => {
-        window.webContents.send(channel, data)
-      })
+    if (!this.rawEventPublisher) {
+      console.warn(`[TerminalService] Missing rawEventPublisher, dropped event: ${channel}`)
+      return
     }
+    this.rawEventPublisher(channel, data)
   }
 }

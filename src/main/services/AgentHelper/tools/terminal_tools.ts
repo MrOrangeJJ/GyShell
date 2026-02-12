@@ -109,9 +109,8 @@ export async function runCommand(args: z.infer<typeof execCommandSchema>, contex
   try {
     // Subscribe to skip wait feedback for this message
     let userSkipped = false
-    const gateway = (global as any).gateway
-    if (gateway) {
-      gateway.waitForFeedback(messageId).then((payload: any) => {
+    if (context.waitForFeedback) {
+      context.waitForFeedback(messageId).then((payload: any) => {
         if (payload?.type === 'SKIP_WAIT') {
           userSkipped = true
         }

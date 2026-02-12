@@ -79,3 +79,16 @@ export interface IGateway {
   broadcast(event: Omit<GatewayEvent, 'id' | 'timestamp'>): void;
   subscribe(type: GatewayEventType, handler: (event: GatewayEvent) => void): () => void;
 }
+
+/**
+ * Runtime command surface exposed to gateway adapters (IPC/WebSocket/etc.).
+ * Keeping this interface transport-agnostic makes it reusable for non-Electron frontends.
+ */
+export interface IGatewayRuntime extends IGateway {
+  waitForRunCompletion(sessionId: string): Promise<void>;
+  submitFeedback(messageId: string, payload: any): { ok: true };
+  deleteChatSession(sessionId: string): Promise<void>;
+  renameSession(sessionId: string, newTitle: string): void;
+  rollbackSessionToMessage(sessionId: string, messageId: string): Promise<{ ok: boolean; removedCount: number }>;
+  broadcastRaw(channel: string, data: any): void;
+}

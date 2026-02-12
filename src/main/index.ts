@@ -11,6 +11,8 @@ import { applyPlatformWindowTweaks, getPlatformBrowserWindowOptions } from './pl
 import { SkillService } from './services/SkillService'
 import { UIHistoryService } from './services/UIHistoryService'
 import { GatewayService } from './services/Gateway/GatewayService'
+import { ElectronGatewayIpcAdapter } from './services/Gateway/ElectronGatewayIpcAdapter'
+import { ElectronWindowTransport } from './services/Gateway/ElectronWindowTransport'
 import { TempFileService } from './services/TempFileService'
 import { VersionService } from './services/VersionService'
 
@@ -24,7 +26,6 @@ let mcpToolService: McpToolService
 let themeService: ThemeService
 let skillService: SkillService
 let uiHistoryService: UIHistoryService
-let gatewayService: GatewayService
 let tempFileService: TempFileService
 let versionService: VersionService
 
@@ -142,12 +143,22 @@ app.whenReady().then(async () => {
 
   modelCapabilityService = new ModelCapabilityService()
   agentService = new AgentService_v2(terminalService, commandPolicyService, mcpToolService, skillService, uiHistoryService)
-  gatewayService = new GatewayService(
+  const gatewayService = new GatewayService(
     terminalService, 
     agentService, 
     uiHistoryService, 
     commandPolicyService, 
-    tempFileService, 
+    settingsService,
+    mcpToolService
+  )
+  gatewayService.registerTransport(new ElectronWindowTransport())
+  const ipcAdapter = new ElectronGatewayIpcAdapter(
+    gatewayService,
+    terminalService,
+    agentService,
+    uiHistoryService,
+    commandPolicyService,
+    tempFileService,
     skillService,
     settingsService,
     modelCapabilityService,
@@ -155,9 +166,7 @@ app.whenReady().then(async () => {
     themeService,
     versionService
   )
-  // Mount to global for AgentHelper and Gateway (temporary solution)
-  ;(global as any).gateway = gatewayService;
-  ;(global as any).settingsService = settingsService;
+  ipcAdapter.registerHandlers()
 
   // Load MCP tools (best-effort)
   void mcpToolService.reloadAll()

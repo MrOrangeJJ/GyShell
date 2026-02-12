@@ -171,6 +171,7 @@ export class AgentService_v2 {
   private actionModelFallbackHelper = new ActionModelFallbackHelper()
   private sessionModelBindings: Map<string, SessionModelBinding> = new Map()
   private selfCorrectionRuntimeManager = new SelfCorrectionRuntimeManager()
+  private waitForFeedback: ((messageId: string, timeoutMs?: number) => Promise<any | null>) | null = null
 
   constructor(
     terminalService: TerminalService,
@@ -194,6 +195,14 @@ export class AgentService_v2 {
     this.settings = settings
     this.builtInToolEnabled = settings.tools?.builtIn ?? {}
     this.initializeGraph()
+  }
+
+  setEventPublisher(publisher: (sessionId: string, event: any) => void): void {
+    this.helpers.setEventPublisher(publisher)
+  }
+
+  setFeedbackWaiter(waiter: (messageId: string, timeoutMs?: number) => Promise<any | null>): void {
+    this.waitForFeedback = waiter
   }
 
   private initializeGraph(): void {
@@ -1292,6 +1301,7 @@ ${recent}
       messageId,
       terminalService: this.terminalService,
       sendEvent: this.helpers.sendEvent.bind(this.helpers),
+      waitForFeedback: this.waitForFeedback ?? undefined,
       commandPolicyService: this.commandPolicyService,
       commandPolicyMode: this.settings?.commandPolicyMode || 'standard',
       signal: config?.signal
@@ -1617,14 +1627,10 @@ ${recent}
       }
       
       // Broadcast with full details
-      ;(global as any).gateway.broadcast({
-        type: 'agent:event',
-        sessionId,
-        payload: { 
-          type: 'error', 
-          message: errorMessage,
-          details: errorDetails
-        }
+      this.helpers.sendEvent(sessionId, {
+        type: 'error',
+        message: errorMessage,
+        details: errorDetails
       })
 
       throw err // Throw to Gateway for UI notification

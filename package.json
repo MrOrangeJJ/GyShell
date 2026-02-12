@@ -16,6 +16,8 @@
     "typecheck:node": "tsc --noEmit -p tsconfig.node.json",
     "typecheck:web": "tsc --noEmit -p tsconfig.web.json",
     "typecheck": "npm run typecheck:node && npm run typecheck:web",
+    "test:backend-regression": "node tests/backend-regression-tests.cjs",
+    "test:backend-extreme": "node tests/backend-extreme-tests.cjs",
     "lint": "eslint .",
     "format": "prettier --write .",
     "rebuild:native": "electron-rebuild -f",

@@ -1,22 +1,3 @@
-import type { AgentEvent } from '../../../types'
-
-export function sendAgentEvent(sessionId: string, event: AgentEvent): void {
-  if ((global as any).gateway) {
-    ;(global as any).gateway.broadcast({
-      type: 'agent:event',
-      sessionId,
-      payload: event
-    })
-    return
-  }
-
-  const { BrowserWindow } = require('electron')
-  const windows = BrowserWindow.getAllWindows()
-  windows.forEach((window: any) => {
-    window.webContents.send('agent:event', { sessionId, event })
-  })
-}
-
 export function extractText(content: any): string {
   if (typeof content === 'string') return content
   if (Array.isArray(content)) {
