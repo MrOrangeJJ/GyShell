@@ -60,6 +60,7 @@
     "tree-sitter-bash": "^0.25.1",
     "uuid": "^9.0.0",
     "web-tree-sitter": "^0.26.3",
+    "ws": "^8.19.0",
     "zod": "^3.25.32"
   },
   "devDependencies": {

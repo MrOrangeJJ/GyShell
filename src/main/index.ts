@@ -13,6 +13,7 @@ import { UIHistoryService } from './services/UIHistoryService'
 import { GatewayService } from './services/Gateway/GatewayService'
 import { ElectronGatewayIpcAdapter } from './services/Gateway/ElectronGatewayIpcAdapter'
 import { ElectronWindowTransport } from './services/Gateway/ElectronWindowTransport'
+import { WebSocketGatewayAdapter } from './services/Gateway/WebSocketGatewayAdapter'
 import { TempFileService } from './services/TempFileService'
 import { VersionService } from './services/VersionService'
 
@@ -28,6 +29,7 @@ let skillService: SkillService
 let uiHistoryService: UIHistoryService
 let tempFileService: TempFileService
 let versionService: VersionService
+let webSocketGatewayAdapter: WebSocketGatewayAdapter | null = null
 
 function createWindow(): void {
   const settings = settingsService.getSettings()
@@ -168,6 +170,76 @@ app.whenReady().then(async () => {
   )
   ipcAdapter.registerHandlers()
 
+  const shouldEnableWebSocketGateway = /^(1|true)$/i.test(process.env.GYSHELL_WS_ENABLE || '')
+  if (shouldEnableWebSocketGateway) {
+    const wsPort = Number(process.env.GYSHELL_WS_PORT || 17888)
+    const wsHost = process.env.GYSHELL_WS_HOST || '127.0.0.1'
+    const validPort = Number.isInteger(wsPort) && wsPort > 0 && wsPort < 65536
+    if (!validPort) {
+      console.error(`[Main] Invalid GYSHELL_WS_PORT: ${process.env.GYSHELL_WS_PORT}`)
+    } else {
+      try {
+        webSocketGatewayAdapter = new WebSocketGatewayAdapter(gatewayService, {
+          host: wsHost,
+          port: wsPort,
+          terminalBridge: {
+            listTerminals: () =>
+              terminalService.getAllTerminals().map((terminal) => ({
+                id: terminal.id,
+                title: terminal.title,
+                type: terminal.type
+              }))
+          },
+          profileBridge: {
+            getProfiles: () => {
+              const settingsSnapshot = settingsService.getSettings()
+              const modelNameById = new Map(settingsSnapshot.models.items.map((model) => [model.id, model.model]))
+              return {
+                activeProfileId: settingsSnapshot.models.activeProfileId,
+                profiles: settingsSnapshot.models.profiles.map((profile) => ({
+                  id: profile.id,
+                  name: profile.name,
+                  globalModelId: profile.globalModelId,
+                  modelName: modelNameById.get(profile.globalModelId)
+                }))
+              }
+            },
+            setActiveProfile: (profileId: string) => {
+              const settingsSnapshot = settingsService.getSettings()
+              const exists = settingsSnapshot.models.profiles.some((profile) => profile.id === profileId)
+              if (!exists) {
+                throw new Error(`Profile not found: ${profileId}`)
+              }
+              settingsService.setSettings({
+                models: {
+                  items: settingsSnapshot.models.items,
+                  profiles: settingsSnapshot.models.profiles,
+                  activeProfileId: profileId
+                }
+              })
+              const nextSettings = settingsService.getSettings()
+              agentService.updateSettings(nextSettings)
+
+              const modelNameById = new Map(nextSettings.models.items.map((model) => [model.id, model.model]))
+              return {
+                activeProfileId: nextSettings.models.activeProfileId,
+                profiles: nextSettings.models.profiles.map((profile) => ({
+                  id: profile.id,
+                  name: profile.name,
+                  globalModelId: profile.globalModelId,
+                  modelName: modelNameById.get(profile.globalModelId)
+                }))
+              }
+            }
+          }
+        })
+        webSocketGatewayAdapter.start()
+      } catch (error) {
+        console.error('[Main] Failed to start websocket gateway server:', error)
+      }
+    }
+  }
+
   // Load MCP tools (best-effort)
   void mcpToolService.reloadAll()
 
@@ -186,6 +258,15 @@ app.whenReady().then(async () => {
 })
 
 app.on('window-all-closed', async () => {
+  if (webSocketGatewayAdapter) {
+    try {
+      await webSocketGatewayAdapter.stop()
+    } catch (error) {
+      console.error('[Main] Failed to stop websocket gateway server:', error)
+    } finally {
+      webSocketGatewayAdapter = null
+    }
+  }
   if (tempFileService) {
     await tempFileService.cleanup()
   }

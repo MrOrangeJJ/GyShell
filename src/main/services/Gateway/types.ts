@@ -85,6 +85,8 @@ export interface IGateway {
  * Keeping this interface transport-agnostic makes it reusable for non-Electron frontends.
  */
 export interface IGatewayRuntime extends IGateway {
+  registerTransport(transport: IClientTransport): void;
+  unregisterTransport(transportId: string): void;
   waitForRunCompletion(sessionId: string): Promise<void>;
   submitFeedback(messageId: string, payload: any): { ok: true };
   deleteChatSession(sessionId: string): Promise<void>;
