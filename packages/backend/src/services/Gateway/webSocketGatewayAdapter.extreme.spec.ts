@@ -343,6 +343,34 @@ const run = async (): Promise<void> => {
       );
     },
   );
+
+  await runCase("empty session lists retain the UI revision boundary", async () => {
+    const adapter = new WebSocketGatewayAdapter(
+      {
+        listSessionSummaries: () => [],
+        getUiRevision: () => 42,
+      } as any,
+      {
+        host: "127.0.0.1",
+        port: 0,
+        logger: {
+          info: () => {},
+          warn: () => {},
+          error: () => {},
+        },
+      },
+    );
+
+    const result = await (adapter as any).executeRequest(
+      { method: "session:list", params: {} },
+      {},
+    );
+    assertDeepEqual(
+      result,
+      { sessions: [], uiRevision: 42 },
+      "an empty list response still needs an authoritative replay boundary",
+    );
+  });
 };
 
 void run()

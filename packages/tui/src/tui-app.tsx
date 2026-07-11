@@ -14,7 +14,10 @@ import {
   Show,
 } from "solid-js";
 import { createStore, produce } from "solid-js/store";
-import type { GatewayClient } from "./gateway-client";
+import {
+  shouldReplayUiUpdateAfterSnapshot,
+  type GatewayClient,
+} from "./gateway-client";
 import type {
   ChatMessage,
   GatewayProfileSummary,
@@ -22,12 +25,17 @@ import type {
   GatewaySessionSummary,
   GatewayTerminalSummary,
   SkillSummary,
+  UIUpdateAction,
 } from "./protocol";
 import {
+  applyRenameToUnloadedSession,
   applyUiUpdate,
+  applyUiUpdateToUnloadedSession,
   compactMessageSummary,
+  createUnloadedRenamedSession,
   createSessionState,
   findLatestPendingAsk,
+  reorderSessionIdsByUpdatedAt,
   type SessionState,
 } from "./state";
 
@@ -56,6 +64,7 @@ export interface TuiBootstrapData {
   initialMessages: ChatMessage[];
   initialSessionBusy: boolean;
   initialSessionLockedProfileId: string | null;
+  initialSessionUiRevision?: number;
   restoredSessionCount: number;
   recoveredSessions: GatewaySessionSummary[];
 }
@@ -67,6 +76,7 @@ type SessionMeta = {
   messagesCount: number;
   lastMessagePreview?: string;
   loaded: boolean;
+  uiRevision?: number;
 };
 
 type MentionOption = {
@@ -198,6 +208,8 @@ function TuiApp(props: {
   let inputRef: any;
   let scrollRef: any;
   let overlayScrollRef: any;
+  const sessionLoadUpdateBuffers = new Map<string, UIUpdateAction[]>();
+  const sessionLoadPromises = new Map<string, Promise<void>>();
 
   const activeSession = createMemo(() => state.sessions[state.activeSessionId]);
 
@@ -432,39 +444,137 @@ function TuiApp(props: {
     ];
   });
 
-  const unsubscribeUi = props.client.on("uiUpdate", (update) => {
+  const applyLiveUpdate = (update: UIUpdateAction): void => {
     setState(
       produce((draft) => {
         const current = draft.sessions[update.sessionId];
+        const installedRevision =
+          draft.sessionMeta[update.sessionId]?.uiRevision;
+        if (
+          typeof update.uiRevision === "number" &&
+          Number.isFinite(update.uiRevision) &&
+          typeof installedRevision === "number" &&
+          Number.isFinite(installedRevision) &&
+          update.uiRevision <= installedRevision
+        ) {
+          return;
+        }
+        if (update.type === "SESSION_RENAMED") {
+          const meta = draft.sessionMeta[update.sessionId];
+          if (
+            applyRenameToUnloadedSession(
+              current,
+              meta,
+              update.title,
+              Date.now(),
+            )
+          ) {
+            if (
+              typeof update.uiRevision === "number" &&
+              Number.isFinite(update.uiRevision)
+            ) {
+              meta!.uiRevision = update.uiRevision;
+            }
+            const nextOrder = reorderSessionIdsByUpdatedAt(
+              draft.sessionOrder,
+              draft.sessionMeta,
+            );
+            draft.sessionOrder.splice(
+              0,
+              draft.sessionOrder.length,
+              ...nextOrder,
+            );
+            return;
+          }
+          if (!meta) {
+            const created = createUnloadedRenamedSession(
+              update.sessionId,
+              update.title,
+              Date.now(),
+              current,
+            );
+            draft.sessions[update.sessionId] = created.session;
+            draft.sessionMeta[update.sessionId] = {
+              ...created.meta,
+              uiRevision: update.uiRevision,
+            };
+            if (!draft.sessionOrder.includes(update.sessionId)) {
+              draft.sessionOrder.unshift(update.sessionId);
+            }
+            return;
+          }
+        }
         if (!current) {
           draft.sessions[update.sessionId] = createSessionState(
             update.sessionId,
             "New Chat",
           );
-          draft.sessionOrder.unshift(update.sessionId);
+          if (!draft.sessionOrder.includes(update.sessionId)) {
+            draft.sessionOrder.unshift(update.sessionId);
+          }
           draft.sessionMeta[update.sessionId] = {
             id: update.sessionId,
             title: "New Chat",
             updatedAt: Date.now(),
             messagesCount: 0,
-            loaded: true,
+            loaded: false,
+            uiRevision: update.uiRevision,
           };
         }
 
         const session = draft.sessions[update.sessionId];
         if (!session) return;
-        applyUiUpdate(session, update);
-
         const meta = draft.sessionMeta[update.sessionId];
+        if (meta && !meta.loaded) {
+          applyUiUpdateToUnloadedSession(session, meta, update, Date.now());
+          const nextOrder = reorderSessionIdsByUpdatedAt(
+            draft.sessionOrder,
+            draft.sessionMeta,
+          );
+          draft.sessionOrder.splice(
+            0,
+            draft.sessionOrder.length,
+            ...nextOrder,
+          );
+          return;
+        }
+
+        applyUiUpdate(session, update);
         if (meta) {
           meta.title = session.title;
           meta.updatedAt = Date.now();
           meta.messagesCount = session.messages.length;
           meta.lastMessagePreview = previewFromSession(session);
           meta.loaded = true;
+          if (
+            typeof update.uiRevision === "number" &&
+            Number.isFinite(update.uiRevision)
+          ) {
+            meta.uiRevision = update.uiRevision;
+          }
+        }
+        if (update.type === "SESSION_RENAMED") {
+          const nextOrder = reorderSessionIdsByUpdatedAt(
+            draft.sessionOrder,
+            draft.sessionMeta,
+          );
+          draft.sessionOrder.splice(
+            0,
+            draft.sessionOrder.length,
+            ...nextOrder,
+          );
         }
       }),
     );
+  };
+
+  const unsubscribeUi = props.client.on("uiUpdate", (update) => {
+    const loadBuffer = sessionLoadUpdateBuffers.get(update.sessionId);
+    if (loadBuffer) {
+      loadBuffer.push(update);
+      return;
+    }
+    applyLiveUpdate(update);
   });
 
   const unsubscribeRaw = props.client.on("raw", (channel, payload) => {
@@ -1116,44 +1226,75 @@ function TuiApp(props: {
   }
 
   async function ensureSessionLoaded(sessionId: string): Promise<void> {
+    const inFlight = sessionLoadPromises.get(sessionId);
+    if (inFlight) {
+      await inFlight;
+      return;
+    }
     const meta = state.sessionMeta[sessionId];
     if (meta?.loaded) return;
 
-    try {
-      const payload = await props.client.request<{
-        session: GatewaySessionSnapshot;
-      }>("session:get", { sessionId });
-      const snapshot = payload.session;
-      setState(
-        produce((draft) => {
-          const session = createSessionState(
-            sessionId,
-            snapshot.title || "Recovered Session",
-          );
-          session.messages = (snapshot.messages || []).map(cloneMessage);
-          session.isBusy = snapshot.isBusy === true;
-          session.isThinking = snapshot.isBusy === true;
-          session.lockedProfileId = snapshot.lockedProfileId || null;
-          draft.sessions[sessionId] = session;
+    const bufferedUpdates: UIUpdateAction[] = [];
+    sessionLoadUpdateBuffers.set(sessionId, bufferedUpdates);
+    const loadPromise = (async () => {
+      let snapshotRevision: number | undefined;
+      let snapshotInstalled = false;
+      try {
+        const payload = await props.client.request<{
+          session: GatewaySessionSnapshot;
+        }>("session:get", { sessionId });
+        const snapshot = payload.session;
+        snapshotRevision = snapshot.uiRevision;
+        setState(
+          produce((draft) => {
+            const session = createSessionState(
+              sessionId,
+              snapshot.title || "Recovered Session",
+            );
+            session.messages = (snapshot.messages || []).map(cloneMessage);
+            session.isBusy = snapshot.isBusy === true;
+            session.isThinking = snapshot.isBusy === true;
+            session.lockedProfileId = snapshot.lockedProfileId || null;
+            draft.sessions[sessionId] = session;
 
-          const current = draft.sessionMeta[sessionId];
-          draft.sessionMeta[sessionId] = {
-            id: sessionId,
-            title: snapshot.title || current?.title || "Recovered Session",
-            updatedAt: snapshot.updatedAt || current?.updatedAt || Date.now(),
-            messagesCount:
-              snapshot.messages?.length ?? current?.messagesCount ?? 0,
-            lastMessagePreview:
-              previewFromSession(session) || current?.lastMessagePreview,
-            loaded: true,
-          };
-        }),
-      );
-    } catch (error) {
-      setState(
-        "statusLine",
-        `Failed to load session ${shortId(sessionId)} ${safeError(error)}`,
-      );
+            const current = draft.sessionMeta[sessionId];
+            draft.sessionMeta[sessionId] = {
+              id: sessionId,
+              title: snapshot.title || current?.title || "Recovered Session",
+              updatedAt: snapshot.updatedAt || current?.updatedAt || Date.now(),
+              messagesCount:
+                snapshot.messages?.length ?? current?.messagesCount ?? 0,
+              lastMessagePreview:
+                previewFromSession(session) || current?.lastMessagePreview,
+              loaded: true,
+              uiRevision: snapshot.uiRevision,
+            };
+          }),
+        );
+        snapshotInstalled = true;
+      } catch (error) {
+        setState(
+          "statusLine",
+          `Failed to load session ${shortId(sessionId)} ${safeError(error)}`,
+        );
+      } finally {
+        sessionLoadUpdateBuffers.delete(sessionId);
+        bufferedUpdates
+          .filter(
+            (update) =>
+              !snapshotInstalled ||
+              shouldReplayUiUpdateAfterSnapshot(update, snapshotRevision),
+          )
+          .forEach(applyLiveUpdate);
+      }
+    })();
+    sessionLoadPromises.set(sessionId, loadPromise);
+    try {
+      await loadPromise;
+    } finally {
+      if (sessionLoadPromises.get(sessionId) === loadPromise) {
+        sessionLoadPromises.delete(sessionId);
+      }
     }
   }
 
@@ -1602,6 +1743,7 @@ function buildBootState(
     messagesCount: initialSession.messages.length,
     lastMessagePreview: previewFromSession(initialSession),
     loaded: true,
+    uiRevision: data.initialSessionUiRevision,
   };
 
   for (const summary of data.recoveredSessions) {
@@ -1614,6 +1756,10 @@ function buildBootState(
       lastMessagePreview:
         summary.lastMessagePreview || existing?.lastMessagePreview,
       loaded: summary.id === data.initialSessionId,
+      uiRevision:
+        summary.id === data.initialSessionId
+          ? data.initialSessionUiRevision ?? summary.uiRevision
+          : summary.uiRevision,
     };
 
     if (summary.id !== data.initialSessionId) {

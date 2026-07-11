@@ -21,10 +21,26 @@ export type GatewayClientEvents = {
   error: (error: Error) => void
 }
 
+export function shouldReplayUiUpdateAfterSnapshot(
+  update: UIUpdateAction,
+  uiRevision?: number,
+): boolean {
+  if (
+    typeof uiRevision === 'number' &&
+    Number.isFinite(uiRevision) &&
+    typeof update.uiRevision === 'number' &&
+    Number.isFinite(update.uiRevision)
+  ) {
+    return update.uiRevision > uiRevision
+  }
+  return update.type === 'SESSION_RENAMED'
+}
+
 export class GatewayClient {
   private socket: WebSocket | null = null
   private readonly emitter = new EventEmitter()
   private readonly pending = new Map<string, PendingRequest>()
+  private pendingUiUpdates: UIUpdateAction[] = []
   private nextRequestId = 1
 
   constructor(
@@ -118,6 +134,7 @@ export class GatewayClient {
   close(): void {
     const socket = this.socket
     this.socket = null
+    this.pendingUiUpdates = []
     if (!socket) return
     try {
       socket.close()
@@ -126,8 +143,33 @@ export class GatewayClient {
     }
   }
 
+  discardBufferedUiUpdatesCoveredBySnapshot(
+    uiRevision?: number,
+    sessionId?: string,
+  ): void {
+    const normalizedRevision =
+      typeof uiRevision === 'number' && Number.isFinite(uiRevision)
+        ? uiRevision
+        : null
+    const normalizedSessionId = String(sessionId || '').trim()
+    this.pendingUiUpdates = this.pendingUiUpdates.filter((update) => {
+      if (normalizedSessionId && update.sessionId !== normalizedSessionId) {
+        return true
+      }
+      return shouldReplayUiUpdateAfterSnapshot(
+        update,
+        normalizedRevision ?? undefined,
+      )
+    })
+  }
+
   on<K extends keyof GatewayClientEvents>(event: K, handler: GatewayClientEvents[K]): () => void {
     this.emitter.on(event, handler)
+    if (event === 'uiUpdate' && this.pendingUiUpdates.length > 0) {
+      const pending = this.pendingUiUpdates.splice(0, this.pendingUiUpdates.length)
+      const uiUpdateHandler = handler as GatewayClientEvents['uiUpdate']
+      pending.forEach((update) => uiUpdateHandler(update))
+    }
     return () => {
       this.emitter.off(event, handler)
     }
@@ -170,7 +212,11 @@ export class GatewayClient {
     }
 
     if (payload.type === 'gateway:ui-update') {
-      this.emitter.emit('uiUpdate', payload.payload)
+      if (this.emitter.listenerCount('uiUpdate') === 0) {
+        this.pendingUiUpdates.push(payload.payload)
+      } else {
+        this.emitter.emit('uiUpdate', payload.payload)
+      }
       return
     }
 

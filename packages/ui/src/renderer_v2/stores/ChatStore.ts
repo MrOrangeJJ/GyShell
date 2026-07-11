@@ -172,6 +172,9 @@ export class ChatStore {
     input: UserInputPayload,
   ) => Promise<boolean>;
   private sessionsChangedListener?: (sessionIds: string[]) => void;
+  private ownedBackendSessionIds = new Set<string>();
+  private sessionOwnershipVersions = new Map<string, number>();
+  private sessionRegistrationPromises = new Map<string, Promise<void>>();
 
   constructor() {
     makeObservable(this, {
@@ -231,6 +234,101 @@ export class ChatStore {
 
   private bumpSessionRenderListVersion(session: ChatSession): void {
     session.renderListVersion += 1;
+  }
+
+  private registerSessionWithBackend(sessionId: string): void {
+    if (
+      typeof window === "undefined" ||
+      typeof window.gyshell?.agent?.registerSession !== "function"
+    ) {
+      return;
+    }
+    if (this.ownedBackendSessionIds.has(sessionId)) {
+      return;
+    }
+    this.ownedBackendSessionIds.add(sessionId);
+    const ownershipVersion =
+      (this.sessionOwnershipVersions.get(sessionId) || 0) + 1;
+    this.sessionOwnershipVersions.set(sessionId, ownershipVersion);
+    const previous = this.sessionRegistrationPromises.get(sessionId);
+    const registration = (previous || Promise.resolve())
+      .then(() => window.gyshell.agent.registerSession(sessionId))
+      .catch((error) => {
+        if (
+          this.sessionOwnershipVersions.get(sessionId) === ownershipVersion
+        ) {
+          this.ownedBackendSessionIds.delete(sessionId);
+        }
+        console.error(`Failed to register chat session ${sessionId}:`, error);
+      });
+    this.sessionRegistrationPromises.set(sessionId, registration);
+    void registration.then(() => {
+      if (this.sessionRegistrationPromises.get(sessionId) === registration) {
+        this.sessionRegistrationPromises.delete(sessionId);
+      }
+    });
+  }
+
+  private unregisterSessionWithBackend(sessionId: string): void {
+    if (!this.ownedBackendSessionIds.delete(sessionId)) {
+      return;
+    }
+    this.sessionOwnershipVersions.set(
+      sessionId,
+      (this.sessionOwnershipVersions.get(sessionId) || 0) + 1,
+    );
+    if (
+      typeof window === "undefined" ||
+      typeof window.gyshell?.agent?.unregisterSession !== "function"
+    ) {
+      this.sessionRegistrationPromises.delete(sessionId);
+      return;
+    }
+    const previous = this.sessionRegistrationPromises.get(sessionId);
+    const unregister = (previous || Promise.resolve())
+      .then(() => window.gyshell.agent.unregisterSession(sessionId))
+      .catch((error) => {
+        console.error(`Failed to unregister chat session ${sessionId}:`, error);
+      });
+    this.sessionRegistrationPromises.set(sessionId, unregister);
+    void unregister.then(() => {
+      if (this.sessionRegistrationPromises.get(sessionId) === unregister) {
+        this.sessionRegistrationPromises.delete(sessionId);
+      }
+    });
+  }
+
+  registerSessionOwnership(sessionId: string): void {
+    this.registerSessionWithBackend(sessionId);
+  }
+
+  unregisterSessionOwnership(sessionId: string): void {
+    this.unregisterSessionWithBackend(sessionId);
+  }
+
+  private async ensureSessionOwnershipRegistered(
+    sessionId: string,
+  ): Promise<boolean> {
+    let failedStableRegistrations = 0;
+    while (failedStableRegistrations < 2) {
+      this.registerSessionWithBackend(sessionId);
+      const ownershipVersion = this.sessionOwnershipVersions.get(sessionId);
+      const pendingOperation = this.sessionRegistrationPromises.get(sessionId);
+      await pendingOperation;
+
+      if (
+        this.sessionOwnershipVersions.get(sessionId) !== ownershipVersion ||
+        (this.sessionRegistrationPromises.get(sessionId) &&
+          this.sessionRegistrationPromises.get(sessionId) !== pendingOperation)
+      ) {
+        continue;
+      }
+      if (this.ownedBackendSessionIds.has(sessionId)) {
+        return true;
+      }
+      failedStableRegistrations += 1;
+    }
+    return false;
   }
 
   get activeSession(): ChatSession | null {
@@ -301,8 +399,14 @@ export class ChatStore {
     const existingById = new Map(
       this.sessions.map((session) => [session.id, session]),
     );
+    this.sessions
+      .filter((session) => !ids.includes(session.id))
+      .forEach((session) => this.unregisterSessionWithBackend(session.id));
     const nextSessions = ids.map(
       (id) => existingById.get(id) || this.createEmptySession(id, "New Chat"),
+    );
+    nextSessions.forEach((session) =>
+      this.registerSessionWithBackend(session.id),
     );
     this.sessions = nextSessions;
     const normalizedPreferredActiveId =
@@ -405,6 +509,9 @@ export class ChatStore {
     const payloadById = new Map(
       sessionPayloads.map((payload) => [payload.id, payload]),
     );
+    sessionPayloads
+      .filter((payload) => !payload.exists)
+      .forEach((payload) => this.unregisterSessionWithBackend(payload.id));
 
     runInAction(() => {
       const existingById = new Map(
@@ -441,10 +548,14 @@ export class ChatStore {
         })
         .filter((session): session is ChatSession => session !== null);
 
-      const resolvedSessions =
-        nextSessions.length > 0
-          ? nextSessions
-          : [this.createEmptySession(uuidv4(), "New Chat")];
+      let resolvedSessions = nextSessions;
+      if (resolvedSessions.length === 0) {
+        const fallbackSessionId = uuidv4();
+        resolvedSessions = [
+          this.createEmptySession(fallbackSessionId, "New Chat"),
+        ];
+        this.registerSessionWithBackend(fallbackSessionId);
+      }
       this.sessions = resolvedSessions;
 
       const normalizedPreferredActiveId =
@@ -489,6 +600,7 @@ export class ChatStore {
       this.sessions.push(session);
       this.activeSessionId = id;
     });
+    this.registerSessionWithBackend(id);
     this.emitSessionsChanged();
     return id;
   }
@@ -499,6 +611,7 @@ export class ChatStore {
       return;
     }
     if (this.getSessionById(normalizedId)) {
+      this.registerSessionWithBackend(normalizedId);
       return;
     }
     const normalizedTitle = String(title || "").trim() || "New Chat";
@@ -506,6 +619,7 @@ export class ChatStore {
     runInAction(() => {
       this.sessions.push(session);
     });
+    this.registerSessionWithBackend(normalizedId);
     this.emitSessionsChanged();
   }
 
@@ -516,6 +630,8 @@ export class ChatStore {
   closeSession(id: string) {
     const idx = this.sessions.findIndex((s) => s.id === id);
     if (idx === -1) return;
+
+    this.unregisterSessionWithBackend(id);
 
     const nextSessions = this.sessions.filter((s) => s.id !== id);
     let nextActiveId = this.activeSessionId;
@@ -560,7 +676,11 @@ export class ChatStore {
             const m = session.messagesById.get(msgId);
             return m && m.role === "user";
           }).length;
-          if (userMsgCount === 1) {
+          const currentTitle = String(session.title || "").trim();
+          if (
+            userMsgCount === 1 &&
+            (!currentTitle || currentTitle === "New Chat")
+          ) {
             session.title = buildAutoSessionTitle(msg.content);
           }
         }
@@ -682,6 +802,12 @@ export class ChatStore {
 
     runInAction(() => {
       switch (type) {
+        case "SESSION_RENAMED": {
+          if (typeof update.title === "string") {
+            session.title = update.title;
+          }
+          break;
+        }
         case "ADD_MESSAGE": {
           const msg = update.message;
           if (!msg || typeof msg.id !== "string" || msg.id.length === 0) {
@@ -699,7 +825,11 @@ export class ChatStore {
               const m = session.messagesById.get(msgId);
               return m && m.role === "user";
             }).length;
-            if (userMsgCount === 1) {
+            const currentTitle = String(session.title || "").trim();
+            if (
+              userMsgCount === 1 &&
+              (!currentTitle || currentTitle === "New Chat")
+            ) {
               session.title = buildAutoSessionTitle(msg.content);
             }
           }
@@ -944,6 +1074,11 @@ export class ChatStore {
           }
         }
       });
+      ids.forEach((id) => {
+        this.ownedBackendSessionIds.delete(id);
+        this.sessionOwnershipVersions.delete(id);
+        this.sessionRegistrationPromises.delete(id);
+      });
       ids.forEach((id) => this.queue.clearSession(id));
       if (this.sessions.length === 0) {
         this.createSession();
@@ -958,6 +1093,9 @@ export class ChatStore {
 
   async renameChatSession(sessionId: string, newTitle: string): Promise<void> {
     try {
+      if (!(await this.ensureSessionOwnershipRegistered(sessionId))) {
+        throw new Error(`Failed to register chat session ${sessionId}`);
+      }
       await window.gyshell.agent.renameSession(sessionId, newTitle);
       runInAction(() => {
         const session = this.sessions.find((s) => s.id === sessionId);

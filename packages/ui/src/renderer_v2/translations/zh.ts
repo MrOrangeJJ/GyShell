@@ -441,6 +441,7 @@ export const zh = {
       messages: "条消息",
       deleteSession: "删除会话",
       renameSession: "重命名会话",
+      renameSessionFailed: "重命名会话失败，请重试。",
       deleteSelected: "删除选中",
       selectAll: "全选",
       confirmDeleteTitle: "删除聊天记录",

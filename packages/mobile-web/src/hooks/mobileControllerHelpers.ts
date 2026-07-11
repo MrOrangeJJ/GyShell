@@ -32,6 +32,7 @@ export function buildSessionMeta(
     messagesCount: session.messages.length,
     lastMessagePreview: previewFromSession(session),
     loaded: previous?.loaded ?? true,
+    uiRevision: previous?.uiRevision,
     ...patch,
   };
 }

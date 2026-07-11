@@ -288,7 +288,6 @@ export class LayoutStore {
       return false;
     }
 
-    this.materializeRestoredTabs(nextTree);
     this.pinnedEmptyPanelIds.clear();
     this.tree = nextTree;
     this.pinRestoredEmptyTabPanels(this.tree);
@@ -1577,60 +1576,6 @@ export class LayoutStore {
     this.tree = nextTree;
     this.syncPanelBindings({ persist: false });
     this.saveLayoutDebounced();
-  }
-
-  private collectTabIdsByKind(
-    tree: LayoutTree,
-  ): Partial<Record<PanelKind, string[]>> {
-    const panelKindById = new Map(
-      listPanels(tree).map(
-        (panel) => [panel.panel.id, panel.panel.kind] as const,
-      ),
-    );
-    const result: Partial<Record<PanelKind, string[]>> = {};
-
-    Object.entries(tree.panelTabs || {}).forEach(([panelId, binding]) => {
-      const kind = panelKindById.get(panelId);
-      if (!kind || !getPanelKindAdapter(kind).supportsTabs) {
-        return;
-      }
-      const ids = Array.isArray(binding.tabIds)
-        ? binding.tabIds.filter(
-            (tabId): tabId is string =>
-              typeof tabId === "string" && tabId.length > 0,
-          )
-        : [];
-      if (ids.length === 0) {
-        return;
-      }
-      result[kind] = unique([...(result[kind] || []), ...ids]);
-    });
-
-    return result;
-  }
-
-  private materializeRestoredTabs(tree: LayoutTree): void {
-    const tabIdsByKind = this.collectTabIdsByKind(tree);
-    const runtime = this.appStore as AppStore & {
-      materializeTransferredTabs?: (
-        kind: PanelKind,
-        tabIds: string[],
-      ) => string[];
-      hydrateTransferredTabs?: (kind: PanelKind, tabIds: string[]) => string[];
-    };
-
-    const chatTabIds = tabIdsByKind.chat || [];
-    if (
-      chatTabIds.length === 0 ||
-      typeof runtime.materializeTransferredTabs !== "function"
-    ) {
-      return;
-    }
-
-    const materialized = runtime.materializeTransferredTabs("chat", chatTabIds);
-    if (typeof runtime.hydrateTransferredTabs === "function") {
-      runtime.hydrateTransferredTabs("chat", materialized);
-    }
   }
 
   private pinMissingRestoredTabPanels(): void {

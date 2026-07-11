@@ -722,6 +722,8 @@ export interface GyShellAPI {
 
   // Agent
   agent: {
+    registerSession: (sessionId: string) => Promise<void>;
+    unregisterSession: (sessionId: string) => Promise<void>;
     startTask: (
       sessionId: string,
       userInput: string | UserInputPayload,
@@ -738,6 +740,7 @@ export interface GyShellAPI {
       messages: any[];
       isBusy: boolean;
       lockedProfileId: string | null;
+      uiRevision: number;
     } | null>;
     deleteChatSession: (sessionId: string) => Promise<void>;
     deleteChatSessions: (sessionIds: string[]) => Promise<void>;
@@ -1188,6 +1191,10 @@ const api: GyShellAPI = {
   },
 
   agent: {
+    registerSession: (sessionId) =>
+      ipcRenderer.invoke("agent:registerSession", sessionId),
+    unregisterSession: (sessionId) =>
+      ipcRenderer.invoke("agent:unregisterSession", sessionId),
     startTask: (sessionId, userInput, options) =>
       ipcRenderer.invoke("agent:startTask", sessionId, userInput, options),
     stopTask: (sessionId) => ipcRenderer.invoke("agent:stopTask", sessionId),

@@ -188,6 +188,12 @@
   color: var(--fg);
 }
 
+.list-panel-row.is-renaming {
+  grid-template-columns: 22px minmax(0, 1fr) 44px;
+  cursor: default;
+  user-select: text;
+}
+
 .list-panel-row:focus-visible {
   box-shadow: inset 0 0 0 2px color-mix(in srgb, var(--accent) 44%, transparent);
 }
@@ -235,6 +241,36 @@
   color: inherit;
   font-size: 12px;
   font-weight: 600;
+  line-height: 1.15;
+}
+
+.list-panel-row-rename-input {
+  width: 100%;
+  min-width: 0;
+  height: 24px;
+  box-sizing: border-box;
+  border: 1px solid color-mix(in srgb, var(--accent) 56%, var(--border));
+  border-radius: 2px;
+  outline: none;
+  background: color-mix(in srgb, var(--app-bg) 82%, transparent);
+  color: var(--fg);
+  padding: 2px 5px;
+  font: inherit;
+  font-size: 12px;
+}
+
+.list-panel-row-rename-input:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent) 24%, transparent);
+}
+
+.list-panel-row-rename-input:disabled {
+  opacity: 0.62;
+}
+
+.list-panel-row-rename-error {
+  color: var(--danger);
+  font-size: 9px;
   line-height: 1.15;
 }
 
@@ -298,6 +334,40 @@
   background: transparent;
   color: var(--danger);
   opacity: 1;
+}
+
+.list-panel-row-rename-actions {
+  display: inline-flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 2px;
+}
+
+.list-panel-row-rename-action {
+  width: 20px;
+  height: 22px;
+  display: inline-grid;
+  place-items: center;
+  padding: 0;
+  border: 1px solid transparent;
+  border-radius: 3px;
+  background: transparent;
+  color: var(--fg-muted);
+  cursor: pointer;
+}
+
+.list-panel-row-rename-action:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--fg) 8%, transparent);
+  color: var(--fg);
+}
+
+.list-panel-row-rename-action:disabled {
+  cursor: wait;
+  opacity: 0.45;
+}
+
+.list-panel-row-context-menu {
+  min-width: 112px;
 }
 
 .list-panel-empty {

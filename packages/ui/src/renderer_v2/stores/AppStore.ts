@@ -53,6 +53,7 @@ import {
 } from "../lib/windowing";
 import type { FileEditorSnapshot } from "../lib/fileEditorSnapshot";
 import {
+  canReconnectTerminalRuntime,
   resolveTerminalConnectionCapabilities,
   type TerminalConnectionRef,
 } from "../lib/terminalConnectionModel";
@@ -1254,6 +1255,11 @@ export class AppStore {
     if (this.updateDetachedVisibleTabIds(kind, normalizedIds, "delete")) {
       changed = true;
     }
+    if (changed && kind === "chat") {
+      normalizedIds.forEach((tabId) =>
+        this.chat.unregisterSessionOwnership(tabId),
+      );
+    }
     if (changed && shouldSyncLayout) {
       this.layout.syncPanelBindings();
     }
@@ -1287,6 +1293,11 @@ export class AppStore {
     });
     if (this.updateDetachedVisibleTabIds(kind, normalizedIds, "add")) {
       changed = true;
+    }
+    if (changed && kind === "chat") {
+      normalizedIds.forEach((tabId) =>
+        this.chat.registerSessionOwnership(tabId),
+      );
     }
     if (changed && shouldSyncLayout) {
       this.layout.syncPanelBindings();
@@ -3197,7 +3208,7 @@ export class AppStore {
 
   async reconnectTerminal(tabId: string): Promise<boolean> {
     const tab = this.terminalTabs.find((entry) => entry.id === tabId);
-    if (!tab || tab.config.type !== "ssh" || tab.runtimeState !== "exited") {
+    if (!tab || !canReconnectTerminalRuntime(tab.config, tab.runtimeState)) {
       return false;
     }
 

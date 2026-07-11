@@ -28,7 +28,7 @@ export class ChatHistoryService {
 
     this.store.saveChatSession({
       id: session.id,
-      title: session.title,
+      title: existing ? existing.title : session.title,
       messages: Array.from(session.messages.entries()).map(([id, message]) => ({
         id,
         type: (message as any)._getType

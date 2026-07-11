@@ -78,7 +78,7 @@ const run = async (): Promise<void> => {
             sessions: {
               "session-1": {
                 id: "session-1",
-                title: "UI Title",
+                title: "This is a historical...",
                 updatedAt: 333,
                 messages: [
                   {
@@ -86,7 +86,7 @@ const run = async (): Promise<void> => {
                     backendMessageId: "message-1",
                     role: "user",
                     type: "text",
-                    content: "hello",
+                    content: "This is a historical first prompt with details",
                     timestamp: 1001,
                   },
                   {
@@ -147,8 +147,8 @@ const run = async (): Promise<void> => {
           );
           assertEqual(
             uiSummary.title,
-            "UI Title",
-            "ui summary title should persist",
+            "This is a historical first prompt with details",
+            "legacy truncated auto-title should expand during migration",
           );
           assertEqual(
             uiSummary.messagesCount,

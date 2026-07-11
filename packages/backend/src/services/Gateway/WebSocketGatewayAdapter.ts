@@ -840,7 +840,11 @@ export class WebSocketGatewayAdapter {
         return { sessionId };
       }
       case "session:list": {
-        return { sessions: this.gateway.listSessionSummaries() };
+        const sessions = this.gateway.listSessionSummaries();
+        return {
+          sessions,
+          uiRevision: sessions[0]?.uiRevision ?? this.gateway.getUiRevision(),
+        };
       }
       case "session:get": {
         const sessionId = this.readStringParam(params, "sessionId");

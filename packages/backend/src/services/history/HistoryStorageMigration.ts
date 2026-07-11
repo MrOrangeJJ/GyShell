@@ -454,7 +454,9 @@ export class HistoryStorageMigration {
     );
     const importBatch = db.transaction((batch: UIChatSession[]) => {
       batch.forEach((rawSession) => {
-        const session = sanitizeUiSession(rawSession);
+        const session = sanitizeUiSession(rawSession, {
+          restoreLegacyAutoTitle: true,
+        });
         const summary = buildUiSessionSummary(session);
         upsertSession.run(summary);
         session.messages.forEach((message, index) => {

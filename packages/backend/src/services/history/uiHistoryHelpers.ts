@@ -41,7 +41,10 @@ export function restoreLegacyAutoTitleIfTruncated(
   }
 }
 
-export function sanitizeUiSession(session: UIChatSession): UIChatSession {
+export function sanitizeUiSession(
+  session: UIChatSession,
+  options?: { restoreLegacyAutoTitle?: boolean },
+): UIChatSession {
   const sanitized = cloneUiSession(session);
   sanitized.messages = sanitized.messages.filter(
     (message) => message.type !== "ask",
@@ -57,7 +60,9 @@ export function sanitizeUiSession(session: UIChatSession): UIChatSession {
     }
   });
   sanitized.messages = normalizeCompactionBoundaryMarkers(sanitized.messages);
-  restoreLegacyAutoTitleIfTruncated(sanitized);
+  if (options?.restoreLegacyAutoTitle) {
+    restoreLegacyAutoTitleIfTruncated(sanitized);
+  }
   return sanitized;
 }
 

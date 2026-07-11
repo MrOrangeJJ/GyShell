@@ -454,6 +454,7 @@ export const en = {
       messages: "messages",
       deleteSession: "Delete session",
       renameSession: "Rename session",
+      renameSessionFailed: "Failed to rename session. Please try again.",
       deleteSelected: "Delete",
       selectAll: "Select all",
       confirmDeleteTitle: "Delete Chat History",

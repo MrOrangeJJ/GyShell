@@ -28,14 +28,19 @@ import {
   readFileAsDataUrl,
 } from "../lib/input-images";
 import {
+  applyRenameToUnloadedSession,
   applyUiUpdate,
+  applyUiUpdateToUnloadedSession,
   cloneMessage,
   cloneSession,
+  createUnloadedRenamedSession,
   createSessionState,
   previewFromSession,
   reorderSessionIds,
+  shouldReplayUiUpdateAfterSnapshot,
   type SessionMeta,
   type SessionState,
+  UiUpdateBootstrapBuffer,
 } from "../session-store";
 import {
   buildSessionMeta,
@@ -301,6 +306,15 @@ export function useMobileController(): {
   const [agentSettingsError, setAgentSettingsError] = React.useState("");
 
   const [view, setView] = React.useState<ViewState>(INITIAL_VIEW_STATE);
+  const uiUpdateBootstrapBufferRef = React.useRef(
+    new UiUpdateBootstrapBuffer(),
+  );
+  const sessionLoadUpdateBuffersRef = React.useRef(
+    new Map<string, UIUpdateAction[]>(),
+  );
+  const sessionLoadPromisesRef = React.useRef(
+    new Map<string, Promise<void>>(),
+  );
   const viewRef = React.useRef<ViewState>(INITIAL_VIEW_STATE);
   React.useEffect(() => {
     viewRef.current = view;
@@ -417,12 +431,112 @@ export function useMobileController(): {
   }, []);
 
   const applyLiveUpdate = React.useCallback((update: UIUpdateAction) => {
+    const loadBuffer = sessionLoadUpdateBuffersRef.current.get(
+      update.sessionId,
+    );
+    if (loadBuffer) {
+      loadBuffer.push(update);
+      return;
+    }
     setView((previous) => {
+      const installedRevision =
+        previous.sessionMeta[update.sessionId]?.uiRevision;
+      if (
+        typeof update.uiRevision === "number" &&
+        Number.isFinite(update.uiRevision) &&
+        typeof installedRevision === "number" &&
+        Number.isFinite(installedRevision) &&
+        update.uiRevision <= installedRevision
+      ) {
+        return previous;
+      }
       const sessions = { ...previous.sessions };
       const sessionMeta = { ...previous.sessionMeta };
       const sessionOrder = [...previous.sessionOrder];
 
       const current = sessions[update.sessionId];
+      if (update.type === "SESSION_RENAMED") {
+        const nextSession = current ? cloneSession(current) : undefined;
+        const currentMeta = sessionMeta[update.sessionId];
+        const nextMeta = currentMeta ? { ...currentMeta } : undefined;
+        if (
+          applyRenameToUnloadedSession(
+            nextSession,
+            nextMeta,
+            update.title,
+            Date.now(),
+          )
+        ) {
+          if (nextSession) {
+            sessions[update.sessionId] = nextSession;
+          }
+          if (
+            typeof update.uiRevision === "number" &&
+            Number.isFinite(update.uiRevision)
+          ) {
+            nextMeta!.uiRevision = update.uiRevision;
+          }
+          sessionMeta[update.sessionId] = nextMeta!;
+          return {
+            ...previous,
+            sessions,
+            sessionMeta,
+            sessionOrder: reorderSessionIds(sessionOrder, sessionMeta),
+          };
+        }
+        if (!currentMeta) {
+          const created = createUnloadedRenamedSession(
+            update.sessionId,
+            update.title,
+            Date.now(),
+            nextSession,
+          );
+          sessions[update.sessionId] = created.session;
+          created.meta.uiRevision = update.uiRevision;
+          sessionMeta[update.sessionId] = created.meta;
+          if (!sessionOrder.includes(update.sessionId)) {
+            sessionOrder.unshift(update.sessionId);
+          }
+          return {
+            ...previous,
+            sessions,
+            sessionMeta,
+            sessionOrder: reorderSessionIds(sessionOrder, sessionMeta),
+          };
+        }
+      }
+      const currentMeta = sessionMeta[update.sessionId];
+      if (!currentMeta?.loaded) {
+        const nextSession = current
+          ? cloneSession(current)
+          : createSessionState(update.sessionId, "New Chat");
+        const nextMeta: SessionMeta = currentMeta
+          ? { ...currentMeta }
+          : {
+              id: update.sessionId,
+              title: nextSession.title,
+              updatedAt: Date.now(),
+              messagesCount: 0,
+              loaded: false,
+            };
+        applyUiUpdateToUnloadedSession(
+          nextSession,
+          nextMeta,
+          update,
+          Date.now(),
+        );
+        sessions[update.sessionId] = nextSession;
+        sessionMeta[update.sessionId] = nextMeta;
+        if (!sessionOrder.includes(update.sessionId)) {
+          sessionOrder.unshift(update.sessionId);
+        }
+        return {
+          ...previous,
+          sessions,
+          sessionMeta,
+          sessionOrder: reorderSessionIds(sessionOrder, sessionMeta),
+        };
+      }
       const nextSession = current
         ? cloneSession(current)
         : createSessionState(update.sessionId, "New Chat");
@@ -457,6 +571,11 @@ export function useMobileController(): {
       sessionMeta[update.sessionId] = buildSessionMeta(nextSession, prevMeta, {
         loaded: true,
         updatedAt: Date.now(),
+        uiRevision:
+          typeof update.uiRevision === "number" &&
+          Number.isFinite(update.uiRevision)
+            ? update.uiRevision
+            : prevMeta?.uiRevision,
       });
 
       return {
@@ -582,8 +701,20 @@ export function useMobileController(): {
 
       const sessionPayload = await client.request<{
         sessions: GatewaySessionSummary[];
+        uiRevision?: number;
       }>("session:list", {});
       let summaries = sessionPayload.sessions || [];
+      const summaryRevision = summaries.reduce<number | undefined>(
+        (latest, summary) =>
+          typeof summary.uiRevision === "number" &&
+          Number.isFinite(summary.uiRevision)
+            ? Math.max(latest ?? summary.uiRevision, summary.uiRevision)
+            : latest,
+        undefined,
+      );
+      uiUpdateBootstrapBufferRef.current.discardCoveredBySnapshot(
+        sessionPayload.uiRevision ?? summaryRevision,
+      );
 
       if (summaries.length === 0) {
         const created = await client.request<{ sessionId: string }>(
@@ -625,6 +756,10 @@ export function useMobileController(): {
             const payload = await client.request<{
               session: GatewaySessionSnapshot;
             }>("session:get", { sessionId });
+            uiUpdateBootstrapBufferRef.current.discardCoveredBySnapshot(
+              payload.session.uiRevision,
+              sessionId,
+            );
             loadedSnapshots.set(sessionId, payload.session);
           } catch (error) {
             if (sessionId === preferredSummary.id) {
@@ -670,6 +805,7 @@ export function useMobileController(): {
             ? previewFromSession(session)
             : summary.lastMessagePreview,
           loaded,
+          uiRevision: snapshot?.uiRevision ?? summary.uiRevision,
         };
       }
 
@@ -801,11 +937,19 @@ export function useMobileController(): {
         return;
       }
       const flow = (async () => {
-        await client.connect(target);
-        if (source === "manual") {
-          saveGatewayUrlToStorage(withoutGatewayAccessToken(target));
+        const uiUpdateBuffer = uiUpdateBootstrapBufferRef.current;
+        uiUpdateBuffer.begin();
+        let snapshotInstalled = false;
+        try {
+          await client.connect(target);
+          if (source === "manual") {
+            saveGatewayUrlToStorage(withoutGatewayAccessToken(target));
+          }
+          await bootstrapAfterConnect(target, source);
+          snapshotInstalled = true;
+        } finally {
+          uiUpdateBuffer.end(applyLiveUpdate, { snapshotInstalled });
         }
-        await bootstrapAfterConnect(target, source);
         lastConnectedAtRef.current = Date.now();
         hasEverConnectedRef.current = true;
         reconnectAttemptRef.current = 0;
@@ -818,7 +962,13 @@ export function useMobileController(): {
       });
       await connectFlowRef.current;
     },
-    [bootstrapAfterConnect, clearReconnectTimer, client, startHeartbeat],
+    [
+      applyLiveUpdate,
+      bootstrapAfterConnect,
+      clearReconnectTimer,
+      client,
+      startHeartbeat,
+    ],
   );
 
   const runAutoReconnectAttempt = React.useCallback(async () => {
@@ -902,7 +1052,7 @@ export function useMobileController(): {
         setConnectionError(message);
       }),
       client.on("uiUpdate", (update) => {
-        applyLiveUpdate(update);
+        uiUpdateBootstrapBufferRef.current.handle(update, applyLiveUpdate);
       }),
       client.on("gatewayEvent", (event) => {
         if (event.type !== "system:notification") return;
@@ -1145,47 +1295,79 @@ export function useMobileController(): {
 
   const ensureSessionLoaded = React.useCallback(
     async (sessionId: string) => {
+      const inFlight = sessionLoadPromisesRef.current.get(sessionId);
+      if (inFlight) {
+        await inFlight;
+        return;
+      }
       const snapshotState = viewRef.current;
       const currentMeta = snapshotState.sessionMeta[sessionId];
       if (currentMeta?.loaded) return;
 
-      const payload = await client.request<{ session: GatewaySessionSnapshot }>(
-        "session:get",
-        { sessionId },
-      );
-      const snapshot = payload.session;
+      const bufferedUpdates: UIUpdateAction[] = [];
+      sessionLoadUpdateBuffersRef.current.set(sessionId, bufferedUpdates);
+      const loadPromise = (async () => {
+        try {
+          const payload = await client.request<{
+            session: GatewaySessionSnapshot;
+          }>("session:get", { sessionId });
+          const snapshot = payload.session;
 
-      setView((previous) => {
-        const sessions = { ...previous.sessions };
-        const sessionMeta = { ...previous.sessionMeta };
+          setView((previous) => {
+            const sessions = { ...previous.sessions };
+            const sessionMeta = { ...previous.sessionMeta };
 
-        const nextSession = createSessionState(
-          sessionId,
-          snapshot.title || "Recovered Session",
-        );
-        nextSession.messages = (snapshot.messages || []).map(cloneMessage);
-        nextSession.isBusy = snapshot.isBusy === true;
-        nextSession.isThinking = snapshot.isBusy === true;
-        nextSession.lockedProfileId = snapshot.lockedProfileId || null;
-        sessions[sessionId] = nextSession;
+            const nextSession = createSessionState(
+              sessionId,
+              snapshot.title || "Recovered Session",
+            );
+            nextSession.messages = (snapshot.messages || []).map(cloneMessage);
+            nextSession.isBusy = snapshot.isBusy === true;
+            nextSession.isThinking = snapshot.isBusy === true;
+            nextSession.lockedProfileId = snapshot.lockedProfileId || null;
+            sessions[sessionId] = nextSession;
 
-        sessionMeta[sessionId] = {
-          id: sessionId,
-          title: nextSession.title,
-          updatedAt: snapshot.updatedAt || Date.now(),
-          messagesCount: nextSession.messages.length,
-          lastMessagePreview: previewFromSession(nextSession),
-          loaded: true,
-        };
+            sessionMeta[sessionId] = {
+              id: sessionId,
+              title: nextSession.title,
+              updatedAt: snapshot.updatedAt || Date.now(),
+              messagesCount: nextSession.messages.length,
+              lastMessagePreview: previewFromSession(nextSession),
+              loaded: true,
+              uiRevision: snapshot.uiRevision,
+            };
 
-        return {
-          ...previous,
-          sessions,
-          sessionMeta,
-        };
-      });
+            return {
+              ...previous,
+              sessions,
+              sessionMeta,
+            };
+          });
+          sessionLoadUpdateBuffersRef.current.delete(sessionId);
+          bufferedUpdates
+            .filter((update) =>
+              shouldReplayUiUpdateAfterSnapshot(
+                update,
+                snapshot.uiRevision,
+              ),
+            )
+            .forEach(applyLiveUpdate);
+        } catch (error) {
+          sessionLoadUpdateBuffersRef.current.delete(sessionId);
+          bufferedUpdates.forEach(applyLiveUpdate);
+          throw error;
+        }
+      })();
+      sessionLoadPromisesRef.current.set(sessionId, loadPromise);
+      try {
+        await loadPromise;
+      } finally {
+        if (sessionLoadPromisesRef.current.get(sessionId) === loadPromise) {
+          sessionLoadPromisesRef.current.delete(sessionId);
+        }
+      }
     },
-    [client],
+    [applyLiveUpdate, client],
   );
 
   const switchSession = React.useCallback(
@@ -2137,6 +2319,7 @@ export function useMobileController(): {
               messagesCount: nextSession.messages.length,
               lastMessagePreview: previewFromSession(nextSession),
               loaded: true,
+              uiRevision: snapshot.uiRevision,
             };
             const sessionOrder = [
               branchSessionId,

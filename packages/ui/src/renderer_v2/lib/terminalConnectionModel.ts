@@ -25,6 +25,11 @@ export const getTerminalConnectionIconKind = (
 ): TerminalConnectionIconKind =>
   getTerminalConnectionTypeDefinition(type).iconKind
 
+export const canReconnectTerminalRuntime = (
+  config: Pick<TerminalConfig, 'type'> | { type: string },
+  runtimeState: unknown,
+): boolean => config.type === 'ssh' && runtimeState === 'exited'
+
 export const resolveTerminalRuntimeIndicatorState = (
   type: string,
   runtimeState: 'initializing' | 'ready' | 'exited',
@@ -35,4 +40,3 @@ export const resolveTerminalRuntimeIndicatorState = (
   }
   return runtimeState
 }
-

@@ -724,9 +724,12 @@ export class UIHistoryService {
     role: string,
     content: string,
   ): void {
+    const currentTitle = String(session.title || "").trim();
     if (
       role === "user" &&
-      session.messages.filter((message) => message.role === "user").length === 1
+      session.messages.filter((message) => message.role === "user").length ===
+        1 &&
+      (!currentTitle || currentTitle === "New Chat")
     ) {
       session.title = buildAutoSessionTitle(content);
     }
@@ -785,6 +788,16 @@ export class UIHistoryService {
 
     const summary = this.sessionSummaryCache[sessionId];
     if (!summary) {
+      const createdSession: UIChatSession = {
+        id: sessionId,
+        title: newTitle,
+        messages: [],
+        updatedAt,
+      };
+      this.sessionsCache[sessionId] = createdSession;
+      this.syncSessionSummary(sessionId);
+      this.dirtySessions.add(sessionId);
+      this.flush(sessionId);
       return;
     }
     this.sessionSummaryCache[sessionId] = {

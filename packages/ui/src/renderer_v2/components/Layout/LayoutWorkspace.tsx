@@ -27,6 +27,7 @@ import {
   resolveHorizontalTabBarReorderHint,
 } from "./tabDropTargets";
 import { getPanelKindAdapter } from "../../stores/panelKindAdapters";
+import { canReconnectTerminalRuntime } from "../../lib/terminalConnectionModel";
 import {
   WINDOW_CONTEXT,
   buildDetachedLayoutTree,
@@ -2815,8 +2816,11 @@ export const LayoutWorkspace: React.FC<LayoutWorkspaceProps> = observer(
         danger?: boolean;
         disabled?: boolean;
       }> =
-        targetTerminalTab?.config.type === "ssh" &&
-        targetTerminalTab.runtimeState === "exited"
+        targetTerminalTab &&
+        canReconnectTerminalRuntime(
+          targetTerminalTab.config,
+          targetTerminalTab.runtimeState,
+        )
           ? [
               {
                 action: "reconnect-terminal",

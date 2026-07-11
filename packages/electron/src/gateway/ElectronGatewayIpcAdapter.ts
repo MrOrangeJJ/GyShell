@@ -6,7 +6,7 @@ import {
   app,
   nativeImage,
 } from "electron";
-import type { NativeImage } from "electron";
+import type { IpcMainInvokeEvent, NativeImage } from "electron";
 import type {
   StartTaskOptions,
   StartTaskInput,
@@ -85,6 +85,8 @@ const resolveDragIcon = async (filePath: string): Promise<NativeImage> => {
 };
 
 export class ElectronGatewayIpcAdapter {
+  private registeredSessionOwnerWebContentsIds = new Set<number>();
+
   constructor(
     private gateway: IGatewayRuntime,
     private terminalService: TerminalService,
@@ -114,6 +116,26 @@ export class ElectronGatewayIpcAdapter {
     private fileTransferService?: FileTransferService,
     private mobileWebServerService?: import("../services/MobileWebServerService").MobileWebServerService,
   ) {}
+
+  private getRendererSessionOwner(event: IpcMainInvokeEvent): string {
+    const webContentsId = event.sender.id;
+    const ownerId = `electron-webcontents:${webContentsId}`;
+    if (this.registeredSessionOwnerWebContentsIds.has(webContentsId)) {
+      return ownerId;
+    }
+
+    this.registeredSessionOwnerWebContentsIds.add(webContentsId);
+    const releaseOwner = () => {
+      this.gateway.unregisterSessionOwner(ownerId);
+    };
+    event.sender.on("did-navigate", releaseOwner);
+    event.sender.on("render-process-gone", releaseOwner);
+    event.sender.once("destroyed", () => {
+      this.registeredSessionOwnerWebContentsIds.delete(webContentsId);
+      releaseOwner();
+    });
+    return ownerId;
+  }
 
   private updateWindowsThemeIfNeeded(): void {
     if (process.platform !== "win32") return;
@@ -161,6 +183,26 @@ export class ElectronGatewayIpcAdapter {
 
   registerHandlers(): void {
     // Agent runtime
+    ipcMain.handle(
+      "agent:registerSession",
+      async (event: IpcMainInvokeEvent, sessionId: string) => {
+        this.gateway.registerSession(
+          sessionId,
+          this.getRendererSessionOwner(event),
+        );
+      },
+    );
+
+    ipcMain.handle(
+      "agent:unregisterSession",
+      async (event: IpcMainInvokeEvent, sessionId: string) => {
+        this.gateway.unregisterSession(
+          sessionId,
+          this.getRendererSessionOwner(event),
+        );
+      },
+    );
+
     ipcMain.handle(
       "agent:startTask",
       async (
@@ -319,8 +361,10 @@ export class ElectronGatewayIpcAdapter {
       },
     );
     ipcMain.handle("session:list", () => {
+      const sessions = this.gateway.listSessionSummaries();
       return {
-        sessions: this.gateway.listSessionSummaries(),
+        sessions,
+        uiRevision: sessions[0]?.uiRevision ?? this.gateway.getUiRevision(),
       };
     });
     ipcMain.handle("session:get", (_: any, sessionId: string) => {

@@ -33,22 +33,39 @@ export async function startTuiCli(argv: string[] = process.argv.slice(2)): Promi
 
     if (options.mode === 'run') {
       const target = await resolveTaskTarget(client, options.sessionId)
+      client.discardBufferedUiUpdatesCoveredBySnapshot(target.uiRevision)
       await runHeadlessMode(client, target.sessionId, options.message || '')
       return
     }
 
     if (options.mode === 'hook') {
       const target = await resolveTaskTarget(client, options.sessionId)
+      client.discardBufferedUiUpdatesCoveredBySnapshot(target.uiRevision)
       await runHookMode(client, target.sessionId, options.message || '')
       return
     }
 
     const profilesData = await safeRequestProfiles(client)
     const skills = await safeRequestSkills(client)
-    const sessionSummaries = await safeRequestSessionSummaries(client)
+    const sessionList = await safeRequestSessionSummaries(client)
+    const sessionSummaries = sessionList.sessions
+    const summaryRevision = sessionSummaries.reduce<number | undefined>(
+      (latest, summary) =>
+        typeof summary.uiRevision === 'number' && Number.isFinite(summary.uiRevision)
+          ? Math.max(latest ?? summary.uiRevision, summary.uiRevision)
+          : latest,
+      undefined,
+    )
+    client.discardBufferedUiUpdatesCoveredBySnapshot(
+      sessionList.uiRevision ?? summaryRevision,
+    )
     const initialSession = options.message
       ? await createInitialPromptSession(client)
       : await resolveInitialSession(client, sessionSummaries, options.sessionId)
+    client.discardBufferedUiUpdatesCoveredBySnapshot(
+      initialSession.uiRevision,
+      initialSession.id,
+    )
 
     const { runTui } = await import('./tui-app')
     const tuiPromise = runTui(client, {
@@ -61,6 +78,7 @@ export async function startTuiCli(argv: string[] = process.argv.slice(2)): Promi
       initialMessages: initialSession.messages,
       initialSessionBusy: initialSession.isBusy,
       initialSessionLockedProfileId: initialSession.lockedProfileId,
+      initialSessionUiRevision: initialSession.uiRevision,
       restoredSessionCount: sessionSummaries.length,
       recoveredSessions: sessionSummaries,
       skills,
@@ -104,12 +122,18 @@ async function safeRequestProfiles(client: { request: <T>(method: string, params
 
 async function safeRequestSessionSummaries(
   client: { request: <T>(method: string, params?: Record<string, unknown>) => Promise<T> },
-): Promise<GatewaySessionSummary[]> {
+): Promise<{ sessions: GatewaySessionSummary[]; uiRevision?: number }> {
   try {
-    const payload = await client.request<{ sessions: GatewaySessionSummary[] }>('session:list', {})
-    return payload.sessions ?? []
+    const payload = await client.request<{
+      sessions: GatewaySessionSummary[]
+      uiRevision?: number
+    }>('session:list', {})
+    return {
+      sessions: payload.sessions ?? [],
+      uiRevision: payload.uiRevision,
+    }
   } catch {
-    return []
+    return { sessions: [] }
   }
 }
 
@@ -147,7 +171,7 @@ async function resolveInitialSession(
   client: { request: <T>(method: string, params?: Record<string, unknown>) => Promise<T> },
   sessions: GatewaySessionSummary[],
   preferredSessionId?: string,
-): Promise<{ id: string; title: string; messages: ChatMessage[]; isBusy: boolean; lockedProfileId: string | null }> {
+): Promise<{ id: string; title: string; messages: ChatMessage[]; isBusy: boolean; lockedProfileId: string | null; uiRevision?: number }> {
   if (preferredSessionId) {
     const matched = await tryLoadSessionSnapshot(client, preferredSessionId)
     if (matched) return matched
@@ -161,6 +185,7 @@ async function resolveInitialSession(
       messages: [],
       isBusy: false,
       lockedProfileId: null,
+      uiRevision: undefined,
     }
   }
 
@@ -175,6 +200,7 @@ async function resolveInitialSession(
     messages: [],
     isBusy: false,
     lockedProfileId: null,
+    uiRevision: undefined,
   }
 }
 
@@ -182,7 +208,7 @@ async function tryLoadSessionSnapshot(
   client: { request: <T>(method: string, params?: Record<string, unknown>) => Promise<T> },
   sessionId: string,
   fallbackTitle?: string,
-): Promise<{ id: string; title: string; messages: ChatMessage[]; isBusy: boolean; lockedProfileId: string | null } | null> {
+): Promise<{ id: string; title: string; messages: ChatMessage[]; isBusy: boolean; lockedProfileId: string | null; uiRevision?: number } | null> {
   try {
     const payload = await client.request<{ session: GatewaySessionSnapshot }>('session:get', {
       sessionId,
@@ -194,6 +220,7 @@ async function tryLoadSessionSnapshot(
       messages: restored.messages ?? [],
       isBusy: restored.isBusy === true,
       lockedProfileId: restored.lockedProfileId || null,
+      uiRevision: restored.uiRevision,
     }
   } catch {
     return null
@@ -208,7 +235,7 @@ async function createNewSession(
 
 async function createInitialPromptSession(
   client: { request: <T>(method: string, params?: Record<string, unknown>) => Promise<T> },
-): Promise<{ id: string; title: string; messages: ChatMessage[]; isBusy: boolean; lockedProfileId: string | null }> {
+): Promise<{ id: string; title: string; messages: ChatMessage[]; isBusy: boolean; lockedProfileId: string | null; uiRevision?: number }> {
   const created = await createNewSession(client)
   return {
     id: created.sessionId,
@@ -216,13 +243,14 @@ async function createInitialPromptSession(
     messages: [],
     isBusy: false,
     lockedProfileId: null,
+    uiRevision: undefined,
   }
 }
 
 async function resolveTaskTarget(
   client: { request: <T>(method: string, params?: Record<string, unknown>) => Promise<T> },
   preferredSessionId?: string,
-): Promise<{ sessionId: string }> {
+): Promise<{ sessionId: string; uiRevision?: number }> {
   if (preferredSessionId) {
     const matched = await tryLoadSessionSnapshot(client, preferredSessionId)
     if (!matched) {
@@ -230,12 +258,14 @@ async function resolveTaskTarget(
     }
     return {
       sessionId: matched.id,
+      uiRevision: matched.uiRevision,
     }
   }
 
   const created = await createNewSession(client)
   return {
     sessionId: created.sessionId,
+    uiRevision: undefined,
   }
 }
 

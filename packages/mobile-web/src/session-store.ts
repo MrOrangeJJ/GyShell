@@ -16,6 +16,96 @@ export interface SessionMeta {
   messagesCount: number;
   lastMessagePreview?: string;
   loaded: boolean;
+  uiRevision?: number;
+}
+
+export function shouldReplayUiUpdateAfterSnapshot(
+  update: UIUpdateAction,
+  uiRevision?: number,
+): boolean {
+  if (
+    typeof uiRevision === "number" &&
+    Number.isFinite(uiRevision) &&
+    typeof update.uiRevision === "number" &&
+    Number.isFinite(update.uiRevision)
+  ) {
+    return update.uiRevision > uiRevision;
+  }
+  return update.type === "SESSION_RENAMED";
+}
+
+export class UiUpdateBootstrapBuffer {
+  private buffering = false;
+  private nextSequence = 0;
+  private pending: Array<{ sequence: number; update: UIUpdateAction }> = [];
+  private coveredBySnapshot: Array<{
+    sequence: number;
+    update: UIUpdateAction;
+  }> = [];
+
+  begin(): void {
+    this.buffering = true;
+    this.nextSequence = 0;
+    this.pending = [];
+    this.coveredBySnapshot = [];
+  }
+
+  handle(
+    update: UIUpdateAction,
+    apply: (pendingUpdate: UIUpdateAction) => void,
+  ): void {
+    if (this.buffering) {
+      this.pending.push({ sequence: this.nextSequence, update });
+      this.nextSequence += 1;
+      return;
+    }
+    apply(update);
+  }
+
+  discardCoveredBySnapshot(uiRevision?: number, sessionId?: string): void {
+    const normalizedRevision =
+      typeof uiRevision === "number" && Number.isFinite(uiRevision)
+        ? uiRevision
+        : null;
+    const normalizedSessionId = String(sessionId || "").trim();
+    const retained: typeof this.pending = [];
+    this.pending.forEach((entry) => {
+      if (
+        normalizedSessionId &&
+        entry.update.sessionId !== normalizedSessionId
+      ) {
+        retained.push(entry);
+        return;
+      }
+      if (
+        shouldReplayUiUpdateAfterSnapshot(
+          entry.update,
+          normalizedRevision ?? undefined,
+        )
+      ) {
+        retained.push(entry);
+        return;
+      }
+      this.coveredBySnapshot.push(entry);
+    });
+    this.pending = retained;
+  }
+
+  end(
+    apply: (pendingUpdate: UIUpdateAction) => void,
+    options?: { snapshotInstalled?: boolean },
+  ): void {
+    this.buffering = false;
+    const entries =
+      options?.snapshotInstalled === false
+        ? [...this.coveredBySnapshot, ...this.pending].sort(
+            (left, right) => left.sequence - right.sequence,
+          )
+        : this.pending;
+    this.pending = [];
+    this.coveredBySnapshot = [];
+    entries.forEach((entry) => apply(entry.update));
+  }
 }
 
 export function createSessionState(
@@ -46,11 +136,109 @@ export function cloneSession(session: SessionState): SessionState {
   };
 }
 
+export function applyRenameToUnloadedSession(
+  session: SessionState | undefined,
+  meta: SessionMeta | undefined,
+  title: string,
+  updatedAt: number,
+): boolean {
+  if (!meta || meta.loaded) {
+    return false;
+  }
+  if (session) {
+    session.title = title;
+  }
+  meta.title = title;
+  meta.updatedAt = updatedAt;
+  return true;
+}
+
+export function createUnloadedRenamedSession(
+  sessionId: string,
+  title: string,
+  updatedAt: number,
+  existingSession?: SessionState,
+): { session: SessionState; meta: SessionMeta } {
+  const session = existingSession || createSessionState(sessionId, title);
+  session.title = title;
+  return {
+    session,
+    meta: {
+      id: sessionId,
+      title,
+      updatedAt,
+      messagesCount: 0,
+      loaded: false,
+    },
+  };
+}
+
+export function applyUiUpdateToUnloadedSession(
+  session: SessionState,
+  meta: SessionMeta,
+  update: UIUpdateAction,
+  updatedAt: number,
+): void {
+  switch (update.type) {
+    case "SESSION_RENAMED":
+      session.title = update.title;
+      break;
+    case "ADD_MESSAGE": {
+      if (update.message.type !== "tokens_count") {
+        session.isBusy = true;
+      }
+      if (update.message.role === "user") {
+        session.isThinking = true;
+        const currentTitle = String(session.title || "").trim();
+        if (!currentTitle || currentTitle === "New Chat") {
+          session.title = autoTitle(update.message.content);
+        }
+      }
+      break;
+    }
+    case "INSERT_MESSAGE":
+    case "APPEND_CONTENT":
+    case "APPEND_OUTPUT":
+    case "UPDATE_MESSAGE":
+      session.isBusy = true;
+      break;
+    case "DONE":
+      session.isThinking = false;
+      break;
+    case "SESSION_PROFILE_LOCKED":
+      session.isBusy = true;
+      session.lockedProfileId = update.lockedProfileId || null;
+      break;
+    case "SESSION_READY":
+      session.isBusy = false;
+      session.lockedProfileId = null;
+      break;
+    case "ROLLBACK":
+      session.isThinking = false;
+      session.isBusy = false;
+      break;
+    case "REMOVE_MESSAGE":
+      break;
+  }
+  meta.title = session.title;
+  meta.updatedAt = updatedAt;
+  if (
+    typeof update.uiRevision === "number" &&
+    Number.isFinite(update.uiRevision)
+  ) {
+    meta.uiRevision = update.uiRevision;
+  }
+}
+
 export function applyUiUpdate(
   session: SessionState,
   update: UIUpdateAction,
 ): void {
   switch (update.type) {
+    case "SESSION_RENAMED": {
+      session.title = update.title;
+      break;
+    }
     case "ADD_MESSAGE": {
       const message = cloneMessage(update.message);
       // Keep reasoning/compaction transient in frontend: once any new message arrives, old transient activity banners are removed.
@@ -64,7 +252,8 @@ export function applyUiUpdate(
         session.isBusy = true;
         const firstUser =
           session.messages.filter((item) => item.role === "user").length === 1;
-        if (firstUser) {
+        const currentTitle = String(session.title || "").trim();
+        if (firstUser && (!currentTitle || currentTitle === "New Chat")) {
           session.title = autoTitle(message.content);
         }
       }

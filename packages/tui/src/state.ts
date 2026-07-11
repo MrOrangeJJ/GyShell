@@ -23,11 +23,140 @@ export function createSessionState(
   };
 }
 
+export function applyRenameToUnloadedSession(
+  session: SessionState | undefined,
+  meta:
+    | {
+        title: string;
+        updatedAt: number;
+        loaded: boolean;
+      }
+    | undefined,
+  title: string,
+  updatedAt: number,
+): boolean {
+  if (!meta || meta.loaded) {
+    return false;
+  }
+  if (session) {
+    session.title = title;
+  }
+  meta.title = title;
+  meta.updatedAt = updatedAt;
+  return true;
+}
+
+export function createUnloadedRenamedSession(
+  sessionId: string,
+  title: string,
+  updatedAt: number,
+  existingSession?: SessionState,
+): {
+  session: SessionState;
+  meta: {
+    id: string;
+    title: string;
+    updatedAt: number;
+    messagesCount: number;
+    loaded: boolean;
+  };
+} {
+  const session = existingSession || createSessionState(sessionId, title);
+  session.title = title;
+  return {
+    session,
+    meta: {
+      id: sessionId,
+      title,
+      updatedAt,
+      messagesCount: 0,
+      loaded: false,
+    },
+  };
+}
+
+export function applyUiUpdateToUnloadedSession(
+  session: SessionState,
+  meta: {
+    title: string;
+    updatedAt: number;
+    loaded: boolean;
+    uiRevision?: number;
+  },
+  update: UIUpdateAction,
+  updatedAt: number,
+): void {
+  switch (update.type) {
+    case "SESSION_RENAMED":
+      session.title = update.title;
+      break;
+    case "ADD_MESSAGE": {
+      if (update.message.type !== "tokens_count") {
+        session.isBusy = true;
+      }
+      if (update.message.role === "user") {
+        session.isThinking = true;
+        const currentTitle = String(session.title || "").trim();
+        if (!currentTitle || currentTitle === "New Chat") {
+          session.title = autoTitle(update.message.content);
+        }
+      }
+      break;
+    }
+    case "INSERT_MESSAGE":
+    case "APPEND_CONTENT":
+    case "APPEND_OUTPUT":
+    case "UPDATE_MESSAGE":
+      session.isBusy = true;
+      break;
+    case "DONE":
+      session.isThinking = false;
+      break;
+    case "SESSION_PROFILE_LOCKED":
+      session.isBusy = true;
+      session.lockedProfileId = update.lockedProfileId || null;
+      break;
+    case "SESSION_READY":
+      session.isBusy = false;
+      session.lockedProfileId = null;
+      break;
+    case "ROLLBACK":
+      session.isThinking = false;
+      session.isBusy = false;
+      break;
+    case "REMOVE_MESSAGE":
+      break;
+  }
+  meta.title = session.title;
+  meta.updatedAt = updatedAt;
+  if (
+    typeof update.uiRevision === "number" &&
+    Number.isFinite(update.uiRevision)
+  ) {
+    meta.uiRevision = update.uiRevision;
+  }
+}
+
+export function reorderSessionIdsByUpdatedAt(
+  sessionIds: readonly string[],
+  sessionMeta: Record<string, { updatedAt: number } | undefined>,
+): string[] {
+  return [...sessionIds].sort(
+    (left, right) =>
+      (sessionMeta[right]?.updatedAt || 0) -
+      (sessionMeta[left]?.updatedAt || 0),
+  );
+}
+
 export function applyUiUpdate(
   session: SessionState,
   update: UIUpdateAction,
 ): void {
   switch (update.type) {
+    case "SESSION_RENAMED": {
+      session.title = update.title;
+      break;
+    }
     case "ADD_MESSAGE": {
       const msg = update.message;
       session.messages.push(msg);
@@ -39,7 +168,8 @@ export function applyUiUpdate(
         session.isThinking = true;
         const firstUser =
           session.messages.filter((item) => item.role === "user").length === 1;
-        if (firstUser) {
+        const currentTitle = String(session.title || "").trim();
+        if (firstUser && (!currentTitle || currentTitle === "New Chat")) {
           session.title = autoTitle(msg.content);
         }
       }

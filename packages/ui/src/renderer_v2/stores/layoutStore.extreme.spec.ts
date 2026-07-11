@@ -889,6 +889,167 @@ const run = async (): Promise<void> => {
     assertEqual(store.getPanelActiveTabId(terminalPanelId!), 'term-a', 'restored terminal panel should activate the tab')
   })
 
+  await runCase('saved layout switching filters closed tabs without materializing inventory', async () => {
+    const spy: SettingsSetSpy = { calls: [] }
+    installWindowMock(spy)
+
+    const currentTree: LayoutTree = {
+      schemaVersion: 2,
+      root: {
+        type: 'split',
+        id: 'root-current-live-tabs',
+        direction: 'horizontal',
+        children: [
+          {
+            type: 'panel',
+            id: 'node-current-chat',
+            panel: { id: 'panel-current-chat', kind: 'chat' }
+          },
+          {
+            type: 'panel',
+            id: 'node-current-terminal',
+            panel: { id: 'panel-current-terminal', kind: 'terminal' }
+          }
+        ],
+        sizes: [50, 50]
+      },
+      panelTabs: {
+        'panel-current-chat': {
+          tabIds: ['chat-live'],
+          activeTabId: 'chat-live'
+        },
+        'panel-current-terminal': {
+          tabIds: ['term-live'],
+          activeTabId: 'term-live'
+        }
+      },
+      focusedPanelId: 'panel-current-chat'
+    }
+    const savedTree: LayoutTree = {
+      schemaVersion: 2,
+      root: {
+        type: 'split',
+        id: 'root-saved-stale-tabs',
+        direction: 'horizontal',
+        children: [
+          {
+            type: 'panel',
+            id: 'node-saved-chat',
+            panel: { id: 'panel-saved-chat', kind: 'chat' }
+          },
+          {
+            type: 'panel',
+            id: 'node-saved-terminal',
+            panel: { id: 'panel-saved-terminal', kind: 'terminal' }
+          }
+        ],
+        sizes: [50, 50]
+      },
+      panelTabs: {
+        'panel-saved-chat': {
+          tabIds: ['chat-live', 'chat-closed-a', 'chat-closed-b'],
+          activeTabId: 'chat-closed-b'
+        },
+        'panel-saved-terminal': {
+          tabIds: ['term-live', 'term-closed'],
+          activeTabId: 'term-closed'
+        }
+      },
+      focusedPanelId: 'panel-saved-chat'
+    }
+    const store = createStore({
+      settings: {
+        layout: {
+          v2: currentTree,
+          savedLayouts: [
+            {
+              slotNumber: 1,
+              createdAt: 1,
+              updatedAt: 1,
+              snapshot: createSavedLayoutSnapshot(currentTree)
+            },
+            {
+              slotNumber: 2,
+              createdAt: 2,
+              updatedAt: 2,
+              snapshot: createSavedLayoutSnapshot(savedTree)
+            }
+          ],
+          activeSavedLayoutId: getSavedLayoutSlotId(1)
+        }
+      },
+      terminalIds: ['term-live'],
+      chatIds: ['chat-live'],
+      activeTerminalId: 'term-live'
+    })
+    store.bootstrap()
+    store.setViewport(1440, 900)
+
+    const materializeCalls: Array<{ kind: string; tabIds: string[] }> = []
+    const hydrateCalls: Array<{ kind: string; tabIds: string[] }> = []
+    const internal = store as any
+    internal.appStore.materializeTransferredTabs = (kind: string, tabIds: string[]) => {
+      materializeCalls.push({ kind, tabIds: [...tabIds] })
+      if (kind === 'chat') {
+        tabIds.forEach((id) => {
+          if (internal.appStore.chat.sessions.some((session: { id: string }) => session.id === id)) return
+          internal.appStore.chat.sessions.push({ id })
+        })
+      }
+      return tabIds
+    }
+    internal.appStore.hydrateTransferredTabs = (kind: string, tabIds: string[]) => {
+      hydrateCalls.push({ kind, tabIds: [...tabIds] })
+      return tabIds
+    }
+
+    const applied = await store.applySavedLayoutSlot(getSavedLayoutSlotId(2))
+    assertEqual(applied, true, 'saved layout with stale bindings should still apply')
+    assertEqual(materializeCalls.length, 0, 'saved layout apply must not materialize closed chat inventory')
+    assertEqual(hydrateCalls.length, 0, 'saved layout apply must not hydrate transfer-only chat inventory')
+    assertEqual(
+      JSON.stringify(internal.appStore.chat.sessions.map((session: { id: string }) => session.id)),
+      JSON.stringify(['chat-live']),
+      'closed chat ids must remain absent from global inventory'
+    )
+    assertEqual(
+      JSON.stringify(store.getPanelTabIds('panel-saved-chat')),
+      JSON.stringify(['chat-live']),
+      'saved chat placement should retain only live chat ids'
+    )
+    assertEqual(
+      JSON.stringify(store.getPanelTabIds('panel-saved-terminal')),
+      JSON.stringify(['term-live']),
+      'saved terminal placement should retain only live terminal ids'
+    )
+
+    const healedSlot = store.savedLayoutSlots.find((slot) => slot.id === getSavedLayoutSlotId(2))
+    assertCondition(Boolean(healedSlot), 'applied saved slot should remain available')
+    assertEqual(
+      JSON.stringify(healedSlot!.snapshot.v2.panelTabs?.['panel-saved-chat']?.tabIds),
+      JSON.stringify(['chat-live']),
+      'dynamic saved snapshot should persist the filtered chat binding'
+    )
+    assertEqual(
+      JSON.stringify(healedSlot!.snapshot.v2.panelTabs?.['panel-saved-terminal']?.tabIds),
+      JSON.stringify(['term-live']),
+      'dynamic saved snapshot should persist the filtered terminal binding'
+    )
+
+    const switchedBack = await store.applySavedLayoutSlot(getSavedLayoutSlotId(1))
+    assertEqual(switchedBack, true, 'switching back to the source saved layout should succeed')
+    assertEqual(
+      JSON.stringify(store.getPanelTabIds('panel-current-chat')),
+      JSON.stringify(['chat-live']),
+      'switching back must not restore closed chat ids into the source layout'
+    )
+    assertEqual(
+      JSON.stringify(store.getPanelTabIds('panel-current-terminal')),
+      JSON.stringify(['term-live']),
+      'switching back must not restore closed terminal ids into the source layout'
+    )
+  })
+
   await runCase('active tab changes update the active saved layout slot', async () => {
     const spy: SettingsSetSpy = { calls: [] }
     installWindowMock(spy)

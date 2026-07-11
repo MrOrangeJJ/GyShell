@@ -3,6 +3,7 @@ import {
   resolveCreatedTerminalTabActivation,
   resolveListPanelChatStatusLabel,
   resolveListPanelHost,
+  resolveListPanelRowContextAction,
   resolveListPanelRowActivation,
   type ListPanelTabSource,
 } from "./listPanelModel";
@@ -198,6 +199,44 @@ runCase(
       }),
       { type: "none" },
       "created terminal tabs should not create a terminal panel from the list panel",
+    );
+  },
+);
+
+runCase(
+  "row context actions match terminal reconnect and chat rename rules",
+  () => {
+    assertEqual(
+      resolveListPanelRowContextAction({
+        kind: "terminal",
+        terminalType: "ssh",
+        terminalRuntimeState: "exited",
+      }),
+      "reconnect",
+      "an exited SSH terminal should expose reconnect",
+    );
+    assertEqual(
+      resolveListPanelRowContextAction({
+        kind: "terminal",
+        terminalType: "ssh",
+        terminalRuntimeState: "ready",
+      }),
+      null,
+      "a ready SSH terminal should not expose reconnect",
+    );
+    assertEqual(
+      resolveListPanelRowContextAction({
+        kind: "terminal",
+        terminalType: "local",
+        terminalRuntimeState: "exited",
+      }),
+      null,
+      "an exited local terminal should not expose reconnect",
+    );
+    assertEqual(
+      resolveListPanelRowContextAction({ kind: "chat" }),
+      "rename",
+      "chat rows should always expose rename",
     );
   },
 );

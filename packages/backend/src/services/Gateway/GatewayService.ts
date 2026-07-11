@@ -12,6 +12,7 @@ import type {
   GatewaySessionSummary,
 } from "./types";
 import type { UIHistoryService } from "../UIHistoryService";
+import type { UIUpdateAction } from "../../types/ui-chat";
 import type {
   IAgentRuntime,
   ICommandPolicyRuntime,
@@ -64,6 +65,10 @@ export class GatewayService extends EventEmitter implements IGatewayRuntime {
     Map<string, RunBackgroundFileTransfer>
   > = new Map();
   private runStateListeners: Set<GatewayRunStateListener> = new Set();
+  private registeredRendererSessionOwners: Map<string, Set<string>> =
+    new Map();
+  private deletedSessionIds: Set<string> = new Set();
+  private uiRevision = 0;
   private lastRunStateKey = "";
 
   constructor(
@@ -165,17 +170,70 @@ export class GatewayService extends EventEmitter implements IGatewayRuntime {
       );
 
       // 1. Send processed UI Actions (for core UI like message list)
-      actions.forEach((action) => this.transportHub.sendUIUpdate(action));
+      actions.forEach((action) => this.sendUIUpdate(action));
       // 2. Send raw Agent Event (for auxiliary components like Banners, status lights, etc.)
       this.transportHub.emitEvent(event);
     });
   }
 
+  private sendUIUpdate(action: UIUpdateAction): void {
+    this.uiRevision += 1;
+    this.transportHub.sendUIUpdate({
+      ...action,
+      uiRevision: this.uiRevision,
+    } satisfies UIUpdateAction);
+  }
+
+  getUiRevision(): number {
+    return this.uiRevision;
+  }
+
   async createSession(): Promise<string> {
     const sessionId = uuidv4();
+    this.deletedSessionIds.delete(sessionId);
     const context = this.createEmptySessionContext(sessionId);
     this.sessions.set(sessionId, context);
     return sessionId;
+  }
+
+  registerSession(sessionId: string, ownerId = "renderer"): void {
+    const normalizedSessionId = String(sessionId || "").trim();
+    const normalizedOwnerId = String(ownerId || "").trim() || "renderer";
+    if (!normalizedSessionId) {
+      throw new Error("Session id is required.");
+    }
+    if (this.deletedSessionIds.has(normalizedSessionId)) {
+      throw new Error(`Session has been deleted: ${normalizedSessionId}`);
+    }
+    const owners =
+      this.registeredRendererSessionOwners.get(normalizedSessionId) ||
+      new Set<string>();
+    owners.add(normalizedOwnerId);
+    this.registeredRendererSessionOwners.set(normalizedSessionId, owners);
+  }
+
+  unregisterSession(sessionId: string, ownerId = "renderer"): void {
+    const normalizedSessionId = String(sessionId || "").trim();
+    if (!normalizedSessionId) return;
+    const owners = this.registeredRendererSessionOwners.get(
+      normalizedSessionId,
+    );
+    if (!owners) return;
+    owners.delete(String(ownerId || "").trim() || "renderer");
+    if (owners.size === 0) {
+      this.registeredRendererSessionOwners.delete(normalizedSessionId);
+    }
+  }
+
+  unregisterSessionOwner(ownerId: string): void {
+    const normalizedOwnerId = String(ownerId || "").trim();
+    if (!normalizedOwnerId) return;
+    this.registeredRendererSessionOwners.forEach((owners, sessionId) => {
+      owners.delete(normalizedOwnerId);
+      if (owners.size === 0) {
+        this.registeredRendererSessionOwners.delete(sessionId);
+      }
+    });
   }
 
   getSession(sessionId: string): SessionContext | undefined {
@@ -187,6 +245,9 @@ export class GatewayService extends EventEmitter implements IGatewayRuntime {
     input: StartTaskInput,
     options?: StartTaskOptions,
   ): Promise<void> {
+    if (this.deletedSessionIds.has(sessionId)) {
+      throw new Error(`Session has been deleted: ${sessionId}`);
+    }
     let context = this.sessions.get(sessionId);
     if (!context) {
       context = this.createEmptySessionContext(sessionId);
@@ -284,7 +345,7 @@ export class GatewayService extends EventEmitter implements IGatewayRuntime {
         });
         // 2. Send SESSION_READY action (for admission control and queue scheduling)
         // This MUST be sent after clearRunState to ensure backend is truly idle
-        this.transportHub.sendUIUpdate({ type: "SESSION_READY", sessionId });
+        this.sendUIUpdate({ type: "SESSION_READY", sessionId });
         this.uiHistoryService.flush(sessionId);
       }
     }
@@ -330,7 +391,7 @@ export class GatewayService extends EventEmitter implements IGatewayRuntime {
           sessionId,
           payload: { type: "done" },
         });
-        this.transportHub.sendUIUpdate({ type: "SESSION_READY", sessionId });
+        this.sendUIUpdate({ type: "SESSION_READY", sessionId });
         this.uiHistoryService.flush(sessionId);
       }
       if (options?.waitForCompletion && runCompletion) {
@@ -353,6 +414,7 @@ export class GatewayService extends EventEmitter implements IGatewayRuntime {
   }
 
   listSessionSummaries(): GatewaySessionSummary[] {
+    const uiRevision = this.uiRevision;
     const uiSummaryById = new Map(
       this.uiHistoryService
         .getAllSessionSummaries()
@@ -399,6 +461,7 @@ export class GatewayService extends EventEmitter implements IGatewayRuntime {
           ),
           isBusy,
           lockedProfileId,
+          uiRevision,
         };
       })
       .sort((left, right) => right.updatedAt - left.updatedAt);
@@ -431,6 +494,7 @@ export class GatewayService extends EventEmitter implements IGatewayRuntime {
       })),
       isBusy,
       lockedProfileId,
+      uiRevision: this.uiRevision,
     };
   }
 
@@ -441,9 +505,19 @@ export class GatewayService extends EventEmitter implements IGatewayRuntime {
   }
 
   async deleteChatSession(sessionId: string): Promise<void> {
-    await this.stopTask(sessionId);
-    this.agentService.deleteChatSession(sessionId);
+    const wasAlreadyDeleted = this.deletedSessionIds.has(sessionId);
+    this.deletedSessionIds.add(sessionId);
+    try {
+      await this.stopTask(sessionId);
+      this.agentService.deleteChatSession(sessionId);
+    } catch (error) {
+      if (!wasAlreadyDeleted) {
+        this.deletedSessionIds.delete(sessionId);
+      }
+      throw error;
+    }
     this.sessions.delete(sessionId);
+    this.registeredRendererSessionOwners.delete(sessionId);
     this.cleanupSessionAgentRuns(sessionId);
   }
 
@@ -454,16 +528,43 @@ export class GatewayService extends EventEmitter implements IGatewayRuntime {
     if (ids.length === 0) {
       return;
     }
-    await Promise.all(ids.map((id) => this.stopTask(id)));
-    this.agentService.deleteChatSessions(ids);
+    const newlyTombstonedIds = ids.filter(
+      (id) => !this.deletedSessionIds.has(id),
+    );
+    ids.forEach((id) => this.deletedSessionIds.add(id));
+    try {
+      await Promise.all(ids.map((id) => this.stopTask(id)));
+      this.agentService.deleteChatSessions(ids);
+    } catch (error) {
+      newlyTombstonedIds.forEach((id) => this.deletedSessionIds.delete(id));
+      throw error;
+    }
     ids.forEach((id) => {
       this.sessions.delete(id);
+      this.registeredRendererSessionOwners.delete(id);
       this.cleanupSessionAgentRuns(id);
     });
   }
 
   renameSession(sessionId: string, newTitle: string): void {
-    this.agentService.renameChatSession(sessionId, newTitle);
+    const normalizedSessionId = String(sessionId || "").trim();
+    const isRegistered =
+      (this.registeredRendererSessionOwners.get(normalizedSessionId)?.size ||
+        0) > 0;
+    if (
+      !normalizedSessionId ||
+      this.deletedSessionIds.has(normalizedSessionId) ||
+      (!isRegistered && !this.getSessionSnapshot(normalizedSessionId))
+    ) {
+      throw new Error(`Session not found: ${normalizedSessionId || sessionId}`);
+    }
+
+    this.agentService.renameChatSession(normalizedSessionId, newTitle);
+    this.sendUIUpdate({
+      type: "SESSION_RENAMED",
+      sessionId: normalizedSessionId,
+      title: newTitle,
+    } satisfies UIUpdateAction);
   }
 
   async rollbackSessionToMessage(
@@ -944,7 +1045,7 @@ export class GatewayService extends EventEmitter implements IGatewayRuntime {
     context.lockedProfileId = settings.models.activeProfileId || "";
     context.lockedExperimentalFlags =
       getRunExperimentalFlagsFromSettings(settings);
-    this.transportHub.sendUIUpdate({
+    this.sendUIUpdate({
       type: "SESSION_PROFILE_LOCKED",
       sessionId: context.sessionId,
       lockedProfileId: context.lockedProfileId || null,

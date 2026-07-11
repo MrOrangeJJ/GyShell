@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { ChatHistoryService } from "./ChatHistoryService";
 import { UIHistoryService } from "./UIHistoryService";
 import { HistorySqliteStore } from "./history/HistorySqliteStore";
 
@@ -65,9 +66,79 @@ const run = (): void => {
   );
   const sqlitePath = path.join(tempDir, "history.sqlite3");
   const store = new HistorySqliteStore({ filePath: sqlitePath });
+  const chatHistory = new ChatHistoryService({ store });
   const uiHistory = new UIHistoryService({ store });
 
   try {
+    runCase(
+      "renaming an empty session persists and survives the first user message",
+      () => {
+        chatHistory.renameSession("empty-renamed", "Investigate...");
+        uiHistory.renameSession("empty-renamed", "Investigate...");
+
+        assertEqual(
+          chatHistory.loadSession("empty-renamed")?.title,
+          "Investigate...",
+          "agent history should upsert the renamed empty session",
+        );
+        assertEqual(
+          uiHistory.getSession("empty-renamed")?.title,
+          "Investigate...",
+          "UI history should upsert the renamed empty session",
+        );
+
+        uiHistory.recordEvent("empty-renamed", {
+          type: "user_input",
+          content: "Investigate production issue",
+          messageId: "empty-renamed-user-1",
+        } as any);
+        uiHistory.flush("empty-renamed");
+
+        const reloadedUiHistory = new UIHistoryService({ store });
+        assertEqual(
+          reloadedUiHistory.getSession("empty-renamed")?.title,
+          "Investigate...",
+          "manual ellipsis title should survive the first prompt and a reload",
+        );
+      },
+    );
+
+    runCase("default empty sessions still receive an automatic title", () => {
+      uiHistory.recordEvent("empty-default", {
+        type: "user_input",
+        content: "Automatic first prompt title",
+        messageId: "empty-default-user-1",
+      } as any);
+
+      assertEqual(
+        uiHistory.getSession("empty-default")?.title,
+        "Automatic first prompt title",
+        "untouched New Chat sessions should retain automatic title behavior",
+      );
+    });
+
+    runCase("a stale active-run snapshot cannot overwrite a newer rename", () => {
+      chatHistory.saveSession({
+        id: "active-run-rename",
+        title: "Old title",
+        messages: new Map(),
+        lastCheckpointOffset: 0,
+      });
+      const staleRunSnapshot = chatHistory.loadSession("active-run-rename");
+      if (!staleRunSnapshot) {
+        throw new Error("expected active-run snapshot to load");
+      }
+
+      chatHistory.renameSession("active-run-rename", "Renamed while running");
+      chatHistory.saveSession(staleRunSnapshot);
+
+      assertEqual(
+        chatHistory.loadSession("active-run-rename")?.title,
+        "Renamed while running",
+        "run completion should merge the latest stored title",
+      );
+    });
+
     runCase(
       "compaction boundary inserts before the protected tail anchor",
       () => {

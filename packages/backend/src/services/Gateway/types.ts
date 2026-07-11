@@ -70,6 +70,7 @@ export interface GatewaySessionSummary {
   lastMessagePreview?: string;
   isBusy: boolean;
   lockedProfileId: string | null;
+  uiRevision: number;
 }
 
 export interface GatewaySessionSnapshot {
@@ -79,6 +80,7 @@ export interface GatewaySessionSnapshot {
   messages: ChatMessage[];
   isBusy: boolean;
   lockedProfileId: string | null;
+  uiRevision: number;
 }
 
 /**
@@ -114,6 +116,10 @@ export interface IGateway {
 export interface IGatewayRuntime extends IGateway {
   registerTransport(transport: IClientTransport): void;
   unregisterTransport(transportId: string): void;
+  registerSession(sessionId: string, ownerId?: string): void;
+  unregisterSession(sessionId: string, ownerId?: string): void;
+  unregisterSessionOwner(ownerId: string): void;
+  getUiRevision(): number;
   listSessionSummaries(): GatewaySessionSummary[];
   getSessionSnapshot(sessionId: string): GatewaySessionSnapshot | null;
   waitForRunCompletion(sessionId: string): Promise<void>;

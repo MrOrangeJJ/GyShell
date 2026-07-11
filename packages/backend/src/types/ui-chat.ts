@@ -59,7 +59,7 @@ export interface UIChatSession {
   updatedAt: number
 }
 
-export type UIUpdateAction =
+export type UIUpdateAction = (
   | { type: 'ADD_MESSAGE'; sessionId: string; message: ChatMessage }
   | {
       type: 'INSERT_MESSAGE'
@@ -74,6 +74,8 @@ export type UIUpdateAction =
   | { type: 'APPEND_OUTPUT'; sessionId: string; messageId: string; outputDelta: string }
   | { type: 'UPDATE_MESSAGE'; sessionId: string; messageId: string; patch: Partial<ChatMessage> }
   | { type: 'DONE'; sessionId: string }
+  | { type: 'SESSION_RENAMED'; sessionId: string; title: string }
   | { type: 'SESSION_PROFILE_LOCKED'; sessionId: string; lockedProfileId: string | null }
   | { type: 'SESSION_READY'; sessionId: string }
   | { type: 'ROLLBACK'; sessionId: string; messageId: string }
+) & { uiRevision?: number }

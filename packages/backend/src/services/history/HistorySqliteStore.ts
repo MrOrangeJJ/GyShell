@@ -325,11 +325,14 @@ export class HistorySqliteStore {
   ): void {
     this.db
       .prepare(
-        `UPDATE chat_sessions
-         SET title = ?, updated_at = ?
-         WHERE id = ?`,
+        `INSERT INTO chat_sessions (
+           id, title, last_checkpoint_offset, last_profile_max_tokens, created_at, updated_at
+         ) VALUES (?, ?, 0, NULL, ?, ?)
+         ON CONFLICT(id) DO UPDATE SET
+           title = excluded.title,
+           updated_at = excluded.updated_at`,
       )
-      .run(newTitle, updatedAt, sessionId);
+      .run(sessionId, newTitle, updatedAt, updatedAt);
   }
 
   loadUiSession(sessionId: string): UIChatSession | null {

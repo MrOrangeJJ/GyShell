@@ -1,4 +1,7 @@
+import { canReconnectTerminalRuntime } from "../../lib/terminalConnectionModel";
+
 export type ListPanelTabKind = "terminal" | "chat";
+export type ListPanelRowContextAction = "reconnect" | "rename";
 
 export interface ListPanelHostInfo {
   panelId: string;
@@ -47,6 +50,26 @@ export type ListPanelCreatedTerminalActivation =
 export const resolveListPanelChatStatusLabel = (
   isSessionBusy: boolean,
 ): "running" | "inactive" => (isSessionBusy ? "running" : "inactive");
+
+export const resolveListPanelRowContextAction = (input: {
+  kind: ListPanelTabKind;
+  terminalType?: string;
+  terminalRuntimeState?: unknown;
+}): ListPanelRowContextAction | null => {
+  if (input.kind === "chat") {
+    return "rename";
+  }
+  if (
+    input.terminalType &&
+    canReconnectTerminalRuntime(
+      { type: input.terminalType },
+      input.terminalRuntimeState,
+    )
+  ) {
+    return "reconnect";
+  }
+  return null;
+};
 
 export const resolveListPanelHost = (
   panelIds: readonly string[],
