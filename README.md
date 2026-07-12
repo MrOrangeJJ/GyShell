@@ -12,6 +12,7 @@ Latest release notes: [`changelogs/v1.6.0.md`](./changelogs/v1.6.0.md)
 If you have any suggestions or questions, please feel free to submit them in [GitHub Discussions](https://github.com/MrOrangeJJ/GyShell/discussions).
 
 Usage guides:
+[`docs/cli-usage.md`](./docs/cli-usage.md) ·
 [`docs/mobile-web-usage.md`](./docs/mobile-web-usage.md) ·
 [`docs/tui-usage.md`](./docs/tui-usage.md) ·
 [`docs/gybackend-usage.md`](./docs/gybackend-usage.md)
@@ -53,7 +54,7 @@ GyShell is built for **persistent execution in your real terminal runtime**:
 - **Live resource visibility**: inspect CPU, memory, disks, network, processes, sockets, and GPU from local or SSH sessions.
 - **OpenClawd-style remote conversation control**: keep the runtime core on your own computer and steer it from anywhere through chat.
 - **Built-in mobile-web delivery**: desktop can publish the mobile-web companion directly over your LAN with copyable access links.
-- **Cross-surface runtime model**: desktop, TUI, and mobile-web share one gateway semantics.
+- **Cross-surface runtime model**: desktop, command CLI, and mobile-web share one gateway semantics.
 - **Profile lock safety**: busy sessions pin active model profile for consistency.
 - **Long-horizon context quality**: memory.md + compaction summaries + visible boundaries + deterministic fallback recovery keep long sessions understandable.
 - **Tooling-native workflow**: skills, MCP servers, and built-in tools are runtime primitives.
@@ -63,7 +64,7 @@ GyShell is built for **persistent execution in your real terminal runtime**:
 - **For shipping work**: not just planning, but iterative execution and correction.
 - **For long-running tasks**: preserves session continuity and state across steps.
 - **For real infrastructure**: shell, SSH, forwarding, file management, and multi-tab interactive terminal control.
-- **For multi-device flow**: desktop + TUI + mobile-web with shared gateway semantics.
+- **For multi-device and agent flow**: desktop + command CLI + mobile-web with shared gateway semantics.
 - **For multimodal workflows**: text and image inputs can be combined in one execution turn.
 
 ## v1.6.0 Key Highlights
@@ -172,11 +173,13 @@ GyShell is built for **persistent execution in your real terminal runtime**:
 2. **Standalone backend runtime** (`apps/gybackend`)
 3. **Deprecated TUI runtime** (`apps/tui` wrapper + `packages/tui` core)
 4. **Mobile-web runtime** (`apps/mobile-web` wrapper + `packages/mobile-web` core)
+5. **Command-only agent CLI** (`apps/cli` wrapper + `packages/cli` core)
 
 ### Which Surface Should You Use?
 
 - **Desktop app**: primary full-featured experience for daily development.
-- **TUI (`gyll`)**: deprecated and unsupported. Desktop packages no longer bundle or install `gyll`.
+- **Command CLI (`gyll`)**: one-shot JSON commands for agents; no TUI and no interactive prompts.
+- **Historical TUI**: deprecated and unsupported. Desktop packages no longer bundle it.
 - **Mobile-web**: OpenClawd-style remote conversational control from phone/browser.
 
 ---
@@ -209,11 +212,18 @@ npm run dev:mobile-web
 
 ---
 
-## Deprecated CLI (`gyll`)
+## Command CLI (`gyll`)
 
-`gyll` is deprecated and unsupported. Desktop packages no longer bundle the CLI/TUI runtime, no longer install launchers, and no longer update shell profiles. New desktop installs do not include `gyll`.
+The new `gyll` is a lightweight, command-only gateway client designed for other agents. It covers common chat/session, approval, terminal, profile, skill, tool, memory, and policy operations with stable JSON output.
 
-When an existing user updates from a version that installed desktop-managed `gyll` launchers, the updated app removes those legacy launchers on startup while leaving any shell profile PATH block untouched.
+```bash
+npm run build:cli
+npm --silent run cli -- status
+npm --silent run cli -- session list
+npm --silent run cli -- chat send --message "Run tests and summarize" --wait
+```
+
+The old interactive TUI remains deprecated. Desktop packages do not bundle or install either CLI, and they do not edit shell profiles. See [`docs/cli-usage.md`](./docs/cli-usage.md).
 
 ---
 
@@ -231,7 +241,7 @@ Core runtime chain (simplified):
 2. `GatewayService` (session runtime + transport-agnostic orchestration)
 3. `WebSocketGatewayControlService` (policy-based ws gateway control)
 4. `WebSocketGatewayAdapter` / `ElectronWindowTransport` (transport implementations)
-5. Client controllers in TUI and mobile-web
+5. Client controllers in command CLI and mobile-web (plus the deprecated historical TUI)
 
 See:
 
@@ -256,7 +266,7 @@ See:
 
 - `npm run build`
 - `npm run build:backend`
-- `npm run build:tui`
+- `npm run build:cli`
 - `npm run build:mobile-web`
 - `npm run dist`
 - `npm run dist:mac`

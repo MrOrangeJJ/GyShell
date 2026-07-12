@@ -12,6 +12,10 @@ This page maps root scripts, packaging targets, and release helpers to their run
   - Electron dev mode (`apps/electron/electron.vite.config.ts`).
 - `npm run dev:mobile-web`
   - Mobile-web dev server (`apps/mobile-web` wrapper, implementation in `packages/mobile-web`).
+- `npm --silent run cli -- <command>` / `npm --silent run dev:cli -- <command>`
+  - Run the command-only agent CLI directly from TypeScript source.
+- `npm run start:cli -- <command>`
+  - Run the built `apps/cli/dist/gyll.cjs` executable.
 - `npm run start:backend`
   - Start standalone gybackend runtime (`@gyshell/gybackend`).
 - `npm run start:mobile-web`
@@ -25,10 +29,12 @@ This page maps root scripts, packaging targets, and release helpers to their run
   - Alias of `npm run build`.
 - `npm run build:backend`
   - Build `@gyshell/gybackend` wrapper.
+- `npm run build:cli`
+  - Build the lightweight single-file Node CLI.
 - `npm run build:mobile-web`
   - Build `@gyshell/mobile-web` wrapper.
 - `npm run build:all`
-  - Build Electron + backend wrappers.
+  - Build Electron + backend + command CLI wrappers.
 - `npm run prepare:mobile-web`
   - Copy built mobile-web assets into `apps/electron/mobile-web-runtime` so the desktop app can serve them as a bundled companion frontend.
 
@@ -37,9 +43,11 @@ This page maps root scripts, packaging targets, and release helpers to their run
 - `npm run typecheck`
   - Combined node/web typecheck (`tsconfig.node.json` + `tsconfig.web.json`).
 - `npm run typecheck:all`
-  - Root typecheck + backend + mobile-web.
+  - Root typecheck + backend + mobile-web + CLI.
 - `npm run typecheck:backend`
+- `npm run typecheck:cli`
 - `npm run typecheck:mobile-web`
+- `npm run test:cli`
 - `npm run test:backend-regression`
 - `npm run test:backend-extreme`
 - `npm run test:layout-ui-extreme`
@@ -82,9 +90,10 @@ Packaging notes:
 - Desktop packages also include:
   - bundled mobile-web frontend under `apps/electron/mobile-web-runtime`
 
-Deprecated CLI note:
+CLI packaging note:
 
-- `gyll` / CLI TUI is deprecated and unsupported.
+- The historical `gyll` TUI is deprecated and unsupported.
+- The new `apps/cli` command client is a separate Node/npm artifact and is not bundled into Electron installers.
 - Desktop packages must not include `apps/electron/cli-runtime`.
 - Desktop startup only removes legacy desktop-managed `gyll` launchers from older installs; it does not install launchers or edit shell profiles.
 
@@ -140,9 +149,11 @@ Environment host override still maps through `GYBACKEND_WS_HOST`.
 ## Workspace Scripts (Development/Internal)
 
 - `npm --workspace @gyshell/gybackend run build|start|typecheck`
+- `npm --workspace @gyshell/cli run dev|build|start|typecheck|test`
 - `npm --workspace @gyshell/mobile-web run dev|build|preview|typecheck`
 - `npm --workspace @gyshell/electron run dev|build|preview`
 - `npm --workspace @gyshell/backend run build|typecheck`
+- `npm --workspace @gyshell/cli-core run build|typecheck`
 - `npm --workspace @gyshell/tui-core run build|typecheck`
 - `npm --workspace @gyshell/mobile-web-core run build|typecheck`
 - `npm --workspace @gyshell/ui run build|typecheck`

@@ -12,6 +12,7 @@
 如果有任何建议或者问题，欢迎在 [GitHub Discussions](https://github.com/MrOrangeJJ/GyShell/discussions) 中提交。
 
 使用教程:
+[`docs/cli-usage.md`](./docs/cli-usage.md) ·
 [`docs/mobile-web-usage.md`](./docs/mobile-web-usage.md) ·
 [`docs/tui-usage.md`](./docs/tui-usage.md) ·
 [`docs/gybackend-usage.md`](./docs/gybackend-usage.md)
@@ -52,7 +53,7 @@ GyShell 的定位是“运行在真实终端中的持续执行系统”：
 - **实时资源可视化**：本地与 SSH 会话都可直接查看 CPU、内存、磁盘、网络、进程、套接字、GPU 等信息。
 - **OpenClawd 风格远程对话控制**：核心运行在你自己的电脑上，你可以在任何地方通过对话持续控制。
 - **桌面端内置 Mobile Web 发布能力**：可直接在桌面设置中对局域网发布移动端页面并复制访问链接。
-- **多端同语义**：桌面端、TUI、Mobile Web 共用统一网关模型。
+- **多端同语义**：桌面端、纯命令 CLI、Mobile Web 共用统一网关模型。
 - **Profile Lock 安全性**：会话繁忙期间锁定模型配置，保证行为一致。
 - **长上下文质量保障**：`memory.md` + 智能压缩摘要 + 可见边界 + 确定性兜底恢复让长会话依然清晰可控。
 - **工具能力原生化**：Skills、MCP、内置工具是运行时一等能力。
@@ -62,7 +63,7 @@ GyShell 的定位是“运行在真实终端中的持续执行系统”：
 - **面向真实交付**：不仅“给方案”，还能持续执行和纠偏。
 - **面向长流程任务**：会话状态连续，不是一次性问答。
 - **面向真实基础设施**：Shell、SSH、端口转发、文件管理、多标签交互式终端控制。
-- **面向多设备协作**：桌面端 + TUI + Mobile Web 共用网关语义。
+- **面向多设备与 agent 协作**：桌面端 + 纯命令 CLI + Mobile Web 共用网关语义。
 - **面向多模态执行**：单轮里可组合文字与图片输入，直接推进真实任务。
 
 ## v1.6.0 关键亮点
@@ -167,11 +168,13 @@ GyShell 的定位是“运行在真实终端中的持续执行系统”：
 2. **独立后端运行时**（`apps/gybackend`）
 3. **已废弃的 TUI 运行时**（`apps/tui` + `packages/tui`）
 4. **Mobile Web 运行时**（`apps/mobile-web` + `packages/mobile-web`）
+5. **面向 agent 的纯命令 CLI**（`apps/cli` + `packages/cli`）
 
 ### 怎么选入口？
 
 - **桌面端**：主力全功能体验，适合日常开发。
-- **TUI（`gyll`）**：已废弃且不再提供支持。桌面安装包不再内置或安装 `gyll`。
+- **纯命令 CLI（`gyll`）**：面向 agent 的单次 JSON 命令；没有 TUI，也不会交互式询问。
+- **历史 TUI**：已废弃且不再提供支持。桌面安装包不再内置它。
 - **Mobile Web**：OpenClawd 风格远程对话控制，适合随时随地接管活跃会话。
 
 ---
@@ -204,11 +207,18 @@ npm run dev:mobile-web
 
 ---
 
-## 已废弃 CLI（`gyll`）
+## 纯命令 CLI（`gyll`）
 
-`gyll` 已废弃且不再提供支持。桌面安装包不再内置 CLI/TUI 运行时，不再安装 launcher，也不再修改 shell profiles。新安装桌面版不会包含 `gyll`。
+新的 `gyll` 是面向其他 agent 的轻量纯命令 gateway 客户端。它通过稳定 JSON 输出覆盖常见的对话/会话、审批、终端、profile、skill、tool、memory 与 policy 操作。
 
-从旧版本升级的用户，启动新版 app 时会清理旧版桌面端自动生成的 `gyll` launcher，但保留 shell profile 中已有的 PATH block。
+```bash
+npm run build:cli
+npm --silent run cli -- status
+npm --silent run cli -- session list
+npm --silent run cli -- chat send --message "运行测试并总结" --wait
+```
+
+旧交互式 TUI 仍然处于废弃状态。桌面安装包不会内置或自动安装任何 CLI，也不会修改 shell profile。详见 [`docs/cli-usage.md`](./docs/cli-usage.md)。
 
 ---
 
@@ -226,7 +236,7 @@ GyShell 采用严格分层：
 2. `GatewayService`（会话运行时与跨传输编排）
 3. `WebSocketGatewayControlService`（访问策略控制）
 4. `WebSocketGatewayAdapter` / `ElectronWindowTransport`（传输层实现）
-5. TUI 与 Mobile Web 客户端控制器
+5. 纯命令 CLI 与 Mobile Web 客户端控制器（以及已废弃的历史 TUI）
 
 详见：
 
@@ -251,7 +261,7 @@ GyShell 采用严格分层：
 
 - `npm run build`
 - `npm run build:backend`
-- `npm run build:tui`
+- `npm run build:cli`
 - `npm run build:mobile-web`
 - `npm run dist`
 - `npm run dist:mac`

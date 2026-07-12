@@ -1,0 +1,17 @@
+{
+  "name": "@gyshell/cli-core",
+  "version": "0.1.0",
+  "description": "Command-only GyShell client core",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "dependencies": {
+    "ws": "^8.19.0"
+  },
+  "scripts": {
+    "build": "echo \"cli-core: built by app wrapper\"",
+    "typecheck": "echo \"cli-core: checked by app wrapper\""
+  }
+}

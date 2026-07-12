@@ -13,6 +13,7 @@ Frontend implementation must not be placed under `packages/backend`.
 2. Standalone backend process (`apps/gybackend`)
 3. Deprecated TUI runtime (`apps/tui` wrapper + `packages/tui` core)
 4. Mobile-web runtime (`apps/mobile-web` wrapper + `packages/mobile-web` core)
+5. Command-only agent CLI (`apps/cli` wrapper + `packages/cli` core)
 
 ## Workspace Layout
 
@@ -20,11 +21,13 @@ Frontend implementation must not be placed under `packages/backend`.
 GyShell/
 ├── apps/
 │   ├── electron/           # thin wrapper: entry/preload/build/package config
+│   ├── cli/                # thin wrapper: gyll command executable/build config
 │   ├── gybackend/          # thin wrapper: backend process entry
 │   ├── mobile-web/         # thin wrapper: vite host + mount entry
 │   └── tui/                # deprecated historical CLI wrapper
 ├── packages/
 │   ├── backend/            # core backend runtime (agent/gateway/terminal/services)
+│   ├── cli/                # command parsing, JSON output, websocket RPC client
 │   ├── electron/           # electron-only implementation (main/gateway/settings/theme)
 │   ├── mobile-web/         # mobile-web UI implementation
 │   ├── tui/                # deprecated historical tui UI implementation
@@ -80,6 +83,13 @@ GyShell/
   - gateway client integration
 - Mirrors profile-lock/readiness events from gateway updates.
 
+### `packages/cli`
+
+- Command-only, non-interactive client for agents.
+- Owns deterministic argument validation, JSON envelopes, exit codes, and Node websocket transport.
+- Maps common mobile-web workflows to one-shot commands and keeps a raw RPC escape hatch.
+- Must not depend on Electron, React, Solid, OpenTUI, or backend implementation modules.
+
 ### `packages/mobile-web`
 
 - Mobile-first web client implementation.
@@ -109,7 +119,7 @@ The desktop runtime chain is intentionally layered:
 5. Create `WebSocketGatewayControlService` and apply websocket policy
 6. Create `MobileWebServerService` for bundled mobile-web hosting
 7. Create `ResourceMonitorService` + `MonitorWindowRegistry`
-8. Desktop renderer windows and mobile-web connect through the shared gateway semantics
+8. Desktop renderer windows, mobile-web, and the command CLI connect through the shared gateway semantics
 
 ## Gateway and Session Invariants
 
@@ -168,4 +178,4 @@ Linux desktop packaging is driven by `apps/electron/electron-builder.yml` and de
 - `apps/electron/scripts/postinstall-linux.sh`
 - icon resources under `apps/electron/materials/icons`
 
-Desktop Linux packages carry bundled mobile-web frontend assets as extra resources. `gyll` / CLI TUI is deprecated and must not be bundled in desktop packages.
+Desktop Linux packages carry bundled mobile-web frontend assets as extra resources. The historical CLI TUI is deprecated and must not be bundled in desktop packages. The new Node-based command CLI is built and installed separately.

@@ -1,0 +1,8 @@
+{
+  "extends": "../../tsconfig.json",
+  "compilerOptions": {
+    "types": ["node"],
+    "allowImportingTsExtensions": false
+  },
+  "include": ["src/**/*.ts", "../../packages/cli/src/**/*.ts"]
+}

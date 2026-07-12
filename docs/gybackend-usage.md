@@ -45,7 +45,7 @@ Notes:
 
 - mobile-web: use desktop-generated access links or configure websocket URL manually in mobile settings.
 - Remote clients outside localhost should also provide an access token.
-- `gyll` / CLI TUI is deprecated and unsupported. Desktop packages no longer bundle or install it.
+- command CLI: run `npm --silent run cli -- status` or a `gyll` command against the gateway. The historical interactive TUI is deprecated and is not bundled by desktop packages.
 
 ### 3. Repository Development Runtime
 
@@ -137,7 +137,7 @@ Gateway exposure policy changes should be done through desktop settings (or runt
 
 - mobile-web：可直接使用桌面端生成的访问链接，或在移动端 Settings 面板中手动填写 websocket 地址。
 - 非 localhost 远程客户端还应同时提供访问令牌。
-- `gyll` / CLI TUI 已废弃且不再提供支持。桌面安装包不再内置或安装它。
+- 纯命令 CLI：可执行 `npm --silent run cli -- status` 或用 `gyll` 命令连接网关。历史交互式 TUI 已废弃，桌面安装包不会内置它。
 
 ### 3. 仓库开发运行时
 

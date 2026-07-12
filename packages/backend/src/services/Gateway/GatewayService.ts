@@ -65,8 +65,7 @@ export class GatewayService extends EventEmitter implements IGatewayRuntime {
     Map<string, RunBackgroundFileTransfer>
   > = new Map();
   private runStateListeners: Set<GatewayRunStateListener> = new Set();
-  private registeredRendererSessionOwners: Map<string, Set<string>> =
-    new Map();
+  private registeredRendererSessionOwners: Map<string, Set<string>> = new Map();
   private deletedSessionIds: Set<string> = new Set();
   private uiRevision = 0;
   private lastRunStateKey = "";
@@ -215,9 +214,8 @@ export class GatewayService extends EventEmitter implements IGatewayRuntime {
   unregisterSession(sessionId: string, ownerId = "renderer"): void {
     const normalizedSessionId = String(sessionId || "").trim();
     if (!normalizedSessionId) return;
-    const owners = this.registeredRendererSessionOwners.get(
-      normalizedSessionId,
-    );
+    const owners =
+      this.registeredRendererSessionOwners.get(normalizedSessionId);
     if (!owners) return;
     owners.delete(String(ownerId || "").trim() || "renderer");
     if (owners.size === 0) {
@@ -501,6 +499,14 @@ export class GatewayService extends EventEmitter implements IGatewayRuntime {
   submitFeedback(messageId: string, payload: any): { ok: true } {
     this.feedbackCache.set(messageId, payload);
     this.feedbackBus.emit(`feedback:${messageId}`, payload);
+    const decision = payload?.decision;
+    if (decision === "allow" || decision === "deny") {
+      const update = this.uiHistoryService.recordFeedbackDecision(
+        messageId,
+        decision,
+      );
+      if (update) this.sendUIUpdate(update);
+    }
     return { ok: true };
   }
 

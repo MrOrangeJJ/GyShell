@@ -1,0 +1,35 @@
+{
+  "name": "@gyshell/cli",
+  "version": "0.1.0",
+  "description": "Command-only GyShell client for agents",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "gyll": "dist/gyll.cjs",
+    "gyshell-cli": "dist/gyll.cjs"
+  },
+  "files": [
+    "dist/**/*",
+    "README.md",
+    "package.json"
+  ],
+  "scripts": {
+    "build": "esbuild src/index.ts --bundle --platform=node --format=cjs --target=node18 --banner:js=\"#!/usr/bin/env node\" --outfile=dist/gyll.cjs",
+    "start": "node dist/gyll.cjs",
+    "dev": "tsx src/index.ts",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test": "tsx ../../packages/cli/src/cli.extreme.spec.ts"
+  },
+  "dependencies": {
+    "ws": "^8.19.0"
+  },
+  "devDependencies": {
+    "@types/ws": "^8.18.1",
+    "esbuild": "^0.25.9",
+    "tsx": "4.20.6",
+    "typescript": "^5.3.3"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

@@ -9,7 +9,7 @@ npm --workspace @gyshell/gybackend run build
 npm --workspace @gyshell/gybackend run start
 ```
 
-This workspace is mainly for repository development and runtime debugging. End users should use the desktop app. `gyll` / CLI TUI is deprecated and unsupported.
+This workspace is mainly for repository development and runtime debugging. End users should use the desktop app. The historical CLI TUI is deprecated; the command-only `gyll` client can control this runtime through its websocket gateway.
 
 ## Environment Variables
 

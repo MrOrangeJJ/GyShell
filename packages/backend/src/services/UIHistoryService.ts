@@ -755,6 +755,46 @@ export class UIHistoryService {
     );
   }
 
+  recordFeedbackDecision(
+    feedbackId: string,
+    decision: "allow" | "deny",
+  ): UIUpdateAction | null {
+    const normalizedId = String(feedbackId || "").trim();
+    if (!normalizedId) return null;
+
+    for (const summary of this.getAllSessionSummaries()) {
+      const session = this.getOrLoadSession(summary.id);
+      if (!session) continue;
+      const message = [...session.messages].reverse().find((entry) => {
+        if (entry.type !== "ask") return false;
+        return (
+          entry.backendMessageId === normalizedId ||
+          entry.metadata?.approvalId === normalizedId
+        );
+      });
+      if (!message) continue;
+      if (message.metadata?.decision === decision) return null;
+
+      message.metadata = {
+        ...(message.metadata || {}),
+        decision,
+      };
+      session.updatedAt = Date.now();
+      this.syncSessionSummary(session.id);
+      this.dirtySessions.add(session.id);
+      this.flush(session.id);
+      return {
+        type: "UPDATE_MESSAGE",
+        sessionId: session.id,
+        messageId: message.id,
+        patch: {
+          metadata: { ...message.metadata },
+        },
+      };
+    }
+    return null;
+  }
+
   deleteSession(sessionId: string): void {
     this.deleteSessions([sessionId]);
   }
