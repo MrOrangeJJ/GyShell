@@ -71,8 +71,6 @@ files:
       - "!node_modules/tree-sitter-bash/binding.gyp"
       - "!node_modules/web-tree-sitter/debug/**"
 extraResources:
-  # gyll/CLI TUI is deprecated and unsupported. Desktop builds must not bundle
-  # the CLI runtime or deploy any gyll launcher into user shells.
   - from: node_modules/better-sqlite3-electron/build/Release
     to: native-modules/better-sqlite3
     filter:
@@ -94,6 +92,13 @@ mac:
   hardenedRuntime: false
   gatekeeperAssess: false
   entitlements: null
+  binaries:
+    - Contents/Resources/cli/bin/gyll
+  extraResources:
+    - from: apps/electron/cli-runtime/darwin-${arch}
+      to: cli
+      filter:
+        - "**/*"
   extendInfo:
     LSMinimumSystemVersion: "12.0.0"
   target:
@@ -110,10 +115,16 @@ win:
     - target: portable
       arch:
         - x64
+  extraResources:
+    - from: apps/electron/cli-runtime/win32-${arch}
+      to: cli
+      filter:
+        - "**/*"
 nsis:
   oneClick: true
   allowToChangeInstallationDirectory: false
   createDesktopShortcut: true
+  include: apps/electron/materials/installer.nsh
   artifactName: "${productName}.Setup.${version}-${arch}.${ext}"
 portable:
   artifactName: "${productName}.Portable.${version}-${arch}.${ext}"
@@ -132,14 +143,18 @@ linux:
       Comment: AI-Native Terminal App
       StartupWMClass: gyshell
   artifactName: "${productName}-${version}-${arch}.${ext}"
+  extraResources:
+    - from: apps/electron/cli-runtime/linux-${arch}
+      to: cli
+      filter:
+        - "**/*"
 appImage:
   artifactName: "${productName}-${version}-${arch}.${ext}"
 deb:
   artifactName: "${productName}-${version}-${arch}.${ext}"
   maintainer: "TUOTUO <tuotuo@gyshell.com>"
-  # Post-install script restores chrome-sandbox SUID permissions and works
-  # around electron-builder's 0x0 icon-size bug (#5294).
-  afterInstall: apps/electron/scripts/postinstall-linux.sh
+  fpm:
+    - apps/electron/cli-launchers/linux/gyll=/usr/bin/gyll
 pacman:
   artifactName: "${productName}-${version}-${arch}.${ext}"
   depends:
@@ -156,11 +171,12 @@ pacman:
     - snappy
     - libnotify
     - libappindicator-gtk3
+  fpm:
+    - apps/electron/cli-launchers/linux/gyll=/usr/bin/gyll
 rpm:
   artifactName: "${productName}-${version}-${arch}.${ext}"
-  # Post-install script restores chrome-sandbox SUID permissions and works
-  # around electron-builder's 0x0 icon-size bug (#5294).
-  afterInstall: apps/electron/scripts/postinstall-linux.sh
+  fpm:
+    - apps/electron/cli-launchers/linux/gyll=/usr/bin/gyll
 dmg:
   artifactName: "${productName}-${version}-${arch}.${ext}"
   contents:

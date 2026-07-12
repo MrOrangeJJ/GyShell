@@ -167,15 +167,15 @@ This reduces "command not found" and unstable cwd behavior for MCP servers.
 
 1. `electron-builder --mac --dir`
 2. `apps/electron/scripts/fix-mac-signatures.sh`
-3. `electron-builder --mac --prepackaged ...`
+3. `electron-builder --mac --prepackaged dist/mac-arm64/GyShell.app`
 
 ### Linux
 
 Linux desktop packaging is driven by `apps/electron/electron-builder.yml` and depends on:
 
-- `apps/electron/scripts/after-pack-linux.mjs`
+- `apps/electron/scripts/after-pack.mjs`
 - `apps/electron/scripts/normalize-linux-artifact-name.mjs`
-- `apps/electron/scripts/postinstall-linux.sh`
+- `apps/electron/cli-launchers/linux/gyll`
 - icon resources under `apps/electron/materials/icons`
 
-Desktop Linux packages carry bundled mobile-web frontend assets as extra resources. The historical CLI TUI is deprecated and must not be bundled in desktop packages. The new Node-based command CLI is built and installed separately.
+Desktop packages carry bundled mobile-web assets plus a target-native Node SEA for the command-only CLI. The historical TUI remains excluded. Installer ownership is platform-specific: NSIS PATH on Windows, `/usr/bin/gyll` in Linux system packages, an explicit app-owned symlink on macOS, and an explicit owned copy for AppImage.

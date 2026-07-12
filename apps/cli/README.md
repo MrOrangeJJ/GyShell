@@ -9,3 +9,7 @@ npm --silent run cli -- status
 ```
 
 See `docs/cli-usage.md` for the complete command reference.
+
+Desktop release builds embed this same bundle into a target-specific Node SEA,
+so the installed `gyll` command does not require Node.js or npm on the target
+machine.

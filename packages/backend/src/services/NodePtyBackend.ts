@@ -1,4 +1,11 @@
 import * as pty from 'node-pty'
+import {
+  buildPackagedCliFishInitCommand,
+  buildPackagedCliNushellInitCommand,
+  buildPackagedCliPathShellSnippet,
+  PACKAGED_CLI_DIRECTORY_ENV,
+  quotePosixShellLiteral,
+} from './terminal/packagedCliEnvironment'
 import * as os from 'os'
 import * as fs from 'fs'
 import * as path from 'path'
@@ -53,10 +60,7 @@ export class NodePtyBackend implements TerminalBackend {
   private promptMarkerStateByPtyId: Map<string, WindowsPromptMarkerState> = new Map()
   private hasScannedWindowsSidecarTempDirs = false
 
-  private buildExecInvocation(
-    command: string,
-    platform = os.platform()
-  ): { shell: string; args: string[] } {
+  private buildExecInvocation(command: string, platform = os.platform()): { shell: string; args: string[] } {
     if (platform === 'win32') {
       return {
         shell: 'powershell.exe',
@@ -130,8 +134,12 @@ export class NodePtyBackend implements TerminalBackend {
         reject(new Error(`exec timeout after ${timeoutMs}ms`))
       }, timeoutMs)
 
-      child.stdout!.on('data', (d: Buffer) => { stdout += d.toString('utf8') })
-      child.stderr!.on('data', (d: Buffer) => { stderr += d.toString('utf8') })
+      child.stdout!.on('data', (d: Buffer) => {
+        stdout += d.toString('utf8')
+      })
+      child.stderr!.on('data', (d: Buffer) => {
+        stderr += d.toString('utf8')
+      })
       child.on('close', () => {
         if (settled) return
         settled = true
@@ -157,14 +165,14 @@ export class NodePtyBackend implements TerminalBackend {
     })
   }
 
-  async prepareCommandTracking(
-    ptyId: string
-  ): Promise<TerminalCommandTrackingToken | undefined> {
+  async prepareCommandTracking(ptyId: string): Promise<TerminalCommandTrackingToken | undefined> {
     if (this.commandTrackingModeByPtyId.get(ptyId) !== 'windows-powershell-sidecar') {
       return undefined
     }
     const cachedSnapshot = this.promptMarkerStateByPtyId.get(ptyId) || null
-    const snapshot = await this.refreshPromptMarkerState(ptyId, { allowCachedFallback: false })
+    const snapshot = await this.refreshPromptMarkerState(ptyId, {
+      allowCachedFallback: false,
+    })
     if (!snapshot && !cachedSnapshot) {
       const resetOk = await this.resetPromptMarkerFile(ptyId)
       return {
@@ -174,7 +182,7 @@ export class NodePtyBackend implements TerminalBackend {
         dispatchMode: this.commandRequestPathByPtyId.get(ptyId) ? 'prompt-file' : undefined,
         displayMode: this.commandRequestPathByPtyId.get(ptyId) ? 'synthetic-transcript' : undefined,
         commandRequestPath: this.commandRequestPathByPtyId.get(ptyId),
-        commandOutputPath: this.commandOutputPathByPtyId.get(ptyId)
+        commandOutputPath: this.commandOutputPathByPtyId.get(ptyId),
       }
     }
     const resolvedSnapshot = snapshot || cachedSnapshot
@@ -188,7 +196,7 @@ export class NodePtyBackend implements TerminalBackend {
       dispatchMode: this.commandRequestPathByPtyId.get(ptyId) ? 'prompt-file' : undefined,
       displayMode: this.commandRequestPathByPtyId.get(ptyId) ? 'synthetic-transcript' : undefined,
       commandRequestPath: this.commandRequestPathByPtyId.get(ptyId),
-      commandOutputPath: this.commandOutputPathByPtyId.get(ptyId)
+      commandOutputPath: this.commandOutputPathByPtyId.get(ptyId),
     }
   }
 
@@ -203,7 +211,7 @@ export class NodePtyBackend implements TerminalBackend {
       return undefined
     }
     const snapshot = await this.refreshPromptMarkerState(ptyId, {
-      allowCachedFallback: !token.awaitingInitialFreshMarker
+      allowCachedFallback: !token.awaitingInitialFreshMarker,
     })
     if (!snapshot || snapshot.sequence <= token.baselineSequence) {
       return undefined
@@ -216,16 +224,14 @@ export class NodePtyBackend implements TerminalBackend {
       }
       token.awaitingInitialFreshMarker = false
     }
-    const output = await this.readCommandOutputFile(
-      token.commandOutputPath || this.commandOutputPathByPtyId.get(ptyId)
-    )
+    const output = await this.readCommandOutputFile(token.commandOutputPath || this.commandOutputPathByPtyId.get(ptyId))
     return {
       mode: 'windows-powershell-sidecar',
       sequence: snapshot.sequence,
       exitCode: snapshot.exitCode,
       cwd: snapshot.cwd,
       homeDir: snapshot.homeDir,
-      output
+      output,
     }
   }
 
@@ -383,9 +389,7 @@ export class NodePtyBackend implements TerminalBackend {
   }
 
   private pickShell(shell?: string): string {
-    const candidates = [shell, this.getDefaultShell(), '/bin/zsh', '/bin/bash'].filter(
-      (x): x is string => !!x
-    )
+    const candidates = [shell, this.getDefaultShell(), '/bin/zsh', '/bin/bash'].filter((x): x is string => !!x)
     for (const c of candidates) {
       try {
         if (fs.existsSync(c)) return c
@@ -407,12 +411,12 @@ export class NodePtyBackend implements TerminalBackend {
     const cwdCandidate = localConfig.cwd || os.homedir()
     const cwd = fs.existsSync(cwdCandidate) ? cwdCandidate : os.homedir()
     const env = this.getSafeEnv()
-    
+
     // Fix for Chinese characters rendering issues in packaged apps
     // Setting LC_ALL and LANG to UTF-8 ensures the shell and sub-processes use UTF-8 encoding
     const localeEnv = {
       LC_ALL: 'en_US.UTF-8',
-      LANG: 'en_US.UTF-8'
+      LANG: 'en_US.UTF-8',
     }
 
     const {
@@ -422,7 +426,7 @@ export class NodePtyBackend implements TerminalBackend {
       commandTrackingMode,
       promptMarkerPath,
       commandRequestPath,
-      commandOutputPath
+      commandOutputPath,
     } = this.buildShellIntegration(shell)
     const mergedEnv = { ...env, ...localeEnv, ...envOverrides }
 
@@ -432,7 +436,7 @@ export class NodePtyBackend implements TerminalBackend {
       rows: config.rows || 24,
       cwd,
       env: mergedEnv,
-      useConpty: os.platform() === 'win32'
+      useConpty: os.platform() === 'win32',
     })
 
     const isWindows = os.platform() === 'win32'
@@ -442,7 +446,7 @@ export class NodePtyBackend implements TerminalBackend {
       exitCallbacks: new Set(),
       oscBuffer: '',
       isInitializing: isWindows,
-      buffer: ''
+      buffer: '',
     }
 
     ptyProcess.onData((data) => {
@@ -505,35 +509,54 @@ export class NodePtyBackend implements TerminalBackend {
     commandOutputPath?: string
   } {
     const shellBase = path.basename(shellPath).toLowerCase()
+    const packagedCliDirectory = process.env[PACKAGED_CLI_DIRECTORY_ENV]
+    const packagedCliPathSnippet = buildPackagedCliPathShellSnippet(packagedCliDirectory)
 
     // zsh integration via ZDOTDIR/.zshrc (no visible setup commands)
     if (shellBase.includes('zsh')) {
       const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'gyshell-zsh-'))
+      const wrapperZdotDir = quotePosixShellLiteral(tmpDir)
+      const userZdotDirEnv = 'GYSHELL_USER_ZDOTDIR'
+      const captureUserZdotDir = `if [ -n "\${ZDOTDIR:-}" ] && [ "$ZDOTDIR" != ${wrapperZdotDir} ]; then export ${userZdotDirEnv}="$ZDOTDIR"; fi\n`
+      const reassertWrapperZdotDir = captureUserZdotDir + `export ZDOTDIR=${wrapperZdotDir}\n`
+      const sourceUserProfile = (name: string) =>
+        `if [ -f "\${${userZdotDirEnv}:-$HOME}/.${name}" ]; then source "\${${userZdotDirEnv}:-$HOME}/.${name}"; fi\n`
       // Login shell reads: .zshenv -> .zprofile -> .zshrc -> .zlogin (all under ZDOTDIR)
-      // We proxy to user's originals to preserve environment and behaviors.
+      // Keep the wrapper ZDOTDIR active even when the user's .zshenv changes
+      // it, while proxying every later profile from the user's chosen path.
       fs.writeFileSync(
         path.join(tmpDir, '.zshenv'),
         `# gyshell integration (generated)\n` +
-          `if [ -f "$HOME/.zshenv" ]; then source "$HOME/.zshenv"; fi\n`,
+          sourceUserProfile('zshenv') +
+          reassertWrapperZdotDir +
+          `${packagedCliPathSnippet}\n`,
         'utf8'
       )
       fs.writeFileSync(
         path.join(tmpDir, '.zprofile'),
         `# gyshell integration (generated)\n` +
-          `if [ -f "$HOME/.zprofile" ]; then source "$HOME/.zprofile"; fi\n`,
+          sourceUserProfile('zprofile') +
+          reassertWrapperZdotDir +
+          `${packagedCliPathSnippet}\n`,
         'utf8'
       )
       fs.writeFileSync(
         path.join(tmpDir, '.zlogin'),
         `# gyshell integration (generated)\n` +
-          `if [ -f "$HOME/.zlogin" ]; then source "$HOME/.zlogin"; fi\n`,
+          sourceUserProfile('zlogin') +
+          captureUserZdotDir +
+          `${packagedCliPathSnippet}\n` +
+          `export ZDOTDIR="\${${userZdotDirEnv}:-$HOME}"\n` +
+          `unset ${userZdotDirEnv}\n`,
         'utf8'
       )
 
       const rcPath = path.join(tmpDir, '.zshrc')
       const script =
         `# gyshell integration (generated)\n` +
-        `if [ -f "$HOME/.zshrc" ]; then source "$HOME/.zshrc"; fi\n` +
+        sourceUserProfile('zshrc') +
+        reassertWrapperZdotDir +
+        `${packagedCliPathSnippet}\n` +
         `autoload -Uz add-zsh-hook 2>/dev/null || true\n` +
         // Use builtin printf with octal escapes for better cross-shell portability.
         `gyshell_preexec() { builtin printf "\\\\033]1337;gyshell_preexec\\\\007"; }\n` +
@@ -543,7 +566,14 @@ export class NodePtyBackend implements TerminalBackend {
       fs.writeFileSync(rcPath, script, 'utf8')
 
       // -l: login shell, -i: interactive
-      return { args: ['-l', '-i'], envOverrides: { ZDOTDIR: tmpDir }, tmpPath: tmpDir }
+      return {
+        args: ['-l', '-i'],
+        envOverrides: {
+          ZDOTDIR: tmpDir,
+          [userZdotDirEnv]: process.env.ZDOTDIR?.trim() || process.env.HOME || os.homedir(),
+        },
+        tmpPath: tmpDir,
+      }
     }
 
     // bash integration via --rcfile (works on macOS bash 3.2)
@@ -553,7 +583,7 @@ export class NodePtyBackend implements TerminalBackend {
       // Improve based on VS Code reference logic
       const script = [
         '# gyshell integration (generated)',
-        // Emulate login shell sourcing logic if we were in login mode, 
+        // Emulate login shell sourcing logic if we were in login mode,
         // but to keep it simple and consistent with existing proven logic:
         'if [ -f "/etc/profile" ]; then source "/etc/profile"; fi',
         'if [ -f "$HOME/.bash_profile" ]; then source "$HOME/.bash_profile"; ' +
@@ -561,6 +591,7 @@ export class NodePtyBackend implements TerminalBackend {
           'elif [ -f "$HOME/.profile" ]; then source "$HOME/.profile"; fi',
         // Also source bashrc (many users put interactive settings here)
         'if [ -f "$HOME/.bashrc" ]; then source "$HOME/.bashrc"; fi',
+        packagedCliPathSnippet,
         '',
         '__gyshell_in_command=0',
         '__gyshell_preexec() {',
@@ -585,7 +616,7 @@ export class NodePtyBackend implements TerminalBackend {
         '}',
         // Preserve existing PROMPT_COMMAND if set
         'PROMPT_COMMAND="__gyshell_precmd${PROMPT_COMMAND:+; $PROMPT_COMMAND}"',
-        ''
+        '',
       ].join('\n')
       fs.writeFileSync(rcPath, script, 'utf8')
 
@@ -593,20 +624,15 @@ export class NodePtyBackend implements TerminalBackend {
         // NOTE: We intentionally do NOT use --login here; see comment above.
         args: ['--noprofile', '--rcfile', rcPath, '-i'],
         envOverrides: {},
-        tmpPath: tmpDir
+        tmpPath: tmpDir,
       }
     }
 
     // cmd.exe integration via PROMPT env var
     // PowerShell integration via -Command
     if (shellBase.includes('powershell') || shellBase.includes('pwsh') || shellBase.includes('cmd.exe')) {
-      const {
-        commandTrackingMode,
-        promptMarkerPath,
-        commandRequestPath,
-        commandOutputPath,
-        tmpPath
-      } = this.resolveWindowsShellTracking(shellBase)
+      const { commandTrackingMode, promptMarkerPath, commandRequestPath, commandOutputPath, tmpPath } =
+        this.resolveWindowsShellTracking(shellBase)
       const b64 = this.buildWindowsPowerShellEncodedCommand(
         commandTrackingMode,
         promptMarkerPath,
@@ -623,7 +649,7 @@ export class NodePtyBackend implements TerminalBackend {
           promptMarkerPath,
           commandRequestPath,
           commandOutputPath,
-          commandTrackingMode
+          commandTrackingMode,
         }
       }
       return {
@@ -633,11 +659,89 @@ export class NodePtyBackend implements TerminalBackend {
         promptMarkerPath,
         commandRequestPath,
         commandOutputPath,
-        commandTrackingMode
+        commandTrackingMode,
       }
     }
 
-    // Unknown shell: no integration (fallback behavior handled in TerminalService).
+    if (shellBase === 'fish') {
+      return {
+        args: ['-C', buildPackagedCliFishInitCommand(packagedCliDirectory)],
+        envOverrides: {},
+      }
+    }
+
+    if (shellBase === 'nu' || shellBase === 'nushell') {
+      return {
+        args: ['-e', buildPackagedCliNushellInitCommand(packagedCliDirectory)],
+        envOverrides: {},
+      }
+    }
+
+    if (['sh', 'dash', 'ksh', 'mksh'].includes(shellBase)) {
+      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'gyshell-posix-shell-'))
+      const envPath = path.join(tmpDir, 'env')
+      const originalEnvName = 'GYSHELL_ORIGINAL_POSIX_ENV'
+      fs.writeFileSync(
+        envPath,
+        `# gyshell integration (generated)\n` +
+          `if [ -n "\${${originalEnvName}:-}" ] && [ -f "$${originalEnvName}" ]; then . "$${originalEnvName}"; fi\n` +
+          `${packagedCliPathSnippet}\n` +
+          `if [ -n "\${${originalEnvName}:-}" ]; then export ENV="$${originalEnvName}"; else unset ENV; fi\n` +
+          `unset ${originalEnvName}\n`,
+        'utf8'
+      )
+      return {
+        args: [],
+        envOverrides: {
+          ENV: envPath,
+          [originalEnvName]: process.env.ENV || '',
+        },
+        tmpPath: tmpDir,
+      }
+    }
+
+    if (shellBase === 'csh' || shellBase === 'tcsh') {
+      const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'gyshell-csh-'))
+      const originalHomeName = 'GYSHELL_ORIGINAL_CSH_HOME'
+      const userProfile = shellBase === 'tcsh' ? '.tcshrc' : '.cshrc'
+      const sourceUserProfile =
+        shellBase === 'tcsh'
+          ? `if ( -f "$HOME/.tcshrc" ) then\n` +
+            `  source "$HOME/.tcshrc"\n` +
+            `else if ( -f "$HOME/.cshrc" ) then\n` +
+            `  source "$HOME/.cshrc"\n` +
+            `endif\n`
+          : `if ( -f "$HOME/.cshrc" ) source "$HOME/.cshrc"\n`
+      const script =
+        `# gyshell integration (generated)\n` +
+        `if ( $?${originalHomeName} ) then\n` +
+        `  setenv HOME "$${originalHomeName}"\n` +
+        `endif\n` +
+        sourceUserProfile +
+        `if ( $?${PACKAGED_CLI_DIRECTORY_ENV} ) then\n` +
+        `  if ( $?path ) then\n` +
+        `    set path = ( "$${PACKAGED_CLI_DIRECTORY_ENV}" $path )\n` +
+        `  else\n` +
+        `    set path = ( "$${PACKAGED_CLI_DIRECTORY_ENV}" )\n` +
+        `  endif\n` +
+        `endif\n` +
+        `if ( $?${originalHomeName} ) unsetenv ${originalHomeName}\n`
+      fs.writeFileSync(path.join(tmpDir, userProfile), script, 'utf8')
+      return {
+        args: [],
+        envOverrides: {
+          HOME: tmpDir,
+          [originalHomeName]: process.env.HOME || os.homedir(),
+        },
+        tmpPath: tmpDir,
+      }
+    }
+
+    if (process.env[PACKAGED_CLI_DIRECTORY_ENV]) {
+      console.warn(`[NodePtyBackend] No post-profile PATH adapter for custom shell: ${shellPath}`)
+    }
+    // Truly unknown shells retain the verified parent PATH. Shell-specific
+    // startup files may still replace it, so keep this fallback explicit.
     return { args: [], envOverrides: {} }
   }
 
@@ -656,21 +760,19 @@ export class NodePtyBackend implements TerminalBackend {
     const useSidecar = shouldUseWindowsPowerShellSidecar({
       buildNumber,
       shell: shellNameForTracking,
-      trackingChannelAvailable: true
+      trackingChannelAvailable: true,
     })
     if (!useSidecar) {
       return { commandTrackingMode: 'shell-integration' }
     }
     this.cleanupStaleWindowsSidecarTempDirs()
-    const tmpPath = fs.mkdtempSync(
-      path.join(os.tmpdir(), WINDOWS_POWERSHELL_LOCAL_SIDECAR_DIR_PREFIX)
-    )
+    const tmpPath = fs.mkdtempSync(path.join(os.tmpdir(), WINDOWS_POWERSHELL_LOCAL_SIDECAR_DIR_PREFIX))
     return {
       commandTrackingMode: 'windows-powershell-sidecar',
       tmpPath,
       promptMarkerPath: path.join(tmpPath, 'prompt-marker.log'),
       commandRequestPath: path.join(tmpPath, `${WINDOWS_POWERSHELL_COMMAND_REQUEST_FILE_PREFIX}exec.b64`),
-      commandOutputPath: path.join(tmpPath, `${WINDOWS_POWERSHELL_COMMAND_OUTPUT_FILE_PREFIX}exec.txt`)
+      commandOutputPath: path.join(tmpPath, `${WINDOWS_POWERSHELL_COMMAND_OUTPUT_FILE_PREFIX}exec.txt`),
     }
   }
 
@@ -685,7 +787,7 @@ export class NodePtyBackend implements TerminalBackend {
       commandTrackingMode,
       promptMarkerPath,
       commandRequestPath,
-      commandOutputPath
+      commandOutputPath,
     })
   }
 
@@ -745,7 +847,9 @@ export class NodePtyBackend implements TerminalBackend {
     const totalBytes = Math.max(0, Number(sourceStat.size) || 0)
     await fs.promises.mkdir(path.dirname(targetLocalPath), { recursive: true })
 
-    const readStream = fs.createReadStream(sourcePath, { highWaterMark: 512 * 1024 })
+    const readStream = fs.createReadStream(sourcePath, {
+      highWaterMark: 512 * 1024,
+    })
     const writeStream = fs.createWriteStream(targetLocalPath, { flags: 'w' })
     let bytesTransferred = 0
     readStream.on('data', (chunk: Buffer | string) => {
@@ -754,7 +858,7 @@ export class NodePtyBackend implements TerminalBackend {
       options?.onProgress?.({
         bytesTransferred,
         totalBytes,
-        eof: bytesTransferred >= totalBytes
+        eof: bytesTransferred >= totalBytes,
       })
     })
 
@@ -774,7 +878,7 @@ export class NodePtyBackend implements TerminalBackend {
     options?.onProgress?.({
       bytesTransferred: totalBytes,
       totalBytes,
-      eof: true
+      eof: true,
     })
     return { totalBytes }
   }
@@ -792,7 +896,9 @@ export class NodePtyBackend implements TerminalBackend {
     const totalBytes = Math.max(0, Number(sourceStat.size) || 0)
     await fs.promises.mkdir(path.dirname(targetPath), { recursive: true })
 
-    const readStream = fs.createReadStream(sourceLocalPath, { highWaterMark: 512 * 1024 })
+    const readStream = fs.createReadStream(sourceLocalPath, {
+      highWaterMark: 512 * 1024,
+    })
     const writeStream = fs.createWriteStream(targetPath, { flags: 'w' })
     let bytesTransferred = 0
     readStream.on('data', (chunk: Buffer | string) => {
@@ -801,7 +907,7 @@ export class NodePtyBackend implements TerminalBackend {
       options?.onProgress?.({
         bytesTransferred,
         totalBytes,
-        eof: bytesTransferred >= totalBytes
+        eof: bytesTransferred >= totalBytes,
       })
     })
 
@@ -820,7 +926,7 @@ export class NodePtyBackend implements TerminalBackend {
     options?.onProgress?.({
       bytesTransferred: totalBytes,
       totalBytes,
-      eof: true
+      eof: true,
     })
     return { totalBytes }
   }
@@ -835,27 +941,31 @@ export class NodePtyBackend implements TerminalBackend {
     offset: number,
     chunkSize: number,
     options?: { totalSizeHint?: number }
-  ): Promise<{ chunk: Buffer; bytesRead: number; totalSize: number; nextOffset: number; eof: boolean }> {
+  ): Promise<{
+    chunk: Buffer
+    bytesRead: number
+    totalSize: number
+    nextOffset: number
+    eof: boolean
+  }> {
     const safeOffset = Number.isFinite(offset) && offset > 0 ? Math.floor(offset) : 0
-    const safeChunkSize = Number.isFinite(chunkSize) && chunkSize > 0
-      ? Math.floor(chunkSize)
-      : 256 * 1024
-    const hintedTotalSize = Number.isFinite(options?.totalSizeHint) && (options?.totalSizeHint || 0) >= 0
-      ? Math.floor(options!.totalSizeHint as number)
-      : null
+    const safeChunkSize = Number.isFinite(chunkSize) && chunkSize > 0 ? Math.floor(chunkSize) : 256 * 1024
+    const hintedTotalSize =
+      Number.isFinite(options?.totalSizeHint) && (options?.totalSizeHint || 0) >= 0
+        ? Math.floor(options!.totalSizeHint as number)
+        : null
 
     const handle = await fs.promises.open(filePath, 'r')
     try {
-      const totalSize = hintedTotalSize !== null
-        ? hintedTotalSize
-        : Math.max(0, Number((await handle.stat()).size) || 0)
+      const totalSize =
+        hintedTotalSize !== null ? hintedTotalSize : Math.max(0, Number((await handle.stat()).size) || 0)
       if (safeOffset >= totalSize) {
         return {
           chunk: Buffer.alloc(0),
           bytesRead: 0,
           totalSize,
           nextOffset: safeOffset,
-          eof: true
+          eof: true,
         }
       }
 
@@ -869,7 +979,7 @@ export class NodePtyBackend implements TerminalBackend {
         bytesRead,
         totalSize,
         nextOffset,
-        eof: nextOffset >= totalSize
+        eof: nextOffset >= totalSize,
       }
     } finally {
       await handle.close()
@@ -906,7 +1016,7 @@ export class NodePtyBackend implements TerminalBackend {
       const { bytesWritten } = await handle.write(payload, 0, payload.length, safeOffset)
       return {
         writtenBytes: bytesWritten,
-        nextOffset: safeOffset + bytesWritten
+        nextOffset: safeOffset + bytesWritten,
       }
     } finally {
       await handle.close()
@@ -933,7 +1043,7 @@ export class NodePtyBackend implements TerminalBackend {
       arch: os.arch(),
       hostname: os.hostname(),
       isRemote: false,
-      shell: this.getDefaultShell()
+      shell: this.getDefaultShell(),
     }
   }
 
@@ -941,7 +1051,11 @@ export class NodePtyBackend implements TerminalBackend {
     try {
       const stat = await fs.promises.stat(filePath)
       const isDirectory = stat.isDirectory()
-      return { exists: true, isDirectory, size: isDirectory ? undefined : stat.size }
+      return {
+        exists: true,
+        isDirectory,
+        size: isDirectory ? undefined : stat.size,
+      }
     } catch (err: any) {
       if (err?.code === 'ENOENT') {
         return { exists: false, isDirectory: false }
@@ -970,14 +1084,17 @@ export class NodePtyBackend implements TerminalBackend {
           isSymbolicLink,
           size: stats ? stats.size : 0,
           mode: stats ? `0${(stats.mode & 0o777).toString(8)}` : undefined,
-          modifiedAt: stats ? new Date(stats.mtimeMs).toISOString() : undefined
+          modifiedAt: stats ? new Date(stats.mtimeMs).toISOString() : undefined,
         } satisfies FileSystemEntry
       })
     )
 
     return mapped.sort((a, b) => {
       if (a.isDirectory !== b.isDirectory) return a.isDirectory ? -1 : 1
-      return a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: 'base' })
+      return a.name.localeCompare(b.name, undefined, {
+        numeric: true,
+        sensitivity: 'base',
+      })
     })
   }
 

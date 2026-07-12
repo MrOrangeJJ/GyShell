@@ -218,7 +218,7 @@ npm --silent run cli -- session list
 npm --silent run cli -- chat send --message "运行测试并总结" --wait
 ```
 
-旧交互式 TUI 仍然处于废弃状态。桌面安装包不会内置或自动安装任何 CLI，也不会修改 shell profile。详见 [`docs/cli-usage.md`](./docs/cli-usage.md)。
+旧交互式 TUI 仍然处于废弃状态。桌面构建现在会携带不依赖系统 Node.js 的自包含 `gyll`：Windows 与 Linux 系统安装包自动提供命令，macOS 与 AppImage 则在首次启动/应用菜单中明确征求安装。GyShell 不会再向 shell profile 追加 PATH block。详见 [`docs/cli-usage.md`](./docs/cli-usage.md)。
 
 ---
 

@@ -1,0 +1,9 @@
+#!/bin/sh
+
+CLI_BIN="/opt/GyShell/resources/cli/bin/gyll"
+if [ ! -x "$CLI_BIN" ]; then
+  printf '%s\n' '{"ok":false,"error":{"code":"CLI_RUNTIME_MISSING","message":"GyShell CLI runtime is missing from /opt/GyShell/resources/cli/bin/gyll."}}' >&2
+  exit 127
+fi
+
+exec "$CLI_BIN" "$@"

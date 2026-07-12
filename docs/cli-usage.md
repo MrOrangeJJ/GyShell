@@ -21,7 +21,7 @@ npm --silent run cli -- --help
 npm --silent run cli -- status
 ```
 
-To expose the built binary locally:
+To expose the development wrapper locally:
 
 ```bash
 cd apps/cli
@@ -29,8 +29,36 @@ npm link
 gyll --help
 ```
 
-The package also exposes the `gyshell-cli` alias. Desktop packages do not install
-either command and do not modify shell profiles.
+The npm workspace also exposes the `gyshell-cli` alias. Desktop installers expose
+the canonical `gyll` command using a separately executable Node SEA; users do not
+need Node.js, npm, Bun, or Electron's `ELECTRON_RUN_AS_NODE` mode.
+
+### Installed desktop packages
+
+- macOS: the app always contains `Contents/Resources/cli/bin/gyll`. After moving
+  GyShell to an Applications folder, accept the first-run prompt or choose
+  **GyShell → Install 'gyll' Command…**. This creates
+  `/usr/local/bin/gyll` as a link to the app-owned binary and never edits shell
+  profiles. The same menu can repair or uninstall the link.
+- Windows Setup: NSIS installs `resources\\cli\\bin\\gyll.exe`, adds that exact
+  directory to the user PATH, broadcasts the environment change, and removes
+  only that entry on uninstall. Start a new terminal/agent process after install.
+- Windows Portable: the portable artifact carries the CLI for GyShell's own local
+  terminals but intentionally does not mutate PATH. Use the Setup installer when
+  a global `gyll` command is required.
+- Linux deb/rpm/pacman: the package owns `/usr/bin/gyll`; install, upgrade, and
+  removal are handled by the package manager.
+- Linux AppImage/unpacked: the app offers an explicit setup that atomically copies
+  its CLI to `~/.local/bin/gyll`. It never links into the ephemeral AppImage mount
+  and never edits `.profile`, `.bashrc`, or `.zshrc`. Owned copies update only
+  when the bundled app version moves forward; opening an older retained AppImage
+  never silently downgrades the command. If `~/.local/bin` is not already on PATH,
+  the app shows the exact directory to add.
+
+Packaged GyShell local terminals place the bundled CLI directory first after the
+startup configuration of platform-default and common custom shells (bash, zsh,
+fish, Nu, POSIX sh/ksh, PowerShell/cmd, and csh/tcsh), including on first launch.
+Unknown shells retain the already-prepended parent PATH and log a diagnostic.
 
 ### Connection and output contract
 
@@ -50,7 +78,7 @@ Global configuration:
 Success is written to stdout:
 
 ```json
-{"ok":true,"command":"status","data":{"pong":true,"ts":123}}
+{ "ok": true, "command": "status", "data": { "pong": true, "ts": 123 } }
 ```
 
 Failure is written to stderr. Exit codes are `2` for usage, `3` for connection,
@@ -136,7 +164,29 @@ npm link
 gyll --help
 ```
 
-也提供 `gyshell-cli` 别名。桌面安装包不会自动安装 CLI，也不会修改 shell profile。
+开发用 npm workspace 也提供 `gyshell-cli` 别名。桌面发行包提供的是规范的
+`gyll` 命令，并将同一套命令代码构建为独立 Node SEA；目标机器不需要安装
+Node.js、npm、Bun，也不依赖 Electron 的 `ELECTRON_RUN_AS_NODE`。
+
+### 桌面安装包中的 CLI
+
+- macOS：App 始终内置 `Contents/Resources/cli/bin/gyll`。先把 GyShell 移入
+  Applications 目录，再接受首次启动提示，或选择
+  **GyShell → Install 'gyll' Command…**；它只会创建
+  `/usr/local/bin/gyll` symlink，不修改任何 shell profile。相同菜单可修复或卸载。
+- Windows Setup：NSIS 把 `gyll.exe` 安装到 `resources\\cli\\bin`，精确加入用户
+  PATH，并在卸载时只删除这一项。安装后需重启已有 Terminal/agent 进程。
+- Windows Portable：便携包不会修改 PATH；如需全局 `gyll`，请使用 Setup 安装包。
+- Linux deb/rpm/pacman：安装包直接拥有 `/usr/bin/gyll`，升级与卸载由包管理器负责。
+- Linux AppImage/unpacked：用户明确同意后，App 会原子复制 CLI 到
+  `~/.local/bin/gyll`，不会链接到临时 mount，也不会修改 `.profile`、`.bashrc`
+  或 `.zshrc`。只有 App 版本向前升级时才会自动更新已有副本，打开保留的旧
+  AppImage 不会静默降级命令。若该目录尚未位于 PATH，App 会显示需要添加的准确目录。
+
+已打包 GyShell 会在平台默认及常见自定义 shell（bash、zsh、fish、Nu、POSIX
+sh/ksh、PowerShell/cmd、csh/tcsh）完成启动配置后，再把 App 内 CLI 目录放到
+Local Terminal 的 PATH 首位，因此首次启动时也可直接运行 `gyll`。无法识别的
+shell 会保留父进程中已前置的 PATH，并写入诊断日志。
 
 ### 关键约定
 

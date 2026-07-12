@@ -223,7 +223,7 @@ npm --silent run cli -- session list
 npm --silent run cli -- chat send --message "Run tests and summarize" --wait
 ```
 
-The old interactive TUI remains deprecated. Desktop packages do not bundle or install either CLI, and they do not edit shell profiles. See [`docs/cli-usage.md`](./docs/cli-usage.md).
+The old interactive TUI remains deprecated. Desktop builds now carry a self-contained `gyll` executable with no system Node.js dependency: Windows and Linux system installers expose it automatically, while macOS and AppImage builds offer an explicit first-run/menu setup. GyShell never appends new shell-profile blocks. See [`docs/cli-usage.md`](./docs/cli-usage.md).
 
 ---
 

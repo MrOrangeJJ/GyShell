@@ -41,6 +41,10 @@ import { TerminalCommandDraftService } from "../../../backend/src/services/Termi
 import { ElectronAppSettingsMigration } from "../settings/ElectronAppSettingsMigration";
 import { cleanupDeprecatedCliLaunchers } from "./DeprecatedCliCleanupService";
 import {
+  configurePackagedCliEnvironment,
+  initializePackagedCliIntegration,
+} from "./CliIntegrationService";
+import {
   buildBuiltInToolStatusSummary,
   buildSkillStatusSummary,
 } from "../../../backend/src/services/Gateway/toolingSummary";
@@ -294,6 +298,8 @@ function createWindow(options?: CreateWindowOptions): BrowserWindow {
 export async function startElectronMain(): Promise<void> {
   await app.whenReady();
 
+  configurePackagedCliEnvironment();
+
   try {
     cleanupDeprecatedCliLaunchers();
   } catch (error) {
@@ -318,6 +324,9 @@ export async function startElectronMain(): Promise<void> {
   themeStore = new ThemeConfigStore();
   await themeStore.loadCustomThemes();
   const primaryWindow = createWindow();
+  void initializePackagedCliIntegration(primaryWindow).catch((error) => {
+    console.warn("[Main] Failed to initialize gyll integration:", error);
+  });
 
   const startRuntimeInitialization = () => {
     historyMigrationCoordinator.run(async () => {
@@ -503,7 +512,8 @@ export async function startElectronMain(): Promise<void> {
                   terminalService.kill(terminalId);
                 },
                 reconnect: async (terminalId) => {
-                  const tab = await terminalService.reconnectTerminal(terminalId);
+                  const tab =
+                    await terminalService.reconnectTerminal(terminalId);
                   return { id: tab.id };
                 },
                 setSelection: async (terminalId, selectionText) => {

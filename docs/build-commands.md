@@ -31,6 +31,10 @@ This page maps root scripts, packaging targets, and release helpers to their run
   - Build `@gyshell/gybackend` wrapper.
 - `npm run build:cli`
   - Build the lightweight single-file Node CLI.
+- `npm run prepare:cli-runtime -- --platform <darwin|win32|linux> --arch <x64|arm64>`
+  - Turn the bundled CLI into a checksum-pinned, target-native Node SEA under the ignored `apps/electron/cli-runtime/<platform>-<arch>` directory.
+- `npm run ensure:dist-target-native`
+  - Prepare the native SQLite runtime for the architecture selected by generic `npm run dist` (macOS arm64, Windows x64, or the Linux host arch).
 - `npm run build:mobile-web`
   - Build `@gyshell/mobile-web` wrapper.
 - `npm run build:all`
@@ -52,26 +56,27 @@ This page maps root scripts, packaging targets, and release helpers to their run
 - `npm run test:backend-extreme`
 - `npm run test:layout-ui-extreme`
 - `npm run test:backend-unit-extreme`
-- `npm run test:desktop-cli-deprecated`
-  - Verify desktop packages do not bundle `gyll` and legacy launcher cleanup preserves shell profile blocks.
+- `npm run test:desktop-cli-distribution`
+  - Verify SEA packaging ownership, installer/PATH rules, setup collision handling, and bounded legacy cleanup.
 
 ### Packaging
 
 - `npm run dist`
-  - Build backend + Electron + bundled mobile-web assets, then package with `electron-builder`.
+  - Build backend + Electron + `gyll` SEA + bundled mobile-web assets, then package with `electron-builder`.
 - `npm run dist:mac`
   - macOS packaging chain:
     1. Build backend + Electron
-    2. Build/bundle mobile-web assets
-    3. `electron-builder --mac --dir`
-    4. `apps/electron/scripts/fix-mac-signatures.sh`
-    5. `electron-builder --mac --prepackaged ...`
+    2. Build `gyll` and prepare the macOS arm64 SEA
+    3. Build/bundle mobile-web assets
+    4. `electron-builder --mac --dir`
+    5. `apps/electron/scripts/fix-mac-signatures.sh`
+    6. `electron-builder --mac --prepackaged dist/mac-arm64/GyShell.app`
 - `npm run dist:win`
-  - Build backend + Electron + bundled mobile-web assets, then package Windows targets.
+  - Build backend + Electron + Windows x64 `gyll` SEA + bundled mobile-web assets, then package Windows targets.
 - `npm run dist:linux`
-  - Build backend + Electron + bundled mobile-web assets, then package Linux x64 targets.
+  - Build backend + Electron + Linux x64 `gyll` SEA + bundled mobile-web assets, then package Linux x64 targets.
 - `npm run dist:linux-arm64`
-  - Build backend + Electron + bundled mobile-web assets, then package Linux arm64 targets.
+  - Build backend + Electron + Linux arm64 `gyll` SEA + bundled mobile-web assets, then package Linux arm64 targets.
 
 Linux targets configured in `apps/electron/electron-builder.yml`:
 
@@ -82,20 +87,22 @@ Linux targets configured in `apps/electron/electron-builder.yml`:
 
 Packaging notes:
 
-- mac packaging must keep the signature workaround sequence used by `dist:mac`.
+- mac packaging signs `Contents/Resources/cli/bin/gyll` as a nested binary and must keep the signature workaround sequence used by `dist:mac`.
 - Linux packaging uses:
-  - `apps/electron/scripts/after-pack-linux.mjs`
+  - `apps/electron/scripts/after-pack.mjs`
   - `apps/electron/scripts/normalize-linux-artifact-name.mjs`
-  - `apps/electron/scripts/postinstall-linux.sh`
+  - `apps/electron/cli-launchers/linux/gyll`
 - Desktop packages also include:
   - bundled mobile-web frontend under `apps/electron/mobile-web-runtime`
 
-CLI packaging note:
+CLI packaging notes:
 
 - The historical `gyll` TUI is deprecated and unsupported.
-- The new `apps/cli` command client is a separate Node/npm artifact and is not bundled into Electron installers.
-- Desktop packages must not include `apps/electron/cli-runtime`.
-- Desktop startup only removes legacy desktop-managed `gyll` launchers from older installs; it does not install launchers or edit shell profiles.
+- Every desktop target bundles the new command client as a target-native Node SEA under `resources/cli`.
+- Node 22 LTS is pinned because its official binaries support GyShell's macOS 12 floor; archive SHA-256 values and generated architecture are validated during every build.
+- Windows NSIS owns the exact CLI PATH entry; Linux deb/rpm/pacman own `/usr/bin/gyll`; macOS uses an explicit `/usr/local/bin/gyll` symlink; AppImage uses an explicit owned copy under `~/.local/bin`.
+- Desktop startup removes only marker-owned launchers and PATH blocks left by the historical installer. New code never edits shell profiles or uses `setx`/WindowsApps.
+- See [`cli-distribution.md`](./cli-distribution.md) for design invariants and platform lifecycle.
 
 ## Release Helper (`build.sh`)
 
