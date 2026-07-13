@@ -345,7 +345,9 @@ export const ListPanel: React.FC<ListPanelProps> = observer(
     );
 
     const handleAddChat = React.useCallback(() => {
-      const sessionId = store.chat.createSession();
+      const sessionId = store.chat.createSession("New Chat", {
+        activate: false,
+      });
       openTabInPrimaryPanel("chat", sessionId);
     }, [openTabInPrimaryPanel, store.chat]);
 

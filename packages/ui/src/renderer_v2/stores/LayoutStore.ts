@@ -1352,9 +1352,9 @@ export class LayoutStore {
     );
     if (!nextTree) return;
     this.tree = nextTree;
+    this.syncGlobalActiveFromPanel(kind, tabId);
     this.syncPanelBindings({ persist: false });
     this.saveLayoutDebounced();
-    this.syncGlobalActiveFromPanel(kind, tabId);
   }
 
   private showTabsInLayout(kind: PanelKind, tabIds: string[]): void {

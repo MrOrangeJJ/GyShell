@@ -868,7 +868,9 @@ export const ChatPanel: React.FC<ChatPanelProps> = observer(
             <button
               className="chat-tab-add"
               onClick={() => {
-                const sessionId = store.chat.createSession();
+                const sessionId = store.chat.createSession("New Chat", {
+                  activate: false,
+                });
                 store.layout.attachTabToPanel("chat", sessionId, panelId);
               }}
             >

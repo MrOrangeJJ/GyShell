@@ -593,12 +593,17 @@ export class ChatStore {
     }
   }
 
-  createSession(title: string = "New Chat"): string {
+  createSession(
+    title: string = "New Chat",
+    options?: { activate?: boolean },
+  ): string {
     const id = uuidv4();
     const session = this.createEmptySession(id, title);
     runInAction(() => {
       this.sessions.push(session);
-      this.activeSessionId = id;
+      if (options?.activate !== false) {
+        this.activeSessionId = id;
+      }
     });
     this.registerSessionWithBackend(id);
     this.emitSessionsChanged();

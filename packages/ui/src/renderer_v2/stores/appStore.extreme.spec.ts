@@ -1545,6 +1545,55 @@ const run = async (): Promise<void> => {
   );
 
   await runCase(
+    "creating a chat in one panel preserves the active chat in other panels",
+    async () => {
+      const store = new AppStore();
+      const layoutTree = buildPersistedTree({
+        focusedPanelId: "panel-chat-b",
+      });
+      layoutTree.panelTabs = {
+        ...layoutTree.panelTabs,
+        "panel-chat-a": {
+          tabIds: ["chat-a", "chat-b"],
+          activeTabId: "chat-b",
+        },
+        "panel-chat-b": {
+          tabIds: ["chat-c"],
+          activeTabId: "chat-c",
+        },
+      };
+      store.settings = { layout: { v2: layoutTree } } as any;
+      store.chat.hydrateSessionInventoryFromLayout(
+        ["chat-a", "chat-b", "chat-c"],
+        "chat-c",
+      );
+      (store as any).lastKnownChatSessionIds = new Set([
+        "chat-a",
+        "chat-b",
+        "chat-c",
+      ]);
+      (store as any).shouldPersistLayout = () => false;
+      store.layout.bootstrap();
+
+      const newSessionId = store.chat.createSession("New Chat", {
+        activate: false,
+      });
+      store.layout.attachTabToPanel("chat", newSessionId, "panel-chat-b");
+
+      assertEqual(
+        store.layout.getPanelActiveTabId("panel-chat-a"),
+        "chat-b",
+        "creating a chat in panel B must not change panel A's active chat",
+      );
+      assertEqual(
+        store.layout.getPanelActiveTabId("panel-chat-b"),
+        newSessionId,
+        "the new chat should become active in the panel where it was created",
+      );
+    },
+  );
+
+  await runCase(
     "AppStore bootstrap passes preferred active chat id into hydration",
     async () => {
       const layoutTree = buildPersistedTree({
@@ -2899,6 +2948,18 @@ const run = async (): Promise<void> => {
             store.layout.getPanelTabIds(panelId).includes("chat-remote"),
           ),
         "history reopen should bind the restored chat session back into a chat panel",
+      );
+      const restoredPanelId = store.layout
+        .getPanelIdsByKind("chat")
+        .find((panelId) =>
+          store.layout.getPanelTabIds(panelId).includes("chat-remote"),
+        );
+      assertEqual(
+        restoredPanelId
+          ? store.layout.getPanelActiveTabId(restoredPanelId)
+          : null,
+        "chat-remote",
+        "history reopen should select the restored session in its chat panel",
       );
       assertCondition(
         loadChatSessionCalls.includes("chat-remote"),
