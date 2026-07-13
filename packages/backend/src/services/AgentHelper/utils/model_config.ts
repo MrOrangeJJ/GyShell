@@ -1,7 +1,7 @@
 import { ChatOpenAI } from '@langchain/openai'
 import type { BackendSettings, ModelDefinition } from '../../../types'
 import { resolveBuiltInToolCapabilityName } from '../tool_capabilities'
-import { BUILTIN_TOOL_INFO } from '../prompts'
+import { BUILTIN_TOOL_INFO } from '../builtInToolMetadata'
 
 export function createChatModel(item: ModelDefinition, temperature: number): ChatOpenAI {
   return new ChatOpenAI({

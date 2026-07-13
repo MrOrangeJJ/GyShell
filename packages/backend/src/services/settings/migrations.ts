@@ -1,5 +1,5 @@
 import type { BackendSettings, WsGatewayAccess } from "../../types";
-import { BUILTIN_TOOL_INFO } from "../AgentHelper/tools";
+import { BUILTIN_TOOL_INFO } from "../AgentHelper/builtInToolMetadata";
 import { normalizeAgentSettingState } from "./agentSettings";
 import { deepMerge, isObject } from "./objectMerge";
 

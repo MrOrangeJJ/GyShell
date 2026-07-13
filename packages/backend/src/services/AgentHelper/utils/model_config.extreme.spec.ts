@@ -1,5 +1,6 @@
 import { buildToolsForModel } from '../tools'
 import { buildBuiltInToolStatusSummary } from '../../Gateway/toolingSummary'
+import { BUILTIN_TOOL_INFO } from '../builtInToolMetadata'
 import { computeReadFileSupport, getEnabledBuiltInTools } from './model_config'
 
 const assertEqual = <T>(actual: T, expected: T, message: string): void => {
@@ -26,6 +27,8 @@ const runCase = async (name: string, fn: () => Promise<void> | void): Promise<vo
 }
 
 const toolName = (tool: any): string => tool?.function?.name ?? tool?.name ?? ''
+const toolDescription = (tool: any): string =>
+  tool?.function?.description ?? tool?.description ?? ''
 
 const run = async (): Promise<void> => {
   await runCase('configured text-only model disables image visibility for the whole profile', () => {
@@ -75,6 +78,56 @@ const run = async (): Promise<void> => {
     assertIncludes(names, 'create_or_edit', 'create_or_edit should stay user-visible as the capability')
     assertNotIncludes(names, 'write_file', 'write_file should not become a settings row')
     assertNotIncludes(names, 'edit_file', 'edit_file should not become a settings row')
+  })
+
+  await runCase('built-in status summaries expose concise user descriptions', () => {
+    const summaries = buildBuiltInToolStatusSummary({})
+    assertEqual(
+      summaries.length,
+      BUILTIN_TOOL_INFO.length,
+      'every configurable built-in tool should have a status summary'
+    )
+
+    for (const tool of BUILTIN_TOOL_INFO) {
+      const summary = summaries.find((item) => item.name === tool.name)
+      assertEqual(
+        summary?.description,
+        tool.userDescription,
+        `${tool.name} should expose its user-facing description`
+      )
+      assertEqual(
+        tool.userDescription.trim().length > 0,
+        true,
+        `${tool.name} should have a non-empty user-facing description`
+      )
+      assertEqual(
+        tool.userDescription.includes('\n'),
+        false,
+        `${tool.name} user-facing description should fit on one line`
+      )
+      assertEqual(
+        tool.userDescription.length <= 100,
+        true,
+        `${tool.name} user-facing description should stay concise`
+      )
+      assertEqual(
+        tool.userDescription === tool.agentDescription,
+        false,
+        `${tool.name} user-facing and agent descriptions should stay separate`
+      )
+    }
+  })
+
+  await runCase('model tools retain agent-facing descriptions', () => {
+    const execTool = buildToolsForModel({ image: false }).find(
+      (tool) => toolName(tool) === 'exec_command'
+    )
+    const metadata = BUILTIN_TOOL_INFO.find((tool) => tool.name === 'exec_command')
+    assertEqual(
+      toolDescription(execTool),
+      metadata?.agentDescription,
+      'model tool definitions should not receive the user-facing summary'
+    )
   })
 
   await runCase('experimental terminal lifecycle tools fail closed when settings keys are missing', () => {

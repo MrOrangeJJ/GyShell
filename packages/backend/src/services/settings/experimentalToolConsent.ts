@@ -1,4 +1,4 @@
-import { BUILTIN_TOOL_INFO } from '../AgentHelper/prompts'
+import { BUILTIN_TOOL_INFO } from '../AgentHelper/builtInToolMetadata'
 
 export const EXPERIMENTAL_TOOL_CONFIRMATION_REQUIRED =
   'experimental_tool_confirmation_required' as const
