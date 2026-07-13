@@ -7,15 +7,20 @@
 [![Shell](https://img.shields.io/badge/Shell-Zsh%20%7C%20Bash%20%7C%20PowerShell-orange)](#key-capabilities)
 
 English README | [中文 README](./README.zh-CN.md)  
-Latest release notes: [`changelogs/v1.6.0.md`](./changelogs/v1.6.0.md)
+Latest release notes: [`changelogs/v1.7.0.md`](./changelogs/v1.7.0.md)
+
+> [!IMPORTANT]
+> 🚀 **v1.7.0 headline upgrade: dramatically faster GyShell Agent execution.** GyShell safely runs supported, compatible tool calls in parallel, significantly reducing wait time in multi-tool and multi-machine tasks while keeping conflicting operations strictly ordered.
+
+> [!TIP]
+> **New in v1.7.0: `gyll` command CLI.** Let other agents control GyShell through stable JSON commands using the standalone executable included with desktop releases. **[Open the `gyll` installation and usage tutorial ->](./docs/cli-usage.md)**
 
 If you have any suggestions or questions, please feel free to submit them in [GitHub Discussions](https://github.com/MrOrangeJJ/GyShell/discussions).
 
 Usage guides:
-[`docs/cli-usage.md`](./docs/cli-usage.md) ·
-[`docs/mobile-web-usage.md`](./docs/mobile-web-usage.md) ·
-[`docs/tui-usage.md`](./docs/tui-usage.md) ·
-[`docs/gybackend-usage.md`](./docs/gybackend-usage.md)
+[`gyll` CLI tutorial](./docs/cli-usage.md) ·
+[Mobile-web guide](./docs/mobile-web-usage.md) ·
+[GyBackend guide](./docs/gybackend-usage.md)
 
 > [!WARNING]
 > **Active Development**: GyShell evolves quickly. If a version introduces history compatibility breaks, it will be called out explicitly in release notes.
@@ -67,24 +72,16 @@ GyShell is built for **persistent execution in your real terminal runtime**:
 - **For multi-device and agent flow**: desktop + command CLI + mobile-web with shared gateway semantics.
 - **For multimodal workflows**: text and image inputs can be combined in one execution turn.
 
-## v1.6.0 Key Highlights
+## v1.7.0 Key Highlights
 
-- **Global Tab List panel**
-  - a new `TAB LIST` panel shows terminal and chat tabs as a vertical workspace inventory, with counts, status dots, latest-first ordering, drag/drop support, close actions, and quick creation for chat, local terminal, and saved-SSH terminal tabs
-- **Default workspace refresh**
-  - new main layouts start with the list panel on the left, chat in the center, and terminal on the right, making tab-heavy sessions easier to scan immediately
-- **More predictable background terminal tabs**
-  - local and SSH tabs created from the list panel can start in the background, stay visible in the global terminal inventory, bind to terminal panels when appropriate, and no longer unexpectedly take over linked filesystem or monitor panels
-- **Visible compaction boundaries**
-  - long chats now persist and render a `[CTX COMPACTED]` marker at the actual retained-history cutoff across desktop, mobile-web, and TUI clients
-- **Deterministic compaction fallback**
-  - when the compaction model fails or returns an empty summary, GyShell can recover with a local deterministic digest while preserving the protected tail and exporting exact older history for on-demand inspection when available
-- **Safer stream recovery**
-  - empty non-tool provider stream finishes now retry through the normal path instead of silently ending a run with no answer, while valid empty tool-call finishes remain routable
-- **Terminal inventory stability**
-  - terminal titles stay unique and stable across duplicate backend snapshots, concurrent terminal creation, explicit numeric suffixes, and detached-window terminal transfers
-- **Mobile-web runtime refresh**
-  - Electron-packaged mobile-web assets were regenerated so desktop builds serve the updated client without requiring a separate mobile-web development server
+- 🚀 **Headline performance upgrade — dramatically faster Agent execution**: supported tool calls now run safely in parallel, significantly accelerating multi-tool and multi-machine tasks without sacrificing execution safety.
+- **[`gyll` command CLI](./docs/cli-usage.md)**: control chats, approvals, terminals, profiles, tools, Skills, memory, and policies through stable JSON commands from a standalone executable.
+- **Live session rename**: rename a chat from the desktop Tab List or `gyll` and see the saved title update across connected clients.
+- **Agent-managed terminal tabs**: opt-in experimental tools let the Agent create Local/SSH tabs and close existing tabs.
+- **Direct SSH transfers**: large single files can move directly between compatible Unix SSH hosts, with automatic relay fallback.
+- **Auto-saved Agent Settings**: edits made while a profile is active are written back automatically.
+- **Clearer tools and Skills**: tool descriptions are shorter, and Skill discovery is limited to GyShell's managed folder plus `~/.agents/skills`.
+- **Reliability fixes**: Windows terminal resizing keeps cursor output synchronized, and chat panels preserve their selected session.
 
 ---
 
@@ -94,8 +91,9 @@ GyShell is built for **persistent execution in your real terminal runtime**:
 
 - Thinking-oriented execution for complex tasks.
 - Context-aware responses from terminal state and selected resources.
+- Supported, compatible tool calls—including read-only tools and commands targeting different machines—can execute safely in parallel to significantly accelerate Agent tasks.
 - Per-profile model routing for `Global`, `Thinking`, `Action`, and `Compaction` roles.
-- Reusable Agent Setting profiles for model profile, security policy, tools, skills, memory, recursion, and experimental workflow flags.
+- Reusable Agent Setting profiles for model profile, security policy, tools, skills, memory, recursion, and experimental workflow flags, with automatic write-back while a profile is active.
 - Long-session context quality with dedicated compaction models, dynamic summaries, visible `[CTX COMPACTED]` boundary markers, and deterministic fallback recovery when model compaction is unavailable.
 - SQLite-backed conversation history with automatic one-time migration from legacy JSON storage.
 - AI-assisted terminal command drafting from recent tab context, with paste-before-run control.
@@ -107,11 +105,13 @@ GyShell is built for **persistent execution in your real terminal runtime**:
 - Multimodal user input pipeline (text + images) for compatible models.
 - OpenAI-compatible model endpoint support, with automatic recovery from malformed empty tool-call stream finishes.
 - Optional experimental agent tools, including asynchronous cross-machine file transfer between terminal tabs with progress polling.
+- Optional experimental terminal lifecycle tools let the agent create tabs from saved Local/SSH connections and close tabs after explicit opt-in.
 
 ### Terminal + SSH + File Management
 
 - Shell support: Zsh, Bash, PowerShell.
 - Older Windows PowerShell environments now use more reliable sidecar-based command completion tracking for local and SSH sessions.
+- Windows PTY output, cursor geometry, and panel refits stay synchronized during continuous output and resizing.
 - SSH support: password/key auth, proxy chaining, bastion workflows.
 - SSH sessions use protocol keepalive to reduce silent idle disconnects.
 - Port forwarding: local, remote, and dynamic SOCKS.
@@ -123,7 +123,7 @@ GyShell is built for **persistent execution in your real terminal runtime**:
 - Local terminal tabs auto-respawn their shell if it exits, so a local tab stays usable instead of going dead.
 - Disconnected SSH tabs can be reconnected in place from the tab right-click menu using their saved connection config.
 - **Integrated file browser panel**: browse, create, rename, delete, preview, sort, filter, and search files across local and SSH sessions.
-- **Cross-session file transfer** (copy/move) with real-time progress, cancellation, and adaptive SFTP tuning.
+- **Cross-session file transfer** (copy/move) with real-time progress, cancellation, adaptive SFTP tuning, and direct routing for large single files between compatible Unix SSH hosts.
 - **Built-in file editor panel** for editing text files, plus inline preview of images (`png/jpg/gif/webp/bmp/ico/svg/avif`) and PDFs (with page navigation and zoom), all directly in the workspace.
 - **File row right-click menu** with Copy / Cut / Paste / Rename / Delete and **Copy Full Path(s)** to the system clipboard.
 - **Paste conflict resolution**: choose between **Overwrite** and **Keep Both** (auto-numbered names) when pasting into a folder with same-named items.
@@ -131,7 +131,7 @@ GyShell is built for **persistent execution in your real terminal runtime**:
 ### Workspace + Monitoring
 
 - Detach panels into dedicated sub-windows and move tabs or whole panels across windows.
-- Use the global Tab List panel to scan terminal/chat inventory, restore unhosted tabs, drag tabs across layout targets, close tabs, and create new chat/local/SSH tabs without forcing a terminal panel to appear.
+- Use the global Tab List panel to scan terminal/chat inventory, rename chat sessions, restore unhosted tabs, drag tabs across layout targets, close tabs, and create new chat/local/SSH tabs without forcing a terminal panel to appear.
 - Save up to three workspace layout slots and restore them from the rail.
 - Optionally keep the computer awake while any chat session is running, with the system-sleep block released automatically when runs finish.
 - Chat tabs show a running indicator while a session is busy, mirroring terminal tab runtime-state dots.
@@ -145,10 +145,10 @@ GyShell is built for **persistent execution in your real terminal runtime**:
 
 ### Skills + MCP + Tools
 
-- Folder-based skills workflow compatible with agentskills-style structure.
+- Folder-based Skills workflow using GyShell's managed directory and `~/.agents/skills` as the default discovery roots.
 - Dynamic MCP server integration.
 - Precision editing tools for safe, targeted file updates.
-- Runtime tool toggles and summaries exposed to clients.
+- Runtime tool toggles and concise user-facing summaries exposed to clients.
 
 ### Mobile-Web Companion
 
@@ -162,6 +162,7 @@ GyShell is built for **persistent execution in your real terminal runtime**:
 - Read-only terminal output tails with unread indicators, local/saved-SSH terminal creation, and SSH reconnect.
 - Detailed turn event inspection from phone browser.
 - Tool, skill, Agent Setting profile, terminal, and settings access through gateway RPC.
+- Session rename updates appear live without reloading the mobile client.
 - Long chat timelines avoid full-list rerenders during composer input, keeping history-heavy mobile sessions responsive.
 - Gateway exposure can now be limited to localhost, LAN-only, custom CIDR ranges, or all interfaces.
 
@@ -186,7 +187,7 @@ GyShell is built for **persistent execution in your real terminal runtime**:
 
 ## Quick Start
 
-### Prerequisites
+### Development Prerequisites
 
 - Node.js 18+
 - npm
@@ -214,16 +215,21 @@ npm run dev:mobile-web
 
 ## Command CLI (`gyll`)
 
-The new `gyll` is a lightweight, command-only gateway client designed for other agents. It covers common chat/session, approval, terminal, profile, skill, tool, memory, and policy operations with stable JSON output.
+Introduced in v1.7.0, `gyll` is a lightweight, command-only gateway client designed for other agents. It covers common chat/session, approval, terminal, profile, skill, tool, memory, and policy operations with stable JSON output.
+
+With the desktop app or `gybackend` running and its WebSocket gateway enabled:
 
 ```bash
-npm run build:cli
-npm --silent run cli -- status
-npm --silent run cli -- session list
-npm --silent run cli -- chat send --message "Run tests and summarize" --wait
+gyll status
+gyll session list
+gyll chat send --message "Run tests and summarize" --wait
 ```
 
-The old interactive TUI remains deprecated. Desktop builds now carry a self-contained `gyll` executable with no system Node.js dependency: Windows and Linux system installers expose it automatically, while macOS and AppImage builds offer an explicit first-run/menu setup. GyShell never appends new shell-profile blocks. See [`docs/cli-usage.md`](./docs/cli-usage.md).
+For source-tree development, run `npm run build:cli` and prefix each command with `npm --silent run cli --`.
+
+The old interactive TUI remains deprecated. Desktop builds carry a self-contained `gyll` executable with no system Node.js dependency: Windows and Linux system installers expose it automatically, while macOS and AppImage builds offer an explicit first-run/menu setup. GyShell never appends new shell-profile blocks.
+
+**[Read the complete `gyll` installation and usage tutorial ->](./docs/cli-usage.md)**
 
 ---
 
@@ -256,7 +262,8 @@ See:
 
 ## Read More
 
-- Release notes: `changelogs/v1.6.0.md`
+- Release notes: [`changelogs/v1.7.0.md`](./changelogs/v1.7.0.md)
+- `gyll` installation and usage: [`docs/cli-usage.md`](./docs/cli-usage.md)
 - Build matrix and packaging: `docs/build-commands.md`
 - Monorepo boundaries and runtime flow: `docs/monorepo-architecture.md`
 

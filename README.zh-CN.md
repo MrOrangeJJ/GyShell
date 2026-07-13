@@ -7,15 +7,20 @@
 [![Shell](https://img.shields.io/badge/Shell-Zsh%20%7C%20Bash%20%7C%20PowerShell-orange)](#核心能力)
 
 [English README](./README.md) | 中文 README  
-最新发布说明：[`changelogs/v1.6.0.md`](./changelogs/v1.6.0.md)
+最新发布说明：[`changelogs/v1.7.0.md`](./changelogs/v1.7.0.md)
+
+> [!IMPORTANT]
+> 🚀 **v1.7.0 核心更新：GyShell Agent 运行速度大幅提升。** GyShell 会安全地并行执行受支持且互不冲突的工具调用，显著缩短多工具、多机器任务的等待时间；存在冲突的操作仍会严格按安全顺序执行。
+
+> [!TIP]
+> **v1.7.0 新增 `gyll` 纯命令 CLI。** 其他 Agent 现在可以通过桌面发行版内置的独立可执行文件，用稳定的 JSON 命令控制 GyShell。**[打开 `gyll` 安装与使用教程 ->](./docs/cli-usage.md)**
 
 如果有任何建议或者问题，欢迎在 [GitHub Discussions](https://github.com/MrOrangeJJ/GyShell/discussions) 中提交。
 
-使用教程:
-[`docs/cli-usage.md`](./docs/cli-usage.md) ·
-[`docs/mobile-web-usage.md`](./docs/mobile-web-usage.md) ·
-[`docs/tui-usage.md`](./docs/tui-usage.md) ·
-[`docs/gybackend-usage.md`](./docs/gybackend-usage.md)
+使用教程：
+[`gyll` CLI 教程](./docs/cli-usage.md) ·
+[Mobile Web 教程](./docs/mobile-web-usage.md) ·
+[GyBackend 教程](./docs/gybackend-usage.md)
 
 > [!WARNING]
 > **项目处于快速迭代阶段**：如果某个版本引入了历史数据兼容性变更，会在发布说明中明确标注。
@@ -66,24 +71,16 @@ GyShell 的定位是“运行在真实终端中的持续执行系统”：
 - **面向多设备与 agent 协作**：桌面端 + 纯命令 CLI + Mobile Web 共用网关语义。
 - **面向多模态执行**：单轮里可组合文字与图片输入，直接推进真实任务。
 
-## v1.6.0 关键亮点
+## v1.7.0 关键亮点
 
-- **全局 Tab List 面板**
-  - 新增 `TAB LIST` 面板，用垂直清单展示 terminal 和 chat tab，包含数量、状态点、按最近更新时间排序、拖拽、关闭，以及快速创建 chat、本地 terminal、已保存 SSH terminal
-- **默认工作区布局更新**
-  - 新的主布局默认左侧为列表面板，中间为聊天，右侧为终端，让多 tab 工作区一打开就更容易扫描
-- **更可预测的后台 terminal tab**
-  - 从列表面板创建的本地和 SSH tab 都可以在后台启动，继续出现在全局 terminal 清单中，按需绑定到 terminal panel，并且不会意外切换关联的文件系统或监控 panel
-- **可见的上下文压缩边界**
-  - 长对话现在会在真实保留历史切点持久化并渲染 `[CTX COMPACTED]` 标记，桌面端、mobile-web 和 TUI 保持一致
-- **确定性压缩兜底**
-  - 当 compaction 模型失败或返回空摘要时，GyShell 可以用本地确定性 digest 恢复，保留受保护尾部，并在可用时导出更早的精确历史供按需查看
-- **更稳的模型空流恢复**
-  - 空内容、非工具调用的 provider stream 结束会进入正常重试路径，不再静默结束；有效的空工具调用结束仍会继续路由执行
-- **终端清单稳定性**
-  - terminal 标题在重复 backend snapshot、并发创建、用户显式数字后缀和 detached-window 转移场景下都保持唯一且稳定
-- **内置 Mobile Web 产物刷新**
-  - Electron 打包内置的 mobile-web 产物已重新生成，因此桌面构建直接托管的移动端页面会包含本次更新
+- 🚀 **核心性能升级——Agent 运行速度大幅提升**：受支持的工具调用现在可以安全并行执行，让多工具、多机器任务明显更快，同时不牺牲执行安全性。
+- **[`gyll` 纯命令 CLI](./docs/cli-usage.md)**：通过桌面发行版内置的独立可执行文件，用稳定 JSON 命令控制聊天、审批、终端、Profile、工具、Skills、记忆和策略。
+- **会话重命名实时同步**：在桌面端 Tab List 或 `gyll` 中重命名后，新标题会持久保存并同步到已连接的客户端。
+- **Agent 管理终端标签**：明确选择启用后，实验性工具可让 Agent 创建本地/SSH 标签并关闭现有标签。
+- **SSH 直传**：兼容的 Unix SSH 主机之间可直接传输单个大文件，条件不满足时自动回退到中转路径。
+- **Agent Setting 自动保存**：Profile 激活期间的更改会自动写回，无需手动覆盖。
+- **工具与 Skills 更清晰**：工具说明更简短，Skills 只从 GyShell 管理目录和 `~/.agents/skills` 自动发现。
+- **稳定性修复**：Windows 终端缩放时保持光标与输出同步，聊天面板也会保留当前选中的会话。
 
 ---
 
@@ -93,8 +90,9 @@ GyShell 的定位是“运行在真实终端中的持续执行系统”：
 
 - 面向复杂任务的思考式执行流程。
 - 基于终端上下文和选中资源的上下文感知。
+- 受支持且互不冲突的工具调用（包括只读工具和面向不同机器的命令）可安全并行执行，大幅提升 Agent 任务运行速度。
 - 支持按 Profile 分配 `Global`、`Thinking`、`Action`、`Compaction` 四类模型角色。
-- 支持可复用 Agent Setting 配置档，保存模型 Profile、安全策略、工具、Skills、memory、递归和实验 workflow flags。
+- 支持可复用 Agent Setting 配置档，保存模型 Profile、安全策略、工具、Skills、memory、递归和实验 workflow flags；Profile 激活期间的更改会自动写回。
 - 长会话智能压缩、独立压缩模型链路、可见的 `[CTX COMPACTED]` 压缩边界标记，以及模型压缩不可用时的确定性兜底恢复。
 - 会话与 UI 历史改为基于 SQLite 持久化，并支持从旧 JSON 存储自动做一次迁移。
 - 支持基于当前 tab 最近上下文生成命令草稿，并保留”先粘贴、再由你决定是否执行”的控制权。
@@ -104,11 +102,13 @@ GyShell 的定位是“运行在真实终端中的持续执行系统”：
 - 支持多模态输入链路（文字 + 图片）。
 - 支持 OpenAI 兼容接口模型，并能在遇到"空的畸形工具调用结束"流时自动恢复。
 - 提供可选的试验性 Agent 工具，包括在终端 tab 之间进行异步跨机器文件传输并轮询进度。
+- 明确选择启用后，实验性终端生命周期工具可让 Agent 从已保存的本地/SSH 连接创建标签并关闭标签。
 
 ### 终端、SSH 与文件管理
 
 - 原生支持 Zsh、Bash、PowerShell。
 - 较旧的 Windows PowerShell 环境在本地与 SSH 场景下都会使用更稳的 sidecar 命令完成跟踪。
+- Windows PTY 持续输出和面板缩放同时发生时，光标位置、画面重排与输出仍能保持同步。
 - SSH 支持密码/密钥认证、代理链路、堡垒机场景。
 - 端口转发支持 Local / Remote / Dynamic SOCKS。
 - Agent 可在单个任务中同时协调**多个 SSH/本地 terminal tab**。
@@ -119,7 +119,7 @@ GyShell 的定位是“运行在真实终端中的持续执行系统”：
 - 本地 terminal tab 在 shell 退出时会自动重新拉起 shell，让本地 tab 保持可用而不"假死"。
 - 已断开的 SSH tab 可从 tab 右键菜单用其保存的连接配置在原地重新连接。
 - **集成文件浏览面板**：可在本地与 SSH 会话中浏览、创建、重命名、删除、预览、排序、筛选和搜索文件。
-- **跨会话文件传输**（复制/移动），实时进度展示、单任务取消、自适应 SFTP 传输调优。
+- **跨会话文件传输**（复制/移动），支持实时进度、单任务取消、自适应 SFTP 调优，以及兼容 Unix SSH 主机之间的单个大文件直传。
 - **内置文件编辑器面板**：直接在工作区内编辑、刷新、搜索和保存文本文件，并支持图片（`png/jpg/gif/webp/bmp/ico/svg/avif`）与 PDF（含翻页与缩放）的内联预览。
 - **文件行右键菜单**：包含复制 / 剪切 / 粘贴 / 重命名 / 删除等操作，并支持 **复制完整路径**（多选时复制多条）到系统剪贴板。
 - **粘贴冲突处理**：粘贴到含同名项的目录时，可在 **覆盖** 与 **保留两者**（自动添加数字后缀）之间选择。
@@ -127,7 +127,7 @@ GyShell 的定位是“运行在真实终端中的持续执行系统”：
 ### 工作区与监控
 
 - 面板可拆到独立子窗口，标签和整块面板都能跨窗口移动。
-- 可通过全局 Tab List 面板扫描 terminal/chat 清单、恢复未托管 tab、跨布局目标拖动 tab、关闭 tab，并创建新的 chat、本地 terminal 或 SSH tab，且不会强制打开 terminal panel。
+- 可通过全局 Tab List 面板扫描 terminal/chat 清单、重命名 chat session、恢复未托管 tab、跨布局目标拖动 tab、关闭 tab，并创建新的 chat、本地 terminal 或 SSH tab，且不会强制打开 terminal panel。
 - 可保存最多 3 个工作区布局槽位，并从 Rail 快速恢复。
 - 可选在任意对话会话运行期间保持电脑唤醒，运行结束后自动解除系统睡眠阻止。
 - 聊天 tab 会在会话繁忙时显示运行中指示器，与终端 tab 的运行状态圆点一致。
@@ -141,10 +141,10 @@ GyShell 的定位是“运行在真实终端中的持续执行系统”：
 
 ### Skills + MCP + Tools
 
-- 支持文件夹式 Skills 组织与复用。
+- 支持文件夹式 Skills 组织与复用，默认从 GyShell 管理目录和 `~/.agents/skills` 自动发现。
 - MCP 服务器可动态接入与管理。
 - 提供精细化文件编辑能力，减少粗暴覆盖。
-- 工具启用状态可被各客户端实时读取与控制。
+- 工具启用状态和简短直观的说明可被各客户端实时读取与控制。
 
 ### Mobile Web 伴随端
 
@@ -158,6 +158,7 @@ GyShell 的定位是“运行在真实终端中的持续执行系统”：
 - 支持只读终端输出尾部、未读输出提示、本地/已保存 SSH terminal 创建，以及 SSH 重连。
 - 可在移动端查看单轮详细事件链路。
 - 通过网关 RPC 统一访问工具、技能、Agent Setting Profiles、终端和设置能力。
+- 会话重命名会实时同步，无需重新加载移动端页面。
 - 网关暴露范围支持仅本机、仅局域网、自定义 CIDR 范围和全部网卡。
 
 ---
@@ -181,7 +182,7 @@ GyShell 的定位是“运行在真实终端中的持续执行系统”：
 
 ## 快速开始
 
-### 前置要求
+### 本地开发前置要求
 
 - Node.js 18+
 - npm
@@ -209,16 +210,21 @@ npm run dev:mobile-web
 
 ## 纯命令 CLI（`gyll`）
 
-新的 `gyll` 是面向其他 agent 的轻量纯命令 gateway 客户端。它通过稳定 JSON 输出覆盖常见的对话/会话、审批、终端、profile、skill、tool、memory 与 policy 操作。
+v1.7.0 新增的 `gyll` 是面向其他 Agent 的轻量纯命令 gateway 客户端。它通过稳定 JSON 输出覆盖常见的对话/会话、审批、终端、Profile、Skill、Tool、memory 与 policy 操作。
+
+先启动桌面端或 `gybackend`，并启用 WebSocket gateway：
 
 ```bash
-npm run build:cli
-npm --silent run cli -- status
-npm --silent run cli -- session list
-npm --silent run cli -- chat send --message "运行测试并总结" --wait
+gyll status
+gyll session list
+gyll chat send --message "运行测试并总结" --wait
 ```
 
-旧交互式 TUI 仍然处于废弃状态。桌面构建现在会携带不依赖系统 Node.js 的自包含 `gyll`：Windows 与 Linux 系统安装包自动提供命令，macOS 与 AppImage 则在首次启动/应用菜单中明确征求安装。GyShell 不会再向 shell profile 追加 PATH block。详见 [`docs/cli-usage.md`](./docs/cli-usage.md)。
+在源码仓库中开发时，先执行 `npm run build:cli`，再在每条命令前加上 `npm --silent run cli --`。
+
+旧交互式 TUI 仍然处于废弃状态。桌面构建会携带不依赖系统 Node.js 的自包含 `gyll`：Windows 与 Linux 系统安装包自动提供命令，macOS 与 AppImage 则在首次启动/应用菜单中明确征求安装。GyShell 不会再向 shell profile 追加 PATH block。
+
+**[阅读完整的 `gyll` 安装与使用教程 ->](./docs/cli-usage.md)**
 
 ---
 
@@ -251,7 +257,8 @@ GyShell 采用严格分层：
 
 ## 延伸阅读
 
-- 发布说明：`changelogs/v1.6.0.md`
+- 发布说明：[`changelogs/v1.7.0.md`](./changelogs/v1.7.0.md)
+- `gyll` 安装与使用：[`docs/cli-usage.md`](./docs/cli-usage.md)
 - 构建与打包命令矩阵：`docs/build-commands.md`
 - Monorepo 边界与运行链路：`docs/monorepo-architecture.md`
 
