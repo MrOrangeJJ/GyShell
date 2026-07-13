@@ -1,4 +1,9 @@
-import { parseWindowsBuildNumber, resolveTerminalWindowsPty, windowsPtyOptionsEqual } from './terminalWindowsPty'
+import {
+  parseWindowsBuildNumber,
+  resolveTerminalWindowsPty,
+  resolveTerminalWindowsPtyTransition,
+  windowsPtyOptionsEqual
+} from './terminalWindowsPty'
 
 const assertEqual = <T>(actual: T, expected: T, message: string): void => {
   if (actual !== expected) {
@@ -55,13 +60,58 @@ runCase('uses winpty for pre-ConPTY Windows builds', () => {
 runCase('falls back to a conservative build number before system info arrives', () => {
   assertDeepEqual(
     resolveTerminalWindowsPty('windows'),
-    { backend: 'winpty', buildNumber: 0 },
-    'windows terminals should use a fallback build number when needed'
+    { backend: 'conpty', buildNumber: 18309 },
+    'unknown Windows terminals should disable POSIX reflow until their exact build arrives'
   )
 })
 
 runCase('does not enable windows pty hints for non-Windows terminals', () => {
   assertEqual(resolveTerminalWindowsPty('unix'), undefined, 'unix terminals should not receive windows pty hints')
+})
+
+runCase('does not downgrade an exact Windows build on stale metadata', () => {
+  assertDeepEqual(
+    resolveTerminalWindowsPtyTransition(
+      { backend: 'conpty', buildNumber: 26100 },
+      'windows'
+    ),
+    { backend: 'conpty', buildNumber: 26100 },
+    'missing release metadata must not replace a known exact build with the fallback'
+  )
+})
+
+runCase('does not replace an exact pre-ConPTY build with the unknown fallback', () => {
+  assertDeepEqual(
+    resolveTerminalWindowsPtyTransition(
+      { backend: 'winpty', buildNumber: 14393 },
+      'windows'
+    ),
+    { backend: 'winpty', buildNumber: 14393 },
+    'missing release metadata must preserve an exact legacy Windows mode'
+  )
+})
+
+runCase('still removes Windows mode when the terminal is confirmed Unix', () => {
+  assertEqual(
+    resolveTerminalWindowsPtyTransition(
+      { backend: 'conpty', buildNumber: 26100 },
+      'unix'
+    ),
+    undefined,
+    'an explicit Unix transition should remove Windows PTY behavior'
+  )
+})
+
+runCase('accepts a new exact build after reconnect', () => {
+  assertDeepEqual(
+    resolveTerminalWindowsPtyTransition(
+      { backend: 'conpty', buildNumber: 22631 },
+      'windows',
+      { release: '10.0.26100' }
+    ),
+    { backend: 'conpty', buildNumber: 26100 },
+    'fresh exact metadata should replace the previous runtime build'
+  )
 })
 
 runCase('compares windows pty options structurally', () => {

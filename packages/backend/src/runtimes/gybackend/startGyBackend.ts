@@ -261,7 +261,11 @@ export async function startGyBackend(): Promise<void> {
           getBufferDelta: async (terminalId, fromOffset) => {
             const data = terminalService.getBufferDelta(terminalId, fromOffset);
             const offset = terminalService.getCurrentOffset(terminalId);
-            return { data, offset };
+            return {
+              data,
+              offset,
+              ...terminalService.getRenderMetadata(terminalId),
+            };
           },
           generateCommandDraft: async (terminalId, prompt, profileId) => {
             return await terminalCommandDraftService.generateCommandDraft({

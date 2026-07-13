@@ -387,6 +387,11 @@ interface TerminalSystemInfo {
   shell?: string;
 }
 
+interface TerminalRenderMetadata {
+  remoteOs?: "unix" | "windows";
+  windowsRelease?: string;
+}
+
 interface TerminalSummary {
   id: string;
   title: string;
@@ -575,7 +580,12 @@ export interface GyShellAPI {
     getBufferDelta: (
       terminalId: string,
       fromOffset: number,
-    ) => Promise<{ data: string; offset: number }>;
+    ) => Promise<{
+      data: string;
+      offset: number;
+      remoteOs?: "unix" | "windows";
+      windowsRelease?: string;
+    }>;
     generateCommandDraft: (
       terminalId: string,
       prompt: string,
@@ -586,7 +596,7 @@ export interface GyShellAPI {
         terminalId: string;
         data: string;
         offset?: number;
-      }) => void,
+      } & TerminalRenderMetadata) => void,
     ) => () => void;
     onExit: (
       callback: (data: { terminalId: string; code: number }) => void,
@@ -1013,7 +1023,11 @@ const api: GyShellAPI = {
     onData: (callback) => {
       const handler = (
         _: IpcRendererEvent,
-        data: { terminalId: string; data: string; offset?: number },
+        data: {
+          terminalId: string;
+          data: string;
+          offset?: number;
+        } & TerminalRenderMetadata,
       ) => callback(data);
       ipcRenderer.on("terminal:data", handler);
       return () => ipcRenderer.off("terminal:data", handler);

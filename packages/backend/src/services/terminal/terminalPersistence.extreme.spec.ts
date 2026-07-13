@@ -54,6 +54,11 @@ class FakeTerminalBackend implements TerminalBackend {
   private readonly spawnFailures = new Set<string>()
   private readonly remoteOsByPtyId = new Map<string, 'unix' | 'windows' | undefined>()
   private readonly systemInfoByPtyId = new Map<string, TerminalSystemInfo | undefined>()
+  private readonly delayedSystemInfoPtyIds = new Set<string>()
+  private readonly delayedSystemInfoResolversByPtyId = new Map<
+    string,
+    Array<(info: TerminalSystemInfo | undefined) => void>
+  >()
   private readonly initializationStateByPtyId = new Map<
     string,
     'initializing' | 'ready' | 'failed'
@@ -102,6 +107,23 @@ class FakeTerminalBackend implements TerminalBackend {
 
   setSystemInfoForTerminalId(terminalId: string, systemInfo: TerminalSystemInfo | undefined): void {
     this.systemInfoByPtyId.set(this.getPtyIdForTerminalId(terminalId), systemInfo)
+  }
+
+  delaySystemInfoForTerminalId(terminalId: string): void {
+    this.delayedSystemInfoPtyIds.add(this.getPtyIdForTerminalId(terminalId))
+  }
+
+  resolveNextSystemInfoForTerminalId(
+    terminalId: string,
+    systemInfo: TerminalSystemInfo | undefined
+  ): void {
+    const ptyId = this.getPtyIdForTerminalId(terminalId)
+    const resolvers = this.delayedSystemInfoResolversByPtyId.get(ptyId)
+    const resolve = resolvers?.shift()
+    if (!resolve) {
+      throw new Error(`No delayed system-info request for ${terminalId}`)
+    }
+    resolve(systemInfo)
   }
 
   setCwdForTerminalId(terminalId: string, cwd: string): void {
@@ -301,6 +323,13 @@ class FakeTerminalBackend implements TerminalBackend {
   }
 
   async getSystemInfo(_ptyId: string): Promise<TerminalSystemInfo | undefined> {
+    if (this.delayedSystemInfoPtyIds.has(_ptyId)) {
+      return await new Promise<TerminalSystemInfo | undefined>((resolve) => {
+        const resolvers = this.delayedSystemInfoResolversByPtyId.get(_ptyId) ?? []
+        resolvers.push(resolve)
+        this.delayedSystemInfoResolversByPtyId.set(_ptyId, resolvers)
+      })
+    }
     return this.systemInfoByPtyId.get(_ptyId)
   }
 
@@ -524,17 +553,32 @@ const run = async (): Promise<void> => {
           systemInfo?: TerminalSystemInfo
         }>
       }> = []
+      const terminalDataEvents: Array<{
+        terminalId: string
+        data: string
+        remoteOs?: 'unix' | 'windows'
+        windowsRelease?: string
+      }> = []
 
       const service = createService(stateFilePath, backend)
       service.setRawEventPublisher((channel, payload) => {
-        if (channel !== 'terminal:tabs') return
-        terminalTabEvents.push(payload as {
-          terminals: Array<{
-            id: string
+        if (channel === 'terminal:tabs') {
+          terminalTabEvents.push(payload as {
+            terminals: Array<{
+              id: string
+              remoteOs?: 'unix' | 'windows'
+              systemInfo?: TerminalSystemInfo
+            }>
+          })
+        }
+        if (channel === 'terminal:data') {
+          terminalDataEvents.push(payload as {
+            terminalId: string
+            data: string
             remoteOs?: 'unix' | 'windows'
-            systemInfo?: TerminalSystemInfo
-          }>
-        })
+            windowsRelease?: string
+          })
+        }
       })
 
       const restore = await service.restorePersistedTerminals()
@@ -562,6 +606,27 @@ const run = async (): Promise<void> => {
           )
         ),
         'renderer tab snapshots should be republished once restored windows metadata is available'
+      )
+
+      backend.emitDataForTerminalId('ssh-win-idle', 'PS C:\\Users\\test> ')
+      await sleep(10)
+      const renderedData = terminalDataEvents.find(
+        (event) => event.terminalId === 'ssh-win-idle'
+      )
+      assertEqual(
+        renderedData?.remoteOs,
+        'windows',
+        'every rendered data packet should carry its Windows parser mode'
+      )
+      assertEqual(
+        renderedData?.windowsRelease,
+        '10.0.19045',
+        'rendered data should carry the exact Windows build before xterm parses it'
+      )
+      assertEqual(
+        service.getRenderMetadata('ssh-win-idle').windowsRelease,
+        '10.0.19045',
+        'buffer replay metadata should match the live renderer stream'
       )
     })
 
@@ -1162,6 +1227,16 @@ const run = async (): Promise<void> => {
 
     await runCase('reconnectTerminal respawns an exited ssh tab with the same terminal id', async () => {
       const backend = new FakeTerminalBackend()
+      backend.setRemoteOsForTerminalId('ssh-reconnect-same-id', 'windows')
+      backend.setSystemInfoForTerminalId('ssh-reconnect-same-id', {
+        os: 'Windows',
+        platform: 'win32',
+        release: '10.0.19045',
+        arch: 'x64',
+        hostname: 'old-windows-host',
+        isRemote: true,
+        shell: 'powershell.exe'
+      })
       const service = createService(stateFilePath, backend)
 
       await service.createTerminal({
@@ -1200,6 +1275,17 @@ const run = async (): Promise<void> => {
       assertEqual(runtimeSnapshot?.reconnectable, true, 'disconnected ssh tab with config should be reconnectable')
       assertEqual(runtimeSnapshot?.canRunCommand, false, 'disconnected ssh tab should not accept commands')
       assertEqual(runtimeSnapshot?.canUseFilesystem, false, 'disconnected ssh tab should not expose filesystem operations')
+
+      backend.setRemoteOsForTerminalId('ssh-reconnect-same-id', 'unix')
+      backend.setSystemInfoForTerminalId('ssh-reconnect-same-id', {
+        os: 'Linux',
+        platform: 'linux',
+        release: '6.8.0',
+        arch: 'x64',
+        hostname: 'new-unix-host',
+        isRemote: true,
+        shell: '/bin/bash'
+      })
 
       const reconnected = await service.reconnectTerminal(
         'ssh-reconnect-same-id'
@@ -1250,6 +1336,135 @@ const run = async (): Promise<void> => {
       assertEqual(runtimeSnapshot?.runtimeState, 'ready', 'runtime snapshot should report reconnected tab ready')
       assertEqual(runtimeSnapshot?.canRunCommand, true, 'ready ssh tab should accept commands')
       assertEqual(runtimeSnapshot?.canUseFilesystem, true, 'ready ssh tab should expose filesystem operations')
+      assertEqual(
+        service.getRenderMetadata('ssh-reconnect-same-id').remoteOs,
+        'unix',
+        'reconnect should hydrate metadata from the replacement PTY runtime'
+      )
+      assertEqual(
+        service.getRenderMetadata('ssh-reconnect-same-id').windowsRelease,
+        undefined,
+        'reconnect should not leak the previous Windows build into a new runtime'
+      )
+    })
+
+    await runCase('reconnect ignores delayed metadata from a reused ssh pty id', async () => {
+      const backend = new FakeTerminalBackend()
+      backend.setRemoteOsForTerminalId('ssh-reconnect-generation', undefined)
+      backend.delaySystemInfoForTerminalId('ssh-reconnect-generation')
+      const service = createService(stateFilePath, backend)
+
+      await service.createTerminal({
+        type: 'ssh',
+        id: 'ssh-reconnect-generation',
+        title: 'SSH Reconnect Generation',
+        host: '10.0.0.6',
+        port: 22,
+        username: 'root',
+        authMethod: 'password',
+        password: 'secret',
+        cols: 80,
+        rows: 24
+      })
+      backend.emitExitForTerminalId('ssh-reconnect-generation', 255)
+      await service.reconnectTerminal('ssh-reconnect-generation')
+
+      backend.resolveNextSystemInfoForTerminalId('ssh-reconnect-generation', {
+        os: 'Windows',
+        platform: 'win32',
+        release: '10.0.19045',
+        arch: 'x64',
+        hostname: 'stale-windows-runtime',
+        isRemote: true,
+        shell: 'powershell.exe'
+      })
+      await sleep(10)
+      assertEqual(
+        service.getDisplayTerminals().find(
+          (terminal) => terminal.id === 'ssh-reconnect-generation'
+        )?.systemInfo,
+        undefined,
+        'metadata from the previous runtime generation must be ignored'
+      )
+
+      backend.resolveNextSystemInfoForTerminalId('ssh-reconnect-generation', {
+        os: 'Linux',
+        platform: 'linux',
+        release: '6.8.0',
+        arch: 'x64',
+        hostname: 'current-unix-runtime',
+        isRemote: true,
+        shell: '/bin/bash'
+      })
+      await sleep(10)
+      assertEqual(
+        service.getRenderMetadata('ssh-reconnect-generation').remoteOs,
+        'unix',
+        'metadata from the current runtime generation should be accepted'
+      )
+      assertEqual(
+        service.getRenderMetadata('ssh-reconnect-generation').windowsRelease,
+        undefined,
+        'stale Windows build metadata must not leak across the reconnect'
+      )
+    })
+
+    await runCase('recreated terminal id rejects metadata from the killed runtime', async () => {
+      const backend = new FakeTerminalBackend()
+      backend.setRemoteOsForTerminalId('ssh-recreate-generation', undefined)
+      backend.delaySystemInfoForTerminalId('ssh-recreate-generation')
+      const service = createService(stateFilePath, backend)
+      const config = {
+        type: 'ssh' as const,
+        id: 'ssh-recreate-generation',
+        title: 'SSH Recreate Generation',
+        host: '10.0.0.7',
+        port: 22,
+        username: 'root',
+        authMethod: 'password' as const,
+        password: 'secret',
+        cols: 80,
+        rows: 24
+      }
+
+      await service.createTerminal(config)
+      service.kill(config.id)
+      backend.setRemoteOsForTerminalId(config.id, undefined)
+      await service.createTerminal(config)
+
+      backend.resolveNextSystemInfoForTerminalId(config.id, {
+        os: 'Windows',
+        platform: 'win32',
+        release: '10.0.19045',
+        arch: 'x64',
+        hostname: 'killed-windows-runtime',
+        isRemote: true,
+        shell: 'powershell.exe'
+      })
+      await sleep(10)
+      assertEqual(
+        service.getDisplayTerminals().find(
+          (terminal) => terminal.id === config.id
+        )?.systemInfo,
+        undefined,
+        'a killed runtime token must never match a recreated terminal id'
+      )
+
+      backend.resolveNextSystemInfoForTerminalId(config.id, {
+        os: 'Linux',
+        platform: 'linux',
+        release: '6.8.0',
+        arch: 'x64',
+        hostname: 'recreated-unix-runtime',
+        isRemote: true,
+        shell: '/bin/bash'
+      })
+      await sleep(10)
+      assertEqual(
+        service.getRenderMetadata(config.id).remoteOs,
+        'unix',
+        'the recreated runtime should accept only its own metadata result'
+      )
     })
 
     await runCase('reconnectTerminal restores exited state when respawn fails synchronously', async () => {
