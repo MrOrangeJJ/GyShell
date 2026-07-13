@@ -514,7 +514,6 @@ export class AppStore {
       setWriteStdinActionModelEnabled: action,
       saveCurrentAgentSetting: action,
       applyAgentSetting: action,
-      overwriteAgentSetting: action,
       deleteAgentSetting: action,
       clearAgentSettingWarnings: action,
       sendChatMessage: action,
@@ -1726,14 +1725,6 @@ export class AppStore {
     if (!("kind" in result)) {
       this.applyAgentSettingOperationResult(result);
     }
-    return result;
-  }
-
-  async overwriteAgentSetting(
-    profileId: string,
-  ): Promise<AgentSettingOperationResult> {
-    const result = await window.gyshell.agentSettings.overwrite(profileId);
-    this.applyAgentSettingOperationResult(result);
     return result;
   }
 

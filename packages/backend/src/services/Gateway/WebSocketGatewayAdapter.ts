@@ -298,15 +298,25 @@ export interface WebSocketGatewayAdapterOptions {
         modelName?: string;
       }>;
     };
-    setActiveProfile: (profileId: string) => {
-      activeProfileId: string;
-      profiles: Array<{
-        id: string;
-        name: string;
-        globalModelId: string;
-        modelName?: string;
-      }>;
-    };
+    setActiveProfile: (profileId: string) =>
+      | {
+          activeProfileId: string;
+          profiles: Array<{
+            id: string;
+            name: string;
+            globalModelId: string;
+            modelName?: string;
+          }>;
+        }
+      | Promise<{
+          activeProfileId: string;
+          profiles: Array<{
+            id: string;
+            name: string;
+            globalModelId: string;
+            modelName?: string;
+          }>;
+        }>;
     probeModel?: (model: unknown) => unknown | Promise<unknown>;
   };
   systemBridge?: {
@@ -1535,7 +1545,7 @@ export class WebSocketGatewayAdapter {
         }
         const profileId = this.readStringParam(params, "profileId");
         try {
-          return this.options.profileBridge.setActiveProfile(profileId);
+          return await this.options.profileBridge.setActiveProfile(profileId);
         } catch (error) {
           const message =
             error instanceof Error

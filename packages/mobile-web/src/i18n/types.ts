@@ -51,7 +51,6 @@ export interface MobileTranslations {
     notConnected: string;
     save: string;
     delete: string;
-    overwrite: string;
     apply: string;
     close: string;
     refresh: string;
@@ -145,7 +144,6 @@ export interface MobileTranslations {
     agentProfileUnknownPolicy: string;
     agentProfileSaveCurrent: string;
     agentProfileSaveCurrentConfirm: string;
-    agentProfileOverwriteConfirm: string;
     agentProfileDeleteConfirm: (slot: number) => string;
     agentProfileApplyFailed: string;
     agentProfileSaveFailed: string;

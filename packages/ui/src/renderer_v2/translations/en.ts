@@ -144,11 +144,6 @@ export const en = {
     saveCurrentAgentSettingMessage:
       "Save the current security, tool, skill, memory, workflow, and active model profile settings?",
     agentSettingSlot: (slotNumber: number) => `Agent Setting ${slotNumber}`,
-    overwriteWithCurrentAgentSetting: "Overwrite with Current Agent Setting",
-    overwriteAgentSettingTitle: "Overwrite Agent Setting",
-    overwriteAgentSettingMessage: (slotNumber: number) =>
-      `Overwrite Agent Setting ${slotNumber} with the current Agent settings?`,
-    overwriteAgentSettingConfirm: "Overwrite",
     deleteAgentSettingTitle: "Delete Agent Setting",
     deleteAgentSettingMessage: (slotNumber: number) =>
       `Delete Agent Setting ${slotNumber}? Its memory file is kept on disk for safety.`,

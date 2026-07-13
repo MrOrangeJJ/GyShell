@@ -11,7 +11,10 @@ import type {
   ISkillRuntime,
   IMemoryRuntime,
 } from './runtimeContracts'
-import type { CommandPolicyLists } from './CommandPolicy/CommandPolicyService'
+import type {
+  CommandPolicyListName,
+  CommandPolicyLists,
+} from './CommandPolicy/CommandPolicyService'
 import type { McpServerSummary } from './McpToolService'
 import type { SkillInfo } from './SkillService'
 import type { MemorySnapshot } from '../memory/FileMemoryStore'
@@ -63,6 +66,9 @@ interface AgentSettingProfileServiceOptions {
   skillService: ISkillRuntime
   memoryService: IMemoryRuntime
   onSettingsChanged?: (settings: BackendSettings) => void | Promise<void>
+  onActiveProfileSnapshotChanged?: (
+    settings: BackendSettings,
+  ) => void | Promise<void>
 }
 
 export class AgentSettingProfileService {
@@ -78,13 +84,18 @@ export class AgentSettingProfileService {
 
   async saveCurrent(): Promise<AgentSettingOperationResult> {
     return this.runMutation(async () => {
-      const settings = this.options.settingsService.getSettings()
-      const state = this.getNormalizedAgentSettings(settings)
-      const slotNumber = getFirstAvailableAgentSettingSlotNumber(state.profiles)
+      const initialSettings = this.options.settingsService.getSettings()
+      const initialState = this.getNormalizedAgentSettings(initialSettings)
+      const slotNumber = getFirstAvailableAgentSettingSlotNumber(
+        initialState.profiles,
+      )
       if (!slotNumber) {
         throw new Error('All Agent Setting slots are already saved.')
       }
 
+      await this.updateActiveProfileSnapshot()
+      const settings = this.options.settingsService.getSettings()
+      const state = this.getNormalizedAgentSettings(settings)
       const now = Date.now()
       const profileId = getAgentSettingProfileId(slotNumber)
       const snapshot = await this.createCurrentSnapshot(settings)
@@ -112,17 +123,20 @@ export class AgentSettingProfileService {
   async overwrite(profileId: string): Promise<AgentSettingOperationResult> {
     return this.runMutation(async () => {
       const normalizedProfileId = this.requireProfileId(profileId)
-      const settings = this.options.settingsService.getSettings()
-      const state = this.getNormalizedAgentSettings(settings)
-      const existing = state.profiles.find(
+      const initialSettings = this.options.settingsService.getSettings()
+      const initialState = this.getNormalizedAgentSettings(initialSettings)
+      const initialProfile = initialState.profiles.find(
         (profile) => profile.id === normalizedProfileId,
       )
-      if (!existing) {
+      if (!initialProfile) {
         throw new Error(
           `Agent Setting profile not found: ${normalizedProfileId}`,
         )
       }
 
+      await this.updateActiveProfileSnapshot()
+      const settings = this.options.settingsService.getSettings()
+      const state = this.getNormalizedAgentSettings(settings)
       const snapshot = await this.createCurrentSnapshot(settings)
       await this.copyActiveMemoryToProfile(settings, normalizedProfileId)
       const now = Date.now()
@@ -181,6 +195,7 @@ export class AgentSettingProfileService {
   ): Promise<AgentSettingApplyResult> {
     return this.runMutation(async () => {
       const normalizedProfileId = this.requireProfileId(profileId)
+      await this.updateActiveProfileSnapshot()
       const settings = this.options.settingsService.getSettings()
       const state = this.getNormalizedAgentSettings(settings)
       const profile = state.profiles.find(
@@ -269,9 +284,152 @@ export class AgentSettingProfileService {
           skills: settings.tools?.skills ?? {},
         },
       })
+      await this.updateActiveProfileSnapshot()
       const nextSettings = this.options.settingsService.getSettings()
       await this.options.onSettingsChanged?.(nextSettings)
       return buildBuiltInToolStatusSummary(nextSettings.tools?.builtIn)
+    })
+  }
+
+  async setMcpToolEnabled(
+    name: string,
+    enabled: boolean,
+  ): Promise<McpServerSummary[]> {
+    return this.runMutation(async () => {
+      const summaries = await this.options.mcpToolService.setServerEnabled(
+        name,
+        enabled,
+      )
+      const profileUpdated = await this.updateActiveProfileSnapshot()
+      if (profileUpdated) {
+        await this.options.onSettingsChanged?.(
+          this.options.settingsService.getSettings(),
+        )
+      }
+      return summaries
+    })
+  }
+
+  async reloadMcpTools(): Promise<McpServerSummary[]> {
+    return this.runMutation(async () => {
+      const summaries = await this.options.mcpToolService.reloadAll()
+      const profileUpdated = await this.updateActiveProfileSnapshot()
+      if (profileUpdated) {
+        await this.options.onSettingsChanged?.(
+          this.options.settingsService.getSettings(),
+        )
+      }
+      return summaries
+    })
+  }
+
+  async reloadSkills(): Promise<SkillInfo[]> {
+    return this.runMutation(async () => {
+      const skills = await this.options.skillService.reload()
+      const profileUpdated = await this.updateActiveProfileSnapshot()
+      if (profileUpdated) {
+        await this.options.onSettingsChanged?.(
+          this.options.settingsService.getSettings(),
+        )
+      }
+      return skills
+    })
+  }
+
+  async createSkillFromTemplate(): Promise<SkillInfo> {
+    return this.runMutation(async () => {
+      const createSkill = this.options.skillService.createSkillFromTemplate
+      if (!createSkill) {
+        throw new Error('Skill creation is not available in this runtime.')
+      }
+      const skill = await createSkill.call(this.options.skillService)
+      const profileUpdated = await this.updateActiveProfileSnapshot()
+      if (profileUpdated) {
+        await this.options.onSettingsChanged?.(
+          this.options.settingsService.getSettings(),
+        )
+      }
+      return skill
+    })
+  }
+
+  async deleteSkillFile(fileName: string): Promise<SkillInfo[]> {
+    return this.runMutation(async () => {
+      const deleteSkillFile = this.options.skillService.deleteSkillFile
+      if (!deleteSkillFile) {
+        throw new Error('Skill deletion is not available in this runtime.')
+      }
+      await deleteSkillFile.call(this.options.skillService, fileName)
+      const skills = await this.options.skillService.getAll()
+      const profileUpdated = await this.updateActiveProfileSnapshot()
+      if (profileUpdated) {
+        await this.options.onSettingsChanged?.(
+          this.options.settingsService.getSettings(),
+        )
+      }
+      return skills
+    })
+  }
+
+  async setSkillEnabled(
+    name: string,
+    enabled: boolean,
+  ): Promise<ReturnType<typeof buildSkillStatusSummary>> {
+    return this.runMutation(async () => {
+      const settings = this.options.settingsService.getSettings()
+      const nextSkills = { ...(settings.tools?.skills ?? {}) }
+      nextSkills[name] = enabled
+      this.options.settingsService.setSettings({
+        tools: {
+          builtIn: settings.tools?.builtIn ?? {},
+          skills: nextSkills,
+        },
+      })
+      await this.updateActiveProfileSnapshot()
+      const nextSettings = this.options.settingsService.getSettings()
+      await this.options.onSettingsChanged?.(nextSettings)
+      return buildSkillStatusSummary(
+        await this.options.skillService.getAll(),
+        nextSettings.tools?.skills,
+      )
+    })
+  }
+
+  async addCommandPolicyRule(
+    listName: CommandPolicyListName,
+    rule: string,
+  ): Promise<CommandPolicyLists> {
+    return this.runMutation(async () => {
+      const lists = await this.options.commandPolicyService.addRule(
+        listName,
+        rule,
+      )
+      const profileUpdated = await this.updateActiveProfileSnapshot()
+      if (profileUpdated) {
+        await this.options.onSettingsChanged?.(
+          this.options.settingsService.getSettings(),
+        )
+      }
+      return lists
+    })
+  }
+
+  async deleteCommandPolicyRule(
+    listName: CommandPolicyListName,
+    rule: string,
+  ): Promise<CommandPolicyLists> {
+    return this.runMutation(async () => {
+      const lists = await this.options.commandPolicyService.deleteRule(
+        listName,
+        rule,
+      )
+      const profileUpdated = await this.updateActiveProfileSnapshot()
+      if (profileUpdated) {
+        await this.options.onSettingsChanged?.(
+          this.options.settingsService.getSettings(),
+        )
+      }
+      return lists
     })
   }
 
@@ -290,6 +448,7 @@ export class AgentSettingProfileService {
         settingsPatch,
       )
       this.options.settingsService.setSettings(settingsPatch)
+      await this.updateActiveProfileSnapshot()
       const nextSettings = this.options.settingsService.getSettings()
       await this.options.onSettingsChanged?.(nextSettings)
       return nextSettings
@@ -395,6 +554,35 @@ export class AgentSettingProfileService {
         activeProfileName: activeProfile?.name,
       },
     }
+  }
+
+  private async updateActiveProfileSnapshot(): Promise<boolean> {
+    const settings = this.options.settingsService.getSettings()
+    const state = this.getNormalizedAgentSettings(settings)
+    const activeProfileId = state.activeProfileId
+    if (!activeProfileId) {
+      return false
+    }
+
+    const snapshot = await this.createCurrentSnapshot(settings)
+    const now = Date.now()
+    const nextState: AgentSettingState = {
+      profiles: state.profiles.map((profile) =>
+        profile.id === activeProfileId
+          ? {
+              ...profile,
+              updatedAt: now,
+              snapshot,
+            }
+          : profile,
+      ),
+      activeProfileId,
+    }
+    this.options.settingsService.setSettings({ agentSettings: nextState })
+    await this.options.onActiveProfileSnapshotChanged?.(
+      this.options.settingsService.getSettings(),
+    )
+    return true
   }
 
   private async applyCommandPolicySnapshot(

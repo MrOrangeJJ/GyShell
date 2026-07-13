@@ -278,7 +278,6 @@ export interface MobileControllerActions {
     profileId: string,
     acknowledgedExperimentalToolNames?: string[],
   ) => Promise<AgentSettingApplyOutcome>;
-  overwriteAgentSetting: (profileId: string) => Promise<boolean>;
   deleteAgentSetting: (profileId: string) => Promise<boolean>;
 }
 
@@ -2248,32 +2247,6 @@ export function useMobileController(): {
     [applyAgentSettingResult, client],
   );
 
-  const overwriteAgentSetting = React.useCallback(
-    async (profileId: string): Promise<boolean> => {
-      if (!profileId || !client.isConnected()) {
-        setConnectionError("Gateway is not connected");
-        return false;
-      }
-      setAgentSettingsSaving(true);
-      setAgentSettingsError("");
-      try {
-        const raw = await client.request<unknown>("agentSettings:overwrite", {
-          profileId,
-        });
-        applyAgentSettingResult(raw, "Agent profile overwritten");
-        return true;
-      } catch (error) {
-        setAgentSettingsError(
-          `Failed to overwrite agent profile: ${safeError(error)}`,
-        );
-        return false;
-      } finally {
-        setAgentSettingsSaving(false);
-      }
-    },
-    [applyAgentSettingResult, client],
-  );
-
   const deleteAgentSetting = React.useCallback(
     async (profileId: string): Promise<boolean> => {
       if (!profileId || !client.isConnected()) {
@@ -2544,7 +2517,6 @@ export function useMobileController(): {
     reloadAgentSettings,
     saveCurrentAgentSetting,
     applyAgentSetting,
-    overwriteAgentSetting,
     deleteAgentSetting,
   };
 

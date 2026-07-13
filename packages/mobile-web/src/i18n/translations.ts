@@ -52,7 +52,6 @@ export const mobileTranslations: Record<MobileLocale, MobileTranslations> = {
       notConnected: "Not connected",
       save: "Save",
       delete: "Delete",
-      overwrite: "Overwrite",
       apply: "Apply",
       close: "Close",
       refresh: "Refresh",
@@ -155,8 +154,6 @@ export const mobileTranslations: Record<MobileLocale, MobileTranslations> = {
       agentProfileSaveCurrent: "Save Current Settings as Profile",
       agentProfileSaveCurrentConfirm:
         "Save the current security, tool, skill, memory, workflow, and active model profile settings?",
-      agentProfileOverwriteConfirm:
-        "Overwrite this saved profile with the current settings? The previous snapshot cannot be restored.",
       agentProfileDeleteConfirm: (slot) =>
         `Delete Saved Profile ${slot}? This action cannot be undone.`,
       agentProfileApplyFailed: "Failed to apply profile",
@@ -288,7 +285,6 @@ export const mobileTranslations: Record<MobileLocale, MobileTranslations> = {
       notConnected: "未连接",
       save: "保存",
       delete: "删除",
-      overwrite: "覆盖",
       apply: "应用",
       close: "关闭",
       refresh: "刷新",
@@ -385,8 +381,6 @@ export const mobileTranslations: Record<MobileLocale, MobileTranslations> = {
       agentProfileSaveCurrent: "将当前设置保存为预设",
       agentProfileSaveCurrentConfirm:
         "将当前的安全、工具、技能、记忆、工作流及激活模型 Profile 设置保存为预设？",
-      agentProfileOverwriteConfirm:
-        "使用当前设置覆盖此预设？之前的快照无法恢复。",
       agentProfileDeleteConfirm: (slot) =>
         `删除预设 ${slot}？此操作不可撤销。`,
       agentProfileApplyFailed: "应用预设失败",
