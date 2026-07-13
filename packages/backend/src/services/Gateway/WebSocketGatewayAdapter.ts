@@ -163,8 +163,18 @@ export interface WebSocketGatewayAdapterOptions {
       terminalId: string,
       fromOffset: number,
     ) =>
-      | { data: string; offset: number }
-      | Promise<{ data: string; offset: number }>;
+      | {
+          data: string;
+          offset: number;
+          remoteOs?: "unix" | "windows";
+          windowsRelease?: string;
+        }
+      | Promise<{
+          data: string;
+          offset: number;
+          remoteOs?: "unix" | "windows";
+          windowsRelease?: string;
+        }>;
     generateCommandDraft?: (
       terminalId: string,
       prompt: string,

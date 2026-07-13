@@ -47,10 +47,15 @@ import {
 } from "../../lib/filesystemDragDrop";
 import {
   resolveTerminalWindowsPty,
+  resolveTerminalWindowsPtyTransition,
   windowsPtyOptionsEqual,
   type TerminalRemoteOs,
   type TerminalSystemInfoLike,
 } from "./terminalWindowsPty";
+import {
+  TerminalWriteCoordinator,
+  type TerminalWriteTransition,
+} from "./terminalWriteCoordinator";
 
 const SCROLLBAR_HIDE_DELAY = 2000; // ms
 const RUNTIME_RELEASE_DELAY = 4000; // ms
@@ -141,6 +146,12 @@ interface TerminalRuntime {
   failedBackendResize: TerminalBackendResizeFailure | null;
   lastHandledRecoveryEpoch: number;
   pendingRecoveryRefit: boolean;
+  writeCoordinator: TerminalWriteCoordinator;
+}
+
+interface TerminalRenderMetadata {
+  remoteOs?: TerminalRemoteOs;
+  windowsRelease?: string;
 }
 
 const runtimePool = new Map<string, TerminalRuntime>();
@@ -187,13 +198,58 @@ const requestBackendResize = (
   }
 };
 
+const applyRuntimeWindowsPty = (
+  runtime: TerminalRuntime,
+  metadata: TerminalRenderMetadata,
+): boolean => {
+  if (!metadata.remoteOs) return false;
+  const currentWindowsPty = runtime.term.options.windowsPty;
+  const nextWindowsPty = resolveTerminalWindowsPtyTransition(
+    currentWindowsPty,
+    metadata.remoteOs,
+    { release: metadata.windowsRelease },
+  );
+  if (windowsPtyOptionsEqual(currentWindowsPty, nextWindowsPty)) {
+    return false;
+  }
+  runtime.term.options.windowsPty = nextWindowsPty ?? {};
+  return true;
+};
+
+const getTerminalRenderMetadataKey = (
+  metadata: TerminalRenderMetadata,
+): string | undefined =>
+  metadata.remoteOs
+    ? `${metadata.remoteOs}:${metadata.windowsRelease ?? "unknown"}`
+    : undefined;
+
+const createRuntimeWindowsPtyTransition = (
+  runtime: TerminalRuntime,
+  metadata: TerminalRenderMetadata,
+  onChanged?: () => void,
+): TerminalWriteTransition | undefined => {
+  const key = getTerminalRenderMetadataKey(metadata);
+  if (!key) return undefined;
+  return {
+    key,
+    apply: () => {
+      if (applyRuntimeWindowsPty(runtime, metadata)) {
+        onChanged?.();
+      }
+    },
+  };
+};
+
 const refitRuntime = (
   runtime: TerminalRuntime,
   request: TerminalRefitRequest = NORMAL_TERMINAL_REFIT_REQUEST,
-): void => {
+): boolean => {
+  if (runtime.writeCoordinator.hasPendingWrites) return false;
   const host = runtime.hostEl;
-  if (!host) return;
-  if (host.clientWidth <= 0 || host.clientHeight <= 0) return;
+  if (!host || host.clientWidth <= 0 || host.clientHeight <= 0) {
+    runtime.writeCoordinator.endRefitBarrier();
+    return true;
+  }
   try {
     if (request.clearTextureAtlas) {
       runtime.term.clearTextureAtlas();
@@ -221,7 +277,10 @@ const refitRuntime = (
     runtime.term.refresh(0, Math.max(0, runtime.term.rows - 1));
   } catch {
     // ignore transient DOM/layout issues
+  } finally {
+    runtime.writeCoordinator.endRefitBarrier();
   }
+  return true;
 };
 
 const scheduleRuntimeRefit = (
@@ -236,12 +295,18 @@ const scheduleRuntimeRefit = (
   clearAnimationFrame(runtime.settleRefitFrame);
   runtime.refitFrame = window.requestAnimationFrame(() => {
     runtime.refitFrame = null;
+    runtime.writeCoordinator.beginRefitBarrier();
     const nextRequest = runtime.pendingRefitRequest;
+    if (!refitRuntime(runtime, nextRequest)) return;
     runtime.pendingRefitRequest = { ...NORMAL_TERMINAL_REFIT_REQUEST };
-    refitRuntime(runtime, nextRequest);
     // Resizable panel layout can settle one frame later; run one more fit pass.
     runtime.settleRefitFrame = window.requestAnimationFrame(() => {
       runtime.settleRefitFrame = null;
+      runtime.writeCoordinator.beginRefitBarrier();
+      if (runtime.writeCoordinator.hasPendingWrites) {
+        scheduleRuntimeRefit(runtime, NORMAL_TERMINAL_REFIT_REQUEST);
+        return;
+      }
       refitRuntime(runtime, NORMAL_TERMINAL_REFIT_REQUEST);
     });
   });
@@ -291,6 +356,7 @@ const disposeRuntime = (runtime: TerminalRuntime): void => {
   runtime.scrollDispose();
   runtime.removeDomListeners();
   runtime.hostEl = null;
+  runtime.writeCoordinator.dispose();
   runtime.term.dispose();
 };
 
@@ -368,7 +434,25 @@ const createRuntime = (
     failedBackendResize: null,
     lastHandledRecoveryEpoch: terminalRecoveryEpoch,
     pendingRecoveryRefit: false,
+    writeCoordinator: new TerminalWriteCoordinator(
+      (data, callback) => {
+        term.write(data, callback);
+      },
+      getTerminalRenderMetadataKey({
+        remoteOs,
+        windowsRelease: systemInfo?.release,
+      }),
+    ),
   };
+
+  runtime.writeCoordinator.setDrainHandler(() => {
+    if (
+      runtime.writeCoordinator.isRefitBarrierActive &&
+      runtime.refitFrame === null
+    ) {
+      scheduleRuntimeRefit(runtime);
+    }
+  });
 
   const showScrollbar = () => {
     runtime.hostEl?.classList.add("is-scrollbar-visible");
@@ -511,40 +595,64 @@ const createRuntime = (
 
   let lastBufferOffset = 0;
   let isSyncingInitialBuffer = true;
-  const pendingLiveEvents: Array<{ data: string; offset?: number }> = [];
-  const writeDataWithOffset = (data: string, offset?: number): void => {
-    if (!data) return;
+  const pendingLiveEvents: Array<{
+    data: string;
+    offset?: number;
+    remoteOs?: TerminalRemoteOs;
+    windowsRelease?: string;
+  }> = [];
+  const writeDataWithOffset = (
+    data: string,
+    offset?: number,
+    metadata: TerminalRenderMetadata = {},
+    applyMetadataWhenDuplicate = false,
+  ): void => {
+    const transition = createRuntimeWindowsPtyTransition(runtime, metadata);
+    if (!data) {
+      if (applyMetadataWhenDuplicate) {
+        runtime.writeCoordinator.write("", transition);
+      }
+      return;
+    }
     if (!Number.isFinite(offset)) {
-      term.write(data);
+      runtime.writeCoordinator.write(data, transition);
       return;
     }
 
     const normalizedOffset = Math.max(0, Math.floor(offset as number));
     const chunkStart = Math.max(0, normalizedOffset - data.length);
     if (normalizedOffset <= lastBufferOffset) {
+      if (applyMetadataWhenDuplicate) {
+        runtime.writeCoordinator.write("", transition);
+      }
       return;
     }
     if (chunkStart < lastBufferOffset) {
       const overlap = lastBufferOffset - chunkStart;
       const nextChunk = data.slice(Math.max(0, overlap));
       if (nextChunk) {
-        term.write(nextChunk);
+        runtime.writeCoordinator.write(nextChunk, transition);
       }
       lastBufferOffset = normalizedOffset;
       return;
     }
-    term.write(data);
+    runtime.writeCoordinator.write(data, transition);
     lastBufferOffset = normalizedOffset;
   };
 
   const cleanup = window.gyshell.terminal.onData(
-    ({ terminalId, data, offset }) => {
+    ({ terminalId, data, offset, remoteOs, windowsRelease }) => {
       if (terminalId === config.id) {
         if (isSyncingInitialBuffer) {
-          pendingLiveEvents.push({ data, offset });
+          pendingLiveEvents.push({
+            data,
+            offset,
+            remoteOs,
+            windowsRelease,
+          });
           return;
         }
-        writeDataWithOffset(data, offset);
+        writeDataWithOffset(data, offset, { remoteOs, windowsRelease });
       }
     },
   );
@@ -568,7 +676,7 @@ const createRuntime = (
         config.id,
         0,
       );
-      writeDataWithOffset(initial.data || "", initial.offset);
+      writeDataWithOffset(initial.data || "", initial.offset, initial, true);
 
       const normalizedOffset = Math.max(
         lastBufferOffset,
@@ -579,16 +687,16 @@ const createRuntime = (
         config.id,
         normalizedOffset,
       );
-      writeDataWithOffset(tail.data || "", tail.offset);
+      writeDataWithOffset(tail.data || "", tail.offset, tail, true);
     } catch {
       // ignore: runtime output sync is best-effort
     } finally {
       isSyncingInitialBuffer = false;
       if (pendingLiveEvents.length > 0) {
         const pending = pendingLiveEvents.splice(0, pendingLiveEvents.length);
-        pending.forEach((event) =>
-          writeDataWithOffset(event.data, event.offset),
-        );
+        pending.forEach((event) => {
+          writeDataWithOffset(event.data, event.offset, event);
+        });
       }
     }
   };
@@ -1094,27 +1202,29 @@ export const XTermView = React.forwardRef<XTermSearchHandle, XTermViewProps>(
       const runtime = runtimeRef.current;
       if (!runtime) return;
 
-      const nextWindowsPty = resolveTerminalWindowsPty(
-        props.remoteOs,
-        props.systemInfo,
-      );
-      const currentWindowsPty = runtime.term.options.windowsPty;
-      if (windowsPtyOptionsEqual(currentWindowsPty, nextWindowsPty)) {
-        return;
-      }
-
-      runtime.term.options.windowsPty = nextWindowsPty ?? {};
-      if (runtime.isActive) {
-        requestAnimationFrame(() => {
-          const activeRuntime = runtimeRef.current;
-          if (!activeRuntime || activeRuntime.terminalId !== props.config.id)
+      const transition = createRuntimeWindowsPtyTransition(
+        runtime,
+        {
+          remoteOs: props.remoteOs,
+          windowsRelease: props.systemInfo?.release,
+        },
+        () => {
+          if (runtime.isActive) {
+            requestAnimationFrame(() => {
+              const activeRuntime = runtimeRef.current;
+              if (
+                !activeRuntime ||
+                activeRuntime.terminalId !== props.config.id
+              )
+                return;
+              scheduleRuntimeRecoveryRefit(activeRuntime);
+            });
             return;
-          scheduleRuntimeRecoveryRefit(activeRuntime);
-        });
-        return;
-      }
-
-      runtime.pendingRecoveryRefit = true;
+          }
+          runtime.pendingRecoveryRefit = true;
+        },
+      );
+      runtime.writeCoordinator.write("", transition);
     }, [props.remoteOs, props.systemInfo?.release, props.config.id]);
 
     // Live-update theme (Tabby-style behavior)

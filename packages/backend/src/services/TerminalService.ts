@@ -94,6 +94,11 @@ export interface TerminalRuntimeSnapshot {
   canUseFilesystem: boolean
 }
 
+export interface TerminalRenderMetadata {
+  remoteOs?: 'unix' | 'windows'
+  windowsRelease?: string
+}
+
 type RawEventPublisher = (channel: string, data: unknown) => void
 type TerminalClosedListener = (terminalId: string) => void
 type PendingTaskFinish = {
@@ -191,6 +196,8 @@ export class TerminalService {
   private headlessWriteSeqByTerminal: Map<string, number> = new Map()
   private headlessFlushedSeqByTerminal: Map<string, number> = new Map()
   private pendingTaskFinishByTerminal: Map<string, PendingTaskFinish> = new Map()
+  private backendRuntimeGenerationByTerminal: Map<string, number> = new Map()
+  private nextBackendRuntimeGeneration = 0
   private startMarkerByTaskId: Map<string, any> = new Map()
   private commandTrackingWatcherByTaskId: Map<string, { cancelled: boolean }> = new Map()
   private onTaskFinishedCallbacks: Map<string, (result: CommandResult) => void> = new Map()
@@ -280,11 +287,19 @@ export class TerminalService {
     }
 
     if (!terminal.systemInfo) {
-      void backend.getSystemInfo(terminal.ptyId).then((info) => {
+      const metadataPtyId = terminal.ptyId
+      const metadataRuntimeGeneration =
+        this.backendRuntimeGenerationByTerminal.get(terminalId) ?? 0
+      void backend.getSystemInfo(metadataPtyId).then((info) => {
         if (!info) return
 
         const latest = this.terminals.get(terminalId)
-        if (!latest) return
+        if (
+          !latest ||
+          latest.ptyId !== metadataPtyId ||
+          this.backendRuntimeGenerationByTerminal.get(terminalId) !==
+            metadataRuntimeGeneration
+        ) return
 
         let shouldPublishLatest = false
         if (!latest.systemInfo) {
@@ -459,6 +474,11 @@ export class TerminalService {
     terminalType: ConnectionType,
     ptyId: string
   ): void {
+    this.nextBackendRuntimeGeneration += 1
+    this.backendRuntimeGenerationByTerminal.set(
+      terminalId,
+      this.nextBackendRuntimeGeneration
+    )
     const backend = this.getBackend(terminalType)
     backend.onData(ptyId, (data: string) => {
       this.handleData(terminalId, data)
@@ -677,6 +697,8 @@ export class TerminalService {
       tab.isInitializing = nextConfig.type === 'ssh'
       tab.runtimeState = nextConfig.type === 'ssh' ? 'initializing' : 'ready'
       tab.lastExitCode = undefined
+      tab.remoteOs = undefined
+      tab.systemInfo = undefined
       this.terminalConfigs.set(terminalId, nextConfig)
 
       const headless = this.headlessPtys.get(terminalId)
@@ -838,7 +860,12 @@ export class TerminalService {
         }
       }
 
-      this.sendToRenderer('terminal:data', { terminalId, data: cleanedData, offset: currentOffset })
+      this.sendToRenderer('terminal:data', {
+        terminalId,
+        data: cleanedData,
+        offset: currentOffset,
+        ...this.getRenderMetadata(terminalId)
+      })
     }
   }
 
@@ -882,7 +909,12 @@ export class TerminalService {
       }
     }
 
-    this.sendToRenderer('terminal:data', { terminalId, data, offset: currentOffset })
+    this.sendToRenderer('terminal:data', {
+      terminalId,
+      data,
+      offset: currentOffset,
+      ...this.getRenderMetadata(terminalId)
+    })
   }
 
   private getVisibleWindowsPromptLine(terminalId: string): string | undefined {
@@ -1235,6 +1267,7 @@ export class TerminalService {
       this.buffers.delete(terminalId)
       this.selectionByTerminal.delete(terminalId)
       this.oscParseBufByTerminal.delete(terminalId)
+      this.backendRuntimeGenerationByTerminal.delete(terminalId)
       this.tasksByTerminal.delete(terminalId)
       const activeTaskId = this.activeTaskByTerminal.get(terminalId)
       if (activeTaskId) {
@@ -1640,6 +1673,17 @@ export class TerminalService {
   getCurrentOffset(terminalId: string): number {
     const buffer = this.buffers.get(terminalId)
     return buffer?.offset || 0
+  }
+
+  getRenderMetadata(terminalId: string): TerminalRenderMetadata {
+    const terminal = this.terminals.get(terminalId)
+    const remoteOs =
+      terminal?.remoteOs ?? this.inferRemoteOsFromSystemInfo(terminal?.systemInfo)
+    return {
+      remoteOs,
+      windowsRelease:
+        remoteOs === 'windows' ? terminal?.systemInfo?.release : undefined
+    }
   }
 
   /**

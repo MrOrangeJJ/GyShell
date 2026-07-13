@@ -821,6 +821,7 @@ export class ElectronGatewayIpcAdapter {
         return {
           data,
           offset,
+          ...this.terminalService.getRenderMetadata(terminalId),
         };
       },
     );
