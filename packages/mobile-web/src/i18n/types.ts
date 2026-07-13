@@ -159,9 +159,7 @@ export interface MobileTranslations {
     noDescription: string;
     reload: string;
     groups: {
-      codex: string;
       agents: string;
-      claude: string;
       custom: string;
       other: string;
     };

@@ -171,9 +171,7 @@ export const mobileTranslations: Record<MobileLocale, MobileTranslations> = {
       noDescription: "No description provided.",
       reload: "Reload skills",
       groups: {
-        codex: "Codex Skills",
-        agents: ".agent/skill",
-        claude: "Claude Skills",
+        agents: ".agents/skills",
         custom: "GyShell Custom",
         other: "Other",
       },
@@ -400,9 +398,7 @@ export const mobileTranslations: Record<MobileLocale, MobileTranslations> = {
       noDescription: "暂无描述。",
       reload: "刷新技能",
       groups: {
-        codex: "Codex 技能",
-        agents: ".agent/skill",
-        claude: "Claude 技能",
+        agents: ".agents/skills",
         custom: "GyShell 自定义",
         other: "其他",
       },

@@ -275,7 +275,7 @@ export const en = {
       mcpConfig:
         'Open the MCP (Model Context Protocol) config. Use this to connect external tools like Google Search or File Indexers.\n\nNOTE: The app may not automatically find your system PATH. When configuring mcpServers, please use [ABSOLUTE PATHS] for the command field (e.g., npm, node, uv, python)!\nExample: Use "/usr/local/bin/node" instead of just "node".',
       skills:
-        'Skills are predefined instruction templates for complex tasks. AI loads them to perform better in specific domains.\n\nGyShell scans the following directories for skills:\n1. [GyShell Custom]: User-created skills (stored in GyShell data directory).\n2. [Claude/Goose Compatible]: ~/.claude/skills, ~/.agents/skills, and platform-specific config paths.\n\nNote: For skills outside the "GyShell Custom" folder, please manage (edit/delete) them manually in your file explorer.',
+        'Skills are predefined instruction templates for complex tasks. AI loads them to perform better in specific domains.\n\nGyShell scans the following directories for skills:\n1. [GyShell Custom]: User-created skills stored in the GyShell data directory.\n2. [Agents]: Skills stored under ~/.agents/skills.\n\nNote: Manage skills under ~/.agents/skills manually in your file explorer.',
       memory:
         "Memory uses the default memory.md when no Agent Setting is active. Saved Agent Settings use their own memory file, and the active file is injected into each session system prompt when memory is enabled.",
       accessTokens:

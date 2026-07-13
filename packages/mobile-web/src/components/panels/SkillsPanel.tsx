@@ -17,7 +17,7 @@ interface SkillGroup {
   items: SkillSummary[];
 }
 
-type SkillGroupLabelKey = "codex" | "agents" | "claude" | "custom" | "other";
+type SkillGroupLabelKey = "agents" | "custom" | "other";
 
 function resolveSkillGroup(scanRoot: string | undefined): {
   key: string;
@@ -27,14 +27,8 @@ function resolveSkillGroup(scanRoot: string | undefined): {
   const root = String(scanRoot || "");
   const lower = root.toLowerCase();
 
-  if (lower.includes("/.codex/") || lower.includes("\\.codex\\")) {
-    return { key: "codex", order: 2, group: "codex" };
-  }
   if (lower.includes("/.agents/") || lower.includes("\\.agents\\")) {
-    return { key: "agents", order: 3, group: "agents" };
-  }
-  if (lower.includes("/.claude/") || lower.includes("\\.claude\\")) {
-    return { key: "claude", order: 4, group: "claude" };
+    return { key: "agents", order: 2, group: "agents" };
   }
   if (
     lower.includes("gyshell") ||

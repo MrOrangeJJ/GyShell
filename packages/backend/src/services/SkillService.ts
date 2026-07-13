@@ -37,10 +37,7 @@ export class SkillService {
     const baseDir = app.getPath('userData')
     return resolveDefaultSkillScanRoots({
       primaryRoot: path.join(baseDir, 'skills'),
-      homeDir: app.getPath('home'),
-      platform: process.platform,
-      appData: process.env.APPDATA,
-      codexHome: process.env.CODEX_HOME
+      homeDir: app.getPath('home')
     })
   }
 

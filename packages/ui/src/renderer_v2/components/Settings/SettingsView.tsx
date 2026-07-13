@@ -1671,12 +1671,10 @@ export const SettingsView: React.FC<{ store: AppStore }> = observer(
                     const isACustom =
                       a.includes("GyShell") ||
                       (a.endsWith("skills") &&
-                        !a.includes(".claude") &&
                         !a.includes(".agents"));
                     const isBCustom =
                       b.includes("GyShell") ||
                       (b.endsWith("skills") &&
-                        !b.includes(".claude") &&
                         !b.includes(".agents"));
                     if (isACustom && !isBCustom) return -1;
                     if (!isACustom && isBCustom) return 1;
@@ -1688,7 +1686,6 @@ export const SettingsView: React.FC<{ store: AppStore }> = observer(
                     const isCustom =
                       dir.includes("GyShell") ||
                       (dir.endsWith("skills") &&
-                        !dir.includes(".claude") &&
                         !dir.includes(".agents"));
                     const sectionTitle = isCustom
                       ? t.settings.skillSections.custom

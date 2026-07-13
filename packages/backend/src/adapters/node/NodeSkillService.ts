@@ -63,10 +63,7 @@ export class NodeSkillService {
   private resolveScanRoots(): string[] {
     return resolveDefaultSkillScanRoots({
       primaryRoot: this.skillsDir,
-      homeDir: os.homedir(),
-      platform: process.platform,
-      appData: process.env.APPDATA,
-      codexHome: process.env.CODEX_HOME
+      homeDir: os.homedir()
     })
   }
 }
