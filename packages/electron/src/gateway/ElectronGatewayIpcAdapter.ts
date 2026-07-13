@@ -41,7 +41,6 @@ import {
 import type { WsGatewayAccess } from "../../../backend/src/types";
 import {
   buildBuiltInToolStatusSummary,
-  buildSkillStatusSummary,
 } from "../../../backend/src/services/Gateway/toolingSummary";
 import { resolveTheme } from "../../../shared/src/theme/themes";
 import type { WebSocketGatewayControlService } from "../../../backend/src/services/Gateway/WebSocketGatewayControlService";
@@ -451,7 +450,7 @@ export class ElectronGatewayIpcAdapter {
     });
 
     ipcMain.handle("skills:reload", async () => {
-      return await this.skillService.reload();
+      return await this.agentSettingProfileService.reloadSkills();
     });
 
     ipcMain.handle("skills:getAll", async () => {
@@ -463,7 +462,7 @@ export class ElectronGatewayIpcAdapter {
     });
 
     ipcMain.handle("skills:create", async () => {
-      return await this.skillService.createSkillFromTemplate();
+      return await this.agentSettingProfileService.createSkillFromTemplate();
     });
 
     ipcMain.handle("skills:openFile", async (_evt: any, fileName: string) => {
@@ -471,26 +470,15 @@ export class ElectronGatewayIpcAdapter {
     });
 
     ipcMain.handle("skills:delete", async (_evt: any, fileName: string) => {
-      await this.skillService.deleteSkillFile(fileName);
-      return await this.skillService.getAll();
+      return await this.agentSettingProfileService.deleteSkillFile(fileName);
     });
 
     ipcMain.handle(
       "skills:setEnabled",
       async (_: any, name: string, enabled: boolean) => {
-        const settings = this.settingsService.getSettings();
-        const nextSkills = { ...(settings.tools?.skills ?? {}) };
-        nextSkills[name] = enabled;
-        this.settingsService.setSettings({
-          tools: { builtIn: settings.tools?.builtIn ?? {}, skills: nextSkills },
-        });
-        this.agentService.updateSettings(this.settingsService.getSettings());
-
-        const nextSettings = this.settingsService.getSettings();
-        const allSkills = await this.skillService.getAll();
-        const summary = buildSkillStatusSummary(
-          allSkills,
-          nextSettings.tools?.skills,
+        const summary = await this.agentSettingProfileService.setSkillEnabled(
+          name,
+          enabled,
         );
         this.gateway.broadcastRaw("skills:updated", summary);
         return summary;
@@ -696,7 +684,10 @@ export class ElectronGatewayIpcAdapter {
         listName: "allowlist" | "denylist" | "asklist",
         rule: string,
       ) => {
-        return await this.commandPolicyService.addRule(listName, rule);
+        return await this.agentSettingProfileService.addCommandPolicyRule(
+          listName,
+          rule,
+        );
       },
     );
 
@@ -707,7 +698,10 @@ export class ElectronGatewayIpcAdapter {
         listName: "allowlist" | "denylist" | "asklist",
         rule: string,
       ) => {
-        return await this.commandPolicyService.deleteRule(listName, rule);
+        return await this.agentSettingProfileService.deleteCommandPolicyRule(
+          listName,
+          rule,
+        );
       },
     );
 
@@ -716,7 +710,7 @@ export class ElectronGatewayIpcAdapter {
     });
 
     ipcMain.handle("tools:reloadMcp", async () => {
-      return await this.mcpToolService.reloadAll();
+      return await this.agentSettingProfileService.reloadMcpTools();
     });
 
     ipcMain.handle("tools:getMcp", async () => {
@@ -726,7 +720,10 @@ export class ElectronGatewayIpcAdapter {
     ipcMain.handle(
       "tools:setMcpEnabled",
       async (_: any, name: string, enabled: boolean) => {
-        return await this.mcpToolService.setServerEnabled(name, enabled);
+        return await this.agentSettingProfileService.setMcpToolEnabled(
+          name,
+          enabled,
+        );
       },
     );
 

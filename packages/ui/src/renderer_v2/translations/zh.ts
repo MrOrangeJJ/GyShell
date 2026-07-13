@@ -144,11 +144,6 @@ export const zh = {
     saveCurrentAgentSettingMessage:
       "确定保存当前安全、工具、技能、记忆、机制和当前模型配置选择吗？",
     agentSettingSlot: (slotNumber: number) => `Agent Setting ${slotNumber}`,
-    overwriteWithCurrentAgentSetting: "用当前 Agent Setting 覆盖",
-    overwriteAgentSettingTitle: "覆盖 Agent Setting",
-    overwriteAgentSettingMessage: (slotNumber: number) =>
-      `确定用当前 Agent 设置覆盖 Agent Setting ${slotNumber} 吗？`,
-    overwriteAgentSettingConfirm: "覆盖",
     deleteAgentSettingTitle: "删除 Agent Setting",
     deleteAgentSettingMessage: (slotNumber: number) =>
       `确定删除 Agent Setting ${slotNumber} 吗？其记忆文件会保留在磁盘上以防误删。`,

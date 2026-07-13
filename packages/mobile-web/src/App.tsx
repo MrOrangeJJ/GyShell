@@ -596,7 +596,6 @@ export const App: React.FC = () => {
                   onReload={() => void actions.reloadAgentSettings()}
                   onSaveCurrent={actions.saveCurrentAgentSetting}
                   onApply={actions.applyAgentSetting}
-                  onOverwrite={actions.overwriteAgentSetting}
                   onDelete={actions.deleteAgentSetting}
                 />
               ) : null}

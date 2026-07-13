@@ -1,5 +1,5 @@
 import React from "react";
-import { Check, Loader2, Plus, RefreshCw, Trash2 } from "lucide-react";
+import { Check, Loader2, Plus, Trash2 } from "lucide-react";
 import { useMobileI18n } from "../../i18n/provider";
 import type {
   AgentSettingApplyOutcome,
@@ -17,7 +17,6 @@ interface AgentProfilesPanelProps {
     profileId: string,
     acknowledgedExperimentalToolNames?: string[],
   ) => Promise<AgentSettingApplyOutcome>;
-  onOverwrite: (profileId: string) => Promise<boolean>;
   onDelete: (profileId: string) => Promise<boolean>;
 }
 
@@ -29,14 +28,10 @@ export const AgentProfilesPanel: React.FC<AgentProfilesPanelProps> = ({
   onReload,
   onSaveCurrent,
   onApply,
-  onOverwrite,
   onDelete,
 }) => {
   const { t } = useMobileI18n();
   const [confirmSave, setConfirmSave] = React.useState(false);
-  const [confirmOverwriteId, setConfirmOverwriteId] = React.useState<string | null>(
-    null,
-  );
   const [confirmDeleteId, setConfirmDeleteId] = React.useState<string | null>(null);
   const [busyId, setBusyId] = React.useState<string | null>(null);
 
@@ -86,19 +81,6 @@ export const AgentProfilesPanel: React.FC<AgentProfilesPanelProps> = ({
     [onApply, t.tools],
   );
 
-  const handleOverwrite = React.useCallback(
-    async (profileId: string) => {
-      setConfirmOverwriteId(null);
-      setBusyId(profileId);
-      try {
-        await onOverwrite(profileId);
-      } finally {
-        setBusyId(null);
-      }
-    },
-    [onOverwrite],
-  );
-
   const handleDelete = React.useCallback(
     async (profileId: string) => {
       setConfirmDeleteId(null);
@@ -115,7 +97,6 @@ export const AgentProfilesPanel: React.FC<AgentProfilesPanelProps> = ({
   const renderProfile = (profile: (typeof profiles)[number]) => {
     const isActive = profile.id === activeProfileId;
     const slot = profile.slotNumber;
-    const busy = busyId === profile.id;
     const policyLabel = profile.commandPolicyMode
       ? profile.commandPolicyMode.charAt(0).toUpperCase() +
         profile.commandPolicyMode.slice(1)
@@ -155,19 +136,6 @@ export const AgentProfilesPanel: React.FC<AgentProfilesPanelProps> = ({
           </div>
         </button>
         <div className="agent-profile-actions">
-          <button
-            type="button"
-            className="agent-profile-action"
-            onClick={() => setConfirmOverwriteId(profile.id)}
-            disabled={saving || busyId !== null}
-            title={t.common.overwrite}
-          >
-            {busy && busyId === profile.id ? (
-              <Loader2 size={14} className="spin" />
-            ) : (
-              <RefreshCw size={14} />
-            )}
-          </button>
           <button
             type="button"
             className="agent-profile-action danger"
@@ -239,26 +207,6 @@ export const AgentProfilesPanel: React.FC<AgentProfilesPanelProps> = ({
           onConfirm={() => void handleSave()}
         />
       ) : null}
-
-      {confirmOverwriteId
-        ? (() => {
-            const profile = profiles.find(
-              (item) => item.id === confirmOverwriteId,
-            );
-            if (!profile) return null;
-            return (
-              <ConfirmDialog
-                title={t.common.overwrite}
-                message={t.settings.agentProfileOverwriteConfirm}
-                confirmLabel={t.common.overwrite}
-                cancelLabel={t.common.cancel}
-                pending={busyId === confirmOverwriteId}
-                onCancel={() => setConfirmOverwriteId(null)}
-                onConfirm={() => void handleOverwrite(confirmOverwriteId)}
-              />
-            );
-          })()
-        : null}
 
       {confirmDeleteId
         ? (() => {

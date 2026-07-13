@@ -46,7 +46,6 @@ import {
 } from "./CliIntegrationService";
 import {
   buildBuiltInToolStatusSummary,
-  buildSkillStatusSummary,
 } from "../../../backend/src/services/Gateway/toolingSummary";
 import { TerminalStateStore } from "../../../backend/src/services/terminal/TerminalStateStore";
 import { createAutoTerminalConfig } from "../../../backend/src/services/terminal/terminalConnectionSupport";
@@ -365,7 +364,6 @@ export async function startElectronMain(): Promise<void> {
         );
 
         skillService = new SkillService(settingsService);
-        void skillService.reload();
         memoryService = new MemoryService();
         void memoryService.ensureMemoryFile();
         agentSettingProfileService = new AgentSettingProfileService({
@@ -376,6 +374,8 @@ export async function startElectronMain(): Promise<void> {
           memoryService,
           onSettingsChanged: (settings) =>
             agentService.updateSettings(settings),
+          onActiveProfileSnapshotChanged: (settings) =>
+            gatewayService.broadcastRaw("settings:updated", settings),
         });
 
         modelCapabilityService = new ModelCapabilityService();
@@ -657,7 +657,7 @@ export async function startElectronMain(): Promise<void> {
                     ),
                   };
                 },
-                setActiveProfile: (profileId: string) => {
+                setActiveProfile: async (profileId: string) => {
                   const settingsSnapshot = settingsService.getSettings();
                   const exists = settingsSnapshot.models.profiles.some(
                     (profile) => profile.id === profileId,
@@ -665,7 +665,7 @@ export async function startElectronMain(): Promise<void> {
                   if (!exists) {
                     throw new Error(`Profile not found: ${profileId}`);
                   }
-                  settingsService.setSettings({
+                  await agentSettingProfileService.applySettingsPatch({
                     models: {
                       items: settingsSnapshot.models.items,
                       profiles: settingsSnapshot.models.profiles,
@@ -673,7 +673,6 @@ export async function startElectronMain(): Promise<void> {
                     },
                   });
                   const nextSettings = settingsService.getSettings();
-                  agentService.updateSettings(nextSettings);
 
                   const modelNameById = new Map(
                     nextSettings.models.items.map((model) => [
@@ -753,7 +752,7 @@ export async function startElectronMain(): Promise<void> {
               },
               skillBridge: {
                 reload: async () => {
-                  return await skillService.reload();
+                  return await agentSettingProfileService.reloadSkills();
                 },
                 getAll: async () => {
                   return await skillService.getAll();
@@ -762,11 +761,12 @@ export async function startElectronMain(): Promise<void> {
                   return await skillService.getEnabledSkills();
                 },
                 create: async () => {
-                  return await skillService.createSkillFromTemplate();
+                  return await agentSettingProfileService.createSkillFromTemplate();
                 },
                 delete: async (fileName: string) => {
-                  await skillService.deleteSkillFile(fileName);
-                  return await skillService.getAll();
+                  return await agentSettingProfileService.deleteSkillFile(
+                    fileName,
+                  );
                 },
                 listSkills: async () => {
                   const settingsSnapshot = settingsService.getSettings();
@@ -779,25 +779,11 @@ export async function startElectronMain(): Promise<void> {
                   }));
                 },
                 setSkillEnabled: async (name: string, enabled: boolean) => {
-                  const settingsSnapshot = settingsService.getSettings();
-                  const nextSkills = {
-                    ...(settingsSnapshot.tools?.skills ?? {}),
-                  };
-                  nextSkills[name] = enabled;
-                  settingsService.setSettings({
-                    tools: {
-                      builtIn: settingsSnapshot.tools?.builtIn ?? {},
-                      skills: nextSkills,
-                    },
-                  });
-                  const nextSettings = settingsService.getSettings();
-                  agentService.updateSettings(nextSettings);
-
-                  const skills = await skillService.getAll();
-                  const summary = buildSkillStatusSummary(
-                    skills,
-                    nextSettings.tools?.skills,
-                  );
+                  const summary =
+                    await agentSettingProfileService.setSkillEnabled(
+                      name,
+                      enabled,
+                    );
                   gatewayService.broadcastRaw("skills:updated", summary);
                   return summary;
                 },
@@ -873,19 +859,28 @@ export async function startElectronMain(): Promise<void> {
                   return await commandPolicyService.getLists();
                 },
                 addRule: async (listName, rule) => {
-                  return await commandPolicyService.addRule(listName, rule);
+                  return await agentSettingProfileService.addCommandPolicyRule(
+                    listName,
+                    rule,
+                  );
                 },
                 deleteRule: async (listName, rule) => {
-                  return await commandPolicyService.deleteRule(listName, rule);
+                  return await agentSettingProfileService.deleteCommandPolicyRule(
+                    listName,
+                    rule,
+                  );
                 },
               },
               toolsBridge: {
                 reloadMcp: async () => {
-                  return await mcpToolService.reloadAll();
+                  return await agentSettingProfileService.reloadMcpTools();
                 },
                 getMcp: () => mcpToolService.getSummaries(),
                 setMcpEnabled: async (name, enabled) => {
-                  return await mcpToolService.setServerEnabled(name, enabled);
+                  return await agentSettingProfileService.setMcpToolEnabled(
+                    name,
+                    enabled,
+                  );
                 },
                 getBuiltIn: () => {
                   const settings = settingsService.getSettings();
@@ -1077,8 +1072,13 @@ export async function startElectronMain(): Promise<void> {
           );
         }
 
-        // Load MCP tools (best-effort)
-        void mcpToolService.reloadAll();
+        // Load skills and MCP tools (best-effort)
+        void agentSettingProfileService.reloadSkills().catch((error) => {
+          console.warn("[Main] Failed to reload skills:", error);
+        });
+        void agentSettingProfileService.reloadMcpTools().catch((error) => {
+          console.warn("[Main] Failed to reload MCP tools:", error);
+        });
 
         // Update agent with current settings
         const settings = settingsService.getSettings();

@@ -22,7 +22,6 @@ import { NodeAccessTokenService } from "../../adapters/node/NodeAccessTokenServi
 import { ModelCapabilityService } from "../../services/ModelCapabilityService";
 import {
   buildBuiltInToolStatusSummary,
-  buildSkillStatusSummary,
 } from "../../services/Gateway/toolingSummary";
 import { ImageAttachmentService } from "../../services/ImageAttachmentService";
 import { TerminalStateStore } from "../../services/terminal/TerminalStateStore";
@@ -126,6 +125,8 @@ export async function startGyBackend(): Promise<void> {
     skillService,
     memoryService,
     onSettingsChanged: (settings) => agentService.updateSettings(settings),
+    onActiveProfileSnapshotChanged: (settings) =>
+      gatewayService.broadcastRaw("settings:updated", settings),
   });
 
   const gatewayService = new GatewayService(
@@ -163,8 +164,8 @@ export async function startGyBackend(): Promise<void> {
   }
 
   agentService.updateSettings(settingsService.getSettings());
-  await skillService.reload();
-  await mcpToolService.reloadAll();
+  await agentSettingProfileService.reloadSkills();
+  await agentSettingProfileService.reloadMcpTools();
 
   if (
     bootstrapLocalTerminal &&
@@ -379,7 +380,7 @@ export async function startGyBackend(): Promise<void> {
               })),
             };
           },
-          setActiveProfile: (profileId: string) => {
+          setActiveProfile: async (profileId: string) => {
             const snapshot = settingsService.getSettings();
             const exists = snapshot.models.profiles.some(
               (profile) => profile.id === profileId,
@@ -388,7 +389,7 @@ export async function startGyBackend(): Promise<void> {
               throw new Error(`Profile not found: ${profileId}`);
             }
 
-            settingsService.setSettings({
+            await agentSettingProfileService.applySettingsPatch({
               models: {
                 items: snapshot.models.items,
                 profiles: snapshot.models.profiles,
@@ -397,7 +398,6 @@ export async function startGyBackend(): Promise<void> {
             });
 
             const next = settingsService.getSettings();
-            agentService.updateSettings(next);
 
             const modelNameById = new Map(
               next.models.items.map((item) => [item.id, item.model]),
@@ -468,7 +468,7 @@ export async function startGyBackend(): Promise<void> {
         },
         skillBridge: {
           reload: async () => {
-            return await skillService.reload();
+            return await agentSettingProfileService.reloadSkills();
           },
           getAll: async () => {
             return await skillService.getAll();
@@ -477,11 +477,10 @@ export async function startGyBackend(): Promise<void> {
             return await skillService.getEnabledSkills();
           },
           create: async () => {
-            return await skillService.createSkillFromTemplate();
+            return await agentSettingProfileService.createSkillFromTemplate();
           },
           delete: async (fileName: string) => {
-            await skillService.deleteSkillFile(fileName);
-            return await skillService.getAll();
+            return await agentSettingProfileService.deleteSkillFile(fileName);
           },
           listSkills: async () => {
             const snapshot = settingsService.getSettings();
@@ -494,21 +493,10 @@ export async function startGyBackend(): Promise<void> {
             }));
           },
           setSkillEnabled: async (name: string, enabled: boolean) => {
-            const snapshot = settingsService.getSettings();
-            const nextSkills = { ...(snapshot.tools?.skills ?? {}) };
-            nextSkills[name] = enabled;
-
-            settingsService.setSettings({
-              tools: {
-                builtIn: snapshot.tools?.builtIn ?? {},
-                skills: nextSkills,
-              },
-            });
-
-            const next = settingsService.getSettings();
-            agentService.updateSettings(next);
-            const skills = await skillService.getAll();
-            const summary = buildSkillStatusSummary(skills, next.tools?.skills);
+            const summary = await agentSettingProfileService.setSkillEnabled(
+              name,
+              enabled,
+            );
             gatewayService.broadcastRaw("skills:updated", summary);
             return summary;
           },
@@ -581,19 +569,28 @@ export async function startGyBackend(): Promise<void> {
             return await commandPolicyService.getLists();
           },
           addRule: async (listName, rule) => {
-            return await commandPolicyService.addRule(listName, rule);
+            return await agentSettingProfileService.addCommandPolicyRule(
+              listName,
+              rule,
+            );
           },
           deleteRule: async (listName, rule) => {
-            return await commandPolicyService.deleteRule(listName, rule);
+            return await agentSettingProfileService.deleteCommandPolicyRule(
+              listName,
+              rule,
+            );
           },
         },
         toolsBridge: {
           reloadMcp: async () => {
-            return await mcpToolService.reloadAll();
+            return await agentSettingProfileService.reloadMcpTools();
           },
           getMcp: () => mcpToolService.getSummaries(),
           setMcpEnabled: async (name, enabled) => {
-            return await mcpToolService.setServerEnabled(name, enabled);
+            return await agentSettingProfileService.setMcpToolEnabled(
+              name,
+              enabled,
+            );
           },
           getBuiltIn: () => {
             const settings = settingsService.getSettings();

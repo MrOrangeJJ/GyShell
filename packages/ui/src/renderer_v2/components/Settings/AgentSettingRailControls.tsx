@@ -21,7 +21,6 @@ interface ProfileMenuState {
 type PendingAgentSettingAction =
   | { type: "save" }
   | { type: "apply"; profileId: string; experimentalToolNames: string[] }
-  | { type: "overwrite"; profileId: string }
   | { type: "delete"; profileId: string };
 
 export const AgentSettingRailControls: React.FC<AgentSettingRailControlsProps> =
@@ -178,22 +177,6 @@ export const AgentSettingRailControls: React.FC<AgentSettingRailControlsProps> =
           },
         };
       }
-      if (pendingAction.type === "overwrite") {
-        return {
-          title: t.settings.overwriteAgentSettingTitle,
-          message: t.settings.overwriteAgentSettingMessage(
-            pendingActionProfile.slotNumber,
-          ),
-          confirmText: t.settings.overwriteAgentSettingConfirm,
-          danger: true,
-          onConfirm: () => {
-            void runBusyAction(async () => {
-              await store.overwriteAgentSetting(pendingActionProfile.id);
-              setPendingAction(null);
-            });
-          },
-        };
-      }
       return {
         title: t.settings.deleteAgentSettingTitle,
         message: t.settings.deleteAgentSettingMessage(
@@ -302,19 +285,6 @@ export const AgentSettingRailControls: React.FC<AgentSettingRailControlsProps> =
               }
             }
           >
-            <button
-              className="gyshell-layout-menu-item"
-              type="button"
-              onClick={() => {
-                setPendingAction({
-                  type: "overwrite",
-                  profileId: profileMenu.profileId,
-                });
-                setProfileMenu(null);
-              }}
-            >
-              {t.settings.overwriteWithCurrentAgentSetting}
-            </button>
             <button
               className="gyshell-layout-menu-item is-danger"
               type="button"

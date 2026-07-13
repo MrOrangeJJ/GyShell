@@ -1,4 +1,8 @@
+import { mkdtempSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import type { BackendSettings } from '../types'
+import { NodeSettingsService } from '../adapters/node/NodeSettingsService'
 import { AgentSettingProfileService } from './AgentSettingProfileService'
 import { migrateBackendSettings } from './settings/migrations'
 import { deepMerge } from './settings/objectMerge'
@@ -283,6 +287,7 @@ const createHarness = () => {
   const skillService = new MockSkillService()
   const memoryService = new MockMemoryService()
   let settingsChangedCount = 0
+  let activeProfileSnapshotChangedCount = 0
   const service = new AgentSettingProfileService({
     settingsService,
     commandPolicyService,
@@ -291,6 +296,9 @@ const createHarness = () => {
     memoryService,
     onSettingsChanged: () => {
       settingsChangedCount += 1
+    },
+    onActiveProfileSnapshotChanged: () => {
+      activeProfileSnapshotChangedCount += 1
     },
   })
   return {
@@ -302,6 +310,9 @@ const createHarness = () => {
     memoryService,
     get settingsChangedCount() {
       return settingsChangedCount
+    },
+    get activeProfileSnapshotChangedCount() {
+      return activeProfileSnapshotChangedCount
     },
   }
 }
@@ -362,11 +373,134 @@ const run = async (): Promise<void> => {
   )
 
   await runCase(
+    'saveCurrent refreshes the outgoing active profile before switching slots',
+    async () => {
+      const harness = createHarness()
+      await harness.service.saveCurrent()
+      const sourceSlotId = getAgentSettingProfileId(1)
+
+      await harness.mcpToolService.setServerEnabled('search', false)
+      await harness.commandPolicyService.addRule('allowlist', 'pwd')
+      await harness.service.saveCurrent()
+
+      await harness.service.setMcpToolEnabled('search', true)
+      await harness.service.deleteCommandPolicyRule('allowlist', 'pwd')
+      const result = await harness.service.apply(sourceSlotId)
+      if (isExperimentalToolConfirmationRequired(result)) {
+        throw new Error('source profile apply unexpectedly required confirmation')
+      }
+
+      assertEqual(
+        harness.mcpToolService
+          .getSummaries()
+          .find((tool) => tool.name === 'search')?.enabled,
+        false,
+        'new-slot creation should save outgoing MCP state before switching',
+      )
+      assertDeepEqual(
+        await harness.commandPolicyService.getLists(),
+        {
+          allowlist: ['ls *', 'pwd'],
+          denylist: ['rm -rf /'],
+          asklist: ['git push'],
+        },
+        'new-slot creation should save outgoing policy state before switching',
+      )
+    },
+  )
+
+  await runCase(
+    'overwrite refreshes the outgoing active profile before switching slots',
+    async () => {
+      const harness = createHarness()
+      await harness.service.saveCurrent()
+      const overwriteTargetId = getAgentSettingProfileId(1)
+      await harness.service.saveCurrent()
+      const sourceSlotId = getAgentSettingProfileId(2)
+
+      await harness.mcpToolService.setServerEnabled('search', false)
+      await harness.service.overwrite(overwriteTargetId)
+      await harness.service.setMcpToolEnabled('search', true)
+
+      const result = await harness.service.apply(sourceSlotId)
+      if (isExperimentalToolConfirmationRequired(result)) {
+        throw new Error('source profile apply unexpectedly required confirmation')
+      }
+      assertEqual(
+        harness.mcpToolService
+          .getSummaries()
+          .find((tool) => tool.name === 'search')?.enabled,
+        false,
+        'overwrite should save the outgoing slot before activating its target',
+      )
+    },
+  )
+
+  await runCase(
+    'MCP reload refreshes and publishes the active profile snapshot',
+    async () => {
+      const harness = createHarness()
+      await harness.service.saveCurrent()
+      harness.mcpToolService.reloadAll = async () => {
+        return await harness.mcpToolService.setServerEnabled('search', false)
+      }
+
+      await harness.service.reloadMcpTools()
+      const profile = harness.settingsService
+        .getSettings()
+        .agentSettings!.profiles.find(
+          (entry) => entry.id === getAgentSettingProfileId(1),
+        )
+      assertEqual(
+        profile!.snapshot.tools.mcp.search,
+        false,
+        'MCP config reload should auto-save the loaded enabled state',
+      )
+      assertEqual(
+        harness.activeProfileSnapshotChangedCount,
+        1,
+        'MCP config reload should publish the refreshed snapshot',
+      )
+    },
+  )
+
+  await runCase(
+    'skill reload refreshes and publishes the active profile snapshot',
+    async () => {
+      const harness = createHarness()
+      await harness.service.saveCurrent()
+      harness.skillService.skills.push({
+        name: 'new-skill',
+        description: 'New skill',
+      })
+
+      await harness.service.reloadSkills()
+      const profile = harness.settingsService
+        .getSettings()
+        .agentSettings!.profiles.find(
+          (entry) => entry.id === getAgentSettingProfileId(1),
+        )
+      assertEqual(
+        profile!.snapshot.skills['new-skill'],
+        true,
+        'skill reload should auto-save newly discovered skills',
+      )
+      assertEqual(
+        harness.activeProfileSnapshotChangedCount,
+        1,
+        'skill reload should publish the refreshed snapshot',
+      )
+    },
+  )
+
+  await runCase(
     'apply restores saved subsets without creating missing tools or skills',
     async () => {
       const harness = createHarness()
       await harness.service.saveCurrent()
       const slotId = getAgentSettingProfileId(1)
+      await harness.service.saveCurrent()
+      const sourceSlotId = getAgentSettingProfileId(2)
 
       harness.settingsService.setSettings({
         commandPolicyMode: 'safe',
@@ -470,6 +604,31 @@ const run = async (): Promise<void> => {
         true,
         'saved MCP state should apply',
       )
+
+      const sourceApplyResult = await harness.service.apply(sourceSlotId)
+      if (isExperimentalToolConfirmationRequired(sourceApplyResult)) {
+        throw new Error(
+          'source profile apply unexpectedly required confirmation',
+        )
+      }
+      const restoredSourceSettings = harness.settingsService.getSettings()
+      assertEqual(
+        restoredSourceSettings.commandPolicyMode,
+        'safe',
+        'switching back should restore the source slot state saved before leaving',
+      )
+      assertEqual(
+        restoredSourceSettings.models.activeProfileId,
+        'profile-deep',
+        'source slot should preserve the last active model profile',
+      )
+      assertEqual(
+        harness.mcpToolService
+          .getSummaries()
+          .find((tool) => tool.name === 'search')?.enabled,
+        false,
+        'source slot should preserve the last MCP state',
+      )
     },
   )
 
@@ -477,6 +636,7 @@ const run = async (): Promise<void> => {
     'apply preserves current model when saved model profile is missing',
     async () => {
       const harness = createHarness()
+      await harness.service.saveCurrent()
       await harness.service.saveCurrent()
       harness.settingsService.setSettings({
         models: {
@@ -507,6 +667,125 @@ const run = async (): Promise<void> => {
         result.warnings.length === 1,
         'missing model should produce warning',
       )
+    },
+  )
+
+  await runCase(
+    'active profile snapshots update after every supported settings mutation',
+    async () => {
+      const harness = createHarness()
+      await harness.service.saveCurrent()
+      const slotId = getAgentSettingProfileId(1)
+
+      await harness.service.applySettingsPatch({
+        commandPolicyMode: 'smart',
+        recursionLimit: 720,
+        models: {
+          ...harness.settingsService.getSettings().models,
+          activeProfileId: 'profile-deep',
+        },
+      })
+      await harness.service.setBuiltInToolEnabled('exec_command', false)
+      await harness.service.setMcpToolEnabled('search', false)
+      await harness.service.setSkillEnabled('docs', false)
+      await harness.service.addCommandPolicyRule('allowlist', 'pwd')
+      await harness.service.deleteCommandPolicyRule('denylist', 'rm -rf /')
+
+      const profile = harness.settingsService
+        .getSettings()
+        .agentSettings!.profiles.find((entry) => entry.id === slotId)
+      assertCondition(Boolean(profile), 'active profile should remain saved')
+      assertEqual(
+        profile!.snapshot.security.commandPolicyMode,
+        'smart',
+        'policy mode should auto-save into the active profile',
+      )
+      assertDeepEqual(
+        profile!.snapshot.security.commandPolicyLists,
+        {
+          allowlist: ['ls *', 'pwd'],
+          denylist: [],
+          asklist: ['git push'],
+        },
+        'command policy list edits should auto-save into the active profile',
+      )
+      assertEqual(
+        profile!.snapshot.tools.builtIn.exec_command,
+        false,
+        'built-in tool changes should auto-save into the active profile',
+      )
+      assertEqual(
+        profile!.snapshot.tools.mcp.search,
+        false,
+        'MCP changes should auto-save into the active profile',
+      )
+      assertEqual(
+        profile!.snapshot.skills.docs,
+        false,
+        'skill changes should auto-save into the active profile',
+      )
+      assertEqual(
+        profile!.snapshot.workflow.recursionLimit,
+        720,
+        'workflow changes should auto-save into the active profile',
+      )
+      assertEqual(
+        profile!.snapshot.model.activeProfileId,
+        'profile-deep',
+        'model selection should auto-save into the active profile',
+      )
+      assertEqual(
+        harness.activeProfileSnapshotChangedCount,
+        6,
+        'each supported mutation should publish the refreshed profile snapshot',
+      )
+    },
+  )
+
+  await runCase(
+    'auto-saved active profile snapshot survives settings service restart',
+    async () => {
+      const dataDir = mkdtempSync(join(tmpdir(), 'gyshell-agent-settings-'))
+      try {
+        const settingsService = new NodeSettingsService(dataDir)
+        settingsService.setSettings(new MockSettingsService().getSettings())
+        const commandPolicyService = new MockCommandPolicyService()
+        const mcpToolService = new MockMcpToolService()
+        const skillService = new MockSkillService()
+        const memoryService = new MockMemoryService()
+        const service = new AgentSettingProfileService({
+          settingsService,
+          commandPolicyService,
+          mcpToolService,
+          skillService,
+          memoryService,
+        })
+
+        await service.saveCurrent()
+        await service.applySettingsPatch({ recursionLimit: 880 })
+        await service.setMcpToolEnabled('search', false)
+
+        const reloadedSettings = new NodeSettingsService(dataDir).getSettings()
+        const reloadedProfile = reloadedSettings.agentSettings!.profiles.find(
+          (profile) => profile.id === getAgentSettingProfileId(1),
+        )
+        assertCondition(
+          Boolean(reloadedProfile),
+          'saved profile should reload from disk',
+        )
+        assertEqual(
+          reloadedProfile!.snapshot.workflow.recursionLimit,
+          880,
+          'reloaded profile should keep the last workflow edit',
+        )
+        assertEqual(
+          reloadedProfile!.snapshot.tools.mcp.search,
+          false,
+          'reloaded profile should keep the last MCP edit',
+        )
+      } finally {
+        rmSync(dataDir, { recursive: true, force: true })
+      }
     },
   )
 
@@ -690,6 +969,7 @@ const run = async (): Promise<void> => {
       })
       await harness.service.saveCurrent()
       const slotId = getAgentSettingProfileId(1)
+      await harness.service.saveCurrent()
       await harness.service.setBuiltInToolEnabled('close_terminal_tab', false)
 
       const challenge = await harness.service.apply(slotId)
