@@ -9,7 +9,11 @@ interface ToolsPanelProps {
   connectionStatus: "connecting" | "connected" | "disconnected";
   onReload: () => Promise<void>;
   onSetMcpEnabled: (name: string, enabled: boolean) => Promise<void>;
-  onSetBuiltInEnabled: (name: string, enabled: boolean) => Promise<void>;
+  onSetBuiltInEnabled: (
+    name: string,
+    enabled: boolean,
+    acknowledgedExperimentalToolNames?: string[],
+  ) => Promise<void>;
 }
 
 export const ToolsPanel: React.FC<ToolsPanelProps> = ({
@@ -22,6 +26,8 @@ export const ToolsPanel: React.FC<ToolsPanelProps> = ({
 }) => {
   const { t } = useMobileI18n();
   const [reloading, setReloading] = React.useState(false);
+  const [pendingBuiltInToolName, setPendingBuiltInToolName] =
+    React.useState<string | null>(null);
   const canMutate = connectionStatus === "connected";
   const enabledMcpCount = mcpTools.filter((item) => item.enabled).length;
   const enabledBuiltInCount = builtInTools.filter(
@@ -46,6 +52,30 @@ export const ToolsPanel: React.FC<ToolsPanelProps> = ({
       setReloading(false);
     }
   }, [onReload]);
+
+  const handleBuiltInToggle = React.useCallback(
+    async (tool: BuiltInToolSummary) => {
+      const nextEnabled = !tool.enabled;
+      if (
+        nextEnabled &&
+        tool.experimental === true &&
+        !window.confirm(t.tools.experimentalEnableWarning(tool.name))
+      ) {
+        return;
+      }
+      setPendingBuiltInToolName(tool.name);
+      try {
+        await onSetBuiltInEnabled(
+          tool.name,
+          nextEnabled,
+          nextEnabled && tool.experimental === true ? [tool.name] : [],
+        );
+      } finally {
+        setPendingBuiltInToolName(null);
+      }
+    },
+    [onSetBuiltInEnabled, t.tools],
+  );
 
   return (
     <section className="panel-scroll tools-panel">
@@ -112,15 +142,20 @@ export const ToolsPanel: React.FC<ToolsPanelProps> = ({
               return (
                 <article key={tool.name} className="skill-item">
                   <div className="skill-item-body tools-item-body">
-                    <h3>{tool.name}</h3>
+                    <h3>
+                      {tool.name}
+                      {tool.experimental
+                        ? ` • ${t.tools.experimentalLabel}`
+                        : ""}
+                    </h3>
                     <p>{tool.description || t.tools.noDescription}</p>
                   </div>
                   <button
                     type="button"
                     className={`skill-toggle ${isEnabled ? "enabled" : ""}`}
-                    disabled={!canMutate}
+                    disabled={!canMutate || pendingBuiltInToolName !== null}
                     onClick={() =>
-                      void onSetBuiltInEnabled(tool.name, !isEnabled)
+                      void handleBuiltInToggle(tool)
                     }
                   >
                     {isEnabled ? t.common.on : t.common.off}

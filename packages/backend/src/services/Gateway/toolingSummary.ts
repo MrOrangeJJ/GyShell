@@ -30,10 +30,16 @@ export function buildBuiltInToolStatusSummary(
   enabledMap: Record<string, boolean> | undefined
 ): BuiltInToolStatusSummary[] {
   const state = enabledMap ?? {}
-  return BUILTIN_TOOL_INFO.map((tool) => ({
-    name: tool.name,
-    description: tool.description,
-    enabled: state[tool.name] ?? tool.defaultEnabled ?? true,
-    ...(tool.experimental ? { experimental: true } : {})
-  }))
+  return BUILTIN_TOOL_INFO.map((tool) => {
+    const configured = state[tool.name]
+    return {
+      name: tool.name,
+      description: tool.description,
+      enabled:
+        typeof configured === 'boolean'
+          ? configured
+          : tool.defaultEnabled ?? true,
+      ...(tool.experimental ? { experimental: true } : {})
+    }
+  })
 }

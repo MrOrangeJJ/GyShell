@@ -118,6 +118,10 @@ export const zh = {
     themeSectionBuiltIn: "内置主题",
     builtInTools: "内置工具",
     experimentalTools: "试验性工具",
+    experimentalToolEnableTitle: "启用试验性工具",
+    experimentalToolEnableMessage: (toolNames: string) =>
+      `确定启用 ${toolNames} 吗？试验性工具可能执行高影响操作。启用后，Agent 可以在不再次请求批准的情况下调用它。相关的非敏感元数据也可能被加入模型上下文；create_terminal_tab 会包含已保存连接的名称和主机/IP。仅在你愿意承担此风险时继续。`,
+    experimentalToolEnableConfirm: "启用并承担风险",
     toolsCount: "个工具",
     toolsUnknown: "未知工具数量",
     noMcpTools: "暂无 MCP 工具配置",

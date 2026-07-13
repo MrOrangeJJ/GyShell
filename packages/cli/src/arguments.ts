@@ -12,6 +12,7 @@ const BOOLEAN_FLAGS = new Set([
   "stdin",
   "enter",
   "include-secrets",
+  "ack-experimental-risk",
 ]);
 const FLAG_ALIASES: Record<string, string> = {
   h: "help",

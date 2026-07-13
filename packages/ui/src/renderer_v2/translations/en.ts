@@ -118,6 +118,10 @@ export const en = {
     themeSectionBuiltIn: "Built-in Themes",
     builtInTools: "Built-in Tools",
     experimentalTools: "Experimental Tools",
+    experimentalToolEnableTitle: "Enable Experimental Tool",
+    experimentalToolEnableMessage: (toolNames: string) =>
+      `Enable ${toolNames}? Experimental tools can perform high-impact actions. Once enabled, the Agent may use them without another approval prompt. Relevant non-secret metadata may be included in model context; create_terminal_tab includes saved connection names and hosts/IPs. Only continue if you accept this risk.`,
+    experimentalToolEnableConfirm: "Enable and Accept Risk",
     toolsCount: "tools",
     toolsUnknown: "Unknown tools",
     noMcpTools: "No MCP tools configured",

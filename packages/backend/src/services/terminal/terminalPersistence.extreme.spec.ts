@@ -70,6 +70,8 @@ class FakeTerminalBackend implements TerminalBackend {
   private readonly resizeCalls: Array<{ ptyId: string; cols: number; rows: number }> = []
   private readonly writeCalls: Array<{ ptyId: string; data: string }> = []
   private spawnDelayMs = 0
+  private emitExitOnKill = true
+  private throwOnKill = false
 
   private getPtyIdForTerminalId(terminalId: string): string {
     return `pty-${terminalId}`
@@ -172,6 +174,14 @@ class FakeTerminalBackend implements TerminalBackend {
     this.spawnDelayMs = Math.max(0, Math.floor(delayMs))
   }
 
+  setEmitExitOnKill(value: boolean): void {
+    this.emitExitOnKill = value
+  }
+
+  setThrowOnKill(value: boolean): void {
+    this.throwOnKill = value
+  }
+
   setInitializationStateForTerminalId(
     terminalId: string,
     state: 'initializing' | 'ready' | 'failed'
@@ -235,9 +245,14 @@ class FakeTerminalBackend implements TerminalBackend {
   }
 
   kill(ptyId: string): void {
+    if (this.throwOnKill) {
+      throw new Error('simulated backend kill failure')
+    }
     const session = this.sessions.get(ptyId)
     if (!session) return
-    session.exitCallbacks.forEach((callback) => callback(0))
+    if (this.emitExitOnKill) {
+      session.exitCallbacks.forEach((callback) => callback(0))
+    }
     this.sessions.delete(ptyId)
     this.initializationStateByPtyId.delete(ptyId)
     this.remoteOsByPtyId.delete(ptyId)
@@ -1648,6 +1663,177 @@ const run = async (): Promise<void> => {
         'C:\\Users\\Administrator\\Desktop',
         'home expansion should use the refreshed sidecar home directory'
       )
+    })
+
+    await runCase('terminal tab broadcasts include monitor identity for agent-created SSH tabs', async () => {
+      const backend = new FakeTerminalBackend()
+      const service = createService(stateFilePath, backend)
+      const tabEvents: Array<{
+        terminals: Array<{ id: string; monitorIdentity?: string }>
+      }> = []
+      service.setRawEventPublisher((channel, payload) => {
+        if (channel === 'terminal:tabs') {
+          tabEvents.push(
+            payload as {
+              terminals: Array<{ id: string; monitorIdentity?: string }>
+            }
+          )
+        }
+      })
+
+      await service.createTerminal({
+        type: 'ssh',
+        id: 'ssh-agent-created-monitor',
+        title: 'Agent Created Monitor',
+        host: '10.0.0.9',
+        port: 2222,
+        username: 'deploy',
+        authMethod: 'password',
+        password: 'secret',
+        cols: 80,
+        rows: 24
+      })
+
+      assertCondition(
+        tabEvents.some((event) =>
+          event.terminals.some(
+            (terminal) =>
+              terminal.id === 'ssh-agent-created-monitor' && terminal.monitorIdentity === 'ssh://deploy@10.0.0.9:2222'
+          )
+        ),
+        'terminal:tabs should carry the same monitor identity as terminal:list'
+      )
+    })
+
+    await runCase('closing a terminal completes and removes its active command callback', async () => {
+      const backend = new FakeTerminalBackend()
+      backend.setEmitExitOnKill(false)
+      const service = createService(stateFilePath, backend)
+      service.setRawEventPublisher(() => {})
+      const terminal = await service.createTerminal({
+        type: 'local',
+        id: 'local-agent-close-active-task',
+        title: 'Agent Close Active Task',
+        cols: 80,
+        rows: 24
+      })
+      terminal.runtimeState = 'ready'
+      terminal.isInitializing = false
+
+      let completionResult: { exitCode?: number; history_command_match_id: string } | undefined
+      let callbackObservedCleanState = false
+      const taskId = await service.runCommandNoWait(terminal.id, 'sleep 60', (result) => {
+        completionResult = result
+        callbackObservedCleanState =
+          !(service as any).activeTaskByTerminal.has(terminal.id) && !(service as any).tasksByTerminal.has(terminal.id)
+      })
+
+      service.kill(terminal.id)
+
+      assertEqual(
+        completionResult?.history_command_match_id,
+        taskId,
+        'terminal close should finish the registered command callback'
+      )
+      assertEqual(completionResult?.exitCode, -2, 'terminal close should report an aborted command exit code')
+      assertEqual(
+        (service as any).onTaskFinishedCallbacks.size,
+        0,
+        'terminal close should not leak command completion callbacks'
+      )
+      assertEqual(
+        callbackObservedCleanState,
+        true,
+        'terminal close should clear task state before notifying completion listeners'
+      )
+    })
+
+    await runCase('closing a terminal resolves an in-flight command wait as aborted', async () => {
+      const backend = new FakeTerminalBackend()
+      const service = createService(stateFilePath, backend)
+      service.setRawEventPublisher(() => {})
+      const terminal = await service.createTerminal({
+        type: 'local',
+        id: 'local-agent-close-waiting-task',
+        title: 'Agent Close Waiting Task',
+        cols: 80,
+        rows: 24
+      })
+      terminal.runtimeState = 'ready'
+      terminal.isInitializing = false
+
+      const taskId = await service.runCommandNoWait(terminal.id, 'sleep 60')
+      const waitingResult = service.waitForTask(terminal.id, taskId)
+
+      service.kill(terminal.id)
+      const result = await Promise.race([
+        waitingResult,
+        sleep(2_000).then(() => {
+          throw new Error('command wait did not settle after its terminal was closed')
+        })
+      ])
+
+      assertEqual(
+        result.history_command_match_id,
+        taskId,
+        'terminal close should settle the same in-flight command task'
+      )
+      assertEqual(result.exitCode, -2, 'terminal close should resolve a waiting command with the aborted exit code')
+      assertCondition(
+        /terminal tab was closed/i.test(result.stdoutDelta),
+        'terminal close should explain why the waiting command was aborted'
+      )
+      assertEqual(
+        (service as any).tasksByTerminal.has(terminal.id),
+        false,
+        'settling a closed command wait should not retain terminal task state'
+      )
+      assertEqual(
+        (service as any).activeTaskByTerminal.has(terminal.id),
+        false,
+        'settling a closed command wait should clear the active task index'
+      )
+    })
+
+    await runCase('failed backend kill restores the active command callback', async () => {
+      const backend = new FakeTerminalBackend()
+      const service = createService(stateFilePath, backend)
+      service.setRawEventPublisher(() => {})
+      const terminal = await service.createTerminal({
+        type: 'local',
+        id: 'local-agent-close-kill-failure',
+        title: 'Agent Close Kill Failure',
+        cols: 80,
+        rows: 24
+      })
+      terminal.runtimeState = 'ready'
+      terminal.isInitializing = false
+      await service.runCommandNoWait(terminal.id, 'sleep 60', () => {})
+
+      backend.setThrowOnKill(true)
+      let failureMessage = ''
+      try {
+        service.kill(terminal.id)
+      } catch (error) {
+        failureMessage = error instanceof Error ? error.message : String(error)
+      }
+
+      assertCondition(
+        /simulated backend kill failure/.test(failureMessage),
+        'backend kill error should still be reported to the caller'
+      )
+      assertEqual(
+        (service as any).onTaskFinishedCallbacks.size,
+        1,
+        'failed close should restore the still-active command callback'
+      )
+      assertCondition(
+        service.getTerminalRuntimeSnapshot(terminal.id) !== null,
+        'failed close should keep the terminal tab available'
+      )
+
+      backend.setThrowOnKill(false)
+      service.kill(terminal.id)
     })
   } finally {
     fs.rmSync(tempDir, { recursive: true, force: true })

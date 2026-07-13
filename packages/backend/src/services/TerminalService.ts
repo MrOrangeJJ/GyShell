@@ -118,6 +118,7 @@ type TerminalTabSnapshot = {
   lastExitCode?: number
   remoteOs?: 'unix' | 'windows'
   systemInfo?: TerminalTab['systemInfo']
+  monitorIdentity?: string
 }
 
 interface TerminalServiceOptions {
@@ -241,7 +242,8 @@ export class TerminalService {
       runtimeState: terminal.runtimeState,
       lastExitCode: terminal.lastExitCode,
       remoteOs: terminal.remoteOs,
-      systemInfo: terminal.systemInfo
+      systemInfo: terminal.systemInfo,
+      monitorIdentity: this.getMonitorIdentity(terminal.id) ?? undefined
     }))
   }
 
@@ -1251,9 +1253,28 @@ export class TerminalService {
     const terminal = this.terminals.get(terminalId)
     if (terminal) {
       const backend = this.getBackend(terminal.type)
+      const activeTaskId = this.activeTaskByTerminal.get(terminalId)
+      const activeTask = activeTaskId
+        ? this.getTaskMap(terminalId)[activeTaskId]
+        : undefined
+      const activeTaskCallback = activeTaskId
+        ? this.onTaskFinishedCallbacks.get(activeTaskId)
+        : undefined
+      if (activeTaskId) {
+        this.onTaskFinishedCallbacks.delete(activeTaskId)
+      }
       this.terminalIdsBeingKilled.add(terminalId)
       try {
         backend.kill(terminal.ptyId)
+      } catch (error) {
+        if (
+          activeTaskId &&
+          activeTaskCallback &&
+          this.activeTaskByTerminal.get(terminalId) === activeTaskId
+        ) {
+          this.onTaskFinishedCallbacks.set(activeTaskId, activeTaskCallback)
+        }
+        throw error
       } finally {
         this.terminalIdsBeingKilled.delete(terminalId)
       }
@@ -1270,13 +1291,28 @@ export class TerminalService {
       this.selectionByTerminal.delete(terminalId)
       this.oscParseBufByTerminal.delete(terminalId)
       this.backendRuntimeGenerationByTerminal.delete(terminalId)
-      this.tasksByTerminal.delete(terminalId)
-      const activeTaskId = this.activeTaskByTerminal.get(terminalId)
       if (activeTaskId) {
+        if (activeTask && activeTask.status !== 'finished') {
+          activeTask.output = activeTask.output || 'Terminal tab was closed.'
+          activeTask.status = 'aborted'
+          activeTask.endTime = Date.now()
+          activeTask.exitCode = -2
+          activeTask.endOffset =
+            activeTask.startOffset + (activeTask.output?.length || 0)
+        }
         this.stopCommandTrackingWatcher(activeTaskId)
         this.startMarkerByTaskId.delete(activeTaskId)
+        this.activeTaskByTerminal.delete(terminalId)
+        this.pendingTaskFinishByTerminal.delete(terminalId)
       }
-      this.activeTaskByTerminal.delete(terminalId)
+      const activeTaskCloseResult: CommandResult | undefined = activeTaskId
+        ? {
+            stdoutDelta: activeTask?.output || 'Terminal tab was closed.',
+            exitCode: -2,
+            history_command_match_id: activeTaskId
+          }
+        : undefined
+      this.tasksByTerminal.delete(terminalId)
       this.headlessWriteSeqByTerminal.delete(terminalId)
       this.headlessFlushedSeqByTerminal.delete(terminalId)
       this.pendingTaskFinishByTerminal.delete(terminalId)
@@ -1286,6 +1322,20 @@ export class TerminalService {
         this.primaryLocalTerminalId = nextLocal?.id || null
       }
       this.notifyTerminalClosed(terminalId)
+      if (
+        activeTaskCloseResult &&
+        activeTaskCallback &&
+        activeTask?.suppressFinishCallback !== true
+      ) {
+        try {
+          activeTaskCallback(activeTaskCloseResult)
+        } catch (error) {
+          console.warn(
+            `[TerminalService] terminal close task callback failed for ${terminalId}:`,
+            error
+          )
+        }
+      }
     }
     this.publishTerminalTabsChanged()
     this.schedulePersistTerminalState()
@@ -2095,25 +2145,33 @@ export class TerminalService {
     const startTime = Date.now()
     const timeoutMs = 120_000
     let suppressionApplied = false
-    const initialTask = this.getTaskMap(terminalId)[taskId]
-    if (opts?.suppressFinishCallback && initialTask?.status === 'running') {
-      initialTask.suppressFinishCallback = true
+    const task = this.tasksByTerminal.get(terminalId)?.[taskId]
+    if (!task) {
+      throw new Error(`Task ${taskId} not found.`)
+    }
+    if (opts?.suppressFinishCallback && task.status === 'running') {
+      task.suppressFinishCallback = true
       suppressionApplied = true
     }
     const clearSuppressionIfStillRunning = (): void => {
       if (!suppressionApplied) return
-      const task = this.getTaskMap(terminalId)[taskId]
-      if (task?.status === 'running') {
+      if (task.status === 'running') {
         task.suppressFinishCallback = false
       }
     }
 
     while (true) {
-      const task = this.getTaskMap(terminalId)[taskId]
-      if (task?.status === 'finished') {
+      if (task.status === 'finished') {
         return {
           stdoutDelta: task.output || '',
           exitCode: task.exitCode ?? -1,
+          history_command_match_id: taskId
+        }
+      }
+      if (task.status === 'aborted') {
+        return {
+          stdoutDelta: task.output || 'Command aborted because the terminal session ended.',
+          exitCode: task.exitCode ?? -2,
           history_command_match_id: taskId
         }
       }
@@ -2126,10 +2184,6 @@ export class TerminalService {
           clearSuppressionIfStillRunning()
         }
         return { stdoutDelta: 'Command aborted by user.', exitCode: -2, history_command_match_id: taskId }
-      }
-
-      if (!task) {
-        throw new Error(`Task ${taskId} not found.`)
       }
 
       // Check if user manually skipped the wait after honoring a just-finished task.

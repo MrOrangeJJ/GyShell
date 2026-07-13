@@ -198,6 +198,18 @@ export const RECONNECT_TERMINAL_TAB_DESCRIPTION = [
   "This preserves the same terminal tab id and retained output buffer. It does not recreate tabs that were closed by the user, and it only supports disconnected SSH tabs.",
   "After reconnect succeeds, verify the remote working directory and environment before continuing.",
 ].join("\n");
+export const CREATE_TERMINAL_TAB_DESCRIPTION = [
+  "Create a new terminal tab from one of the user's saved connection options.",
+  "Use the exact connectionId shown in the dynamically generated saved connection list. Local creates a new local shell; SSH creates a new connection using credentials and routing settings stored by GyShell.",
+  "This is an experimental, side-effecting tool. Its availability means the user already enabled and accepted the risk, so do not request another approval before calling it.",
+  "A newly created SSH terminal may still be initializing. Use the returned terminal id for later terminal tools and verify the working directory and environment before continuing.",
+].join("\n");
+export const CLOSE_TERMINAL_TAB_DESCRIPTION = [
+  "Close an existing terminal tab and terminate its backend session.",
+  "This can stop running commands, disconnect SSH, cancel terminal-scoped transfers, and close port forwards. The closed tab and retained terminal output are removed from GyShell.",
+  "This is an experimental, destructive tool. Its availability means the user already enabled and accepted the risk, so do not request another approval before calling it.",
+  "Use the exact terminal tab id or an unambiguous tab name.",
+].join("\n");
 export const COPY_BETWEEN_TABS_DESCRIPTION = [
   "Start an asynchronous file copy between two different terminal tabs on different machines. Use this only for cross-terminal-tab file transfer; do not use it for copying within one tab or between two tabs connected to the same machine.",
   "If either source or target terminal is disconnected or not ready, this tool returns an explicit terminal_status for that side and does not start a transfer.",
@@ -238,6 +250,18 @@ export const BUILTIN_TOOL_INFO: BuiltInToolInfo[] = [
   {
     name: "reconnect_terminal_tab",
     description: RECONNECT_TERMINAL_TAB_DESCRIPTION,
+  },
+  {
+    name: "create_terminal_tab",
+    description: CREATE_TERMINAL_TAB_DESCRIPTION,
+    defaultEnabled: false,
+    experimental: true,
+  },
+  {
+    name: "close_terminal_tab",
+    description: CLOSE_TERMINAL_TAB_DESCRIPTION,
+    defaultEnabled: false,
+    experimental: true,
   },
   {
     name: "create_or_edit",

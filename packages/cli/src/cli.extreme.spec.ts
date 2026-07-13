@@ -537,6 +537,124 @@ await runCase(
 );
 
 await runCase(
+  "experimental tool enable requires an explicit CLI risk acknowledgement",
+  async () => {
+    const challenge = {
+      kind: "experimental_tool_confirmation_required",
+      experimentalToolNames: ["create_terminal_tab"],
+    };
+    const withoutAck = new FakeClient();
+    withoutAck.responses.set("tools:setBuiltInEnabled", challenge);
+    await assert.rejects(
+      executeCommand(
+        args([
+          "tool",
+          "enable",
+          "--kind",
+          "built-in",
+          "--name",
+          "create_terminal_tab",
+        ]),
+        withoutAck,
+        io().io,
+      ),
+      /--ack-experimental-risk/,
+    );
+    assert.equal(withoutAck.calls.length, 1);
+
+    const withAck = new FakeClient();
+    withAck.responses.set(
+      "tools:setBuiltInEnabled",
+      (params: Record<string, unknown>) =>
+        Array.isArray(params.acknowledgedExperimentalToolNames)
+          ? [{ name: "create_terminal_tab", enabled: true }]
+          : challenge,
+    );
+    const result = await executeCommand(
+      args([
+        "tool",
+        "enable",
+        "--kind",
+        "built-in",
+        "--name",
+        "create_terminal_tab",
+        "--ack-experimental-risk",
+      ]),
+      withAck,
+      io().io,
+    );
+    assert.deepEqual(result.data, [
+      { name: "create_terminal_tab", enabled: true },
+    ]);
+    assert.deepEqual(withAck.calls[1]?.params, {
+      name: "create_terminal_tab",
+      enabled: true,
+      acknowledgedExperimentalToolNames: ["create_terminal_tab"],
+    });
+  },
+);
+
+await runCase(
+  "agent setting apply retries a consent challenge only with the CLI risk flag",
+  async () => {
+    const client = new FakeClient();
+    client.responses.set(
+      "agentSettings:apply",
+      (params: Record<string, unknown>) =>
+        Array.isArray(params.acknowledgedExperimentalToolNames)
+          ? { settings: { applied: true } }
+          : {
+              kind: "experimental_tool_confirmation_required",
+              experimentalToolNames: ["close_terminal_tab"],
+            },
+    );
+    await executeCommand(
+      args([
+        "agent-setting",
+        "apply",
+        "--profile-id",
+        "agent-setting-slot-1",
+        "--ack-experimental-risk",
+      ]),
+      client,
+      io().io,
+    );
+    assert.deepEqual(client.calls[1]?.params, {
+      profileId: "agent-setting-slot-1",
+      acknowledgedExperimentalToolNames: ["close_terminal_tab"],
+    });
+  },
+);
+
+await runCase(
+  "runCli reports unresolved experimental consent as a failed mutation",
+  async () => {
+    const client = new FakeClient();
+    client.responses.set("tools:setBuiltInEnabled", {
+      kind: "experimental_tool_confirmation_required",
+      experimentalToolNames: ["create_terminal_tab"],
+    });
+    const streams = io();
+    const exitCode = await runCli({
+      argv: [
+        "tool",
+        "enable",
+        "--kind",
+        "built-in",
+        "--name",
+        "create_terminal_tab",
+      ],
+      env: {},
+      io: streams.io,
+      createClient: () => client,
+    });
+    assert.equal(exitCode, 2);
+    assert.equal(streams.stdout.length, 0);
+    assert.match(streams.stderr.join(""), /ack-experimental-risk/);
+  },
+);
+
+await runCase(
   "runCli rejects unknown options before opening a connection",
   async () => {
     let created = false;

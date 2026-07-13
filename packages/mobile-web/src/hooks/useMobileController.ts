@@ -61,6 +61,7 @@ import {
   normalizeSkillItem,
   normalizeCommandPolicyLists,
   readCommandPolicyModeFromSettings,
+  readExperimentalToolConfirmationRequired,
   readMemoryEnabledFromSettings,
   readProfilesFromSettings,
   safeError,
@@ -72,6 +73,7 @@ import {
   type TerminalBufferEntry,
 } from "./useTerminalBuffer";
 import type {
+  AgentSettingApplyOutcome,
   AgentSettingStateSummary,
   BuiltInToolSummary,
   ChatMessage,
@@ -253,7 +255,11 @@ export interface MobileControllerActions {
   reloadMemory: () => Promise<void>;
   reloadTools: () => Promise<void>;
   setMcpEnabled: (name: string, enabled: boolean) => Promise<void>;
-  setBuiltInToolEnabled: (name: string, enabled: boolean) => Promise<void>;
+  setBuiltInToolEnabled: (
+    name: string,
+    enabled: boolean,
+    acknowledgedExperimentalToolNames?: string[],
+  ) => Promise<void>;
   replyAsk: (message: ChatMessage, decision: "allow" | "deny") => Promise<void>;
   rollbackToMessage: (sessionId: string, messageId: string) => Promise<boolean>;
   branchFromMessage: (
@@ -268,7 +274,10 @@ export interface MobileControllerActions {
   markTerminalBufferSeen: (terminalId: string) => void;
   reloadAgentSettings: () => Promise<void>;
   saveCurrentAgentSetting: () => Promise<boolean>;
-  applyAgentSetting: (profileId: string) => Promise<boolean>;
+  applyAgentSetting: (
+    profileId: string,
+    acknowledgedExperimentalToolNames?: string[],
+  ) => Promise<AgentSettingApplyOutcome>;
   overwriteAgentSetting: (profileId: string) => Promise<boolean>;
   deleteAgentSetting: (profileId: string) => Promise<boolean>;
 }
@@ -1767,13 +1776,25 @@ export function useMobileController(): {
   );
 
   const setBuiltInToolEnabled = React.useCallback(
-    async (name: string, enabled: boolean) => {
+    async (
+      name: string,
+      enabled: boolean,
+      acknowledgedExperimentalToolNames: string[] = [],
+    ) => {
       if (!name || !client.isConnected()) return;
       try {
         const payload = await client.request<unknown>(
           "tools:setBuiltInEnabled",
-          { name, enabled },
+          { name, enabled, acknowledgedExperimentalToolNames },
         );
+        const confirmationToolNames =
+          readExperimentalToolConfirmationRequired(payload);
+        if (confirmationToolNames) {
+          setConnectionError(
+            `Experimental tool confirmation is required: ${confirmationToolNames.join(", ")}`,
+          );
+          return;
+        }
         const nextBuiltInTools = Array.isArray(payload)
           ? payload
               .map((item) => normalizeBuiltInTool(item))
@@ -2195,22 +2216,31 @@ export function useMobileController(): {
   }, [applyAgentSettingResult, client]);
 
   const applyAgentSetting = React.useCallback(
-    async (profileId: string): Promise<boolean> => {
+    async (
+      profileId: string,
+      acknowledgedExperimentalToolNames: string[] = [],
+    ): Promise<AgentSettingApplyOutcome> => {
       if (!profileId || !client.isConnected()) {
         setConnectionError("Gateway is not connected");
-        return false;
+        return { applied: false, experimentalToolNames: [] };
       }
       setAgentSettingsSaving(true);
       setAgentSettingsError("");
       try {
         const raw = await client.request<unknown>("agentSettings:apply", {
           profileId,
+          acknowledgedExperimentalToolNames,
         });
+        const experimentalToolNames =
+          readExperimentalToolConfirmationRequired(raw);
+        if (experimentalToolNames) {
+          return { applied: false, experimentalToolNames };
+        }
         applyAgentSettingResult(raw, "Agent profile applied");
-        return true;
+        return { applied: true, experimentalToolNames: [] };
       } catch (error) {
         setAgentSettingsError(`Failed to apply agent profile: ${safeError(error)}`);
-        return false;
+        return { applied: false, experimentalToolNames: [] };
       } finally {
         setAgentSettingsSaving(false);
       }

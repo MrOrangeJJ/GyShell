@@ -425,6 +425,10 @@ export const SettingsView: React.FC<{ store: AppStore }> = observer(
     const [accessTokenModalError, setAccessTokenModalError] = useState("");
     const [deleteAccessTokenConfirm, setDeleteAccessTokenConfirm] =
       useState<null | { id: string; name: string }>(null);
+    const [experimentalToolEnableConfirm, setExperimentalToolEnableConfirm] =
+      useState<null | { name: string }>(null);
+    const [experimentalToolEnableBusy, setExperimentalToolEnableBusy] =
+      useState(false);
     const [showMobileWebGatewayWarning, setShowMobileWebGatewayWarning] =
       useState(false);
 
@@ -453,6 +457,19 @@ export const SettingsView: React.FC<{ store: AppStore }> = observer(
       () => store.builtInTools.filter((tool) => tool.experimental === true),
       [store.builtInTools],
     );
+    const enableExperimentalTool = async () => {
+      const tool = experimentalToolEnableConfirm;
+      if (!tool || experimentalToolEnableBusy) return;
+      setExperimentalToolEnableBusy(true);
+      try {
+        await store.setBuiltInToolEnabled(tool.name, true, [tool.name]);
+        setExperimentalToolEnableConfirm(null);
+      } catch (error) {
+        console.error("Failed to enable experimental tool", error);
+      } finally {
+        setExperimentalToolEnableBusy(false);
+      }
+    };
   const formattedCheckedAt =
     versionInfo?.checkedAt && versionInfo.checkedAt > 0
       ? new Date(versionInfo.checkedAt).toLocaleString()
@@ -635,6 +652,21 @@ export const SettingsView: React.FC<{ store: AppStore }> = observer(
             if (!deleteAccessTokenConfirm) return;
             void store.deleteAccessToken(deleteAccessTokenConfirm.id);
             setDeleteAccessTokenConfirm(null);
+        }}
+      />
+      <ConfirmDialog
+        open={!!experimentalToolEnableConfirm}
+        title={t.settings.experimentalToolEnableTitle}
+        message={t.settings.experimentalToolEnableMessage(
+          experimentalToolEnableConfirm?.name || "",
+        )}
+        confirmText={t.settings.experimentalToolEnableConfirm}
+        cancelText={t.common.cancel}
+        danger
+        loading={experimentalToolEnableBusy}
+        onCancel={() => setExperimentalToolEnableConfirm(null)}
+        onConfirm={() => {
+          void enableExperimentalTool();
         }}
       />
         <ConfirmDialog
@@ -1608,12 +1640,19 @@ export const SettingsView: React.FC<{ store: AppStore }> = observer(
                             <input
                               type="checkbox"
                               checked={tool.enabled}
-                              onChange={(e) =>
-                                store.setBuiltInToolEnabled(
+                              disabled={experimentalToolEnableBusy}
+                              onChange={(event) => {
+                                if (event.target.checked) {
+                                  setExperimentalToolEnableConfirm({
+                                    name: tool.name,
+                                  });
+                                  return;
+                                }
+                                void store.setBuiltInToolEnabled(
                                   tool.name,
-                                  e.target.checked,
-                                )
-                              }
+                                  false,
+                                );
+                              }}
                             />
                             <span className="switch-slider" />
                           </label>

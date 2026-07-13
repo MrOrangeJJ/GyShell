@@ -322,6 +322,15 @@ interface AgentSettingOperationResult {
   warnings: string[];
 }
 
+interface ExperimentalToolConfirmationRequired {
+  kind: "experimental_tool_confirmation_required";
+  experimentalToolNames: string[];
+}
+
+type AgentSettingApplyResult =
+  | AgentSettingOperationResult
+  | ExperimentalToolConfirmationRequired;
+
 interface AccessTokenSummary {
   id: string;
   name: string;
@@ -814,7 +823,10 @@ export interface GyShellAPI {
     setBuiltInEnabled: (
       name: string,
       enabled: boolean,
-    ) => Promise<BuiltInToolSummary[]>;
+      acknowledgedExperimentalToolNames?: string[],
+    ) => Promise<
+      BuiltInToolSummary[] | ExperimentalToolConfirmationRequired
+    >;
     onMcpUpdated: (callback: (data: McpToolSummary[]) => void) => () => void;
     onBuiltInUpdated: (
       callback: (data: BuiltInToolSummary[]) => void,
@@ -852,7 +864,10 @@ export interface GyShellAPI {
   agentSettings: {
     get: () => Promise<AgentSettingState>;
     saveCurrent: () => Promise<AgentSettingOperationResult>;
-    apply: (profileId: string) => Promise<AgentSettingOperationResult>;
+    apply: (
+      profileId: string,
+      acknowledgedExperimentalToolNames?: string[],
+    ) => Promise<AgentSettingApplyResult>;
     overwrite: (profileId: string) => Promise<AgentSettingOperationResult>;
     delete: (profileId: string) => Promise<AgentSettingOperationResult>;
   };
@@ -1263,8 +1278,13 @@ const api: GyShellAPI = {
     setMcpEnabled: (name, enabled) =>
       ipcRenderer.invoke("tools:setMcpEnabled", name, enabled),
     getBuiltIn: () => ipcRenderer.invoke("tools:getBuiltIn"),
-    setBuiltInEnabled: (name, enabled) =>
-      ipcRenderer.invoke("tools:setBuiltInEnabled", name, enabled),
+    setBuiltInEnabled: (name, enabled, acknowledgedExperimentalToolNames) =>
+      ipcRenderer.invoke(
+        "tools:setBuiltInEnabled",
+        name,
+        enabled,
+        acknowledgedExperimentalToolNames,
+      ),
     onMcpUpdated: (callback) => {
       const handler = (_: IpcRendererEvent, data: McpToolSummary[]) =>
         callback(data);
@@ -1315,8 +1335,12 @@ const api: GyShellAPI = {
   agentSettings: {
     get: () => ipcRenderer.invoke("agentSettings:get"),
     saveCurrent: () => ipcRenderer.invoke("agentSettings:saveCurrent"),
-    apply: (profileId: string) =>
-      ipcRenderer.invoke("agentSettings:apply", profileId),
+    apply: (profileId, acknowledgedExperimentalToolNames) =>
+      ipcRenderer.invoke(
+        "agentSettings:apply",
+        profileId,
+        acknowledgedExperimentalToolNames,
+      ),
     overwrite: (profileId: string) =>
       ipcRenderer.invoke("agentSettings:overwrite", profileId),
     delete: (profileId: string) =>

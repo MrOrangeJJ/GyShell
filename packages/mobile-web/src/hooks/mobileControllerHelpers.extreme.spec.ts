@@ -3,6 +3,8 @@ import {
   deriveSessionStatus,
   findFirstApprovalSession,
   normalizeAgentSettingState,
+  normalizeBuiltInTool,
+  readExperimentalToolConfirmationRequired,
   type SessionStatusInfo,
 } from "./mobileControllerHelpers";
 import { createSessionState } from "../session-store";
@@ -313,6 +315,13 @@ runCase("normalizeAgentSettingState: extracts nested snapshot model + policy", (
         snapshot: {
           model: { activeProfileId: "gpt-4", activeProfileName: "GPT-4" },
           security: { commandPolicyMode: "safe" },
+          tools: {
+            builtIn: {
+              create_terminal_tab: true,
+              close_terminal_tab: false,
+              malformed: "yes",
+            },
+          },
         },
       },
     ],
@@ -329,6 +338,43 @@ runCase("normalizeAgentSettingState: extracts nested snapshot model + policy", (
     state.profiles[0].commandPolicyMode,
     "safe",
     "policy mode extracted",
+  );
+});
+
+runCase("normalizeBuiltInTool: preserves experimental metadata", () => {
+  assertDeepEqual(
+    normalizeBuiltInTool({
+      name: "create_terminal_tab",
+      description: "Create a terminal",
+      enabled: false,
+      experimental: true,
+    }),
+    {
+      name: "create_terminal_tab",
+      description: "Create a terminal",
+      enabled: false,
+      experimental: true,
+    },
+    "mobile tools UI needs experimental metadata before enabling",
+  );
+});
+
+runCase("experimental confirmation challenge: accepts only valid tool names", () => {
+  assertDeepEqual(
+    readExperimentalToolConfirmationRequired({
+      kind: "experimental_tool_confirmation_required",
+      experimentalToolNames: ["close_terminal_tab", 42, "close_terminal_tab"],
+    }),
+    ["close_terminal_tab"],
+    "mobile profile apply should recognize the backend confirmation challenge",
+  );
+  assertDeepEqual(
+    readExperimentalToolConfirmationRequired({
+      kind: "unrelated",
+      experimentalToolNames: ["close_terminal_tab"],
+    }),
+    null,
+    "unrelated payloads must not be treated as confirmation challenges",
   );
 });
 

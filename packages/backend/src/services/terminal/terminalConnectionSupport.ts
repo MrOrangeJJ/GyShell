@@ -2,12 +2,50 @@ import {
   getTerminalConnectionCapabilities,
   getTerminalConnectionTypeDefinition,
 } from '@gyshell/shared'
+import { createHmac, randomBytes } from 'node:crypto'
+import { v4 as uuidv4 } from 'uuid'
 import type {
+  BackendSettings,
   GenericConnectionConfig,
   LocalConnectionConfig,
   SSHConnectionConfig,
+  SSHConnectionEntry,
   TerminalConfig,
+  TunnelEntry,
 } from '../../types'
+
+const LOCAL_SAVED_CONNECTION_ID = 'local'
+const SSH_SAVED_CONNECTION_ID_PREFIX = 'ssh:'
+const OPAQUE_SSH_SAVED_CONNECTION_ID_PREFIX = 'ssh-opaque:'
+// Selectors are sent to the model. A process-local HMAC key keeps them
+// version-bound without exposing a reusable digest of saved credentials.
+const SAVED_CONNECTION_SELECTOR_KEY = randomBytes(32)
+
+export const buildSavedSshConnectionSelector = (
+  entry: SSHConnectionEntry,
+  settings: BackendSettings | null | undefined,
+): string | null => {
+  if (typeof entry.id !== 'string' || entry.id.length === 0) return null
+  const idPrefix = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(entry.id)
+    ? `${SSH_SAVED_CONNECTION_ID_PREFIX}${entry.id}`
+    : `${OPAQUE_SSH_SAVED_CONNECTION_ID_PREFIX}${authenticateSelectorPart(entry.id)}`
+  const connectionFingerprint = authenticateSelectorPart(
+    JSON.stringify(buildSshConnectionConfig(entry, settings)),
+  )
+  return `${idPrefix}:${connectionFingerprint}`
+}
+
+const authenticateSelectorPart = (value: string): string =>
+  createHmac('sha256', SAVED_CONNECTION_SELECTOR_KEY)
+    .update(value, 'utf8')
+    .digest('base64url')
+
+export const getSavedSshConnectionDisplayName = (
+  entry: Pick<SSHConnectionEntry, 'name' | 'host'>,
+): string =>
+  String(entry.name || '').trim() ||
+  String(entry.host || '').trim() ||
+  'Unnamed SSH connection'
 
 const asPositiveInt = (value: unknown, fallback: number): number => {
   if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0) {
@@ -83,6 +121,78 @@ export const createAutoTerminalConfig = (
     title,
     cols,
     rows,
+  }
+}
+
+/**
+ * Resolves a version-bound saved-connection selector into a one-shot terminal
+ * config. The selector fingerprints the resolved connection so edits made
+ * after a model pass fail closed instead of targeting a different endpoint.
+ */
+export const buildTerminalConfigFromSavedConnection = (
+  settings: BackendSettings | null | undefined,
+  connectionId: string,
+): TerminalConfig | null => {
+  const normalizedConnectionId = String(connectionId || '').trim()
+  if (normalizedConnectionId === LOCAL_SAVED_CONNECTION_ID) {
+    return {
+      type: 'local',
+      id: `local-${uuidv4()}`,
+      title: 'Local',
+      cols: 80,
+      rows: 24,
+    }
+  }
+
+  const entry = settings?.connections?.ssh?.find(
+    (candidate) =>
+      buildSavedSshConnectionSelector(candidate, settings) ===
+      normalizedConnectionId,
+  )
+  if (!entry) return null
+
+  return {
+    ...buildSshConnectionConfig(entry, settings),
+    id: `ssh-${uuidv4()}`,
+  }
+}
+
+const buildSshConnectionConfig = (
+  entry: SSHConnectionEntry,
+  settings: BackendSettings | null | undefined,
+): SSHConnectionConfig => {
+  const proxy = entry.proxyId
+    ? settings?.connections?.proxies?.find(
+        (candidate) => candidate.id === entry.proxyId,
+      )
+    : undefined
+  const tunnels = (entry.tunnelIds ?? [])
+    .map((tunnelId) =>
+      settings?.connections?.tunnels?.find(
+        (candidate) => candidate.id === tunnelId,
+      ),
+    )
+    .filter((tunnel): tunnel is TunnelEntry => Boolean(tunnel))
+
+  return {
+    type: 'ssh',
+    id: entry.id,
+    title: getSavedSshConnectionDisplayName(entry),
+    cols: 80,
+    rows: 24,
+    host: entry.host,
+    port: asPositiveInt(entry.port, 22),
+    username: entry.username,
+    authMethod: entry.authMethod,
+    password: entry.password,
+    privateKey: entry.privateKey,
+    privateKeyPath: entry.privateKeyPath,
+    passphrase: entry.passphrase,
+    proxy,
+    ...(tunnels.length > 0 ? { tunnels } : {}),
+    ...(entry.jumpHost
+      ? { jumpHost: buildSshConnectionConfig(entry.jumpHost, settings) }
+      : {}),
   }
 }
 

@@ -20,6 +20,7 @@ interface ProfileMenuState {
 
 type PendingAgentSettingAction =
   | { type: "save" }
+  | { type: "apply"; profileId: string; experimentalToolNames: string[] }
   | { type: "overwrite"; profileId: string }
   | { type: "delete"; profileId: string };
 
@@ -147,6 +148,36 @@ export const AgentSettingRailControls: React.FC<AgentSettingRailControlsProps> =
         };
       }
       if (!pendingActionProfile) return null;
+      if (pendingAction.type === "apply") {
+        return {
+          title: t.settings.experimentalToolEnableTitle,
+          message: t.settings.experimentalToolEnableMessage(
+            pendingAction.experimentalToolNames.join(", "),
+          ),
+          confirmText: t.settings.experimentalToolEnableConfirm,
+          danger: true,
+          onConfirm: () => {
+            void runBusyAction(async () => {
+              const result = await store.applyAgentSetting(
+                pendingActionProfile.id,
+                pendingAction.experimentalToolNames,
+              );
+              if (
+                "kind" in result &&
+                result.kind === "experimental_tool_confirmation_required"
+              ) {
+                setPendingAction({
+                  type: "apply",
+                  profileId: pendingActionProfile.id,
+                  experimentalToolNames: result.experimentalToolNames,
+                });
+                return;
+              }
+              setPendingAction(null);
+            });
+          },
+        };
+      }
       if (pendingAction.type === "overwrite") {
         return {
           title: t.settings.overwriteAgentSettingTitle,
@@ -194,7 +225,19 @@ export const AgentSettingRailControls: React.FC<AgentSettingRailControlsProps> =
               aria-label={t.settings.agentSettingSlot(profile.slotNumber)}
               disabled={busy}
               onClick={() => {
-                void runBusyAction(() => store.applyAgentSetting(profile.id));
+                void runBusyAction(async () => {
+                  const result = await store.applyAgentSetting(profile.id);
+                  if (
+                    "kind" in result &&
+                    result.kind === "experimental_tool_confirmation_required"
+                  ) {
+                    setPendingAction({
+                      type: "apply",
+                      profileId: profile.id,
+                      experimentalToolNames: result.experimentalToolNames,
+                    });
+                  }
+                });
               }}
               onContextMenu={(event) => {
                 event.preventDefault();

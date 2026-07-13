@@ -3,6 +3,10 @@ import { AgentSettingProfileService } from './AgentSettingProfileService'
 import { migrateBackendSettings } from './settings/migrations'
 import { deepMerge } from './settings/objectMerge'
 import { getAgentSettingProfileId } from './settings/agentSettings'
+import {
+  assertSettingsPatchDoesNotEnableExperimentalTools,
+  isExperimentalToolConfirmationRequired,
+} from './settings/experimentalToolConsent'
 
 const assertEqual = <T>(actual: T, expected: T, message: string): void => {
   if (actual !== expected) {
@@ -403,7 +407,11 @@ const run = async (): Promise<void> => {
       await harness.memoryService.writeMemory('changed default', null)
       await harness.memoryService.writeMemory('slot memory', slotId)
 
-      const result = await harness.service.apply(slotId)
+      const applyResult = await harness.service.apply(slotId)
+      if (isExperimentalToolConfirmationRequired(applyResult)) {
+        throw new Error('ordinary profile apply unexpectedly required confirmation')
+      }
+      const result = applyResult
       const settings = harness.settingsService.getSettings()
       assertEqual(
         settings.commandPolicyMode,
@@ -483,7 +491,13 @@ const run = async (): Promise<void> => {
           activeProfileId: 'profile-deep',
         },
       })
-      const result = await harness.service.apply(getAgentSettingProfileId(1))
+      const applyResult = await harness.service.apply(
+        getAgentSettingProfileId(1),
+      )
+      if (isExperimentalToolConfirmationRequired(applyResult)) {
+        throw new Error('ordinary profile apply unexpectedly required confirmation')
+      }
+      const result = applyResult
       assertEqual(
         harness.settingsService.getSettings().models.activeProfileId,
         'profile-deep',
@@ -510,6 +524,258 @@ const run = async (): Promise<void> => {
         .join(',')
       assertEqual(slots, '1,2', 'concurrent saves should not collide')
       assertEqual(harness.settingsChangedCount, 2, 'both saves should persist')
+    },
+  )
+
+  await runCase(
+    'experimental tool enable requires acknowledgement at the serialized mutation boundary',
+    async () => {
+      const harness = createHarness()
+      const firstAttempt = await harness.service.setBuiltInToolEnabled(
+        'create_terminal_tab',
+        true,
+      )
+      assertCondition(
+        isExperimentalToolConfirmationRequired(firstAttempt),
+        'unacknowledged experimental enable should return a challenge',
+      )
+      if (!isExperimentalToolConfirmationRequired(firstAttempt)) return
+      assertDeepEqual(
+        firstAttempt.experimentalToolNames,
+        ['create_terminal_tab'],
+        'challenge should identify the exact experimental tool',
+      )
+      assertEqual(
+        harness.settingsService.getSettings().tools.builtIn.create_terminal_tab,
+        false,
+        'challenge must not mutate settings',
+      )
+
+      const enabled = await harness.service.setBuiltInToolEnabled(
+        'create_terminal_tab',
+        true,
+        ['create_terminal_tab'],
+      )
+      assertCondition(
+        !isExperimentalToolConfirmationRequired(enabled),
+        'acknowledged experimental enable should apply',
+      )
+      assertEqual(
+        harness.settingsService.getSettings().tools.builtIn.create_terminal_tab,
+        true,
+        'acknowledged enable should persist',
+      )
+
+      const [disabled, racedEnable] = await Promise.all([
+        harness.service.setBuiltInToolEnabled('create_terminal_tab', false),
+        harness.service.setBuiltInToolEnabled('create_terminal_tab', true),
+      ])
+      assertCondition(
+        !isExperimentalToolConfirmationRequired(disabled),
+        'disable should never require confirmation',
+      )
+      assertCondition(
+        isExperimentalToolConfirmationRequired(racedEnable),
+        'queued re-enable must re-check the latest committed state',
+      )
+      assertEqual(
+        harness.settingsService.getSettings().tools.builtIn.create_terminal_tab,
+        false,
+        'unacknowledged raced re-enable must remain disabled',
+      )
+
+      harness.settingsService.setSettings({
+        tools: {
+          ...harness.settingsService.getSettings().tools,
+          builtIn: {
+            ...harness.settingsService.getSettings().tools.builtIn,
+            create_terminal_tab: 'yes' as any,
+          },
+        },
+      })
+      const malformedStateAttempt =
+        await harness.service.setBuiltInToolEnabled(
+          'create_terminal_tab',
+          true,
+        )
+      assertCondition(
+        isExperimentalToolConfirmationRequired(malformedStateAttempt),
+        'truthy non-boolean settings must be treated as the fail-closed default',
+      )
+    },
+  )
+
+  await runCase(
+    'generic settings writes share the profile mutation boundary',
+    async () => {
+      const harness = createHarness()
+      await harness.service.setBuiltInToolEnabled(
+        'create_terminal_tab',
+        true,
+        ['create_terminal_tab'],
+      )
+      await harness.service.saveCurrent()
+      const slotId = getAgentSettingProfileId(1)
+
+      let signalMcpStarted: () => void = () => undefined
+      const mcpStarted = new Promise<void>((resolve) => {
+        signalMcpStarted = resolve
+      })
+      let releaseMcp: () => void = () => undefined
+      const mcpRelease = new Promise<void>((resolve) => {
+        releaseMcp = resolve
+      })
+      const applyBatch =
+        harness.mcpToolService.setServerEnabledBatch.bind(
+          harness.mcpToolService,
+        )
+      harness.mcpToolService.setServerEnabledBatch = async (enabledByName) => {
+        signalMcpStarted()
+        await mcpRelease
+        return await applyBatch(enabledByName)
+      }
+
+      const applyPromise = harness.service.apply(slotId)
+      await mcpStarted
+      const current = harness.settingsService.getSettings()
+      let patchSettled = false
+      const patchPromise = harness.service
+        .applySettingsPatch({
+          tools: {
+            builtIn: {
+              ...current.tools.builtIn,
+              create_terminal_tab: false,
+            },
+            skills: current.tools.skills,
+          },
+        })
+        .then(() => {
+          patchSettled = true
+        })
+      await Promise.resolve()
+      assertEqual(
+        patchSettled,
+        false,
+        'generic settings write should wait for the active profile mutation',
+      )
+
+      releaseMcp()
+      const applyResult = await applyPromise
+      assertCondition(
+        !isExperimentalToolConfirmationRequired(applyResult),
+        'an already-enabled profile should apply without a new challenge',
+      )
+      await patchPromise
+      assertEqual(
+        harness.settingsService.getSettings().tools.builtIn
+          .create_terminal_tab,
+        false,
+        'the queued disable must commit after profile apply without being re-enabled',
+      )
+    },
+  )
+
+  await runCase(
+    'profile apply challenges before any experimental enable side effects',
+    async () => {
+      const harness = createHarness()
+      harness.settingsService.setSettings({
+        tools: {
+          ...harness.settingsService.getSettings().tools,
+          builtIn: {
+            ...harness.settingsService.getSettings().tools.builtIn,
+            close_terminal_tab: true,
+          },
+        },
+      })
+      await harness.service.saveCurrent()
+      const slotId = getAgentSettingProfileId(1)
+      await harness.service.setBuiltInToolEnabled('close_terminal_tab', false)
+
+      const challenge = await harness.service.apply(slotId)
+      assertCondition(
+        isExperimentalToolConfirmationRequired(challenge),
+        'profile apply should return an experimental confirmation challenge',
+      )
+      if (!isExperimentalToolConfirmationRequired(challenge)) return
+      assertDeepEqual(
+        challenge.experimentalToolNames,
+        ['close_terminal_tab'],
+        'profile challenge should list every newly enabled experimental tool',
+      )
+      assertEqual(
+        harness.settingsService.getSettings().tools.builtIn.close_terminal_tab,
+        false,
+        'unconfirmed profile apply must not change built-in settings',
+      )
+
+      const applied = await harness.service.apply(
+        slotId,
+        challenge.experimentalToolNames,
+      )
+      assertCondition(
+        !isExperimentalToolConfirmationRequired(applied),
+        'confirmed profile apply should complete',
+      )
+      assertEqual(
+        harness.settingsService.getSettings().tools.builtIn.close_terminal_tab,
+        true,
+        'confirmed profile apply should enable the saved experimental tool',
+      )
+    },
+  )
+
+  await runCase(
+    'generic settings patches cannot bypass experimental confirmation',
+    () => {
+      const harness = createHarness()
+      let errorMessage = ''
+      try {
+        assertSettingsPatchDoesNotEnableExperimentalTools(
+          harness.settingsService.getSettings().tools.builtIn,
+          {
+            tools: {
+              builtIn: { create_terminal_tab: true },
+            },
+          },
+        )
+      } catch (error) {
+        errorMessage = error instanceof Error ? error.message : String(error)
+      }
+      assertCondition(
+        /tools:setBuiltInEnabled/.test(errorMessage),
+        'generic settings patch should be directed to the consent-aware endpoint',
+      )
+
+      assertCondition(
+        (() => {
+          try {
+            assertSettingsPatchDoesNotEnableExperimentalTools(
+              harness.settingsService.getSettings().tools.builtIn,
+              {
+                tools: {
+                  builtIn: { create_terminal_tab: 'yes' },
+                },
+              },
+            )
+            return false
+          } catch (error) {
+            return /boolean value/.test(
+              error instanceof Error ? error.message : String(error),
+            )
+          }
+        })(),
+        'generic settings patches should reject malformed known-tool values',
+      )
+
+      assertSettingsPatchDoesNotEnableExperimentalTools(
+        harness.settingsService.getSettings().tools.builtIn,
+        {
+          tools: {
+            builtIn: { create_terminal_tab: false },
+          },
+        },
+      )
     },
   )
 }

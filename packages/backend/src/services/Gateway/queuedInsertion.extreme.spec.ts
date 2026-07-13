@@ -312,6 +312,107 @@ const run = async (): Promise<void> => {
   );
 
   await runCase(
+    "terminal inventory mutations are model-visible tool-call boundaries",
+    async () => {
+      for (const toolName of ["create_terminal_tab", "close_terminal_tab"]) {
+        const agent = createAgentService();
+        const lifecycleCall = {
+          id: `call-${toolName}`,
+          name: toolName,
+          args:
+            toolName === "create_terminal_tab"
+              ? { connectionId: "local" }
+              : { tabIdOrName: "local-existing" },
+        };
+        const laterCall = {
+          id: `call-after-${toolName}`,
+          name: "read_terminal_tab",
+          args: { tabIdOrName: "local-existing" },
+        };
+        const assistantMessage = new AIMessage({
+          content: "",
+          tool_calls: [lifecycleCall, laterCall],
+        });
+
+        const node = (agent as any).createBatchToolcallExecutorNode();
+        const result = await node.invoke({
+          sessionId: `session-${toolName}-boundary`,
+          messages: [assistantMessage],
+        });
+
+        assertEqual(
+          result.pendingToolCalls.length,
+          1,
+          `${toolName} should trim later calls based on the old terminal inventory`,
+        );
+        assertEqual(
+          result.pendingToolCalls[0]?.id,
+          lifecycleCall.id,
+          `${toolName} should remain as the only pending tool call`,
+        );
+        assertEqual(
+          (result.messages[0] as any).tool_calls.length,
+          1,
+          `${toolName} should trim assistant history to one tool call`,
+        );
+      }
+    },
+  );
+
+  await runCase(
+    "disabled experimental terminal mutation cannot execute after it was queued",
+    async () => {
+      let createCalls = 0;
+      const agent = createAgentService({
+        createTerminal: async () => {
+          createCalls += 1;
+          return null;
+        },
+      });
+      (agent as any).getSessionModelBinding = () => ({});
+
+      assertEqual(
+        (agent as any).routeModelOutput({
+          pendingToolCalls: [
+            {
+              id: "call-disabled-create-terminal",
+              name: "create_terminal_tab",
+              args: { connectionId: "local" },
+            },
+          ],
+        }),
+        "tools",
+        "disabled terminal mutation should route through the rejection node",
+      );
+
+      const node = (agent as any).createToolsNode();
+      const result = await node.invoke({
+        sessionId: "session-disabled-terminal-mutation",
+        messages: [],
+        pendingToolCalls: [
+          {
+            id: "call-disabled-create-terminal",
+            name: "create_terminal_tab",
+            args: { connectionId: "local" },
+          },
+        ],
+      });
+
+      assertEqual(
+        createCalls,
+        0,
+        "execution-time permission check should block a queued create call",
+      );
+      assertTruthy(
+        String(result.messages[0]?.content || "").includes(
+          "disabled in the current GyShell settings",
+        ),
+        "blocked queued call should return a deterministic disabled-tool result",
+      );
+    },
+  );
+
+  await runCase(
     "write_stdin disconnected precheck emits a normal tool event",
     async () => {
       const terminal = {
