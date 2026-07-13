@@ -39,7 +39,7 @@ export const PANEL_KIND_UI_REGISTRY: Record<RailPanelKind, PanelKindUiRegistryIt
     resolveRailClickIntent: resolveDefaultRailClickIntent,
     getOwnerTabCount: (store) => store.chat.sessions.length,
     createDefaultTab: (store, panelId) => {
-      const sessionId = store.chat.createSession()
+      const sessionId = store.chat.createSession('New Chat', { activate: false })
       store.layout.attachTabToPanel('chat', sessionId, panelId)
     }
   }),
