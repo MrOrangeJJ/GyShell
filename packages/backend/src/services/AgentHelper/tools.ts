@@ -29,13 +29,13 @@ import {
   listSavedTerminalConnectionOptions
 } from './tools/terminal_tab_lifecycle_tools'
 import { buildTerminalConfigFromSavedConnection } from '../terminal/terminalConnectionSupport'
-import { 
-  BUILTIN_TOOL_INFO, 
+import {
   EDIT_FILE_TOOL_DESCRIPTION,
   WRITE_FILE_TOOL_DESCRIPTION,
   buildReadFileDescription,
+  getBuiltInToolAgentDescription,
   WAIT_TERMINAL_IDLE_DESCRIPTION
-} from './prompts'
+} from './builtInToolMetadata'
 import { EDIT_FILE_TOOL_NAME, WRITE_FILE_TOOL_NAME } from './tool_capabilities'
 import type { ReadFileSupport } from './types'
 import { waitSchema, waitTerminalIdleSchema, wait, waitTerminalIdle } from './tools/wait_tools'
@@ -80,7 +80,7 @@ export { waitSchema, waitTerminalIdleSchema } from './tools/wait_tools'
 export { copyBetweenTabsSchema, readFileTransferStatusSchema } from './tools/file_transfer_tools'
 export { skillToolSchema, createSkillSchema, buildSkillToolDescription } from './tools/skill_tools'
 
-export { BUILTIN_TOOL_INFO } from './prompts'
+export { BUILTIN_TOOL_INFO } from './builtInToolMetadata'
 
 export type { ToolExecutionContext, ReadFileSupport } from './types'
 
@@ -89,17 +89,17 @@ export function buildToolsForModel(readFileSupport: ReadFileSupport) {
   return [
     {
       name: 'exec_command',
-      description: BUILTIN_TOOL_INFO.find((t) => t.name === 'exec_command')?.description ?? '',
+      description: getBuiltInToolAgentDescription('exec_command'),
       schema: execCommandSchema
     },
     {
       name: 'read_terminal_tab',
-      description: BUILTIN_TOOL_INFO.find((t) => t.name === 'read_terminal_tab')?.description ?? '',
+      description: getBuiltInToolAgentDescription('read_terminal_tab'),
       schema: readTerminalTabSchema
     },
     {
       name: 'read_command_output',
-      description: BUILTIN_TOOL_INFO.find((t) => t.name === 'read_command_output')?.description ?? '',
+      description: getBuiltInToolAgentDescription('read_command_output'),
       schema: readCommandOutputSchema
     },
     {
@@ -109,12 +109,12 @@ export function buildToolsForModel(readFileSupport: ReadFileSupport) {
     },
     {
       name: 'write_stdin',
-      description: BUILTIN_TOOL_INFO.find((t) => t.name === 'write_stdin')?.description ?? '',
+      description: getBuiltInToolAgentDescription('write_stdin'),
       schema: writeStdinSchema
     },
     {
       name: 'reconnect_terminal_tab',
-      description: BUILTIN_TOOL_INFO.find((t) => t.name === 'reconnect_terminal_tab')?.description ?? '',
+      description: getBuiltInToolAgentDescription('reconnect_terminal_tab'),
       schema: reconnectTerminalTabSchema
     },
     {
@@ -124,7 +124,7 @@ export function buildToolsForModel(readFileSupport: ReadFileSupport) {
     },
     {
       name: 'close_terminal_tab',
-      description: BUILTIN_TOOL_INFO.find((t) => t.name === 'close_terminal_tab')?.description ?? '',
+      description: getBuiltInToolAgentDescription('close_terminal_tab'),
       schema: closeTerminalTabSchema
     },
     {
@@ -149,7 +149,7 @@ export function buildToolsForModel(readFileSupport: ReadFileSupport) {
     },
     {
       name: 'wait',
-      description: BUILTIN_TOOL_INFO.find((t) => t.name === 'wait')?.description ?? '',
+      description: getBuiltInToolAgentDescription('wait'),
       schema: waitSchema
     },
     {
@@ -159,12 +159,12 @@ export function buildToolsForModel(readFileSupport: ReadFileSupport) {
     },
     {
       name: 'copy_between_tabs',
-      description: BUILTIN_TOOL_INFO.find((t) => t.name === 'copy_between_tabs')?.description ?? '',
+      description: getBuiltInToolAgentDescription('copy_between_tabs'),
       schema: copyBetweenTabsSchema
     },
     {
       name: 'read_file_transfer_status',
-      description: BUILTIN_TOOL_INFO.find((t) => t.name === 'read_file_transfer_status')?.description ?? '',
+      description: getBuiltInToolAgentDescription('read_file_transfer_status'),
       schema: readFileTransferStatusSchema
     }
   ].map((tool) => convertToOpenAITool(tool))

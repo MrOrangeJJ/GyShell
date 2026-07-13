@@ -285,7 +285,7 @@ interface McpToolSummary {
 
 interface BuiltInToolSummary {
   name: string;
-  description?: string;
+  description: string;
   enabled: boolean;
   experimental?: boolean;
 }

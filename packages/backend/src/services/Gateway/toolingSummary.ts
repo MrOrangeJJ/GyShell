@@ -1,5 +1,5 @@
 import type { SkillInfo } from '../../skills/FileSkillStore'
-import { BUILTIN_TOOL_INFO } from '../AgentHelper/tools'
+import { BUILTIN_TOOL_INFO } from '../AgentHelper/builtInToolMetadata'
 
 export interface SkillStatusSummary {
   name: string
@@ -34,7 +34,7 @@ export function buildBuiltInToolStatusSummary(
     const configured = state[tool.name]
     return {
       name: tool.name,
-      description: tool.description,
+      description: tool.userDescription,
       enabled:
         typeof configured === 'boolean'
           ? configured

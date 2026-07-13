@@ -4,7 +4,7 @@ import {
   buildSavedSshConnectionSelector,
   getSavedSshConnectionDisplayName
 } from '../../terminal/terminalConnectionSupport'
-import { CREATE_TERMINAL_TAB_DESCRIPTION } from '../prompts'
+import { CREATE_TERMINAL_TAB_DESCRIPTION } from '../builtInToolMetadata'
 import type { ToolExecutionContext } from '../types'
 import { resolveTerminalForTool } from './terminal_runtime_guard'
 
