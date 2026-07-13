@@ -276,7 +276,24 @@ export function normalizeBuiltInTool(raw: unknown): BuiltInToolSummary | null {
     name: item.name,
     description: typeof item.description === "string" ? item.description : "",
     enabled: item.enabled !== false,
+    experimental: item.experimental === true ? true : undefined,
   };
+}
+
+export function readExperimentalToolConfirmationRequired(
+  raw: unknown,
+): string[] | null {
+  if (!raw || typeof raw !== "object") return null;
+  const record = raw as Record<string, unknown>;
+  if (record.kind !== "experimental_tool_confirmation_required") return null;
+  if (!Array.isArray(record.experimentalToolNames)) return null;
+  return Array.from(
+    new Set(
+      record.experimentalToolNames.filter(
+        (name): name is string => typeof name === "string" && name.length > 0,
+      ),
+    ),
+  ).sort();
 }
 
 export async function fetchToolsSnapshot(client: GatewayClient): Promise<{

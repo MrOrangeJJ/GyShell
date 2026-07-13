@@ -114,13 +114,19 @@ const COMMANDS: Record<string, CommandDefinition> = {
   "skill.disable": { flags: ["name"], handler: skillDisable },
   "tool.list": { flags: [], handler: toolList },
   "tool.reload": { flags: [], handler: toolReload },
-  "tool.enable": { flags: ["kind", "name"], handler: toolEnable },
+  "tool.enable": {
+    flags: ["kind", "name", "ack-experimental-risk"],
+    handler: toolEnable,
+  },
   "tool.disable": { flags: ["kind", "name"], handler: toolDisable },
   "memory.get": { flags: [], handler: memoryGet },
   "memory.set": { flags: ["content", "file", "stdin"], handler: memorySet },
   "agent-setting.list": { flags: [], handler: agentSettingList },
   "agent-setting.save": { flags: [], handler: agentSettingSave },
-  "agent-setting.apply": { flags: ["profile-id"], handler: agentSettingApply },
+  "agent-setting.apply": {
+    flags: ["profile-id", "ack-experimental-risk"],
+    handler: agentSettingApply,
+  },
   "agent-setting.overwrite": {
     flags: ["profile-id"],
     handler: agentSettingOverwrite,
@@ -773,9 +779,16 @@ async function setTool(
 ): Promise<unknown> {
   const kind = enumFlag(args, "kind", ["mcp", "built-in"] as const);
   const name = requiredFlag(args, "name");
-  return await client.request(
-    kind === "mcp" ? "tools:setMcpEnabled" : "tools:setBuiltInEnabled",
-    { name, enabled },
+  const method =
+    kind === "mcp" ? "tools:setMcpEnabled" : "tools:setBuiltInEnabled";
+  const result = await client.request(method, { name, enabled });
+  if (kind !== "built-in" || !enabled) return result;
+  return await retryExperimentalMutation(args, result, (toolNames) =>
+    client.request(method, {
+      name,
+      enabled,
+      acknowledgedExperimentalToolNames: toolNames,
+    }),
   );
 }
 
@@ -831,9 +844,53 @@ async function agentSettingApply(
   args: ParsedArguments,
   client: RpcClient,
 ): Promise<unknown> {
-  return await client.request("agentSettings:apply", {
-    profileId: requiredFlag(args, "profile-id"),
-  });
+  const profileId = requiredFlag(args, "profile-id");
+  const result = await client.request("agentSettings:apply", { profileId });
+  return await retryExperimentalMutation(args, result, (toolNames) =>
+    client.request("agentSettings:apply", {
+      profileId,
+      acknowledgedExperimentalToolNames: toolNames,
+    }),
+  );
+}
+
+async function retryExperimentalMutation(
+  args: ParsedArguments,
+  result: unknown,
+  retry: (toolNames: string[]) => Promise<unknown>,
+): Promise<unknown> {
+  const toolNames = readExperimentalConfirmationToolNames(result);
+  if (!toolNames) return result;
+  if (!hasFlag(args, "ack-experimental-risk")) {
+    throw new CliUsageError(
+      `Enabling experimental tools (${toolNames.join(", ")}) requires an explicit risk acknowledgement. Re-run with --ack-experimental-risk to confirm that the Agent may use them without another approval prompt.`,
+    );
+  }
+  const retried = await retry(toolNames);
+  const remaining = readExperimentalConfirmationToolNames(retried);
+  if (remaining) {
+    throw new CliUsageError(
+      `Experimental tool state changed while applying the request (${remaining.join(", ")}). Review the current settings and run the command again.`,
+    );
+  }
+  return retried;
+}
+
+function readExperimentalConfirmationToolNames(
+  value: unknown,
+): string[] | null {
+  if (!value || typeof value !== "object") return null;
+  const record = value as Record<string, unknown>;
+  if (record.kind !== "experimental_tool_confirmation_required") return null;
+  if (!Array.isArray(record.experimentalToolNames)) return null;
+  const names = Array.from(
+    new Set(
+      record.experimentalToolNames.filter(
+        (name): name is string => typeof name === "string" && name.length > 0,
+      ),
+    ),
+  ).sort();
+  return names.length > 0 ? names : null;
 }
 
 async function agentSettingOverwrite(

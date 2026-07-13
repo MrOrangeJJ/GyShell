@@ -42,6 +42,8 @@ import {
   readFileSchema,
   writeStdinSchema,
   reconnectTerminalTabSchema,
+  createTerminalTabSchema,
+  closeTerminalTabSchema,
   editFileSchema,
   writeAndEditSchema,
   writeFileSchema,
@@ -51,6 +53,8 @@ import {
   readFileTransferStatusSchema,
   toolImplementations,
   buildSkillToolDescription,
+  buildCreateTerminalTabDescription,
+  buildTerminalConfigFromSavedConnection,
 } from "./AgentHelper/tools";
 import type { ToolExecutionContext } from "./AgentHelper/types";
 import {
@@ -235,6 +239,8 @@ const FALLBACK_COMPACTION_TITLE_MAX_CHARS = 240;
 const SINGLE_CALL_TOOL_BOUNDARY_NAMES = new Set([
   "exec_command",
   "reconnect_terminal_tab",
+  "create_terminal_tab",
+  "close_terminal_tab",
 ]);
 
 function clipTextMiddle(input: string, maxChars: number): string {
@@ -1126,6 +1132,14 @@ export class AgentService_v2 {
           buildSkillToolDescription(skills);
       }
 
+      const createTerminalToolIndex = builtInTools.findIndex(
+        (tool) => tool.function.name === "create_terminal_tab",
+      );
+      if (createTerminalToolIndex !== -1) {
+        builtInTools[createTerminalToolIndex].function.description =
+          buildCreateTerminalTabDescription(this.settings);
+      }
+
       const mcpTools = this.mcpToolService.getActiveTools();
       const shouldUseThinkingModelOnThisPass =
         state.firstTurnThinkingModelEnabled === true && nextPassCount === 1;
@@ -1491,6 +1505,19 @@ export class AgentService_v2 {
       const messageHistory: BaseMessage[] = state.messages;
       let result = "";
       let shouldInterruptPendingToolsForQueuedInsertion = false;
+      if (
+        !this.helpers.isBuiltInToolEnabled(
+          toolCall.name,
+          this.builtInToolEnabled,
+        )
+      ) {
+        toolMessage.content = `Tool "${toolCall.name}" is disabled in the current GyShell settings.`;
+        return {
+          messages: [...state.messages, toolMessage],
+          sessionId,
+          pendingToolCalls: queue.slice(1),
+        };
+      }
       switch (toolCall.name) {
         case "skill": {
           let args: any = toolCall.args || {};
@@ -1693,6 +1720,34 @@ export class AgentService_v2 {
             );
           } catch (err) {
             result = `Parameter validation error for reconnect_terminal_tab: ${(err as Error).message}`;
+          }
+          break;
+        }
+        case "create_terminal_tab": {
+          try {
+            const validatedArgs = createTerminalTabSchema.parse(
+              toolCall.args || {},
+            );
+            result = await toolImplementations.createTerminalTab(
+              validatedArgs,
+              executionContext,
+            );
+          } catch (err) {
+            result = `Parameter validation error for create_terminal_tab: ${(err as Error).message}`;
+          }
+          break;
+        }
+        case "close_terminal_tab": {
+          try {
+            const validatedArgs = closeTerminalTabSchema.parse(
+              toolCall.args || {},
+            );
+            result = await toolImplementations.closeTerminalTab(
+              validatedArgs,
+              executionContext,
+            );
+          } catch (err) {
+            result = `Parameter validation error for close_terminal_tab: ${(err as Error).message}`;
           }
           break;
         }
@@ -2494,6 +2549,14 @@ export class AgentService_v2 {
       sessionId,
       messageId,
       terminalService: this.terminalService,
+      createTerminalFromSavedConnection: async (connectionId) => {
+        const terminalConfig = buildTerminalConfigFromSavedConnection(
+          this.settings,
+          connectionId,
+        );
+        if (!terminalConfig) return null;
+        return await this.terminalService.createTerminal(terminalConfig);
+      },
       fileTransferService: this.fileTransferService ?? undefined,
       sendEvent: this.helpers.sendEvent.bind(this.helpers),
       waitForFeedback: this.waitForFeedback ?? undefined,
@@ -3068,10 +3131,21 @@ export class AgentService_v2 {
       // Security: Double-check if the tool is actually enabled before routing.
       // This prevents the Agent from calling tools that were disabled during the session.
       const capabilityName = resolveBuiltInToolCapabilityName(first.name);
-      if (this.builtInToolEnabled[capabilityName] === false) {
+      if (
+        !this.helpers.isBuiltInToolEnabled(
+          first.name,
+          this.builtInToolEnabled,
+        )
+      ) {
         console.warn(
           `[AgentService_v2] LLM tried to call disabled tool: ${first.name} (capability=${capabilityName})`,
         );
+        if (
+          first.name === "create_terminal_tab" ||
+          first.name === "close_terminal_tab"
+        ) {
+          return "tools";
+        }
         return "final_output";
       }
 

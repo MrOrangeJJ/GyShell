@@ -186,6 +186,9 @@ export const mobileTranslations: Record<MobileLocale, MobileTranslations> = {
       mcpEmpty: "No MCP servers found.",
       builtInEmpty: "No built-in tools found.",
       noDescription: "No description provided.",
+      experimentalLabel: "Experimental",
+      experimentalEnableWarning: (toolNames) =>
+        `Enable ${toolNames}? Experimental tools can perform high-impact actions. Once enabled, the Agent may use them without another approval prompt. Relevant non-secret metadata may be included in model context; create_terminal_tab includes saved connection names and hosts/IPs. Only continue if you accept this risk.`,
       status: {
         connected: "Connected",
         connecting: "Connecting",
@@ -415,6 +418,9 @@ export const mobileTranslations: Record<MobileLocale, MobileTranslations> = {
       mcpEmpty: "未找到 MCP 服务器。",
       builtInEmpty: "未找到内置工具。",
       noDescription: "暂无描述。",
+      experimentalLabel: "试验性",
+      experimentalEnableWarning: (toolNames) =>
+        `确定启用 ${toolNames} 吗？试验性工具可能执行高影响操作。启用后，Agent 可以在不再次请求批准的情况下调用它。相关的非敏感元数据也可能被加入模型上下文；create_terminal_tab 会包含已保存连接的名称和主机/IP。仅在你愿意承担此风险时继续。`,
       status: {
         connected: "已连接",
         connecting: "连接中",

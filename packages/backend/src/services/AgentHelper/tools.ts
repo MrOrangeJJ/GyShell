@@ -20,6 +20,15 @@ import {
   writeStdin,
   reconnectTerminalTab
 } from './tools/terminal_tools'
+import {
+  buildCreateTerminalTabDescription,
+  closeTerminalTab,
+  closeTerminalTabSchema,
+  createTerminalTab,
+  createTerminalTabSchema,
+  listSavedTerminalConnectionOptions
+} from './tools/terminal_tab_lifecycle_tools'
+import { buildTerminalConfigFromSavedConnection } from '../terminal/terminalConnectionSupport'
 import { 
   BUILTIN_TOOL_INFO, 
   EDIT_FILE_TOOL_DESCRIPTION,
@@ -57,6 +66,14 @@ export {
   writeStdinSchema,
   reconnectTerminalTabSchema
 } from './tools/terminal_tools'
+
+export {
+  buildCreateTerminalTabDescription,
+  buildTerminalConfigFromSavedConnection,
+  closeTerminalTabSchema,
+  createTerminalTabSchema,
+  listSavedTerminalConnectionOptions
+}
 
 export { readFileSchema } from './tools/read_tools'
 export { waitSchema, waitTerminalIdleSchema } from './tools/wait_tools'
@@ -99,6 +116,16 @@ export function buildToolsForModel(readFileSupport: ReadFileSupport) {
       name: 'reconnect_terminal_tab',
       description: BUILTIN_TOOL_INFO.find((t) => t.name === 'reconnect_terminal_tab')?.description ?? '',
       schema: reconnectTerminalTabSchema
+    },
+    {
+      name: 'create_terminal_tab',
+      description: buildCreateTerminalTabDescription(undefined),
+      schema: createTerminalTabSchema
+    },
+    {
+      name: 'close_terminal_tab',
+      description: BUILTIN_TOOL_INFO.find((t) => t.name === 'close_terminal_tab')?.description ?? '',
+      schema: closeTerminalTabSchema
     },
     {
       name: WRITE_FILE_TOOL_NAME,
@@ -153,6 +180,8 @@ export const toolImplementations = {
   readCommandOutput,
   writeStdin,
   reconnectTerminalTab,
+  createTerminalTab,
+  closeTerminalTab,
   wait,
   waitTerminalIdle,
   copyBetweenTabs,

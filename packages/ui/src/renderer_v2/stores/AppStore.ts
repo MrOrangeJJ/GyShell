@@ -214,6 +214,13 @@ export type AgentSettingState = Awaited<
 export type AgentSettingOperationResult = Awaited<
   ReturnType<Window["gyshell"]["agentSettings"]["saveCurrent"]>
 >;
+export type AgentSettingApplyResult = Awaited<
+  ReturnType<Window["gyshell"]["agentSettings"]["apply"]>
+>;
+export type ExperimentalToolConfirmationRequired = Extract<
+  AgentSettingApplyResult,
+  { kind: "experimental_tool_confirmation_required" }
+>;
 export type AccessTokenSummary = Awaited<
   ReturnType<Window["gyshell"]["accessTokens"]["list"]>
 >[number];
@@ -1710,9 +1717,15 @@ export class AppStore {
 
   async applyAgentSetting(
     profileId: string,
-  ): Promise<AgentSettingOperationResult> {
-    const result = await window.gyshell.agentSettings.apply(profileId);
-    this.applyAgentSettingOperationResult(result);
+    acknowledgedExperimentalToolNames: string[] = [],
+  ): Promise<AgentSettingApplyResult> {
+    const result = await window.gyshell.agentSettings.apply(
+      profileId,
+      acknowledgedExperimentalToolNames,
+    );
+    if (!("kind" in result)) {
+      this.applyAgentSettingOperationResult(result);
+    }
     return result;
   }
 
@@ -2140,14 +2153,24 @@ export class AppStore {
     });
   }
 
-  async setBuiltInToolEnabled(name: string, enabled: boolean): Promise<void> {
-    const builtInTools = await window.gyshell.tools.setBuiltInEnabled(
+  async setBuiltInToolEnabled(
+    name: string,
+    enabled: boolean,
+    acknowledgedExperimentalToolNames: string[] = [],
+  ): Promise<
+    BuiltInToolSummary[] | ExperimentalToolConfirmationRequired
+  > {
+    const result = await window.gyshell.tools.setBuiltInEnabled(
       name,
       enabled,
+      acknowledgedExperimentalToolNames,
     );
-    runInAction(() => {
-      this.applyBuiltInToolStatusUpdate(builtInTools);
-    });
+    if (Array.isArray(result)) {
+      runInAction(() => {
+        this.applyBuiltInToolStatusUpdate(result);
+      });
+    }
+    return result;
   }
 
   async setSkillEnabled(name: string, enabled: boolean): Promise<void> {

@@ -40,10 +40,12 @@ Commands:
   profile list | profile use --profile-id <id>
   skill list | skill reload | skill enable|disable --name <name>
   tool list | tool reload
-  tool enable|disable --kind mcp|built-in --name <name>
+  tool enable --kind mcp|built-in --name <name> [--ack-experimental-risk]
+  tool disable --kind mcp|built-in --name <name>
   memory get | memory set (--content <text> | --file <path> | --stdin)
   agent-setting list | agent-setting save
-  agent-setting apply|overwrite|delete --profile-id <id>
+  agent-setting apply --profile-id <id> [--ack-experimental-risk]
+  agent-setting overwrite|delete --profile-id <id>
   policy list
   policy add|delete --list allowlist|denylist|asklist --rule <rule>
   settings get [--include-secrets]
@@ -57,4 +59,5 @@ Environment:
 Output:
   Commands write one JSON envelope to stdout. Errors write one JSON envelope to stderr.
   No command prompts for input or automatically approves a permission request.
+  --ack-experimental-risk explicitly confirms experimental-tool enablement when required.
 `;

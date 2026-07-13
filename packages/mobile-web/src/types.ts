@@ -146,6 +146,7 @@ export interface BuiltInToolSummary {
   name: string
   description: string
   enabled: boolean
+  experimental?: boolean
 }
 
 export interface GatewayTerminalSummary {
@@ -253,6 +254,11 @@ export interface AgentSettingProfileSummary {
 export interface AgentSettingStateSummary {
   profiles: AgentSettingProfileSummary[]
   activeProfileId: string | null
+}
+
+export interface AgentSettingApplyOutcome {
+  applied: boolean
+  experimentalToolNames: string[]
 }
 
 export interface RpcRequest {

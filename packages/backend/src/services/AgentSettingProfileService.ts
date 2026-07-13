@@ -29,6 +29,13 @@ import {
   buildBuiltInToolStatusSummary,
   buildSkillStatusSummary,
 } from './Gateway/toolingSummary'
+import {
+  assertSettingsPatchDoesNotEnableExperimentalTools,
+  buildExperimentalToolConfirmationRequired,
+  getExperimentalToolsEnabledByTransition,
+  getUnacknowledgedExperimentalTools,
+  type ExperimentalToolConfirmationRequired,
+} from './settings/experimentalToolConsent'
 
 export interface AgentSettingOperationResult {
   settings: BackendSettings
@@ -40,6 +47,14 @@ export interface AgentSettingOperationResult {
   memory: MemorySnapshot
   warnings: string[]
 }
+
+export type AgentSettingApplyResult =
+  | AgentSettingOperationResult
+  | ExperimentalToolConfirmationRequired
+
+export type BuiltInToolMutationResult =
+  | ReturnType<typeof buildBuiltInToolStatusSummary>
+  | ExperimentalToolConfirmationRequired
 
 interface AgentSettingProfileServiceOptions {
   settingsService: ISettingsRuntime
@@ -160,7 +175,10 @@ export class AgentSettingProfileService {
     })
   }
 
-  async apply(profileId: string): Promise<AgentSettingOperationResult> {
+  async apply(
+    profileId: string,
+    acknowledgedExperimentalToolNames: readonly string[] = [],
+  ): Promise<AgentSettingApplyResult> {
     return this.runMutation(async () => {
       const normalizedProfileId = this.requireProfileId(profileId)
       const settings = this.options.settingsService.getSettings()
@@ -176,6 +194,26 @@ export class AgentSettingProfileService {
 
       const warnings: string[] = []
       const snapshot = profile.snapshot
+      const nextBuiltIn = this.buildAppliedBuiltInTools(
+        settings.tools?.builtIn ?? {},
+        snapshot.tools.builtIn,
+      )
+      const requiredExperimentalTools =
+        getExperimentalToolsEnabledByTransition(
+          settings.tools?.builtIn,
+          nextBuiltIn,
+        )
+      const unacknowledgedExperimentalTools =
+        getUnacknowledgedExperimentalTools(
+          requiredExperimentalTools,
+          acknowledgedExperimentalToolNames,
+        )
+      if (unacknowledgedExperimentalTools.length > 0) {
+        return buildExperimentalToolConfirmationRequired(
+          requiredExperimentalTools,
+        )
+      }
+
       const mcpTools = await this.applyMcpSnapshot(snapshot.tools.mcp)
       await this.applyCommandPolicySnapshot(
         snapshot.security.commandPolicyLists,
@@ -200,6 +238,61 @@ export class AgentSettingProfileService {
       )
 
       return await this.buildResult(warnings, mcpTools)
+    })
+  }
+
+  async setBuiltInToolEnabled(
+    name: string,
+    enabled: boolean,
+    acknowledgedExperimentalToolNames: readonly string[] = [],
+  ): Promise<BuiltInToolMutationResult> {
+    return this.runMutation(async () => {
+      const settings = this.options.settingsService.getSettings()
+      const currentBuiltIn = settings.tools?.builtIn ?? {}
+      const nextBuiltIn = { ...currentBuiltIn, [name]: enabled }
+      const requiredExperimentalTools =
+        getExperimentalToolsEnabledByTransition(currentBuiltIn, nextBuiltIn)
+      const unacknowledgedExperimentalTools =
+        getUnacknowledgedExperimentalTools(
+          requiredExperimentalTools,
+          acknowledgedExperimentalToolNames,
+        )
+      if (unacknowledgedExperimentalTools.length > 0) {
+        return buildExperimentalToolConfirmationRequired(
+          requiredExperimentalTools,
+        )
+      }
+
+      this.options.settingsService.setSettings({
+        tools: {
+          builtIn: nextBuiltIn,
+          skills: settings.tools?.skills ?? {},
+        },
+      })
+      const nextSettings = this.options.settingsService.getSettings()
+      await this.options.onSettingsChanged?.(nextSettings)
+      return buildBuiltInToolStatusSummary(nextSettings.tools?.builtIn)
+    })
+  }
+
+  async applySettingsPatch(
+    settingsPatch: Partial<BackendSettings>,
+    beforeCommit?: () => Promise<void>,
+  ): Promise<BackendSettings> {
+    return this.runMutation(async () => {
+      assertSettingsPatchDoesNotEnableExperimentalTools(
+        this.options.settingsService.getSettings().tools?.builtIn,
+        settingsPatch,
+      )
+      await beforeCommit?.()
+      assertSettingsPatchDoesNotEnableExperimentalTools(
+        this.options.settingsService.getSettings().tools?.builtIn,
+        settingsPatch,
+      )
+      this.options.settingsService.setSettings(settingsPatch)
+      const nextSettings = this.options.settingsService.getSettings()
+      await this.options.onSettingsChanged?.(nextSettings)
+      return nextSettings
     })
   }
 
@@ -353,13 +446,10 @@ export class AgentSettingProfileService {
     currentSkills: SkillInfo[],
     warnings: string[],
   ): BackendSettings {
-    const currentBuiltIn = currentSettings.tools?.builtIn ?? {}
-    const nextBuiltIn = { ...currentBuiltIn }
-    Object.entries(snapshot.tools.builtIn).forEach(([name, enabled]) => {
-      if (Object.prototype.hasOwnProperty.call(currentBuiltIn, name)) {
-        nextBuiltIn[name] = enabled
-      }
-    })
+    const nextBuiltIn = this.buildAppliedBuiltInTools(
+      currentSettings.tools?.builtIn ?? {},
+      snapshot.tools.builtIn,
+    )
 
     const currentSkillNames = new Set(currentSkills.map((skill) => skill.name))
     const nextSkills = { ...(currentSettings.tools?.skills ?? {}) }
@@ -401,6 +491,19 @@ export class AgentSettingProfileService {
         activeProfileId: profileId,
       },
     }
+  }
+
+  private buildAppliedBuiltInTools(
+    currentBuiltIn: Record<string, boolean>,
+    snapshotBuiltIn: Record<string, boolean>,
+  ): Record<string, boolean> {
+    const nextBuiltIn = { ...currentBuiltIn }
+    Object.entries(snapshotBuiltIn).forEach(([name, enabled]) => {
+      if (Object.prototype.hasOwnProperty.call(currentBuiltIn, name)) {
+        nextBuiltIn[name] = enabled
+      }
+    })
+    return nextBuiltIn
   }
 
   private async persistAgentSettings(

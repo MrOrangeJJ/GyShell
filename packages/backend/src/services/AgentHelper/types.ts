@@ -7,11 +7,15 @@ import type {
   RunBackgroundExecCommandInput,
   RunBackgroundFileTransferInput
 } from './queuedInsertions'
+import type { TerminalTab } from '../../types'
 
 export interface ToolExecutionContext {
   sessionId: string
   messageId: string
   terminalService: TerminalService
+  createTerminalFromSavedConnection?: (
+    connectionId: string
+  ) => Promise<TerminalTab | null>
   fileTransferService?: FileTransferService
   sendEvent: (sessionId: string, event: any) => void
   waitForFeedback?: (messageId: string, timeoutMs?: number) => Promise<any | null>

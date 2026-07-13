@@ -178,6 +178,8 @@ export interface MobileTranslations {
     mcpEmpty: string;
     builtInEmpty: string;
     noDescription: string;
+    experimentalLabel: string;
+    experimentalEnableWarning: (toolNames: string) => string;
     status: {
       connected: string;
       connecting: string;

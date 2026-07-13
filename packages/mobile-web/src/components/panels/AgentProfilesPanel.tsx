@@ -1,7 +1,10 @@
 import React from "react";
 import { Check, Loader2, Plus, RefreshCw, Trash2 } from "lucide-react";
 import { useMobileI18n } from "../../i18n/provider";
-import type { AgentSettingStateSummary } from "../../types";
+import type {
+  AgentSettingApplyOutcome,
+  AgentSettingStateSummary,
+} from "../../types";
 
 interface AgentProfilesPanelProps {
   state: AgentSettingStateSummary | null;
@@ -10,7 +13,10 @@ interface AgentProfilesPanelProps {
   saving: boolean;
   onReload: () => void;
   onSaveCurrent: () => Promise<boolean>;
-  onApply: (profileId: string) => Promise<boolean>;
+  onApply: (
+    profileId: string,
+    acknowledgedExperimentalToolNames?: string[],
+  ) => Promise<AgentSettingApplyOutcome>;
   onOverwrite: (profileId: string) => Promise<boolean>;
   onDelete: (profileId: string) => Promise<boolean>;
 }
@@ -57,12 +63,27 @@ export const AgentProfilesPanel: React.FC<AgentProfilesPanelProps> = ({
     async (profileId: string) => {
       setBusyId(profileId);
       try {
-        await onApply(profileId);
+        let outcome = await onApply(profileId);
+        while (
+          !outcome.applied &&
+          outcome.experimentalToolNames.length > 0
+        ) {
+          const accepted = window.confirm(
+            t.tools.experimentalEnableWarning(
+              outcome.experimentalToolNames.join(", "),
+            ),
+          );
+          if (!accepted) return;
+          outcome = await onApply(
+            profileId,
+            outcome.experimentalToolNames,
+          );
+        }
       } finally {
         setBusyId(null);
       }
     },
-    [onApply],
+    [onApply, t.tools],
   );
 
   const handleOverwrite = React.useCallback(
@@ -108,9 +129,10 @@ export const AgentProfilesPanel: React.FC<AgentProfilesPanelProps> = ({
           type="button"
           className="agent-profile-main"
           onClick={() => {
-            if (!isActive && !busy) void handleApply(profile.id);
+            if (isActive || saving || busyId !== null) return;
+            void handleApply(profile.id);
           }}
-          disabled={busy || isActive}
+          disabled={saving || busyId !== null || isActive}
           aria-pressed={isActive}
         >
           <div className="agent-profile-radio">
@@ -137,7 +159,7 @@ export const AgentProfilesPanel: React.FC<AgentProfilesPanelProps> = ({
             type="button"
             className="agent-profile-action"
             onClick={() => setConfirmOverwriteId(profile.id)}
-            disabled={busy}
+            disabled={saving || busyId !== null}
             title={t.common.overwrite}
           >
             {busy && busyId === profile.id ? (
@@ -150,7 +172,7 @@ export const AgentProfilesPanel: React.FC<AgentProfilesPanelProps> = ({
             type="button"
             className="agent-profile-action danger"
             onClick={() => setConfirmDeleteId(profile.id)}
-            disabled={busy}
+            disabled={saving || busyId !== null}
             title={t.common.delete}
           >
             <Trash2 size={14} />
@@ -190,7 +212,7 @@ export const AgentProfilesPanel: React.FC<AgentProfilesPanelProps> = ({
           type="button"
           className="accent-btn-flat"
           onClick={() => setConfirmSave(true)}
-          disabled={saving || busyId === "__save__"}
+          disabled={saving || busyId !== null}
         >
           {saving || busyId === "__save__" ? (
             <>

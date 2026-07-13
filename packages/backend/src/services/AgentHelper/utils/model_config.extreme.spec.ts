@@ -76,6 +76,49 @@ const run = async (): Promise<void> => {
     assertNotIncludes(names, 'write_file', 'write_file should not become a settings row')
     assertNotIncludes(names, 'edit_file', 'edit_file should not become a settings row')
   })
+
+  await runCase('experimental terminal lifecycle tools fail closed when settings keys are missing', () => {
+    const defaults = getEnabledBuiltInTools(
+      buildToolsForModel({ image: false }),
+      {}
+    ).map(toolName)
+    assertNotIncludes(
+      defaults,
+      'create_terminal_tab',
+      'create_terminal_tab should default to disabled'
+    )
+    assertNotIncludes(
+      defaults,
+      'close_terminal_tab',
+      'close_terminal_tab should default to disabled'
+    )
+
+    const enabled = getEnabledBuiltInTools(
+      buildToolsForModel({ image: false }),
+      {
+        create_terminal_tab: true,
+        close_terminal_tab: true
+      }
+    ).map(toolName)
+    assertIncludes(enabled, 'create_terminal_tab', 'explicit enable should expose create_terminal_tab')
+    assertIncludes(enabled, 'close_terminal_tab', 'explicit enable should expose close_terminal_tab')
+
+    const summaries = buildBuiltInToolStatusSummary({})
+    const createSummary = summaries.find((tool) => tool.name === 'create_terminal_tab')
+    const closeSummary = summaries.find((tool) => tool.name === 'close_terminal_tab')
+    assertEqual(createSummary?.enabled, false, 'create terminal summary should default disabled')
+    assertEqual(createSummary?.experimental, true, 'create terminal summary should be experimental')
+    assertEqual(closeSummary?.enabled, false, 'close terminal summary should default disabled')
+    assertEqual(closeSummary?.experimental, true, 'close terminal summary should be experimental')
+    const malformedSummary = buildBuiltInToolStatusSummary({
+      create_terminal_tab: 'yes' as any
+    }).find((tool) => tool.name === 'create_terminal_tab')
+    assertEqual(
+      malformedSummary?.enabled,
+      false,
+      'non-boolean experimental settings should remain fail-closed in UI summaries'
+    )
+  })
 }
 
 void run().catch((error) => {

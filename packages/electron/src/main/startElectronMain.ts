@@ -62,6 +62,9 @@ import { HistorySqliteStore } from "../../../backend/src/services/history/Histor
 import { HistoryStorageMigration } from "../../../backend/src/services/history/HistoryStorageMigration";
 import { SleepBlockerService } from "./SleepBlockerService";
 import { AgentSettingProfileService } from "../../../backend/src/services/AgentSettingProfileService";
+import {
+  isExperimentalToolConfirmationRequired,
+} from "../../../backend/src/services/settings/experimentalToolConsent";
 
 let mainWindow: BrowserWindow | null = null;
 let settingsService: SettingsService;
@@ -823,10 +826,18 @@ export async function startElectronMain(): Promise<void> {
                   broadcastAgentSettingResult(result);
                   return result;
                 },
-                apply: async (profileId: string) => {
+                apply: async (
+                  profileId: string,
+                  acknowledgedExperimentalToolNames: string[],
+                ) => {
                   const result =
-                    await agentSettingProfileService.apply(profileId);
-                  broadcastAgentSettingResult(result);
+                    await agentSettingProfileService.apply(
+                      profileId,
+                      acknowledgedExperimentalToolNames,
+                    );
+                  if (!isExperimentalToolConfirmationRequired(result)) {
+                    broadcastAgentSettingResult(result);
+                  }
                   return result;
                 },
                 overwrite: async (profileId: string) => {
@@ -850,9 +861,10 @@ export async function startElectronMain(): Promise<void> {
                       "settings.gateway.ws is not configurable via websocket RPC.",
                     );
                   }
-                  settingsService.setSettings(patch as any);
-                  const next = settingsService.getSettings();
-                  agentService.updateSettings(next);
+                  const next =
+                    await agentSettingProfileService.applySettingsPatch(
+                      patch as any,
+                    );
                   return next;
                 },
               },
@@ -879,23 +891,24 @@ export async function startElectronMain(): Promise<void> {
                   const settings = settingsService.getSettings();
                   return buildBuiltInToolStatusSummary(settings.tools?.builtIn);
                 },
-                setBuiltInEnabled: async (name, enabled) => {
-                  const settings = settingsService.getSettings();
-                  const nextBuiltIn = { ...(settings.tools?.builtIn ?? {}) };
-                  nextBuiltIn[name] = enabled;
-                  settingsService.setSettings({
-                    tools: {
-                      builtIn: nextBuiltIn,
-                      skills: settings.tools?.skills ?? {},
-                    },
-                  });
-                  const next = settingsService.getSettings();
-                  agentService.updateSettings(next);
-                  const summary = buildBuiltInToolStatusSummary(
-                    next.tools?.builtIn,
-                  );
-                  gatewayService.broadcastRaw("tools:builtInUpdated", summary);
-                  return summary;
+                setBuiltInEnabled: async (
+                  name,
+                  enabled,
+                  acknowledgedExperimentalToolNames,
+                ) => {
+                  const result =
+                    await agentSettingProfileService.setBuiltInToolEnabled(
+                      name,
+                      enabled,
+                      acknowledgedExperimentalToolNames,
+                    );
+                  if (!isExperimentalToolConfirmationRequired(result)) {
+                    gatewayService.broadcastRaw(
+                      "tools:builtInUpdated",
+                      result,
+                    );
+                  }
+                  return result;
                 },
               },
             }),

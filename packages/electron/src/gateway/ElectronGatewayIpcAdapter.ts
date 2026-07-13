@@ -34,6 +34,10 @@ import type { McpToolService } from "../../../backend/src/services/McpToolServic
 import type { VersionService } from "../../../backend/src/services/VersionService";
 import type { TerminalCommandDraftService } from "../../../backend/src/services/TerminalCommandDraftService";
 import type { AgentSettingProfileService } from "../../../backend/src/services/AgentSettingProfileService";
+import {
+  assertSettingsPatchDoesNotEnableExperimentalTools,
+  isExperimentalToolConfirmationRequired,
+} from "../../../backend/src/services/settings/experimentalToolConsent";
 import type { WsGatewayAccess } from "../../../backend/src/types";
 import {
   buildBuiltInToolStatusSummary,
@@ -551,11 +555,30 @@ export class ElectronGatewayIpcAdapter {
       return result;
     });
 
-    ipcMain.handle("agentSettings:apply", async (_: any, profileId: string) => {
-      const result = await this.agentSettingProfileService.apply(profileId);
-      this.broadcastAgentSettingResult(result);
-      return result;
-    });
+    ipcMain.handle(
+      "agentSettings:apply",
+      async (
+        _: any,
+        profileId: string,
+        acknowledgedExperimentalToolNames?: unknown,
+      ) => {
+        const acknowledgements = Array.isArray(
+          acknowledgedExperimentalToolNames,
+        )
+          ? acknowledgedExperimentalToolNames.filter(
+              (name): name is string => typeof name === "string",
+            )
+          : [];
+        const result = await this.agentSettingProfileService.apply(
+          profileId,
+          acknowledgements,
+        );
+        if (!isExperimentalToolConfirmationRequired(result)) {
+          this.broadcastAgentSettingResult(result);
+        }
+        return result;
+      },
+    );
 
     ipcMain.handle(
       "agentSettings:overwrite",
@@ -582,17 +605,23 @@ export class ElectronGatewayIpcAdapter {
     });
 
     ipcMain.handle("settings:set", async (_: any, settings: any) => {
-      if (settings?.gateway?.ws) {
-        await this.applyWsGatewayConfig(settings.gateway.ws);
-      }
-      this.settingsService.setSettings(settings);
-      const currentSettings = this.settingsService.getSettings();
-      this.agentService.updateSettings(currentSettings);
+      await this.agentSettingProfileService.applySettingsPatch(
+        settings,
+        settings?.gateway?.ws
+          ? async () => {
+              await this.applyWsGatewayConfig(settings.gateway.ws);
+            }
+          : undefined,
+      );
     });
 
     ipcMain.on("settings:setSync", (event: any, settings: any) => {
       try {
         const patch = normalizeSyncSettingsPatch(settings);
+        assertSettingsPatchDoesNotEnableExperimentalTools(
+          this.settingsService.getSettings().tools?.builtIn,
+          patch,
+        );
         this.settingsService.setSettings(patch);
         const currentSettings = this.settingsService.getSettings();
         this.agentService.updateSettings(currentSettings);
@@ -708,20 +737,28 @@ export class ElectronGatewayIpcAdapter {
 
     ipcMain.handle(
       "tools:setBuiltInEnabled",
-      async (_: any, name: string, enabled: boolean) => {
-        const settings = this.settingsService.getSettings();
-        const nextBuiltIn = { ...(settings.tools?.builtIn ?? {}) };
-        nextBuiltIn[name] = enabled;
-        this.settingsService.setSettings({
-          tools: { builtIn: nextBuiltIn, skills: settings.tools?.skills ?? {} },
-        });
-        const nextSettings = this.settingsService.getSettings();
-        this.agentService.updateSettings(nextSettings);
-        const summary = buildBuiltInToolStatusSummary(
-          nextSettings.tools?.builtIn,
+      async (
+        _: any,
+        name: string,
+        enabled: boolean,
+        acknowledgedExperimentalToolNames?: unknown,
+      ) => {
+        const acknowledgements = Array.isArray(
+          acknowledgedExperimentalToolNames,
+        )
+          ? acknowledgedExperimentalToolNames.filter(
+              (toolName): toolName is string => typeof toolName === "string",
+            )
+          : [];
+        const result = await this.agentSettingProfileService.setBuiltInToolEnabled(
+          name,
+          enabled,
+          acknowledgements,
         );
-        this.gateway.broadcastRaw("tools:builtInUpdated", summary);
-        return summary;
+        if (!isExperimentalToolConfirmationRequired(result)) {
+          this.gateway.broadcastRaw("tools:builtInUpdated", result);
+        }
+        return result;
       },
     );
 

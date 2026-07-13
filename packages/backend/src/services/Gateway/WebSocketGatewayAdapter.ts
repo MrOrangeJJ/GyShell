@@ -350,7 +350,10 @@ export interface WebSocketGatewayAdapterOptions {
   agentSettingsBridge?: {
     get?: () => unknown | Promise<unknown>;
     saveCurrent?: () => unknown | Promise<unknown>;
-    apply?: (profileId: string) => unknown | Promise<unknown>;
+    apply?: (
+      profileId: string,
+      acknowledgedExperimentalToolNames: string[],
+    ) => unknown | Promise<unknown>;
     overwrite?: (profileId: string) => unknown | Promise<unknown>;
     delete?: (profileId: string) => unknown | Promise<unknown>;
   };
@@ -380,6 +383,7 @@ export interface WebSocketGatewayAdapterOptions {
     setBuiltInEnabled?: (
       name: string,
       enabled: boolean,
+      acknowledgedExperimentalToolNames: string[],
     ) => unknown | Promise<unknown>;
   };
   serverFactory?: WebSocketServerFactory;
@@ -1674,7 +1678,17 @@ export class WebSocketGatewayAdapter {
           );
         }
         const profileId = this.readStringParam(params, "profileId");
-        return await this.options.agentSettingsBridge.apply(profileId);
+        const acknowledgedExperimentalToolNames = Array.isArray(
+          params.acknowledgedExperimentalToolNames,
+        )
+          ? params.acknowledgedExperimentalToolNames.filter(
+              (name): name is string => typeof name === "string",
+            )
+          : [];
+        return await this.options.agentSettingsBridge.apply(
+          profileId,
+          acknowledgedExperimentalToolNames,
+        );
       }
       case "agentSettings:overwrite": {
         if (!this.options.agentSettingsBridge?.overwrite) {
@@ -1808,7 +1822,18 @@ export class WebSocketGatewayAdapter {
             "enabled must be boolean.",
           );
         }
-        return await this.options.toolsBridge.setBuiltInEnabled(name, enabled);
+        const acknowledgedExperimentalToolNames = Array.isArray(
+          params.acknowledgedExperimentalToolNames,
+        )
+          ? params.acknowledgedExperimentalToolNames.filter(
+              (toolName): toolName is string => typeof toolName === "string",
+            )
+          : [];
+        return await this.options.toolsBridge.setBuiltInEnabled(
+          name,
+          enabled,
+          acknowledgedExperimentalToolNames,
+        );
       }
       case "agent:startTask": {
         const sessionId = this.readStringParam(params, "sessionId");
