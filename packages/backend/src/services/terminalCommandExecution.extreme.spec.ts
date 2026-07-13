@@ -17,6 +17,14 @@ const assertEqual = <T>(actual: T, expected: T, message: string): void => {
   }
 }
 
+const createDeferred = (): { promise: Promise<void>; resolve: () => void } => {
+  let resolve: () => void = () => {}
+  const promise = new Promise<void>((resolvePromise) => {
+    resolve = resolvePromise
+  })
+  return { promise, resolve }
+}
+
 type FakeSession = {
   dataCallbacks: Array<(data: string) => void>
   exitCallbacks: Array<(code: number) => void>
@@ -25,6 +33,7 @@ type FakeSession = {
 class FakeCommandBackend implements TerminalBackend {
   private readonly sessions = new Map<string, FakeSession>()
   private readonly writesByPtyId = new Map<string, string[]>()
+  private readonly writeLog: Array<{ ptyId: string; data: string }> = []
   private readonly fileWritesByPtyId = new Map<string, Array<{ path: string; content: string }>>()
   private readonly trackingStateByPtyId = new Map<string, TerminalCommandTrackingUpdate>()
   private prepareTrackingError?: Error
@@ -33,6 +42,14 @@ class FakeCommandBackend implements TerminalBackend {
   private promptFileRequestPath?: string
   private promptFileOutputPath?: string
   private writeFileError?: Error
+  private nextWriteError?: Error
+  private nextWriteErrorHook?: () => void
+  private writeErrorForData?: { data: string; error: Error }
+  private nextKillError?: Error
+  private deferNextKillExitCallback = false
+  private nextWriteFileGate?: { promise: Promise<void>; onStarted: () => void }
+  private nextWriteFileSuccessHook?: () => void
+  private spawnCount = 0
 
   constructor(
     private readonly remoteOs: 'unix' | 'windows',
@@ -45,6 +62,7 @@ class FakeCommandBackend implements TerminalBackend {
   }
 
   async spawn(config: TerminalConfig): Promise<string> {
+    this.spawnCount += 1
     const ptyId = this.getPtyId(config.id)
     this.sessions.set(ptyId, {
       dataCallbacks: [],
@@ -56,22 +74,49 @@ class FakeCommandBackend implements TerminalBackend {
   }
 
   write(ptyId: string, data: string): void {
+    const nextWriteError = this.nextWriteError
+    this.nextWriteError = undefined
+    if (nextWriteError) {
+      const nextWriteErrorHook = this.nextWriteErrorHook
+      this.nextWriteErrorHook = undefined
+      nextWriteErrorHook?.()
+      throw nextWriteError
+    }
+    if (this.writeErrorForData?.data === data) {
+      const error = this.writeErrorForData.error
+      this.writeErrorForData = undefined
+      throw error
+    }
     const writes = this.writesByPtyId.get(ptyId)
     if (!writes) {
       throw new Error(`Missing fake session for ${ptyId}`)
     }
     writes.push(data)
+    this.writeLog.push({ ptyId, data })
   }
 
   resize(_ptyId: string, _cols: number, _rows: number): void {}
 
   kill(ptyId: string): void {
+    const nextKillError = this.nextKillError
+    this.nextKillError = undefined
+    if (nextKillError) {
+      throw nextKillError
+    }
     const session = this.sessions.get(ptyId)
     if (!session) {
       return
     }
-    session.exitCallbacks.forEach((callback) => callback(0))
-    this.sessions.delete(ptyId)
+    const finishExit = (): void => {
+      session.exitCallbacks.forEach((callback) => callback(0))
+      this.sessions.delete(ptyId)
+    }
+    if (this.deferNextKillExitCallback) {
+      this.deferNextKillExitCallback = false
+      queueMicrotask(finishExit)
+      return
+    }
+    finishExit()
   }
 
   onData(ptyId: string, callback: (data: string) => void): void {
@@ -151,6 +196,14 @@ class FakeCommandBackend implements TerminalBackend {
     return writes[writes.length - 1] || ''
   }
 
+  getWrites(terminalId: string): string[] {
+    return [...(this.writesByPtyId.get(this.getPtyId(terminalId)) || [])]
+  }
+
+  getWriteLog(): Array<{ ptyId: string; data: string }> {
+    return [...this.writeLog]
+  }
+
   getLastFileWrite(terminalId: string): { path: string; content: string } | undefined {
     const writes = this.fileWritesByPtyId.get(this.getPtyId(terminalId)) || []
     return writes[writes.length - 1]
@@ -178,19 +231,59 @@ class FakeCommandBackend implements TerminalBackend {
     this.writeFileError = error
   }
 
+  setNextWriteError(error?: Error, onThrow?: () => void): void {
+    this.nextWriteError = error
+    this.nextWriteErrorHook = onThrow
+  }
+
+  setWriteErrorForData(data: string, error: Error): void {
+    this.writeErrorForData = { data, error }
+  }
+
+  setNextKillError(error?: Error): void {
+    this.nextKillError = error
+  }
+
+  deferNextKillExit(): void {
+    this.deferNextKillExitCallback = true
+  }
+
+  getSpawnCount(): number {
+    return this.spawnCount
+  }
+
+  delayNextWriteFile(promise: Promise<void>, onStarted: () => void): void {
+    this.nextWriteFileGate = { promise, onStarted }
+  }
+
+  onNextWriteFileSuccess(callback: () => void): void {
+    this.nextWriteFileSuccessHook = callback
+  }
+
   async readFile(): Promise<Buffer> {
     throw new Error('not implemented')
   }
 
   async writeFile(ptyId: string, filePath: string, content: string): Promise<void> {
-    if (this.writeFileError) {
-      throw this.writeFileError
+    const gate = this.nextWriteFileGate
+    if (gate) {
+      this.nextWriteFileGate = undefined
+      gate.onStarted()
+      await gate.promise
+    }
+    const writeFileError = this.writeFileError
+    this.writeFileError = undefined
+    if (writeFileError) {
+      throw writeFileError
     }
     const writes = this.fileWritesByPtyId.get(ptyId)
     if (!writes) {
       throw new Error(`Missing fake session for ${ptyId}`)
     }
     writes.push({ path: filePath, content })
+    const successHook = this.nextWriteFileSuccessHook
+    this.nextWriteFileSuccessHook = undefined
+    successHook?.()
   }
 
   async readFileChunk(): Promise<any> {
@@ -238,6 +331,56 @@ const createService = (backend: FakeCommandBackend): TerminalService => {
   return service
 }
 
+const createUnixBackend = (): FakeCommandBackend =>
+  new FakeCommandBackend('unix', {
+    os: 'linux',
+    platform: 'linux',
+    release: '6.8.0',
+    arch: 'x64',
+    hostname: 'localhost',
+    isRemote: false,
+    shell: '/bin/bash'
+  })
+
+const createLocalTerminal = async (
+  service: TerminalService,
+  terminalId: string
+): Promise<void> => {
+  await service.createTerminal({
+    type: 'local',
+    id: terminalId,
+    title: terminalId,
+    cols: 120,
+    rows: 32
+  })
+}
+
+const createReadySshTerminal = async (
+  service: TerminalService,
+  terminalId: string
+): Promise<void> => {
+  await service.createTerminal({
+    type: 'ssh',
+    id: terminalId,
+    title: terminalId,
+    host: '192.0.2.10',
+    port: 22,
+    username: 'tester',
+    authMethod: 'password',
+    password: 'secret',
+    cols: 120,
+    rows: 32
+  })
+  const terminal = service
+    .getDisplayTerminals()
+    .find((item) => item.id === terminalId)
+  if (!terminal) {
+    throw new Error(`Missing SSH terminal ${terminalId}`)
+  }
+  terminal.isInitializing = false
+  terminal.runtimeState = 'ready'
+}
+
 const runCase = async (name: string, fn: () => Promise<void> | void): Promise<void> => {
   await fn()
   console.log(`PASS ${name}`)
@@ -275,6 +418,1236 @@ const dumpViewport = (service: TerminalService, terminalId: string, rows: number
 }
 
 const run = async (): Promise<void> => {
+  await runCase('same-terminal command starts reserve before asynchronous preparation', async () => {
+    const backend = createUnixBackend()
+    const service = createService(backend)
+    await createLocalTerminal(service, 'reserved-start')
+    const gate = createDeferred()
+    const prepare = (service as any).prepareCommandTracking.bind(service)
+    ;(service as any).prepareCommandTracking = async (terminal: any) => {
+      await gate.promise
+      return await prepare(terminal)
+    }
+
+    const first = service.runCommandNoWait('reserved-start', 'printf first')
+    const competing = service.runCommandNoWait('reserved-start', 'printf second')
+    gate.resolve()
+    const outcomes = await Promise.allSettled([first, competing])
+
+    assertEqual(outcomes[0]?.status, 'fulfilled', 'reserved command should start')
+    assertEqual(outcomes[1]?.status, 'rejected', 'competing command should be rejected')
+    assertEqual(
+      service.getCommandTasks('reserved-start').length,
+      1,
+      'only one same-terminal task may be registered'
+    )
+    assertEqual(
+      backend.getWrites('reserved-start').slice(-1)[0],
+      'printf first\n',
+      'only the reservation holder may reach the backend'
+    )
+  })
+
+  await runCase('dispatch failures dispose every registered headless start marker', async () => {
+    const backend = createUnixBackend()
+    const service = createService(backend)
+    const terminalId = 'failed-dispatch-markers'
+    await createLocalTerminal(service, terminalId)
+    const headless = (service as any).headlessPtys.get(terminalId)
+    if (!headless) {
+      throw new Error('Missing headless terminal for marker disposal test')
+    }
+    let registeredMarkers = 0
+    let disposedMarkers = 0
+    ;(headless as any).registerMarker = () => {
+      registeredMarkers += 1
+      return {
+        line: 0,
+        dispose: () => {
+          disposedMarkers += 1
+        }
+      }
+    }
+
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      backend.setNextWriteError(new Error(`dispatch failure ${attempt}`))
+      const outcome = await Promise.allSettled([
+        service.runCommandNoWait(terminalId, `printf attempt-${attempt}`)
+      ])
+      assertEqual(outcome[0]?.status, 'rejected', 'each simulated dispatch should fail')
+    }
+
+    assertEqual(registeredMarkers, 3, 'each attempted dispatch should register one marker')
+    assertEqual(disposedMarkers, 3, 'every failed dispatch marker should be disposed')
+    assertEqual(
+      (service as any).startMarkerByTaskId.size,
+      0,
+      'failed dispatches must not retain marker references'
+    )
+  })
+
+  await runCase('stop during command preparation retains reservation until safe settlement', async () => {
+    const backend = createUnixBackend()
+    const service = createService(backend)
+    await createLocalTerminal(service, 'stopped-start')
+    const baseline = backend.getWrites('stopped-start').length
+    const gate = createDeferred()
+    const prepare = (service as any).prepareCommandTracking.bind(service)
+    ;(service as any).prepareCommandTracking = async (terminal: any) => {
+      await gate.promise
+      return await prepare(terminal)
+    }
+    const controller = new AbortController()
+    const starting = service.runCommandAndWait(
+      'stopped-start',
+      'printf must-not-run',
+      { signal: controller.signal, interruptOnAbort: false }
+    )
+    controller.abort()
+    assertEqual(
+      (service as any).commandStartReservationByTerminal.size,
+      1,
+      'non-cancellable preparation should retain the start reservation'
+    )
+    const competing = await Promise.allSettled([
+      service.runCommandNoWait('stopped-start', 'printf competing')
+    ])
+    assertEqual(competing[0]?.status, 'rejected', 'a new command must not overlap stale preparation')
+    gate.resolve()
+    const outcome = await Promise.allSettled([starting])
+    assertEqual(outcome[0]?.status, 'rejected', 'stopped startup should reject after preparation settles')
+    assertEqual(
+      (service as any).commandStartReservationByTerminal.size,
+      0,
+      'settlement should release the start reservation'
+    )
+    assertEqual(
+      backend.getWrites('stopped-start').length,
+      baseline,
+      'late preparation must not dispatch the stopped command'
+    )
+  })
+
+  await runCase('aborted input waiting on command preparation never dispatches later', async () => {
+    const backend = createUnixBackend()
+    const service = createService(backend)
+    const terminalId = 'stopped-deferred-input'
+    await createLocalTerminal(service, terminalId)
+    const gate = createDeferred()
+    const prepareStarted = createDeferred()
+    const prepare = (service as any).prepareCommandTracking.bind(service)
+    ;(service as any).prepareCommandTracking = async (terminal: any) => {
+      prepareStarted.resolve()
+      await gate.promise
+      return await prepare(terminal)
+    }
+    const starting = service.runCommandNoWait(
+      terminalId,
+      'printf command-after-preparation'
+    )
+    await prepareStarted.promise
+    const controller = new AbortController()
+    const inputSequence = service.writeInputSequence(
+      terminalId,
+      ['\x03', '\r'],
+      { intervalMs: 100, signal: controller.signal }
+    )
+    await Promise.resolve()
+    controller.abort()
+
+    const inputOutcome = await Promise.allSettled([inputSequence])
+    assertEqual(
+      inputOutcome[0]?.status,
+      'rejected',
+      'stop must reject input waiting on command preparation'
+    )
+    gate.resolve()
+    const startOutcome = await Promise.allSettled([starting])
+    assertEqual(
+      startOutcome[0]?.status,
+      'fulfilled',
+      'the pending command should dispatch'
+    )
+    assertEqual(
+      backend.getWrites(terminalId).includes('\x03'),
+      false,
+      'an aborted control sequence must never be injected after command startup'
+    )
+    assertEqual(
+      backend.getWrites(terminalId).includes('\r'),
+      false,
+      'the unsent sequence tail must never be injected after command startup'
+    )
+    service.kill(terminalId)
+  })
+
+  await runCase('deferred input failure cannot hide a successfully started command', async () => {
+    const backend = createUnixBackend()
+    const service = createService(backend)
+    const terminalId = 'failed-deferred-input'
+    await createLocalTerminal(service, terminalId)
+    const gate = createDeferred()
+    const prepareStarted = createDeferred()
+    const prepare = (service as any).prepareCommandTracking.bind(service)
+    ;(service as any).prepareCommandTracking = async (terminal: any) => {
+      prepareStarted.resolve()
+      await gate.promise
+      return await prepare(terminal)
+    }
+    const starting = service.runCommandNoWait(
+      terminalId,
+      'printf command-remains-tracked'
+    )
+    await prepareStarted.promise
+    const deferredInput = 'DEFERRED_INPUT_WRITE_FAILURE'
+    service.write(terminalId, deferredInput)
+    backend.setWriteErrorForData(
+      deferredInput,
+      new Error('deferred input write failed')
+    )
+    gate.resolve()
+
+    const outcome = await Promise.allSettled([starting])
+    assertEqual(
+      outcome[0]?.status,
+      'fulfilled',
+      'deferred input failure must not replace the successful task id'
+    )
+    const taskId =
+      outcome[0]?.status === 'fulfilled' ? outcome[0].value : undefined
+    assertEqual(
+      service.getActiveTaskId(terminalId),
+      taskId,
+      'the successfully dispatched command must remain actively tracked'
+    )
+    assertEqual(
+      backend.getWrites(terminalId).includes(deferredInput),
+      false,
+      'the failed deferred input should not appear as a successful write'
+    )
+    service.kill(terminalId)
+  })
+
+  await runCase('abort during delayed prompt-file write clears payload before deferred enter', async () => {
+    const backend = new FakeCommandBackend('windows', {
+      os: 'Windows',
+      platform: 'win32',
+      release: '10.0.14393',
+      arch: 'x64',
+      hostname: 'ws2016-abort',
+      isRemote: false,
+      shell: 'powershell.exe'
+    }, 'windows-powershell-sidecar')
+    const requestPath = 'C:/Windows/Temp/GyShell/abort-request.b64'
+    backend.setPromptFileDispatch(
+      requestPath,
+      'C:/Windows/Temp/GyShell/abort-output.txt'
+    )
+    const writeGate = createDeferred()
+    const writeStarted = createDeferred()
+    backend.delayNextWriteFile(writeGate.promise, writeStarted.resolve)
+    const service = createService(backend)
+    await service.createTerminal({
+      type: 'local',
+      id: 'win-prompt-abort',
+      title: 'Windows Prompt Abort',
+      cols: 120,
+      rows: 32
+    })
+    const baselineWrites = backend.getWrites('win-prompt-abort').length
+    const controller = new AbortController()
+    const starting = service.runCommandNoWait(
+      'win-prompt-abort',
+      'Write-Output danger',
+      undefined,
+      controller.signal
+    )
+    await writeStarted.promise
+    controller.abort()
+    service.write('win-prompt-abort', '\r')
+
+    assertEqual(
+      (service as any).commandStartReservationByTerminal.size,
+      1,
+      'the prompt request write must retain the terminal start reservation'
+    )
+    const competing = await Promise.allSettled([
+      service.runCommandNoWait('win-prompt-abort', 'Write-Output competing')
+    ])
+    assertEqual(competing[0]?.status, 'rejected', 'a competing command must be rejected')
+    assertEqual(
+      backend.getWrites('win-prompt-abort').length,
+      baselineWrites,
+      'user enter must remain deferred while an unsafe payload may appear'
+    )
+
+    writeGate.resolve()
+    const outcome = await Promise.allSettled([starting])
+    assertEqual(outcome[0]?.status, 'rejected', 'the aborted command should never dispatch')
+    const fileWrites = (backend as any).fileWritesByPtyId.get('pty-win-prompt-abort') as Array<{
+      path: string
+      content: string
+    }>
+    assertEqual(fileWrites[0]?.path, requestPath, 'the delayed payload should target the request file')
+    assertEqual(
+      Buffer.from(fileWrites[0]?.content || '', 'base64').toString('utf8'),
+      'Write-Output danger',
+      'the delayed backend write should have completed for the regression setup'
+    )
+    assertEqual(
+      fileWrites[fileWrites.length - 1]?.content,
+      '',
+      'the request file must be cleared before the reservation is released'
+    )
+    assertEqual(
+      JSON.stringify(backend.getWrites('win-prompt-abort').slice(baselineWrites)),
+      JSON.stringify(['\r']),
+      'only the deferred user enter may reach the prompt after cleanup'
+    )
+    assertEqual(
+      service.getCommandTasks('win-prompt-abort').length,
+      0,
+      'the aborted payload must never register or dispatch a command task'
+    )
+  })
+
+  await runCase('prompt-file trigger failure clears payload before deferred input is released', async () => {
+    const backend = new FakeCommandBackend('windows', {
+      os: 'Windows',
+      platform: 'win32',
+      release: '10.0.14393',
+      arch: 'x64',
+      hostname: 'ws2016-trigger-failure',
+      isRemote: false,
+      shell: 'powershell.exe'
+    }, 'windows-powershell-sidecar')
+    const requestPath = 'C:/Windows/Temp/GyShell/trigger-failure-request.b64'
+    backend.setPromptFileDispatch(
+      requestPath,
+      'C:/Windows/Temp/GyShell/trigger-failure-output.txt'
+    )
+    const writeGate = createDeferred()
+    const writeStarted = createDeferred()
+    backend.delayNextWriteFile(writeGate.promise, writeStarted.resolve)
+    const service = createService(backend)
+    await service.createTerminal({
+      type: 'local',
+      id: 'win-prompt-trigger-failure',
+      title: 'Windows Prompt Trigger Failure',
+      cols: 120,
+      rows: 32
+    })
+    const baselineWrites = backend.getWrites('win-prompt-trigger-failure').length
+    backend.setNextWriteError(new Error('terminal input write failed before dispatch'))
+    const starting = service.runCommandNoWait(
+      'win-prompt-trigger-failure',
+      'Write-Output must-not-run'
+    )
+    await writeStarted.promise
+    service.write('win-prompt-trigger-failure', '\r')
+    writeGate.resolve()
+
+    const outcome = await Promise.allSettled([starting])
+    assertEqual(outcome[0]?.status, 'rejected', 'a failed prompt trigger should reject startup')
+    const fileWrites = (backend as any).fileWritesByPtyId.get(
+      'pty-win-prompt-trigger-failure'
+    ) as Array<{ path: string; content: string }>
+    assertEqual(
+      Buffer.from(fileWrites[0]?.content || '', 'base64').toString('utf8'),
+      'Write-Output must-not-run',
+      'the regression setup should persist the command before trigger failure'
+    )
+    assertEqual(
+      fileWrites[fileWrites.length - 1]?.content,
+      '',
+      'trigger failure must clear the persisted request before releasing deferred input'
+    )
+    assertEqual(
+      JSON.stringify(backend.getWrites('win-prompt-trigger-failure').slice(baselineWrites)),
+      JSON.stringify(['\r']),
+      'only deferred user input may reach the prompt after request cleanup'
+    )
+    assertEqual(
+      service.getCommandTasks('win-prompt-trigger-failure').length,
+      0,
+      'a failed prompt trigger must not leave a tracked or ghost command task'
+    )
+  })
+
+  await runCase('prompt cleanup and kill failure quarantine the runtime and drop deferred input', async () => {
+    const backend = new FakeCommandBackend('windows', {
+      os: 'Windows',
+      platform: 'win32',
+      release: '10.0.14393',
+      arch: 'x64',
+      hostname: 'ws2016-quarantine',
+      isRemote: true,
+      shell: 'powershell.exe'
+    }, 'windows-powershell-sidecar')
+    const requestPath = 'C:/Windows/Temp/GyShell/quarantine-request.b64'
+    backend.setPromptFileDispatch(
+      requestPath,
+      'C:/Windows/Temp/GyShell/quarantine-output.txt'
+    )
+    const writeGate = createDeferred()
+    const writeStarted = createDeferred()
+    backend.delayNextWriteFile(writeGate.promise, writeStarted.resolve)
+    const service = createService(backend)
+    const terminalId = 'win-prompt-quarantine'
+    await createReadySshTerminal(service, terminalId)
+    const baselineWrites = backend.getWrites(terminalId).length
+    backend.setNextWriteError(
+      new Error('prompt trigger failed'),
+      () => {
+        backend.setWriteFileError(new Error('request cleanup failed'))
+        backend.setNextKillError(new Error('runtime kill failed'))
+      }
+    )
+    const starting = service.runCommandNoWait(
+      terminalId,
+      'Write-Output quarantined'
+    )
+    await writeStarted.promise
+    service.writePaths(terminalId, ['C:/deferred path.txt'])
+    service.write(terminalId, '\r')
+    writeGate.resolve()
+
+    const outcome = await Promise.allSettled([starting])
+    assertEqual(outcome[0]?.status, 'rejected', 'unsafe startup should reject')
+    assertEqual(
+      service.getTerminalRuntimeSnapshot(terminalId)?.runtimeState,
+      'exited',
+      'a runtime with an uncleared request and failed kill must be quarantined'
+    )
+    assertEqual(
+      JSON.stringify(backend.getWrites(terminalId).slice(baselineWrites)),
+      JSON.stringify([]),
+      'path input and Enter deferred behind the unsafe request must be dropped'
+    )
+    service.write(terminalId, '\r')
+    assertEqual(
+      backend.getWrites(terminalId).length,
+      baselineWrites,
+      'future input must remain blocked on the quarantined runtime'
+    )
+    assertEqual(
+      service.getCommandTasks(terminalId).length,
+      0,
+      'quarantine must not leave a ghost command task'
+    )
+  })
+
+  await runCase('prompt cleanup quarantine survives an asynchronous local exit', async () => {
+    const backend = new FakeCommandBackend('windows', {
+      os: 'Windows',
+      platform: 'win32',
+      release: '10.0.14393',
+      arch: 'x64',
+      hostname: 'ws2016-local-quarantine',
+      isRemote: false,
+      shell: 'powershell.exe'
+    }, 'windows-powershell-sidecar')
+    backend.setPromptFileDispatch(
+      'C:/Windows/Temp/GyShell/local-quarantine-request.b64',
+      'C:/Windows/Temp/GyShell/local-quarantine-output.txt'
+    )
+    const service = createService(backend)
+    const terminalId = 'win-prompt-local-quarantine'
+    await service.createTerminal({
+      type: 'local',
+      id: terminalId,
+      title: 'Windows Local Quarantine',
+      cols: 120,
+      rows: 32
+    })
+    backend.setNextWriteError(
+      new Error('prompt trigger failed'),
+      () => {
+        backend.setWriteFileError(new Error('request cleanup failed'))
+        backend.deferNextKillExit()
+      }
+    )
+
+    const outcome = await Promise.allSettled([
+      service.runCommandNoWait(terminalId, 'Write-Output quarantined-local')
+    ])
+    assertEqual(outcome[0]?.status, 'rejected', 'unsafe local startup should reject')
+    await Promise.resolve()
+    assertEqual(
+      service.getTerminalRuntimeSnapshot(terminalId)?.runtimeState,
+      'exited',
+      'an asynchronous local exit must preserve the explicit quarantine'
+    )
+    assertEqual(
+      backend.getSpawnCount(),
+      1,
+      'a quarantined local runtime must not auto-restart after its delayed exit'
+    )
+    service.kill(terminalId)
+  })
+
+  await runCase('prompt-file io fence protects a replacement payload from late old-runtime writes', async () => {
+    const backend = new FakeCommandBackend('windows', {
+      os: 'Windows',
+      platform: 'win32',
+      release: '10.0.14393',
+      arch: 'x64',
+      hostname: 'ws2016-replacement',
+      isRemote: true,
+      shell: 'powershell.exe'
+    }, 'windows-powershell-sidecar')
+    backend.setPromptFileDispatch(
+      'C:/Windows/Temp/GyShell/replacement-request.b64',
+      'C:/Windows/Temp/GyShell/replacement-output.txt'
+    )
+    const oldWriteGate = createDeferred()
+    const oldWriteStarted = createDeferred()
+    backend.delayNextWriteFile(oldWriteGate.promise, oldWriteStarted.resolve)
+    const service = createService(backend)
+    const terminalId = 'win-prompt-replacement'
+    await createReadySshTerminal(service, terminalId)
+    const oldStarting = service.runCommandNoWait(
+      terminalId,
+      'Write-Output old-runtime'
+    )
+    await oldWriteStarted.promise
+
+    backend.kill(`pty-${terminalId}`)
+    await service.reconnectTerminal(terminalId)
+    const replacement = service
+      .getDisplayTerminals()
+      .find((item) => item.id === terminalId)
+    if (!replacement) {
+      throw new Error('Missing prompt-file replacement terminal')
+    }
+    replacement.isInitializing = false
+    replacement.runtimeState = 'ready'
+
+    const replacementPrepared = createDeferred()
+    const prepare = (service as any).prepareCommandTracking.bind(service)
+    ;(service as any).prepareCommandTracking = async (terminal: any) => {
+      const tracking = await prepare(terminal)
+      replacementPrepared.resolve()
+      return tracking
+    }
+    const replacementWriteBaseline = backend.getWrites(terminalId).length
+    const replacementStarting = service.runCommandNoWait(
+      terminalId,
+      'Write-Output replacement-runtime'
+    )
+    let replacementSettled = false
+    void replacementStarting.then(
+      () => {
+        replacementSettled = true
+      },
+      () => {
+        replacementSettled = true
+      }
+    )
+    await replacementPrepared.promise
+    await Promise.resolve()
+    service.write(terminalId, 'NEW_RUNTIME_INPUT')
+
+    assertEqual(
+      replacementSettled,
+      false,
+      'the replacement dispatch must wait for old request-file io to settle'
+    )
+    assertEqual(
+      backend.getLastFileWrite(terminalId),
+      undefined,
+      'the replacement must not write its payload while the old write owns the shared path'
+    )
+    assertEqual(
+      backend.getWrites(terminalId).length,
+      replacementWriteBaseline,
+      'the replacement must not send Enter before it owns the shared request path'
+    )
+
+    oldWriteGate.resolve()
+    const outcomes = await Promise.allSettled([oldStarting, replacementStarting])
+    assertEqual(outcomes[0]?.status, 'rejected', 'the old startup should reject after reconnect')
+    assertEqual(
+      outcomes[1]?.status,
+      'fulfilled',
+      'the replacement command should dispatch after the old io lease releases'
+    )
+    const replacementFileWrites = (backend as any).fileWritesByPtyId.get(
+      `pty-${terminalId}`
+    ) as Array<{ path: string; content: string }>
+    assertEqual(
+      Buffer.from(
+        replacementFileWrites[replacementFileWrites.length - 1]?.content || '',
+        'base64'
+      ).toString('utf8'),
+      'Write-Output replacement-runtime',
+      'the final request payload must belong to the replacement command'
+    )
+    assertEqual(
+      JSON.stringify(backend.getWrites(terminalId).slice(replacementWriteBaseline)),
+      JSON.stringify(['\r', 'NEW_RUNTIME_INPUT']),
+      'only the replacement Enter may dispatch before its deferred input is released'
+    )
+    service.kill(terminalId)
+  })
+
+  await runCase('ordinary replacement input waits behind stale prompt-file io', async () => {
+    const backend = new FakeCommandBackend('windows', {
+      os: 'Windows',
+      platform: 'win32',
+      release: '10.0.14393',
+      arch: 'x64',
+      hostname: 'ws2016-input-fence',
+      isRemote: true,
+      shell: 'powershell.exe'
+    }, 'windows-powershell-sidecar')
+    backend.setPromptFileDispatch(
+      'C:/Windows/Temp/GyShell/input-fence-request.b64',
+      'C:/Windows/Temp/GyShell/input-fence-output.txt'
+    )
+    const oldWriteGate = createDeferred()
+    const oldWriteStarted = createDeferred()
+    backend.delayNextWriteFile(oldWriteGate.promise, oldWriteStarted.resolve)
+    const service = createService(backend)
+    const terminalId = 'win-prompt-input-fence'
+    await createReadySshTerminal(service, terminalId)
+    const oldStarting = service.runCommandNoWait(
+      terminalId,
+      'Write-Output stale-input-owner'
+    )
+    await oldWriteStarted.promise
+
+    backend.kill(`pty-${terminalId}`)
+    await service.reconnectTerminal(terminalId)
+    const replacement = service
+      .getDisplayTerminals()
+      .find((item) => item.id === terminalId)
+    if (!replacement) {
+      throw new Error('Missing replacement terminal for ordinary input fence test')
+    }
+    replacement.isInitializing = false
+    replacement.runtimeState = 'ready'
+    const replacementWriteBaseline = backend.getWrites(terminalId).length
+
+    service.write(terminalId, 'REPLACEMENT_USER_ENTER')
+    await Promise.resolve()
+    assertEqual(
+      backend.getWrites(terminalId).length,
+      replacementWriteBaseline,
+      'ordinary input must not bypass an unsettled stale request write'
+    )
+
+    oldWriteGate.resolve()
+    const oldOutcome = await Promise.allSettled([oldStarting])
+    assertEqual(oldOutcome[0]?.status, 'rejected', 'the stale command should reject')
+    await waitUntil(
+      () => backend.getWrites(terminalId).includes('REPLACEMENT_USER_ENTER'),
+      'replacement input should flush after stale request cleanup'
+    )
+    assertEqual(
+      backend.getLastFileWrite(terminalId)?.content,
+      '',
+      'the stale request must be empty before replacement input is released'
+    )
+    assertEqual(
+      JSON.stringify(backend.getWrites(terminalId).slice(replacementWriteBaseline)),
+      JSON.stringify(['REPLACEMENT_USER_ENTER']),
+      'only the replacement input should reach the safe prompt'
+    )
+    service.kill(terminalId)
+  })
+
+  await runCase('aborted input sequence never leaks past a stale prompt-file io fence', async () => {
+    const backend = new FakeCommandBackend('windows', {
+      os: 'Windows',
+      platform: 'win32',
+      release: '10.0.14393',
+      arch: 'x64',
+      hostname: 'ws2016-aborted-input-fence',
+      isRemote: true,
+      shell: 'powershell.exe'
+    }, 'windows-powershell-sidecar')
+    backend.setPromptFileDispatch(
+      'C:/Windows/Temp/GyShell/aborted-input-request.b64',
+      'C:/Windows/Temp/GyShell/aborted-input-output.txt'
+    )
+    const oldWriteGate = createDeferred()
+    const oldWriteStarted = createDeferred()
+    backend.delayNextWriteFile(oldWriteGate.promise, oldWriteStarted.resolve)
+    const service = createService(backend)
+    const terminalId = 'win-prompt-aborted-input-fence'
+    await createReadySshTerminal(service, terminalId)
+    const oldStarting = service.runCommandNoWait(
+      terminalId,
+      'Write-Output stale-input-owner'
+    )
+    await oldWriteStarted.promise
+
+    backend.kill(`pty-${terminalId}`)
+    await service.reconnectTerminal(terminalId)
+    const replacement = service
+      .getDisplayTerminals()
+      .find((item) => item.id === terminalId)
+    if (!replacement) {
+      throw new Error('Missing replacement terminal for aborted input test')
+    }
+    replacement.isInitializing = false
+    replacement.runtimeState = 'ready'
+    const replacementWriteBaseline = backend.getWrites(terminalId).length
+    const controller = new AbortController()
+    const inputSequence = service.writeInputSequence(
+      terminalId,
+      ['CANCELLED_REPLACEMENT_INPUT'],
+      { signal: controller.signal }
+    )
+    await Promise.resolve()
+    controller.abort()
+
+    const inputOutcome = await Promise.allSettled([inputSequence])
+    assertEqual(
+      inputOutcome[0]?.status,
+      'rejected',
+      'stop must reject input waiting behind stale request io'
+    )
+    assertEqual(
+      backend.getWrites(terminalId).length,
+      replacementWriteBaseline,
+      'aborted input must not write before the stale request settles'
+    )
+
+    oldWriteGate.resolve()
+    const oldOutcome = await Promise.allSettled([oldStarting])
+    assertEqual(oldOutcome[0]?.status, 'rejected', 'the stale command should reject')
+    await Promise.resolve()
+    await Promise.resolve()
+    assertEqual(
+      backend.getWrites(terminalId).length,
+      replacementWriteBaseline,
+      'aborted input must not write after the stale request settles'
+    )
+    service.kill(terminalId)
+  })
+
+  await runCase('input sequence rejects when its runtime changes behind a prompt-file io fence', async () => {
+    const backend = new FakeCommandBackend('windows', {
+      os: 'Windows',
+      platform: 'win32',
+      release: '10.0.14393',
+      arch: 'x64',
+      hostname: 'ws2016-input-runtime-change',
+      isRemote: true,
+      shell: 'powershell.exe'
+    })
+    const service = createService(backend)
+    const terminalId = 'win-prompt-input-runtime-change'
+    await createReadySshTerminal(service, terminalId)
+    const promptFileIo = (service as any).reservePromptFileIo(terminalId)
+    const inputSequence = service.writeInputSequence(
+      terminalId,
+      ['STALE_AGENT_INPUT']
+    )
+    await Promise.resolve()
+    await Promise.resolve()
+
+    backend.kill(`pty-${terminalId}`)
+    await service.reconnectTerminal(terminalId)
+    const replacement = service
+      .getDisplayTerminals()
+      .find((item) => item.id === terminalId)
+    if (!replacement) {
+      throw new Error('Missing replacement terminal for fenced input runtime-change test')
+    }
+    replacement.isInitializing = false
+    replacement.runtimeState = 'ready'
+    const replacementWriteBaseline = backend.getWrites(terminalId).length
+
+    promptFileIo.release()
+    const outcome = await Promise.allSettled([inputSequence])
+
+    assertEqual(
+      outcome[0]?.status,
+      'rejected',
+      'agent input must not report success after its accepted runtime was replaced'
+    )
+    assertEqual(
+      outcome[0]?.status === 'rejected' &&
+        String(outcome[0].reason).includes('changed while input was waiting'),
+      true,
+      'runtime replacement should surface an explicit fenced-input error'
+    )
+    assertEqual(
+      backend.getWrites(terminalId).length,
+      replacementWriteBaseline,
+      'stale agent input must reach neither the exited runtime nor its replacement'
+    )
+    service.kill(terminalId)
+  })
+
+  await runCase('stale cleanup failure quarantines replacement input even when kill fails', async () => {
+    const backend = new FakeCommandBackend('windows', {
+      os: 'Windows',
+      platform: 'win32',
+      release: '10.0.14393',
+      arch: 'x64',
+      hostname: 'ws2016-stale-quarantine',
+      isRemote: true,
+      shell: 'powershell.exe'
+    }, 'windows-powershell-sidecar')
+    backend.setPromptFileDispatch(
+      'C:/Windows/Temp/GyShell/stale-quarantine-request.b64',
+      'C:/Windows/Temp/GyShell/stale-quarantine-output.txt'
+    )
+    const oldWriteGate = createDeferred()
+    const oldWriteStarted = createDeferred()
+    backend.delayNextWriteFile(oldWriteGate.promise, oldWriteStarted.resolve)
+    const service = createService(backend)
+    const terminalId = 'win-prompt-stale-quarantine'
+    await createReadySshTerminal(service, terminalId)
+    const oldStarting = service.runCommandNoWait(
+      terminalId,
+      'Write-Output uncleared-stale-command'
+    )
+    await oldWriteStarted.promise
+
+    backend.kill(`pty-${terminalId}`)
+    await service.reconnectTerminal(terminalId)
+    const replacement = service
+      .getDisplayTerminals()
+      .find((item) => item.id === terminalId)
+    if (!replacement) {
+      throw new Error('Missing replacement terminal for stale quarantine test')
+    }
+    replacement.isInitializing = false
+    replacement.runtimeState = 'ready'
+    const replacementWriteBaseline = backend.getWrites(terminalId).length
+    service.write(terminalId, 'UNSAFE_REPLACEMENT_ENTER')
+    backend.onNextWriteFileSuccess(() => {
+      backend.setWriteFileError(new Error('stale request cleanup failed'))
+      backend.setNextKillError(new Error('replacement kill failed'))
+    })
+
+    oldWriteGate.resolve()
+    const oldOutcome = await Promise.allSettled([oldStarting])
+    assertEqual(oldOutcome[0]?.status, 'rejected', 'the stale command should reject')
+    await Promise.resolve()
+    assertEqual(
+      service.getTerminalRuntimeSnapshot(terminalId)?.runtimeState,
+      'exited',
+      'an uncleared shared request path must quarantine the replacement runtime'
+    )
+    assertEqual(
+      backend.getWrites(terminalId).length,
+      replacementWriteBaseline,
+      'queued replacement input must be dropped when cleanup cannot prove safety'
+    )
+    service.write(terminalId, 'LATER_UNSAFE_INPUT')
+    assertEqual(
+      backend.getWrites(terminalId).length,
+      replacementWriteBaseline,
+      'future input must remain blocked after replacement quarantine'
+    )
+    assertEqual(
+      Buffer.from(backend.getLastFileWrite(terminalId)?.content || '', 'base64').toString('utf8'),
+      'Write-Output uncleared-stale-command',
+      'the regression setup should leave the stale payload uncleared'
+    )
+    service.kill(terminalId)
+  })
+
+  await runCase('terminal close releases a pending start without allowing ghost dispatch', async () => {
+    const backend = createUnixBackend()
+    const service = createService(backend)
+    await createLocalTerminal(service, 'closed-start')
+    const gate = createDeferred()
+    const prepare = (service as any).prepareCommandTracking.bind(service)
+    ;(service as any).prepareCommandTracking = async (terminal: any) => {
+      await gate.promise
+      return await prepare(terminal)
+    }
+    const starting = service.runCommandNoWait('closed-start', 'printf ghost')
+    service.kill('closed-start')
+
+    assertEqual(
+      (service as any).commandStartReservationByTerminal.size,
+      0,
+      'closing the terminal should release its pending start reservation'
+    )
+    gate.resolve()
+    const outcome = await Promise.allSettled([starting])
+    assertEqual(outcome[0]?.status, 'rejected', 'closed runtime must reject the pending start')
+    assertEqual(
+      backend.getWriteLog().some((entry) => entry.data.includes('printf ghost')),
+      false,
+      'late preparation must never dispatch into a closed runtime'
+    )
+  })
+
+  await runCase('same-terminal input sequences are atomic while different terminals progress concurrently', async () => {
+    const backend = createUnixBackend()
+    const service = createService(backend)
+    await createLocalTerminal(service, 'input-a')
+    await createLocalTerminal(service, 'input-b')
+    const aBaseline = backend.getWrites('input-a').length
+    const logBaseline = backend.getWriteLog().length
+
+    await Promise.allSettled([
+      service.writeInputSequence('input-a', ['A', 'B'], { intervalMs: 20 }),
+      service.writeInputSequence('input-a', ['1', '2'], { intervalMs: 20 }),
+      service.writeInputSequence('input-b', ['X', 'Y'], { intervalMs: 20 })
+    ])
+
+    assertEqual(
+      JSON.stringify(backend.getWrites('input-a').slice(aBaseline)),
+      JSON.stringify(['A', 'B', '1', '2']),
+      'same-terminal sequence items must never interleave'
+    )
+    const log = backend.getWriteLog().slice(logBaseline)
+    const bFirst = log.findIndex((entry) => entry.data === 'X')
+    const aLast = log.findIndex((entry) => entry.data === '2')
+    assertEqual(
+      bFirst >= 0 && bFirst < aLast,
+      true,
+      'another terminal should progress before terminal A drains its queue'
+    )
+  })
+
+  await runCase('queued input never crosses an exit and reconnect boundary', async () => {
+    const backend = new FakeCommandBackend('unix', {
+      os: 'linux',
+      platform: 'linux',
+      release: '6.8.0',
+      arch: 'x64',
+      hostname: 'remote-sequence-host',
+      isRemote: true,
+      shell: '/bin/bash'
+    })
+    const service = createService(backend)
+    const terminalId = 'queued-input-reconnect'
+    await createReadySshTerminal(service, terminalId)
+
+    const first = service.writeInputSequence(
+      terminalId,
+      ['old-runtime-first', 'old-runtime-second'],
+      { intervalMs: 200 }
+    )
+    await waitUntil(
+      () => backend.getWrites(terminalId).includes('old-runtime-first'),
+      'the first sequence should own the old runtime before reconnect'
+    )
+    const staleQueued = service.writeInputSequence(terminalId, ['stale-queued-input'])
+
+    backend.kill(`pty-${terminalId}`)
+    await service.reconnectTerminal(terminalId)
+    const replacement = service
+      .getDisplayTerminals()
+      .find((item) => item.id === terminalId)
+    if (!replacement) {
+      throw new Error('Missing replacement terminal after reconnect')
+    }
+    replacement.isInitializing = false
+    replacement.runtimeState = 'ready'
+    const replacementBaseline = backend.getWrites(terminalId).length
+
+    const outcomes = await Promise.allSettled([first, staleQueued])
+    assertEqual(outcomes[0]?.status, 'rejected', 'the interrupted owner should reject')
+    assertEqual(outcomes[1]?.status, 'rejected', 'queued old-runtime input should reject')
+    assertEqual(
+      backend.getWrites(terminalId).slice(replacementBaseline).includes('stale-queued-input'),
+      false,
+      'queued input from the old runtime must never reach the replacement shell'
+    )
+  })
+
+  await runCase('late old-runtime callbacks cannot mutate replacement state', async () => {
+    const backend = new FakeCommandBackend('unix', {
+      os: 'linux',
+      platform: 'linux',
+      release: '6.8.0',
+      arch: 'x64',
+      hostname: 'remote-stale-callback-host',
+      isRemote: true,
+      shell: '/bin/bash'
+    })
+    const service = createService(backend)
+    const terminalId = 'stale-runtime-callback'
+    await createReadySshTerminal(service, terminalId)
+    const oldSession = (backend as any).sessions.get(`pty-${terminalId}`) as
+      | FakeSession
+      | undefined
+    const oldDataCallback = oldSession?.dataCallbacks[0]
+    const oldExitCallback = oldSession?.exitCallbacks[0]
+    if (!oldDataCallback || !oldExitCallback) {
+      throw new Error('Missing old runtime callbacks for stale callback test')
+    }
+
+    backend.kill(`pty-${terminalId}`)
+    await service.reconnectTerminal(terminalId)
+    const replacement = service
+      .getDisplayTerminals()
+      .find((item) => item.id === terminalId)
+    if (!replacement) {
+      throw new Error('Missing replacement terminal for stale callback test')
+    }
+    replacement.isInitializing = false
+    replacement.runtimeState = 'ready'
+
+    const sequenceController = new AbortController()
+    const inputSequence = service.writeInputSequence(
+      terminalId,
+      ['replacement-sequence-first', 'replacement-sequence-second'],
+      { intervalMs: 1000, signal: sequenceController.signal }
+    )
+    await waitUntil(
+      () => backend.getWrites(terminalId).includes('replacement-sequence-first'),
+      'the replacement input sequence should acquire its queue turn'
+    )
+    const replacementInputTail = (service as any).terminalInputSequenceTailByTerminal.get(
+      terminalId
+    )
+
+    const prepareGate = createDeferred()
+    const prepareStarted = createDeferred()
+    const prepare = (service as any).prepareCommandTracking.bind(service)
+    ;(service as any).prepareCommandTracking = async (terminal: any) => {
+      prepareStarted.resolve()
+      await prepareGate.promise
+      return await prepare(terminal)
+    }
+    const replacementStarting = service.runCommandNoWait(
+      terminalId,
+      'printf replacement-command'
+    )
+    await prepareStarted.promise
+    service.write(terminalId, 'REPLACEMENT_DEFERRED_INPUT')
+    const replacementReservation = (service as any).commandStartReservationByTerminal.get(
+      terminalId
+    )
+
+    oldDataCallback('STALE_OLD_RUNTIME_DATA')
+    oldExitCallback(255)
+
+    assertEqual(
+      (service as any).commandStartReservationByTerminal.get(terminalId),
+      replacementReservation,
+      'a stale exit must not consume the replacement command reservation'
+    )
+    assertEqual(
+      JSON.stringify(
+        (service as any).deferredWritesDuringCommandStartByTerminal.get(terminalId)
+      ),
+      JSON.stringify(['REPLACEMENT_DEFERRED_INPUT']),
+      'a stale exit must not delete input deferred for the replacement runtime'
+    )
+    assertEqual(
+      (service as any).terminalInputSequenceTailByTerminal.get(terminalId),
+      replacementInputTail,
+      'a stale exit must not delete the replacement input queue tail'
+    )
+    assertEqual(
+      service.getTerminalRuntimeSnapshot(terminalId)?.runtimeState,
+      'ready',
+      'a stale exit must not mark the replacement runtime exited'
+    )
+    assertEqual(
+      service.getRecentOutput(terminalId).includes('STALE_OLD_RUNTIME_DATA'),
+      false,
+      'stale data callbacks must not publish into the replacement terminal'
+    )
+
+    sequenceController.abort()
+    prepareGate.resolve()
+    const outcomes = await Promise.allSettled([inputSequence, replacementStarting])
+    assertEqual(outcomes[0]?.status, 'rejected', 'the test input sequence should stop cleanly')
+    assertEqual(outcomes[1]?.status, 'fulfilled', 'the replacement command should still dispatch')
+    assertEqual(
+      backend.getWrites(terminalId).includes('REPLACEMENT_DEFERRED_INPUT'),
+      true,
+      'the replacement reservation should still release its deferred input'
+    )
+    service.kill(terminalId)
+  })
+
+  await runCase('stop after dispatch rejects agent wait while terminal tracking continues', async () => {
+    const backend = createUnixBackend()
+    const service = createService(backend)
+    await createLocalTerminal(service, 'continuing-stop')
+    const controller = new AbortController()
+    const waiting = service.runCommandAndWait(
+      'continuing-stop',
+      'printf continuing',
+      { signal: controller.signal, interruptOnAbort: false }
+    )
+    await waitUntil(
+      () => service.getActiveTaskId('continuing-stop') !== undefined,
+      'command should dispatch before stop'
+    )
+    const taskId = service.getActiveTaskId('continuing-stop') as string
+    controller.abort()
+    const outcome = await Promise.allSettled([waiting])
+
+    assertEqual(outcome[0]?.status, 'rejected', 'agent wait should reject')
+    assertEqual(
+      outcome[0]?.status === 'rejected'
+        ? (outcome[0].reason as any).history_command_match_id
+        : '',
+      taskId,
+      'AbortError should identify the continuing command'
+    )
+    assertEqual(
+      service.getActiveTaskId('continuing-stop'),
+      taskId,
+      'the terminal process should remain active'
+    )
+    backend.emitData('continuing-stop', `done${WINDOWS_OSC_PRECMD}\n`)
+    await waitUntil(
+      () => service.getCommandTask('continuing-stop', taskId)?.status === 'finished',
+      'terminal tracking should still observe completion'
+    )
+  })
+
+  await runCase('stop after terminal exit never reports an aborted task as continuing', async () => {
+    const backend = new FakeCommandBackend('unix', {
+      os: 'linux',
+      platform: 'linux',
+      release: '6.8.0',
+      arch: 'x64',
+      hostname: 'remote-stop-exit-host',
+      isRemote: true,
+      shell: '/bin/bash'
+    })
+    const service = createService(backend)
+    const terminalId = 'stop-exit-race'
+    await createReadySshTerminal(service, terminalId)
+    const controller = new AbortController()
+    const waiting = service.runCommandAndWait(
+      terminalId,
+      'printf race',
+      { signal: controller.signal, interruptOnAbort: false }
+    )
+    await waitUntil(
+      () => service.getActiveTaskId(terminalId) !== undefined,
+      'the command should be active before the terminal exits'
+    )
+    const taskId = service.getActiveTaskId(terminalId) as string
+
+    backend.kill(`pty-${terminalId}`)
+    controller.abort()
+    const outcome = await Promise.allSettled([waiting])
+
+    assertEqual(outcome[0]?.status, 'rejected', 'stop should still reject the agent wait')
+    assertEqual(
+      outcome[0]?.status === 'rejected'
+        ? (outcome[0].reason as any).commandContinues
+        : true,
+      false,
+      'an exited and inactive task must not be tagged as continuing'
+    )
+    assertEqual(
+      (service as any).tasksByTerminal.get(terminalId)?.[taskId]?.status,
+      'aborted',
+      'terminal exit should retain the task only as an aborted record'
+    )
+    assertEqual(
+      service.getActiveTaskId(terminalId),
+      undefined,
+      'terminal exit should remove the task from active tracking'
+    )
+  })
+
+  await runCase('terminal exit settles a wait even when no stop signal follows', async () => {
+    const backend = new FakeCommandBackend('unix', {
+      os: 'linux',
+      platform: 'linux',
+      release: '6.8.0',
+      arch: 'x64',
+      hostname: 'remote-exit-host',
+      isRemote: true,
+      shell: '/bin/bash'
+    })
+    const service = createService(backend)
+    const terminalId = 'exit-without-stop'
+    await createReadySshTerminal(service, terminalId)
+    const waiting = service.runCommandAndWait(terminalId, 'printf exit')
+    await waitUntil(
+      () => service.getActiveTaskId(terminalId) !== undefined,
+      'the command should be active before the terminal exits'
+    )
+
+    backend.kill(`pty-${terminalId}`)
+    const result = await waiting
+
+    assertEqual(
+      result.stdoutDelta,
+      'Terminal exited before command completion.',
+      'an exited task should settle immediately with an explicit outcome'
+    )
+    assertEqual(
+      result.runtimeBoundary,
+      true,
+      'an exited task must create a runtime boundary for later mutations'
+    )
+    assertEqual(
+      service.getActiveTaskId(terminalId),
+      undefined,
+      'the exited command should not remain active'
+    )
+  })
+
+  await runCase('terminal exit settles a nowait callback with an unknown runtime boundary', async () => {
+    const backend = new FakeCommandBackend('unix', {
+      os: 'linux',
+      platform: 'linux',
+      release: '6.8.0',
+      arch: 'x64',
+      hostname: 'remote-nowait-exit-host',
+      isRemote: true,
+      shell: '/bin/bash'
+    })
+    const service = createService(backend)
+    const terminalId = 'nowait-exit-callback'
+    await createReadySshTerminal(service, terminalId)
+    const callbackResults: Array<{
+      stdoutDelta: string
+      exitCode?: number
+      history_command_match_id: string
+      runtimeBoundary?: boolean
+    }> = []
+    const taskId = await service.runCommandNoWait(
+      terminalId,
+      'printf background-exit',
+      (result) => callbackResults.push(result)
+    )
+
+    backend.kill(`pty-${terminalId}`)
+
+    assertEqual(callbackResults.length, 1, 'terminal exit should settle the nowait callback exactly once')
+    assertEqual(
+      callbackResults[0]?.history_command_match_id,
+      taskId,
+      'the exit callback should preserve the original command task id'
+    )
+    assertEqual(
+      callbackResults[0]?.runtimeBoundary,
+      true,
+      'the exit callback must report that command outcome is unknown across the runtime boundary'
+    )
+    assertEqual(
+      callbackResults[0]?.stdoutDelta,
+      'Terminal exited before command completion.',
+      'the exit callback should include an explicit non-success outcome'
+    )
+    assertEqual(
+      (service as any).tasksByTerminal.get(terminalId)?.[taskId]?.status,
+      'aborted',
+      'terminal exit should retain the nowait task as aborted rather than finished'
+    )
+    assertEqual(
+      (service as any).onTaskFinishedCallbacks.has(taskId),
+      false,
+      'the completion callback must be removed before it can fire again'
+    )
+  })
+
   await runCase('windows command waits can finish from an explicit marker even when the marker is chunked', async () => {
     const backend = new FakeCommandBackend('windows', {
       os: 'Windows',
@@ -1022,6 +2395,11 @@ const run = async (): Promise<void> => {
     const result = await service.waitForTask('win-ssh-tracking-failure', taskId)
 
     assertEqual(result.exitCode, -1, 'tracking loss should end the wait with an explicit failure code')
+    assertEqual(
+      result.runtimeBoundary,
+      true,
+      'tracking loss must create a runtime boundary because the command may still be running'
+    )
     if (!result.stdoutDelta.includes('Hidden command-tracking channel failed')) {
       throw new Error('tracking loss should surface a clear diagnostic instead of timing out silently')
     }

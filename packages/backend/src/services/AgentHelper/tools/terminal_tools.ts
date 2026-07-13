@@ -80,6 +80,8 @@ const RECONNECT_READY_POLL_MS = 500
 type RunCommandOptions = {
   shouldSkipWait?: () => boolean
   getSkipWaitReason?: () => string | undefined
+  onContinuesInBackground?: () => void
+  onRuntimeBoundary?: () => void
 }
 
 function enqueueNowaitCompletionNotification(params: {
@@ -89,6 +91,7 @@ function enqueueNowaitCompletionNotification(params: {
   command: string
   historyCommandMatchId: string
   exitCode?: number
+  runtimeBoundary?: boolean
 }): void {
   params.context.completeBackgroundExecCommand?.({
     terminalId: params.terminalId,
@@ -104,7 +107,8 @@ function enqueueNowaitCompletionNotification(params: {
       terminalName: params.terminalName,
       historyCommandMatchId: params.historyCommandMatchId,
       command: params.command,
-      exitCode: params.exitCode
+      exitCode: params.exitCode,
+      runtimeBoundary: params.runtimeBoundary
     })
   )
 }
@@ -163,8 +167,8 @@ export async function runCommand(
     isNowait: false
   })
 
+  let shouldNotifyAsyncCompletion = false
   try {
-    let shouldNotifyAsyncCompletion = false
     // Subscribe to skip wait feedback for this message
     let userSkipped = false
     if (context.waitForFeedback) {
@@ -183,6 +187,7 @@ export async function runCommand(
           userSkipped || options?.shouldSkipWait?.() === true
         if (shouldSkip) {
           shouldNotifyAsyncCompletion = true
+          options?.onContinuesInBackground?.()
         }
         return shouldSkip
       },
@@ -194,7 +199,8 @@ export async function runCommand(
           terminalName: bestMatch.title || bestMatch.id,
           command,
           historyCommandMatchId: finished.history_command_match_id,
-          exitCode: finished.exitCode
+          exitCode: finished.exitCode,
+          runtimeBoundary: finished.runtimeBoundary
         })
       }
     })
@@ -204,6 +210,7 @@ export async function runCommand(
     let finalResult = ''
     if (result.exitCode === -3 || result.stdoutDelta === 'USER_SKIPPED_WAIT') {
       shouldNotifyAsyncCompletion = true
+      options?.onContinuesInBackground?.()
       context.registerBackgroundExecCommand?.({
         terminalId: bestMatch.id,
         terminalName: bestMatch.title || bestMatch.id,
@@ -227,8 +234,15 @@ export async function runCommand(
         isNowait: true // Force UI to switch to Async style
       })
       return finalResult
+    } else if (result.runtimeBoundary) {
+      options?.onRuntimeBoundary?.()
+      finalResult = `The command did not reach a definitive tracked completion. It may still be running, or the terminal runtime may have exited; the command outcome is unknown and must not be treated as successful or replayed automatically. The following output was retained (history_command_match_id=${historyCommandMatchId}):
+<terminal_content>
+${truncatedOutput}
+</terminal_content>`
     } else if (result.exitCode === -1 && result.stdoutDelta?.includes('timed out')) {
       shouldNotifyAsyncCompletion = true
+      options?.onContinuesInBackground?.()
       context.registerBackgroundExecCommand?.({
         terminalId: bestMatch.id,
         terminalName: bestMatch.title || bestMatch.id,
@@ -255,6 +269,41 @@ ${truncatedOutput}
     return finalResult
   } catch (error) {
     if (isAbortError(error)) {
+      const continuingCommandId =
+        error &&
+        typeof error === 'object' &&
+        (error as any).commandContinues === true
+          ? String((error as any).history_command_match_id || '')
+          : ''
+      if (continuingCommandId) {
+        const task = terminalService.getCommandTask(
+          bestMatch.id,
+          continuingCommandId
+        )
+        const isStillRunning =
+          task?.status === 'running' &&
+          terminalService.getActiveTaskId(bestMatch.id) ===
+            continuingCommandId
+        if (isStillRunning) {
+          shouldNotifyAsyncCompletion = true
+          context.registerBackgroundExecCommand?.({
+            terminalId: bestMatch.id,
+            terminalName: bestMatch.title || bestMatch.id,
+            historyCommandMatchId: continuingCommandId,
+            command
+          })
+        } else if (task?.status === 'finished') {
+          enqueueNowaitCompletionNotification({
+            context,
+            terminalId: bestMatch.id,
+            terminalName: bestMatch.title || bestMatch.id,
+            command,
+            historyCommandMatchId: continuingCommandId,
+            exitCode: task.exitCode,
+            runtimeBoundary: task.runtimeBoundary
+          })
+        }
+      }
       throw error
     }
     let errorMessage = error instanceof Error ? error.message : String(error)
@@ -343,9 +392,11 @@ export async function runCommandNowait(args: z.infer<typeof execCommandSchema>, 
           terminalName: bestMatch.title || bestMatch.id,
           command,
           historyCommandMatchId: finished.history_command_match_id,
-          exitCode: finished.exitCode
+          exitCode: finished.exitCode,
+          runtimeBoundary: finished.runtimeBoundary
         })
-      }
+      },
+      context.signal
     )
     context.registerBackgroundExecCommand?.({
       terminalId: bestMatch.id,
@@ -355,6 +406,9 @@ export async function runCommandNowait(args: z.infer<typeof execCommandSchema>, 
     })
     return `Command started in background. Use read_command_output to view output and check status (finished or running). history_command_match_id=${historyCommandMatchId}, terminalId=${bestMatch.id}.`
   } catch (error) {
+    if (isAbortError(error)) {
+      throw error
+    }
     let errorMessage = error instanceof Error ? error.message : String(error)
 
     // If it's a "command running" error, append the last terminal output
@@ -559,14 +613,10 @@ export async function writeStdin(args: z.infer<typeof writeStdinSchema>, context
     }
   }
 
-  for (const ch of resolvedSequence) {
-    abortIfNeeded(context.signal)
-    terminalService.write(bestMatch.id, ch)
-    // Add 0.1s interval between characters if it's a list
-    if (resolvedSequence.length > 1) {
-      await waitWithSignal(100, context.signal)
-    }
-  }
+  await terminalService.writeInputSequence(bestMatch.id, resolvedSequence, {
+    intervalMs: resolvedSequence.length > 1 ? 100 : 0,
+    signal: context.signal
+  })
 
   await waitWithSignal(1000, context.signal)
   abortIfNeeded(context.signal)

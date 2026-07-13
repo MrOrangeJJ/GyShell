@@ -315,15 +315,18 @@ export async function runReadFile(
     level = 'warning'
     return { resultText }
   } finally {
-    // Always emit an event so the frontend can display the sub tool banner,
-    // including failure cases (as warning).
-    sendEvent(sessionId, {
-      messageId,
-      type: 'file_read',
-      level,
-      filePath,
-      input: JSON.stringify(args || {}),
-      output: resultText
-    })
+    // A LangGraph run may already have returned from stop while an adapter
+    // that ignored AbortSignal is still unwinding. Never publish that stale
+    // result into the next visible run.
+    if (!signal?.aborted) {
+      sendEvent(sessionId, {
+        messageId,
+        type: 'file_read',
+        level,
+        filePath,
+        input: JSON.stringify(args || {}),
+        output: resultText
+      })
+    }
   }
 }

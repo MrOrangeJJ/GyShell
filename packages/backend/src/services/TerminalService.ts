@@ -130,6 +130,78 @@ interface TerminalResizeTarget {
   rows: number
 }
 
+interface CommandStartReservation {
+  token: symbol
+  command: string
+  waitForRelease: Promise<void>
+  releaseWaiters: () => void
+}
+
+interface PromptFileIoLease {
+  waitForTurn: Promise<void>
+  release: () => void
+}
+
+interface TerminalInputSequenceOptions {
+  intervalMs?: number
+  signal?: AbortSignal
+}
+
+const createTerminalAbortError = (): Error => {
+  const error = new Error('AbortError')
+  error.name = 'AbortError'
+  return error
+}
+
+const throwIfTerminalOperationAborted = (signal?: AbortSignal): void => {
+  if (signal?.aborted) throw createTerminalAbortError()
+}
+
+const waitForPromiseOrAbort = <T>(
+  promise: Promise<T>,
+  signal?: AbortSignal
+): Promise<T> => {
+  if (!signal) return promise
+  throwIfTerminalOperationAborted(signal)
+  return new Promise((resolve, reject) => {
+    let settled = false
+    const finish = (callback: () => void): void => {
+      if (settled) return
+      settled = true
+      signal.removeEventListener('abort', onAbort)
+      callback()
+    }
+    const onAbort = (): void => finish(() => reject(createTerminalAbortError()))
+    signal.addEventListener('abort', onAbort, { once: true })
+    promise.then(
+      (value) => finish(() => resolve(value)),
+      (error) => finish(() => reject(error))
+    )
+  })
+}
+
+const waitForTerminalDelay = (
+  ms: number,
+  signal?: AbortSignal
+): Promise<void> => {
+  throwIfTerminalOperationAborted(signal)
+  return new Promise((resolve, reject) => {
+    const cleanup = (): void => {
+      clearTimeout(timer)
+      signal?.removeEventListener('abort', onAbort)
+    }
+    const timer = setTimeout(() => {
+      cleanup()
+      resolve()
+    }, ms)
+    const onAbort = (): void => {
+      cleanup()
+      reject(createTerminalAbortError())
+    }
+    signal?.addEventListener('abort', onAbort, { once: true })
+  })
+}
+
 export interface RestoreTerminalResult {
   restored: string[]
   failed: Array<{ id: string; reason: string }>
@@ -195,6 +267,11 @@ export class TerminalService {
   private selectionByTerminal: Map<string, string> = new Map()
   private tasksByTerminal: Map<string, Record<string, CommandTask>> = new Map()
   private activeTaskByTerminal: Map<string, string> = new Map()
+  private commandStartReservationByTerminal: Map<string, CommandStartReservation> = new Map()
+  private deferredWritesDuringCommandStartByTerminal: Map<string, string[]> = new Map()
+  private promptFileIoTailByTerminal: Map<string, Promise<void>> = new Map()
+  private promptFileIoReleaseByCommandStartToken: Map<symbol, () => void> = new Map()
+  private terminalInputSequenceTailByTerminal: Map<string, Promise<void>> = new Map()
   private oscParseBufByTerminal: Map<string, string> = new Map()
   private headlessWriteSeqByTerminal: Map<string, number> = new Map()
   private headlessFlushedSeqByTerminal: Map<string, number> = new Map()
@@ -479,15 +556,29 @@ export class TerminalService {
     ptyId: string
   ): void {
     this.nextBackendRuntimeGeneration += 1
+    const runtimeGeneration = this.nextBackendRuntimeGeneration
     this.backendRuntimeGenerationByTerminal.set(
       terminalId,
-      this.nextBackendRuntimeGeneration
+      runtimeGeneration
     )
     const backend = this.getBackend(terminalType)
+    let runtimeExited = false
+    const isCurrentRuntime = (): boolean => {
+      const terminal = this.terminals.get(terminalId)
+      return (
+        !runtimeExited &&
+        terminal?.ptyId === ptyId &&
+        this.backendRuntimeGenerationByTerminal.get(terminalId) ===
+          runtimeGeneration
+      )
+    }
     backend.onData(ptyId, (data: string) => {
+      if (!isCurrentRuntime()) return
       this.handleData(terminalId, data)
     })
     backend.onExit(ptyId, (code: number) => {
+      if (!isCurrentRuntime()) return
+      runtimeExited = true
       this.handleExit(terminalId, code)
     })
   }
@@ -1137,23 +1228,68 @@ export class TerminalService {
     this.finishActiveTask(terminalId, pending.exitCode)
   }
 
+  private disposeTaskStartMarker(taskId: string): void {
+    const marker = this.startMarkerByTaskId.get(taskId)
+    this.startMarkerByTaskId.delete(taskId)
+    if (marker && typeof marker.dispose === 'function') {
+      try {
+        marker.dispose()
+      } catch {
+        // Marker disposal is best-effort and must not hide the command outcome.
+      }
+    }
+  }
+
   private handleExit(terminalId: string, code: number): void {
+    // A command still preparing against this runtime must not block a
+    // replacement runtime that reuses the same terminal id. Its generation
+    // check will prevent any late dispatch.
+    this.cancelCommandStartReservation(terminalId)
     const tab = this.terminals.get(terminalId)
     
-    // Mark active task as aborted if terminal exits unexpectedly
+    // Mark active task as aborted if terminal exits unexpectedly. A nowait
+    // caller relies on its completion callback to retire the background
+    // record, so terminal exit must settle that callback exactly once with an
+    // explicit runtime boundary instead of silently deleting it.
     const activeTaskId = this.activeTaskByTerminal.get(terminalId)
     if (activeTaskId) {
       const task = this.getTaskMap(terminalId)[activeTaskId]
-      if (task && task.status === 'running') {
+      const callback = this.onTaskFinishedCallbacks.get(activeTaskId)
+      this.onTaskFinishedCallbacks.delete(activeTaskId)
+      let exitResult: CommandResult | null = null
+      if (task && (task.status === 'running' || task.status === 'timeout')) {
+        const retainedOutput = this.resolveFinalTaskOutput(terminalId, task, tab)
+        task.output = retainedOutput || 'Terminal exited before command completion.'
         task.status = 'aborted'
         task.endTime = Date.now()
         task.exitCode = typeof code === 'number' ? code : -1
+        task.runtimeBoundary = true
+        task.endOffset = task.startOffset + task.output.length
+        if (!task.suppressFinishCallback) {
+          exitResult = {
+            stdoutDelta: task.output,
+            exitCode: task.exitCode,
+            history_command_match_id: activeTaskId,
+            runtimeBoundary: true
+          }
+        }
       }
       this.stopCommandTrackingWatcher(activeTaskId)
       this.activeTaskByTerminal.delete(terminalId)
-      this.onTaskFinishedCallbacks.delete(activeTaskId)
-      this.startMarkerByTaskId.delete(activeTaskId)
+      this.disposeTaskStartMarker(activeTaskId)
+      if (callback && exitResult) {
+        try {
+          callback(exitResult)
+        } catch (error) {
+          // Runtime cleanup must continue even if a consumer callback fails.
+          console.warn(
+            `[TerminalService] Command completion callback failed during terminal exit for ${terminalId}.`,
+            error
+          )
+        }
+      }
     }
+    this.terminalInputSequenceTailByTerminal.delete(terminalId)
     this.pendingTaskFinishByTerminal.delete(terminalId)
     this.pendingResizeByTerminal.delete(terminalId)
     this.headlessWriteSeqByTerminal.delete(terminalId)
@@ -1162,7 +1298,11 @@ export class TerminalService {
     // UI lifecycle is user-driven. Do not auto-remove tab metadata on backend exit.
     // We only update runtime state and keep captured output until user closes the tab.
     if (tab) {
-      if (tab.type === 'local' && !this.terminalIdsBeingKilled.has(terminalId)) {
+      if (
+        tab.type === 'local' &&
+        tab.runtimeState !== 'exited' &&
+        !this.terminalIdsBeingKilled.has(terminalId)
+      ) {
         void this.restartLocalTerminalAfterExit(terminalId, code)
         return
       }
@@ -1202,21 +1342,182 @@ export class TerminalService {
     return terminal.runtimeState === 'ready'
   }
 
+  private queueWriteAfterPromptFileIo(
+    terminalId: string,
+    terminal: TerminalTab,
+    data: string,
+    options?: {
+      signal?: AbortSignal
+      rejectOnRuntimeChange?: boolean
+    }
+  ): Promise<void> | undefined {
+    if (!this.promptFileIoTailByTerminal.has(terminalId)) {
+      return undefined
+    }
+
+    const runtimePtyId = terminal.ptyId
+    const runtimeGeneration =
+      this.backendRuntimeGenerationByTerminal.get(terminalId)
+    const promptFileIo = this.reservePromptFileIo(terminalId)
+    return (async () => {
+      try {
+        await waitForPromiseOrAbort(promptFileIo.waitForTurn, options?.signal)
+        throwIfTerminalOperationAborted(options?.signal)
+        const currentTerminal = this.terminals.get(terminalId)
+        if (
+          currentTerminal !== terminal ||
+          currentTerminal.ptyId !== runtimePtyId ||
+          !this.canWriteToTerminal(currentTerminal) ||
+          this.backendRuntimeGenerationByTerminal.get(terminalId) !==
+            runtimeGeneration
+        ) {
+          if (options?.rejectOnRuntimeChange) {
+            throw new Error(
+              `Terminal ${terminalId} changed while input was waiting for prompt-file io.`
+            )
+          }
+          return
+        }
+        const backend = this.getBackend(currentTerminal.type)
+        backend.write(runtimePtyId, data)
+      } finally {
+        promptFileIo.release()
+      }
+    })()
+  }
+
   write(terminalId: string, data: string): void {
+    if (this.commandStartReservationByTerminal.has(terminalId)) {
+      const deferred =
+        this.deferredWritesDuringCommandStartByTerminal.get(terminalId) || []
+      deferred.push(data)
+      this.deferredWritesDuringCommandStartByTerminal.set(terminalId, deferred)
+      return
+    }
     const terminal = this.terminals.get(terminalId)
     if (terminal && this.canWriteToTerminal(terminal)) {
+      const queuedWrite = this.queueWriteAfterPromptFileIo(
+        terminalId,
+        terminal,
+        data
+      )
+      if (queuedWrite) {
+        void queuedWrite.catch((error) => {
+          console.warn(
+            `[TerminalService] Failed to write input after prompt-file io settled for ${terminalId}.`,
+            error
+          )
+        })
+        return
+      }
       const backend = this.getBackend(terminal.type)
       backend.write(terminal.ptyId, data)
+    }
+  }
+
+  async writeInputSequence(
+    terminalId: string,
+    sequence: readonly string[],
+    options?: TerminalInputSequenceOptions
+  ): Promise<void> {
+    if (sequence.length === 0) {
+      throwIfTerminalOperationAborted(options?.signal)
+      return
+    }
+
+    // Bind queued input to the runtime that accepted it. A predecessor may
+    // outlive an exit/reconnect, and stale input must never spill into the
+    // replacement shell when that predecessor releases the queue.
+    const terminal = this.terminals.get(terminalId)
+    if (!terminal || !this.canWriteToTerminal(terminal)) {
+      throw new Error(`Terminal ${terminalId} is not available for input.`)
+    }
+    const runtimePtyId = terminal.ptyId
+    const runtimeGeneration =
+      this.backendRuntimeGenerationByTerminal.get(terminalId)
+
+    const predecessor =
+      this.terminalInputSequenceTailByTerminal.get(terminalId) ??
+      Promise.resolve()
+    let releaseTurn: () => void = () => {}
+    const turn = new Promise<void>((resolve) => {
+      releaseTurn = resolve
+    })
+    const queuedTail = predecessor.then(() => turn)
+    this.terminalInputSequenceTailByTerminal.set(terminalId, queuedTail)
+
+    try {
+      await waitForPromiseOrAbort(predecessor, options?.signal)
+      const requestedIntervalMs = options?.intervalMs ?? 0
+      const intervalMs =
+        Number.isFinite(requestedIntervalMs) && requestedIntervalMs > 0
+          ? Math.floor(requestedIntervalMs)
+          : 0
+
+      for (let index = 0; index < sequence.length; index += 1) {
+        while (true) {
+          throwIfTerminalOperationAborted(options?.signal)
+          const currentTerminal = this.terminals.get(terminalId)
+          if (
+            currentTerminal !== terminal ||
+            currentTerminal?.ptyId !== runtimePtyId ||
+            !this.canWriteToTerminal(terminal) ||
+            this.backendRuntimeGenerationByTerminal.get(terminalId) !==
+              runtimeGeneration
+          ) {
+            throw new Error(
+              `Terminal ${terminalId} changed while the input sequence was being written.`
+            )
+          }
+          const commandStartReservation =
+            this.commandStartReservationByTerminal.get(terminalId)
+          if (commandStartReservation) {
+            await waitForPromiseOrAbort(
+              commandStartReservation.waitForRelease,
+              options?.signal
+            )
+            continue
+          }
+          const queuedWrite = this.queueWriteAfterPromptFileIo(
+            terminalId,
+            currentTerminal,
+            sequence[index],
+            {
+              signal: options?.signal,
+              rejectOnRuntimeChange: true
+            }
+          )
+          if (queuedWrite) {
+            await queuedWrite
+          } else {
+            const backend = this.getBackend(currentTerminal.type)
+            backend.write(runtimePtyId, sequence[index])
+          }
+          break
+        }
+        if (index < sequence.length - 1 && intervalMs > 0) {
+          await waitForTerminalDelay(intervalMs, options?.signal)
+        }
+      }
+    } finally {
+      releaseTurn()
+      void queuedTail.then(() => {
+        if (
+          this.terminalInputSequenceTailByTerminal.get(terminalId) ===
+          queuedTail
+        ) {
+          this.terminalInputSequenceTailByTerminal.delete(terminalId)
+        }
+      })
     }
   }
 
   writePaths(terminalId: string, paths: string[]): void {
     const terminal = this.terminals.get(terminalId)
     if (!terminal || paths.length === 0) return
-    const backend = this.getBackend(terminal.type)
     const text = escapeShellPathList(paths)
     if (!text) return
-    backend.write(terminal.ptyId, text)
+    this.write(terminalId, text)
   }
 
   resize(terminalId: string, cols: number, rows: number): void {
@@ -1293,23 +1594,34 @@ export class TerminalService {
       this.backendRuntimeGenerationByTerminal.delete(terminalId)
       if (activeTaskId) {
         if (activeTask && activeTask.status !== 'finished') {
-          activeTask.output = activeTask.output || 'Terminal tab was closed.'
+          const terminalClosedMessage = 'Terminal tab was closed.'
+          const retainedOutput = (activeTask.output || '').trimEnd()
+          activeTask.output =
+            !retainedOutput ||
+            retainedOutput === 'Terminal exited before command completion.'
+              ? terminalClosedMessage
+              : retainedOutput.includes(terminalClosedMessage)
+                ? retainedOutput
+                : `${retainedOutput}\n\n${terminalClosedMessage}`
           activeTask.status = 'aborted'
           activeTask.endTime = Date.now()
           activeTask.exitCode = -2
+          activeTask.runtimeBoundary = true
           activeTask.endOffset =
             activeTask.startOffset + (activeTask.output?.length || 0)
         }
         this.stopCommandTrackingWatcher(activeTaskId)
-        this.startMarkerByTaskId.delete(activeTaskId)
-        this.activeTaskByTerminal.delete(terminalId)
-        this.pendingTaskFinishByTerminal.delete(terminalId)
+        this.disposeTaskStartMarker(activeTaskId)
       }
+      this.activeTaskByTerminal.delete(terminalId)
+      this.cancelCommandStartReservation(terminalId)
+      this.terminalInputSequenceTailByTerminal.delete(terminalId)
       const activeTaskCloseResult: CommandResult | undefined = activeTaskId
         ? {
             stdoutDelta: activeTask?.output || 'Terminal tab was closed.',
             exitCode: -2,
-            history_command_match_id: activeTaskId
+            history_command_match_id: activeTaskId,
+            runtimeBoundary: true
           }
         : undefined
       this.tasksByTerminal.delete(terminalId)
@@ -1953,8 +2265,19 @@ export class TerminalService {
     return { found: matches }
   }
 
-  async runCommandNoWait(terminalId: string, command: string, onFinished?: (result: CommandResult) => void): Promise<string> {
-    const taskId = await this.executeCommandInternal(terminalId, command, 'nowait', onFinished)
+  async runCommandNoWait(
+    terminalId: string,
+    command: string,
+    onFinished?: (result: CommandResult) => void,
+    signal?: AbortSignal
+  ): Promise<string> {
+    const taskId = await this.executeCommandInternal(
+      terminalId,
+      command,
+      'nowait',
+      onFinished,
+      signal
+    )
     return taskId
   }
 
@@ -2128,7 +2451,13 @@ export class TerminalService {
       suppressFinishCallback?: boolean;
     }
   ): Promise<CommandResult> {
-    const taskId = await this.executeCommandInternal(terminalId, command, 'wait', opts?.onFinished)
+    const taskId = await this.executeCommandInternal(
+      terminalId,
+      command,
+      'wait',
+      opts?.onFinished,
+      opts?.signal
+    )
     return this.waitForTask(terminalId, taskId, opts)
   }
 
@@ -2165,27 +2494,42 @@ export class TerminalService {
         return {
           stdoutDelta: task.output || '',
           exitCode: task.exitCode ?? -1,
-          history_command_match_id: taskId
+          history_command_match_id: taskId,
+          ...(task.runtimeBoundary ? { runtimeBoundary: true } : {})
         }
       }
-      if (task.status === 'aborted') {
-        return {
-          stdoutDelta: task.output || 'Command aborted because the terminal session ended.',
-          exitCode: task.exitCode ?? -2,
-          history_command_match_id: taskId
-        }
-      }
-
       if (opts?.signal?.aborted) {
         if (opts.interruptOnAbort !== false) {
-          this.interrupt(terminalId)
-          this.markTaskAborted(terminalId, taskId)
+          if (
+            task.status === 'running' &&
+            this.activeTaskByTerminal.get(terminalId) === taskId
+          ) {
+            this.interrupt(terminalId)
+            this.markTaskAborted(terminalId, taskId)
+          }
         } else {
           clearSuppressionIfStillRunning()
+          const abortError = createTerminalAbortError() as Error & {
+            history_command_match_id?: string
+            commandContinues?: boolean
+          }
+          abortError.history_command_match_id = taskId
+          abortError.commandContinues =
+            task?.status === 'running' &&
+            this.activeTaskByTerminal.get(terminalId) === taskId
+          throw abortError
         }
         return { stdoutDelta: 'Command aborted by user.', exitCode: -2, history_command_match_id: taskId }
       }
 
+      if (task.status === 'aborted') {
+        return {
+          stdoutDelta: task.output || 'Command aborted because the terminal session ended.',
+          exitCode: task.exitCode ?? (task.runtimeBoundary ? -1 : -2),
+          history_command_match_id: taskId,
+          ...(task.runtimeBoundary ? { runtimeBoundary: true } : {})
+        }
+      }
       // Check if user manually skipped the wait after honoring a just-finished task.
       if (opts?.shouldSkip?.()) {
         clearSuppressionIfStillRunning()
@@ -2213,8 +2557,10 @@ export class TerminalService {
     terminalId: string,
     command: string,
     type: 'wait' | 'nowait',
-    onFinished?: (result: CommandResult) => void
+    onFinished?: (result: CommandResult) => void,
+    signal?: AbortSignal
   ): Promise<string> {
+    throwIfTerminalOperationAborted(signal)
     const terminal = this.terminals.get(terminalId)
     if (!terminal) {
       throw new Error(`Terminal ${terminalId} not found`)
@@ -2223,21 +2569,272 @@ export class TerminalService {
       throw new Error(`Terminal ${terminal.title || terminal.id} is not ready (state=${terminal.runtimeState || 'unknown'}).`)
     }
 
-    if (this.activeTaskByTerminal.has(terminalId)) {
-      const activeTaskId = this.activeTaskByTerminal.get(terminalId)!
-      const activeTask = this.getTaskMap(terminalId)[activeTaskId]
-      const commandName = activeTask ? activeTask.command : 'unknown'
+    const reservationToken = this.reserveCommandStart(terminalId, command)
+    try {
+      return await this.executeReservedCommand(
+        terminal,
+        command,
+        type,
+        onFinished,
+        signal,
+        reservationToken
+      )
+    } finally {
+      const releasePromptFileIo =
+        this.promptFileIoReleaseByCommandStartToken.get(reservationToken)
+      this.promptFileIoReleaseByCommandStartToken.delete(reservationToken)
+      releasePromptFileIo?.()
+      this.releaseCommandStart(terminalId, reservationToken)
+    }
+  }
+
+  private reservePromptFileIo(
+    terminalId: string,
+    reservationToken?: symbol
+  ): PromptFileIoLease {
+    const predecessor =
+      this.promptFileIoTailByTerminal.get(terminalId) ?? Promise.resolve()
+    let releaseTurn: () => void = () => {}
+    const turn = new Promise<void>((resolve) => {
+      releaseTurn = resolve
+    })
+    const queuedTail = predecessor.then(() => turn)
+    this.promptFileIoTailByTerminal.set(terminalId, queuedTail)
+
+    let released = false
+    const release = (): void => {
+      if (released) return
+      released = true
+      releaseTurn()
+      void queuedTail.then(() => {
+        if (this.promptFileIoTailByTerminal.get(terminalId) === queuedTail) {
+          this.promptFileIoTailByTerminal.delete(terminalId)
+        }
+      })
+    }
+    if (reservationToken) {
+      this.promptFileIoReleaseByCommandStartToken.set(
+        reservationToken,
+        release
+      )
+    }
+    return { waitForTurn: predecessor, release }
+  }
+
+  private reserveCommandStart(terminalId: string, command: string): symbol {
+    const activeTaskId = this.activeTaskByTerminal.get(terminalId)
+    const pendingStart = this.commandStartReservationByTerminal.get(terminalId)
+    if (activeTaskId || pendingStart) {
+      const activeTask = activeTaskId
+        ? this.getTaskMap(terminalId)[activeTaskId]
+        : undefined
+      const commandName =
+        activeTask?.command ?? pendingStart?.command ?? 'unknown'
       throw new Error(
         `There is a running exec_command in the terminal tab: "${commandName}". If you need to end the previous command, use write_stdin to end it, otherwise wait until it finishes.`
       )
     }
 
+    const token = Symbol(terminalId)
+    let releaseWaiters: () => void = () => {}
+    const waitForRelease = new Promise<void>((resolve) => {
+      releaseWaiters = resolve
+    })
+    this.commandStartReservationByTerminal.set(terminalId, {
+      token,
+      command,
+      waitForRelease,
+      releaseWaiters
+    })
+    return token
+  }
+
+  private cancelCommandStartReservation(terminalId: string): void {
+    const reservation =
+      this.commandStartReservationByTerminal.get(terminalId)
+    this.commandStartReservationByTerminal.delete(terminalId)
+    this.deferredWritesDuringCommandStartByTerminal.delete(terminalId)
+    reservation?.releaseWaiters()
+  }
+
+  private releaseCommandStart(terminalId: string, token: symbol): void {
+    const reservation =
+      this.commandStartReservationByTerminal.get(terminalId)
+    if (reservation?.token !== token) return
+
+    this.commandStartReservationByTerminal.delete(terminalId)
+    const deferred =
+      this.deferredWritesDuringCommandStartByTerminal.get(terminalId) || []
+    this.deferredWritesDuringCommandStartByTerminal.delete(terminalId)
+    try {
+      const terminal = this.terminals.get(terminalId)
+      if (terminal && this.canWriteToTerminal(terminal)) {
+        for (const data of deferred) {
+          try {
+            this.write(terminalId, data)
+          } catch (error) {
+            // The command is already dispatched and tracked. A failed manual
+            // input replay must not replace its task id with an exception.
+            console.warn(
+              `[TerminalService] Failed to replay input deferred during command startup for ${terminalId}.`,
+              error
+            )
+          }
+        }
+      }
+    } finally {
+      reservation.releaseWaiters()
+    }
+  }
+
+  private async executeReservedCommand(
+    terminal: TerminalTab,
+    command: string,
+    type: 'wait' | 'nowait',
+    onFinished: ((result: CommandResult) => void) | undefined,
+    signal: AbortSignal | undefined,
+    reservationToken: symbol
+  ): Promise<string> {
+    const terminalId = terminal.id
+    const runtimePtyId = terminal.ptyId
+    const runtimeGeneration =
+      this.backendRuntimeGenerationByTerminal.get(terminalId)
+    const runtimeIsCurrent = (): boolean =>
+      this.terminals.get(terminalId) === terminal &&
+      terminal.ptyId === runtimePtyId &&
+      terminal.runtimeState === 'ready' &&
+      this.backendRuntimeGenerationByTerminal.get(terminalId) ===
+        runtimeGeneration
+
     const taskId = uuidv4()
     const startOffset = this.getCurrentOffset(terminalId)
-    const headless = this.headlessPtys.get(terminalId)
+    // Preparation can mutate shared prompt-marker state and is not
+    // cancellable. Keep the start reservation until it settles, then honor
+    // stop before any dispatch.
     const completionTracking = await this.prepareCommandTracking(terminal)
+    throwIfTerminalOperationAborted(signal)
     const wireCommand = this.buildDispatchedCommand(terminal, command, taskId)
 
+    const backend = this.getBackend(terminal.type)
+    const eol = terminal.remoteOs === 'windows' ? '\r' : '\n'
+    let usedPromptFileDispatch = false
+    let promptRequestPending = false
+    let promptRequestCleanup: (() => Promise<boolean>) | undefined
+    const clearPendingPromptRequest = async (): Promise<boolean> => {
+      if (!promptRequestPending || !promptRequestCleanup) {
+        return true
+      }
+      const cleared = await promptRequestCleanup()
+      // A failed cleanup quarantines the runtime, so either outcome makes it
+      // safe to release the command-start reservation.
+      promptRequestPending = false
+      return cleared
+    }
+    const usesPromptFileDispatch = Boolean(
+      completionTracking?.dispatchMode === 'prompt-file' &&
+      completionTracking.commandRequestPath &&
+      isTerminalFileSystemBackend(backend)
+    )
+    if (
+      usesPromptFileDispatch ||
+      this.promptFileIoTailByTerminal.has(terminalId)
+    ) {
+      const promptFileIo = this.reservePromptFileIo(
+        terminalId,
+        reservationToken
+      )
+      // Request-file writes are not cancellable and SSH reconnects may reuse
+      // both the pty id and request path. Keep later generations behind this
+      // fence until the previous write/cleanup has fully settled.
+      await promptFileIo.waitForTurn
+      throwIfTerminalOperationAborted(signal)
+      if (!runtimeIsCurrent()) {
+        throw new Error(
+          `Terminal ${terminalId} changed before the prompt-file command could be prepared.`
+        )
+      }
+    }
+    if (
+      usesPromptFileDispatch &&
+      completionTracking?.commandRequestPath &&
+      isTerminalFileSystemBackend(backend)
+    ) {
+      promptRequestCleanup = async (): Promise<boolean> => {
+        try {
+          await backend.writeFile(
+            runtimePtyId,
+            completionTracking.commandRequestPath!,
+            ''
+          )
+          return true
+        } catch (cleanupError) {
+          // A stale request file is unsafe. Quarantine the tab before trying
+          // to close its runtime so even a throwing/no-op kill cannot release
+          // deferred or future input into the abandoned prompt hook.
+          const currentTerminal = this.terminals.get(terminalId)
+          if (currentTerminal) {
+            this.deferredWritesDuringCommandStartByTerminal.delete(terminalId)
+            currentTerminal.isInitializing = false
+            currentTerminal.runtimeState = 'exited'
+            currentTerminal.lastExitCode = -1
+            this.terminalIdsBeingKilled.add(terminalId)
+            try {
+              this.getBackend(currentTerminal.type).kill(currentTerminal.ptyId)
+            } catch {
+              // The quarantined runtime remains non-writable even when the
+              // backend cannot confirm termination.
+            } finally {
+              this.terminalIdsBeingKilled.delete(terminalId)
+            }
+            this.publishTerminalTabsChanged()
+            this.schedulePersistTerminalState()
+          }
+          console.warn(
+            `[TerminalService] Failed to clear a pending prompt-file command for ${terminalId}; quarantined the current terminal runtime.`,
+            cleanupError
+          )
+          return false
+        }
+      }
+      const requestPayload = Buffer.from(command, 'utf8').toString('base64')
+      let promptWriteSucceeded = false
+      promptRequestPending = true
+      try {
+        // The backend file write is not cancellable. Await it while retaining
+        // the per-terminal start reservation; otherwise a late write can leave
+        // a command that the next PowerShell prompt executes unexpectedly.
+        await backend.writeFile(
+          runtimePtyId,
+          completionTracking.commandRequestPath,
+          requestPayload
+        )
+        promptWriteSucceeded = true
+      } catch (writeError) {
+        const cleared = await clearPendingPromptRequest()
+        if (signal?.aborted) {
+          throwIfTerminalOperationAborted(signal)
+        }
+        if (!cleared) {
+          throw writeError
+        }
+        usedPromptFileDispatch = false
+      }
+      if (signal?.aborted) {
+        await clearPendingPromptRequest()
+        throwIfTerminalOperationAborted(signal)
+      }
+      usedPromptFileDispatch = promptWriteSucceeded
+    }
+
+    throwIfTerminalOperationAborted(signal)
+    if (!runtimeIsCurrent()) {
+      await clearPendingPromptRequest()
+      throw new Error(
+        `Terminal ${terminalId} changed before the command could be dispatched.`
+      )
+    }
+
+    const headless = this.headlessPtys.get(terminalId)
     const task: CommandTask = {
       id: taskId,
       command,
@@ -2249,46 +2846,36 @@ export class TerminalService {
       startTime: Date.now(),
       output: '',
       // Scheme 1: Record start line in headless buffer
-      startAbsLine: headless ? headless.buffer.active.baseY + headless.buffer.active.cursorY : undefined
+      startAbsLine: headless
+        ? headless.buffer.active.baseY + headless.buffer.active.cursorY
+        : undefined
     }
-
     const taskMap = this.getTaskMap(terminalId)
     taskMap[taskId] = task
     if (headless && typeof (headless as any).registerMarker === 'function') {
       const marker = (headless as any).registerMarker(0)
-      if (marker) {
-        this.startMarkerByTaskId.set(taskId, marker)
-      }
+      if (marker) this.startMarkerByTaskId.set(taskId, marker)
     }
     this.activeTaskByTerminal.set(terminalId, taskId)
-    if (onFinished) {
-      this.onTaskFinishedCallbacks.set(taskId, onFinished)
-    }
+    if (onFinished) this.onTaskFinishedCallbacks.set(taskId, onFinished)
 
-    const backend = this.getBackend(terminal.type)
-    const eol = terminal.remoteOs === 'windows' ? '\r' : '\n'
-    let usedPromptFileDispatch = false
-    if (
-      completionTracking?.dispatchMode === 'prompt-file' &&
-      completionTracking.commandRequestPath &&
-      isTerminalFileSystemBackend(backend)
-    ) {
-      try {
-        const requestPayload = Buffer.from(command, 'utf8').toString('base64')
-        await backend.writeFile(
-          terminal.ptyId,
-          completionTracking.commandRequestPath,
-          requestPayload
-        )
-        backend.write(terminal.ptyId, eol)
-        usedPromptFileDispatch = true
-      } catch {
-        usedPromptFileDispatch = false
+    try {
+      backend.write(
+        runtimePtyId,
+        usedPromptFileDispatch ? eol : `${wireCommand}${eol}`
+      )
+    } catch (error) {
+      delete taskMap[taskId]
+      if (this.activeTaskByTerminal.get(terminalId) === taskId) {
+        this.activeTaskByTerminal.delete(terminalId)
       }
+      this.onTaskFinishedCallbacks.delete(taskId)
+      this.disposeTaskStartMarker(taskId)
+      await clearPendingPromptRequest()
+      throw error
     }
-    if (!usedPromptFileDispatch) {
-      backend.write(terminal.ptyId, `${wireCommand}${eol}`)
-    }
+    promptRequestPending = false
+
     if (usedPromptFileDispatch && completionTracking?.displayMode === 'synthetic-transcript') {
       task.displayMode = 'synthetic-transcript'
       this.appendSyntheticDisplayData(
@@ -2355,7 +2942,11 @@ export class TerminalService {
 
   private finalizeActiveTask(
     terminalId: string,
-    options?: { exitCode?: number; outputOverride?: string }
+    options?: {
+      exitCode?: number
+      outputOverride?: string
+      runtimeBoundary?: boolean
+    }
   ): void {
     const taskId = this.activeTaskByTerminal.get(terminalId)
     if (!taskId) return
@@ -2371,6 +2962,7 @@ export class TerminalService {
     task.status = 'finished'
     task.endTime = Date.now()
     task.exitCode = options?.exitCode
+    task.runtimeBoundary = options?.runtimeBoundary === true
     task.endOffset = task.startOffset + task.output.length
 
     this.stopCommandTrackingWatcher(taskId)
@@ -2388,7 +2980,8 @@ export class TerminalService {
       callback({
         stdoutDelta: task.output,
         exitCode: options?.exitCode,
-        history_command_match_id: taskId
+        history_command_match_id: taskId,
+        ...(task.runtimeBoundary ? { runtimeBoundary: true } : {})
       })
     }
   }
@@ -2413,7 +3006,8 @@ export class TerminalService {
       : COMMAND_TRACKING_FAILURE_MESSAGE
     this.finalizeActiveTask(terminalId, {
       exitCode: -1,
-      outputOverride
+      outputOverride,
+      runtimeBoundary: true
     })
   }
 
@@ -2425,10 +3019,7 @@ export class TerminalService {
 
     const marker = this.startMarkerByTaskId.get(task.id)
     const markerLine = marker && typeof marker.line === 'number' ? marker.line : undefined
-    if (marker && typeof marker.dispose === 'function') {
-      marker.dispose()
-    }
-    this.startMarkerByTaskId.delete(task.id)
+    this.disposeTaskStartMarker(task.id)
 
     const startAbsLineFromMarker = markerLine !== undefined && markerLine >= 0 ? markerLine : undefined
     const startAbsLine = startAbsLineFromMarker !== undefined ? startAbsLineFromMarker : task.startAbsLine
@@ -2458,7 +3049,7 @@ export class TerminalService {
     this.stopCommandTrackingWatcher(taskId)
     this.activeTaskByTerminal.delete(terminalId)
     this.onTaskFinishedCallbacks.delete(taskId)
-    this.startMarkerByTaskId.delete(taskId)
+    this.disposeTaskStartMarker(taskId)
   }
 
   private stripEchoedCommand(output: string, command: string): string {

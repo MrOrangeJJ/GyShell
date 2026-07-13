@@ -244,11 +244,31 @@ const createGateway = (): {
   return { gateway, agent, uiHistory };
 };
 
-const createAgentService = (terminalService: any = {}): AgentService_v2 =>
+const createAgentService = (
+  terminalService: any = {},
+  mcpToolService: any = {},
+): AgentService_v2 =>
   new AgentService_v2(
-    terminalService as any,
+    {
+      resolveTerminal(tabIdOrName: string) {
+        const terminal = {
+          id: tabIdOrName,
+          title: tabIdOrName,
+          type: "local",
+        };
+        return { found: [terminal], bestMatch: terminal };
+      },
+      getTransferMachineIdentity() {
+        return "local://default";
+      },
+      ...terminalService,
+    } as any,
     {} as any,
-    {} as any,
+    {
+      isMcpToolName: () => false,
+      getActiveTools: () => [],
+      ...mcpToolService,
+    } as any,
     {} as any,
     {} as any,
     {} as any,
@@ -288,25 +308,35 @@ const run = async (): Promise<void> => {
 
       assertEqual(
         result.pendingToolCalls.length,
-        1,
-        "reconnect should not leave later tool calls pending in the same model response",
+        3,
+        "reconnect should preserve every later tool call in the planned batch",
       );
       assertEqual(
         result.pendingToolCalls[0]?.id,
         "call-reconnect",
-        "reconnect should be the only queued tool call",
+        "reconnect should remain the first queued tool call",
+      );
+      assertEqual(
+        result.pendingToolCalls[2]?._gyshellExecution?.mode,
+        "not_executed",
+        "later same-terminal input should be explicitly deferred",
       );
 
       const cleanedAssistantMessage = result.messages[0] as any;
       assertEqual(
         cleanedAssistantMessage.tool_calls.length,
-        1,
-        "reconnect boundary should trim skipped tool calls from assistant history",
+        3,
+        "reconnect boundary should preserve every original assistant tool call",
       );
       assertEqual(
         cleanedAssistantMessage.tool_calls[0]?.id,
         "call-reconnect",
-        "assistant history should keep only the reconnect tool call",
+        "assistant history should preserve the reconnect tool call at its original ordinal",
+      );
+      assertEqual(
+        cleanedAssistantMessage.tool_calls[2]?.id,
+        "call-stdin",
+        "assistant history should retain the deferred stdin call id",
       );
     },
   );
@@ -316,6 +346,7 @@ const run = async (): Promise<void> => {
     async () => {
       for (const toolName of ["create_terminal_tab", "close_terminal_tab"]) {
         const agent = createAgentService();
+        (agent as any).builtInToolEnabled[toolName] = true;
         const lifecycleCall = {
           id: `call-${toolName}`,
           name: toolName,
@@ -342,18 +373,28 @@ const run = async (): Promise<void> => {
 
         assertEqual(
           result.pendingToolCalls.length,
-          1,
-          `${toolName} should trim later calls based on the old terminal inventory`,
+          2,
+          `${toolName} should preserve every call while creating a model-visible boundary`,
         );
         assertEqual(
           result.pendingToolCalls[0]?.id,
           lifecycleCall.id,
-          `${toolName} should remain as the only pending tool call`,
+          `${toolName} should remain the first pending tool call`,
+        );
+        assertEqual(
+          result.pendingToolCalls[1]?.id,
+          laterCall.id,
+          `${toolName} should preserve the later call id`,
+        );
+        assertEqual(
+          result.pendingToolCalls[1]?._gyshellExecution?.mode,
+          "not_executed",
+          `${toolName} should explicitly defer the later call`,
         );
         assertEqual(
           (result.messages[0] as any).tool_calls.length,
-          1,
-          `${toolName} should trim assistant history to one tool call`,
+          2,
+          `${toolName} should preserve every assistant tool call`,
         );
       }
     },
@@ -369,6 +410,7 @@ const run = async (): Promise<void> => {
           return null;
         },
       });
+      agent.setEventPublisher(() => {});
       (agent as any).getSessionModelBinding = () => ({});
 
       assertEqual(
@@ -403,11 +445,17 @@ const run = async (): Promise<void> => {
         0,
         "execution-time permission check should block a queued create call",
       );
+      const disabledResult = JSON.parse(
+        String(result.messages[0]?.content || "{}"),
+      );
+      assertEqual(
+        disabledResult.status,
+        "not_executed",
+        "blocked queued call should return a structured not_executed result",
+      );
       assertTruthy(
-        String(result.messages[0]?.content || "").includes(
-          "disabled in the current GyShell settings",
-        ),
-        "blocked queued call should return a deterministic disabled-tool result",
+        String(disabledResult.reason || "").includes("disabled before execution"),
+        "blocked queued call should explain the execution-time permission change",
       );
     },
   );
@@ -567,6 +615,39 @@ const run = async (): Promise<void> => {
         systemPrompt.includes("exec_command_nowait_completed"),
         true,
         "system prompt should document the nowait completion notification type",
+      );
+    },
+  );
+
+  await runCase(
+    "unknown nowait outcome never claims command completion",
+    () => {
+      const insertion = buildExecCommandNowaitCompletedInsertion({
+        terminalId: "terminal-1",
+        terminalName: "Local",
+        historyCommandMatchId: "history-unknown",
+        command: "long-running-command",
+        exitCode: -1,
+        runtimeBoundary: true,
+      });
+      const payload = JSON.parse(
+        insertion.content.slice(AGENT_NOTIFICATION_TAG.length),
+      );
+
+      assertEqual(
+        payload.notification_type,
+        "exec_command_nowait_outcome_unknown",
+        "tracking loss should emit an unknown-outcome notification",
+      );
+      assertEqual(
+        payload.instruction.includes("Do not assume success"),
+        true,
+        "unknown outcome should prevent automatic success or replay assumptions",
+      );
+      assertEqual(
+        insertion.kind,
+        "exec_command_nowait_outcome_unknown",
+        "the queue kind should preserve the unknown-outcome boundary",
       );
     },
   );
@@ -1351,9 +1432,9 @@ const run = async (): Promise<void> => {
         pendingToolCalls: [waitCall, trailingCall],
       });
 
-      const toolMessage = result.messages[result.messages.length - 1] as any;
+      const waitToolMessage = result.messages[1] as any;
       assertEqual(
-        String(toolMessage.content).includes("Wait ended early"),
+        String(waitToolMessage.content).includes("Wait ended early"),
         true,
         "time wait should return an early-ended result when queued content is available",
       );
@@ -1370,8 +1451,8 @@ const run = async (): Promise<void> => {
       );
       assertEqual(
         assistantMessage.tool_calls.length,
-        1,
-        "interrupted wait should trim skipped tool calls from assistant history",
+        2,
+        "interrupted wait should preserve skipped tool calls in assistant history",
       );
       assertEqual(
         assistantMessage.tool_calls[0]?.id,
@@ -1382,8 +1463,19 @@ const run = async (): Promise<void> => {
         assistantMessage.tool_calls.some(
           (call: any) => call?.id === "call-read-terminal-tab",
         ),
-        false,
-        "interrupted wait should not leave unanswered trailing tool calls in assistant history",
+        true,
+        "interrupted wait should retain the trailing tool call id",
+      );
+      const deferredToolMessage = result.messages[2] as any;
+      assertEqual(
+        deferredToolMessage.tool_call_id,
+        "call-read-terminal-tab",
+        "interrupted wait should append a result for the trailing call",
+      );
+      assertEqual(
+        JSON.parse(String(deferredToolMessage.content)).status,
+        "not_executed",
+        "interrupted wait should explicitly mark the trailing call as not executed",
       );
       assertEqual(
         (agent as any).routeAfterToolCall(result),

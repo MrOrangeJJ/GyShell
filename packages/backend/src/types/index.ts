@@ -327,6 +327,7 @@ export interface CommandResult {
   stdoutDelta: string
   exitCode?: number
   history_command_match_id: string
+  runtimeBoundary?: boolean
 }
 
 export type TerminalCommandTrackingMode = 'windows-powershell-sidecar'
@@ -365,6 +366,7 @@ export interface CommandTask {
   output?: string
   lastOutputAtMs?: number
   capturedOutput?: string
+  runtimeBoundary?: boolean
   suppressFinishCallback?: boolean
   startTime: number
   endTime?: number

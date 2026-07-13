@@ -93,7 +93,19 @@ import { buildDeterministicCompactionDigest } from "./AgentHelper/utils/determin
 import { createStreamReasoningExtractor } from "./AgentHelper/utils/stream_reasoning_extractor";
 import { resolveRunExperimentalFlags } from "./AgentHelper/utils/experimental_flags";
 import { SelfCorrectionRuntimeManager } from "./AgentHelper/utils/self_correction_runtime";
-import { removeUnmatchedToolCallsFromHistory } from "./AgentHelper/utils/tool_call_history";
+import { completeUnmatchedToolCallsInHistory } from "./AgentHelper/utils/tool_call_history";
+import {
+  createSyntheticToolOutcomeContent,
+  deferTerminalMutationsAfterRuntimeBoundary,
+  getParallelToolCallPrefix,
+  isParallelToolCallPrefixStillSafe,
+  normalizeToolCallIds,
+  normalizeToolCallNames,
+  planToolCallBatch,
+  resolveToolCallTerminalIds,
+  type PlannedToolCall,
+  type ToolBatchPlanningEnvironment,
+} from "./AgentHelper/tool_batch_planner";
 import { sanitizeCompressionAfterRollback } from "./AgentHelper/utils/history_compression_maintenance";
 import { cloneMessageWithPatch } from "./AgentHelper/utils/message_clone";
 import {
@@ -182,6 +194,10 @@ const StateAnnotation = Ann.Root({
     reducer: (x: string, y?: string) => y ?? x,
     default: () => "",
   }),
+  physicalRunId: Ann({
+    reducer: (x: string, y?: string) => y ?? x,
+    default: () => "",
+  }),
   startup_input: Ann({
     reducer: (x: StartupInputState, y?: StartTaskInput) => y ?? x,
     default: (): StartupInputState => undefined,
@@ -197,6 +213,11 @@ const StateAnnotation = Ann.Root({
       return x;
     },
     default: () => [],
+  }),
+  pendingToolSupplementMessages: Ann({
+    reducer: (x: BaseMessage[], y?: BaseMessage[]) =>
+      Array.isArray(y) ? y : x,
+    default: (): BaseMessage[] => [],
   }),
   completionGuardDecision: Ann({
     reducer: (x: "end" | "continue", y?: "end" | "continue") => y ?? x,
@@ -236,13 +257,6 @@ const FALLBACK_COMPACTION_DIGEST_MIN_CHARS = 8_000;
 const FALLBACK_COMPACTION_FAILURE_REASON_MAX_CHARS = 2_000;
 const FALLBACK_COMPACTION_HISTORY_REFERENCE_MAX_CHARS = 8_000;
 const FALLBACK_COMPACTION_TITLE_MAX_CHARS = 240;
-const SINGLE_CALL_TOOL_BOUNDARY_NAMES = new Set([
-  "exec_command",
-  "reconnect_terminal_tab",
-  "create_terminal_tab",
-  "close_terminal_tab",
-]);
-
 function clipTextMiddle(input: string, maxChars: number): string {
   if (maxChars <= 0) return "";
   if (input.length <= maxChars) return input;
@@ -306,8 +320,10 @@ export class AgentService_v2 {
   private helpers: AgentHelpers;
   private checkpointer: MemorySaver;
   private builtInToolEnabled: Record<string, boolean> = {};
-  private lastAbortedMessage: BaseMessage | null = null;
+  private abortedMessagesByRunId: Map<string, BaseMessage> = new Map();
+  private activePhysicalRunIds: Set<string> = new Set();
   private sessionModelBindings: Map<string, SessionModelBinding> = new Map();
+  private fileMutationTailByMachine: Map<string, Promise<void>> = new Map();
   private selfCorrectionRuntimeManager = new SelfCorrectionRuntimeManager();
   private waitForFeedback:
     | ((messageId: string, timeoutMs?: number) => Promise<any | null>)
@@ -335,6 +351,15 @@ export class AgentService_v2 {
   private fallbackCompactionHistoryExportService: PassChatTempExportService | null =
     null;
   private activeAgentRunIdsBySession: Map<string, string> = new Map();
+
+  private captureAbortedMessageForActiveRun(
+    physicalRunId: string,
+    message: BaseMessage,
+  ): boolean {
+    if (!this.activePhysicalRunIds.has(physicalRunId)) return false;
+    this.abortedMessagesByRunId.set(physicalRunId, message);
+    return true;
+  }
 
   constructor(
     terminalService: TerminalService,
@@ -457,6 +482,11 @@ export class AgentService_v2 {
       "batch_toolcall_executor",
       this.createBatchToolcallExecutorNode(),
     );
+    workflow.addNode("parallel_tools", this.createParallelToolsNode());
+    workflow.addNode(
+      "flush_tool_supplements",
+      this.createFlushToolSupplementsNode(),
+    );
     workflow.addNode(
       "task_completion_guard",
       this.createTaskCompletionGuardNode(),
@@ -482,6 +512,7 @@ export class AgentService_v2 {
         "file_tools",
         "read_file",
         "mcp_tools",
+        "parallel_tools",
         "token_pruner_runtime",
         "task_completion_guard",
         "final_output",
@@ -500,6 +531,8 @@ export class AgentService_v2 {
       "file_tools",
       "read_file",
       "mcp_tools",
+      "parallel_tools",
+      "flush_tool_supplements",
       "token_pruner_runtime",
     ]);
     workflow.addConditionalEdges("command_tools", this.routeAfterToolCall, [
@@ -508,6 +541,8 @@ export class AgentService_v2 {
       "file_tools",
       "read_file",
       "mcp_tools",
+      "parallel_tools",
+      "flush_tool_supplements",
       "token_pruner_runtime",
     ]);
     workflow.addConditionalEdges("file_tools", this.routeAfterToolCall, [
@@ -516,6 +551,8 @@ export class AgentService_v2 {
       "file_tools",
       "read_file",
       "mcp_tools",
+      "parallel_tools",
+      "flush_tool_supplements",
       "token_pruner_runtime",
     ]);
     workflow.addConditionalEdges("read_file", this.routeAfterToolCall, [
@@ -524,6 +561,8 @@ export class AgentService_v2 {
       "file_tools",
       "read_file",
       "mcp_tools",
+      "parallel_tools",
+      "flush_tool_supplements",
       "token_pruner_runtime",
     ]);
     workflow.addConditionalEdges("mcp_tools", this.routeAfterToolCall, [
@@ -532,8 +571,21 @@ export class AgentService_v2 {
       "file_tools",
       "read_file",
       "mcp_tools",
+      "parallel_tools",
+      "flush_tool_supplements",
       "token_pruner_runtime",
     ]);
+    workflow.addConditionalEdges("parallel_tools", this.routeAfterToolCall, [
+      "tools",
+      "command_tools",
+      "file_tools",
+      "read_file",
+      "mcp_tools",
+      "parallel_tools",
+      "flush_tool_supplements",
+      "token_pruner_runtime",
+    ]);
+    workflow.addEdge("flush_tool_supplements", "token_pruner_runtime");
 
     workflow.addConditionalEdges("final_output", this.routeFinalOutput, [
       "token_pruner_runtime",
@@ -720,6 +772,16 @@ export class AgentService_v2 {
 
   private createTokenManagerNode() {
     return RunnableLambda.from(async (state: any, config: any) => {
+      if (
+        (Array.isArray(state.pendingToolCalls) &&
+          state.pendingToolCalls.length > 0) ||
+        (Array.isArray(state.pendingToolSupplementMessages) &&
+          state.pendingToolSupplementMessages.length > 0)
+      ) {
+        throw new Error(
+          "Tool batch invariant violation: token pruning/compaction cannot run before every tool result and supplemental message is committed.",
+        );
+      }
       if (state.sessionId) {
         this.ackQueuedInsertionMessagesInState(
           state.sessionId,
@@ -1256,16 +1318,22 @@ export class AgentService_v2 {
           } catch (err) {
             finishReasoningBanner();
             if (partialText.trim()) {
-              this.lastAbortedMessage = new AIMessage({
-                content: partialText,
-                additional_kwargs: {
-                  _gyshellMessageId: messageId,
-                  _gyshellAborted: true,
-                },
-              });
-              console.log(
-                "[AgentService_v2] Captured partial message from error/abort in instance variable.",
+              const physicalRunId = String(state.physicalRunId || sessionId);
+              const captured = this.captureAbortedMessageForActiveRun(
+                physicalRunId,
+                new AIMessage({
+                  content: partialText,
+                  additional_kwargs: {
+                    _gyshellMessageId: messageId,
+                    _gyshellAborted: true,
+                  },
+                }),
               );
+              if (captured) {
+                console.log(
+                  "[AgentService_v2] Captured partial message from error/abort in instance variable.",
+                );
+              }
             }
             throw err;
           }
@@ -1400,6 +1468,7 @@ export class AgentService_v2 {
         token_state: { current_tokens: currentTokens },
         sessionId,
         pendingToolCalls: [],
+        pendingToolSupplementMessages: [],
         modelRequestPassCount: nextPassCount,
       };
     });
@@ -1417,7 +1486,7 @@ export class AgentService_v2 {
       const messages: BaseMessage[] = [...state.messages];
       const lastMessage = messages[messages.length - 1];
 
-      let pendingToolCalls: any[] = [];
+      let pendingToolCalls: PlannedToolCall[] = [];
 
       if (
         AIMessage.isInstance(lastMessage) &&
@@ -1446,40 +1515,43 @@ export class AgentService_v2 {
         ? (lastMessage as any).tool_calls
         : [];
 
-      // Always clean tool-call chunk/invalid metadata to prevent context bloat,
-      // and then decide how many tool calls we keep/enqueue.
       if (!toolCalls || toolCalls.length === 0) {
-        this.cleanupModelToolCallMetadata(lastMessage, []);
+        this.cleanupModelToolCallMetadata(lastMessage);
         return { messages, sessionId, pendingToolCalls };
       }
 
-      // If only one tool call, just enqueue it and continue (no extra checks needed).
-      if (toolCalls.length === 1) {
-        pendingToolCalls = toolCalls.slice(0, 1);
-        this.cleanupModelToolCallMetadata(lastMessage, pendingToolCalls);
-        return { messages, sessionId, pendingToolCalls };
+      const normalized = normalizeToolCallIds(toolCalls, uuidv4);
+      const normalizedNames = normalizeToolCallNames(normalized.toolCalls);
+      if (
+        normalized.repairs.length > 0 ||
+        normalizedNames.repairedOrdinals.length > 0
+      ) {
+        // Only malformed empty/duplicate ids are repaired. Every valid id remains
+        // unchanged and every call still receives exactly one result.
+        (lastMessage as any).tool_calls = normalizedNames.toolCalls;
+      }
+      if (normalized.repairs.length > 0) {
+        this.helpers.sendEvent(sessionId, {
+          type: "alert",
+          message: `The model returned ${normalized.repairs.length} empty or duplicate tool-call id(s). GyShell repaired those invalid ids before execution so no valid call or result is lost.`,
+          level: "warning",
+          messageId: `repaired-tool-call-ids-${uuidv4()}`,
+        });
+      }
+      if (normalizedNames.repairedOrdinals.length > 0) {
+        this.helpers.sendEvent(sessionId, {
+          type: "alert",
+          message: `The model returned ${normalizedNames.repairedOrdinals.length} tool call(s) with a missing or blank function name. GyShell preserved each call id and will return an explicit not_executed result.`,
+          level: "warning",
+          messageId: `repaired-tool-call-names-${uuidv4()}`,
+        });
       }
 
-      // Tools that can change terminal execution state must form a model-visible boundary.
-      const hasSingleCallBoundaryTool = toolCalls.some((tc) =>
-        SINGLE_CALL_TOOL_BOUNDARY_NAMES.has(tc?.name),
+      pendingToolCalls = planToolCallBatch(
+        normalizedNames.toolCalls,
+        this.createToolBatchPlanningEnvironment(),
       );
-      if (hasSingleCallBoundaryTool) {
-        pendingToolCalls = toolCalls.slice(0, 1);
-        this.cleanupModelToolCallMetadata(lastMessage, pendingToolCalls);
-        return { messages, sessionId, pendingToolCalls };
-      }
-
-      const skillCall = toolCalls.find((tc) => tc?.name === "skill");
-      if (skillCall) {
-        pendingToolCalls = [skillCall];
-        this.cleanupModelToolCallMetadata(lastMessage, pendingToolCalls);
-        return { messages, sessionId, pendingToolCalls };
-      }
-
-      // Otherwise (no exec_command), allow executing ALL tool calls sequentially.
-      pendingToolCalls = toolCalls.slice();
-      this.cleanupModelToolCallMetadata(lastMessage, pendingToolCalls);
+      this.cleanupModelToolCallMetadata(lastMessage);
       return { messages, sessionId, pendingToolCalls };
     });
   }
@@ -1488,7 +1560,7 @@ export class AgentService_v2 {
     return RunnableLambda.from(async (state: any, config: any) => {
       const sessionId = state.sessionId;
       if (!sessionId) throw new Error("No session ID in state");
-      const sessionBinding = this.getSessionModelBinding(sessionId);
+      this.throwIfAborted(config?.signal);
 
       const queue: any[] = Array.isArray(state.pendingToolCalls)
         ? state.pendingToolCalls
@@ -1496,6 +1568,16 @@ export class AgentService_v2 {
       const toolCall = queue[0];
       if (!toolCall) return state;
 
+      if (toolCall?._gyshellExecution?.mode === "not_executed") {
+        return this.completeToolCallWithoutExecution(
+          state,
+          queue,
+          toolCall,
+          toolCall._gyshellExecution.reason ||
+            "GyShell deferred this call at a model-visible execution boundary.",
+          toolCall._gyshellExecution.retryable !== false,
+        );
+      }
       const toolMessage = this.createToolMessage(toolCall);
       const executionContext = this.createExecutionContext(
         sessionId,
@@ -1503,6 +1585,10 @@ export class AgentService_v2 {
         config,
       );
       const messageHistory: BaseMessage[] = state.messages;
+      const rethrowIfAborted = (error: unknown): void => {
+        if (this.helpers.isAbortError(error)) throw error;
+        this.throwIfAborted(config?.signal);
+      };
       let result = "";
       let shouldInterruptPendingToolsForQueuedInsertion = false;
       if (
@@ -1511,12 +1597,12 @@ export class AgentService_v2 {
           this.builtInToolEnabled,
         )
       ) {
-        toolMessage.content = `Tool "${toolCall.name}" is disabled in the current GyShell settings.`;
-        return {
-          messages: [...state.messages, toolMessage],
-          sessionId,
-          pendingToolCalls: queue.slice(1),
-        };
+        return this.completeToolCallWithoutExecution(
+          state,
+          queue,
+          toolCall,
+          `Tool "${toolCall.name}" was disabled before execution.`,
+        );
       }
       switch (toolCall.name) {
         case "skill": {
@@ -1542,6 +1628,7 @@ export class AgentService_v2 {
             this.skillService,
             config?.signal,
           );
+          this.throwIfAborted(config?.signal);
           result = outcome.message;
 
           // Only emit content delta on success: error messages do not contain USEFUL_SKILL_TAG
@@ -1577,6 +1664,7 @@ export class AgentService_v2 {
             this.skillService,
             config?.signal,
           );
+          this.throwIfAborted(config?.signal);
           result = outcome.message;
 
           // Force a reload of the graph to pick up the new tool definition if needed,
@@ -1602,6 +1690,7 @@ export class AgentService_v2 {
               executionContext,
             );
           } catch (err) {
+            rethrowIfAborted(err);
             result = `Parameter validation error for read_terminal_tab: ${(err as Error).message}`;
           }
           break;
@@ -1616,11 +1705,13 @@ export class AgentService_v2 {
               executionContext,
             );
           } catch (err) {
+            rethrowIfAborted(err);
             result = `Parameter validation error for read_command_output: ${(err as Error).message}`;
           }
           break;
         }
         case "write_stdin": {
+          const sessionBinding = this.getSessionModelBinding(sessionId);
           try {
             const validatedArgs = writeStdinSchema.parse(toolCall.args || {});
             const emitWriteStdinToolCall = (output: string): void => {
@@ -1655,9 +1746,8 @@ export class AgentService_v2 {
               sessionBinding.actionModel
             ) {
               // Build temporary history for action model
-              const finalActionMessages = this.helpers.buildActionModelHistory(
-                state.messages as BaseMessage[],
-              );
+              const finalActionMessages =
+                this.buildActionModelHistoryBeforeActiveToolBatch(state);
 
               // Call action model for write_stdin policy check
               const user = createWriteStdinPolicyUserPrompt({
@@ -1678,6 +1768,7 @@ export class AgentService_v2 {
                   "write_stdin",
                 );
               } catch (err: any) {
+                rethrowIfAborted(err);
                 console.warn(
                   "[AgentService_v2] Action model decision for write_stdin failed after retries, falling back to allow:",
                   err,
@@ -1705,6 +1796,7 @@ export class AgentService_v2 {
               executionContext,
             );
           } catch (err) {
+            rethrowIfAborted(err);
             result = `Parameter validation error for write_stdin: ${(err as Error).message}`;
           }
           break;
@@ -1719,6 +1811,7 @@ export class AgentService_v2 {
               executionContext,
             );
           } catch (err) {
+            rethrowIfAborted(err);
             result = `Parameter validation error for reconnect_terminal_tab: ${(err as Error).message}`;
           }
           break;
@@ -1733,6 +1826,7 @@ export class AgentService_v2 {
               executionContext,
             );
           } catch (err) {
+            rethrowIfAborted(err);
             result = `Parameter validation error for create_terminal_tab: ${(err as Error).message}`;
           }
           break;
@@ -1747,6 +1841,7 @@ export class AgentService_v2 {
               executionContext,
             );
           } catch (err) {
+            rethrowIfAborted(err);
             result = `Parameter validation error for close_terminal_tab: ${(err as Error).message}`;
           }
           break;
@@ -1762,6 +1857,7 @@ export class AgentService_v2 {
               executionContext,
             );
           } catch (err) {
+            rethrowIfAborted(err);
             result = `Parameter validation error for wait: ${(err as Error).message}`;
           }
           break;
@@ -1776,6 +1872,7 @@ export class AgentService_v2 {
               executionContext,
             );
           } catch (err) {
+            rethrowIfAborted(err);
             result = `Parameter validation error for wait_terminal_idle: ${(err as Error).message}`;
           }
           break;
@@ -1790,6 +1887,7 @@ export class AgentService_v2 {
               executionContext,
             );
           } catch (err) {
+            rethrowIfAborted(err);
             result = `Parameter validation error for copy_between_tabs: ${(err as Error).message}`;
           }
           break;
@@ -1804,6 +1902,7 @@ export class AgentService_v2 {
               executionContext,
             );
           } catch (err) {
+            rethrowIfAborted(err);
             result = `Parameter validation error for read_file_transfer_status: ${(err as Error).message}`;
           }
           break;
@@ -1812,13 +1911,21 @@ export class AgentService_v2 {
           result = `Tool "${toolCall.name}" is not supported.`;
       }
 
+      this.throwIfAborted(config?.signal);
       toolMessage.content = result;
-      if (shouldInterruptPendingToolsForQueuedInsertion) {
-        this.trimInterruptedToolCallHistory(messageHistory, toolCall);
-      }
+      const interruptedToolMessages =
+        shouldInterruptPendingToolsForQueuedInsertion
+          ? queue.slice(1).map((pendingCall) =>
+              this.createSyntheticToolMessage(pendingCall, {
+                status: "not_executed",
+                reason: `A queued user insertion interrupted the batch after tool call "${toolCall.id}". Replan this call after reading the inserted message.`,
+                retryable: true,
+              }),
+            )
+          : [];
 
       return {
-        messages: [...messageHistory, toolMessage],
+        messages: [...messageHistory, toolMessage, ...interruptedToolMessages],
         sessionId,
         pendingToolCalls: shouldInterruptPendingToolsForQueuedInsertion
           ? []
@@ -1831,12 +1938,26 @@ export class AgentService_v2 {
     return RunnableLambda.from(async (state: any, config: any) => {
       const sessionId = state.sessionId;
       if (!sessionId) throw new Error("No session ID in state");
+      this.throwIfAborted(config?.signal);
 
       const queue: any[] = Array.isArray(state.pendingToolCalls)
         ? state.pendingToolCalls
         : [];
       const toolCall = queue[0];
       if (!toolCall || toolCall.name !== "exec_command") return state;
+      if (
+        !this.helpers.isBuiltInToolEnabled(
+          toolCall.name,
+          this.builtInToolEnabled,
+        )
+      ) {
+        return this.completeToolCallWithoutExecution(
+          state,
+          queue,
+          toolCall,
+          `Tool "${toolCall.name}" was disabled before execution.`,
+        );
+      }
 
       const toolMessage = this.createToolMessage(toolCall);
       const executionContext = this.createExecutionContext(
@@ -1845,6 +1966,9 @@ export class AgentService_v2 {
         config,
       );
       const messageHistory: BaseMessage[] = state.messages;
+      let runtimeTerminalBoundaryId: string | null = null;
+      let commandContinuesInBackground = false;
+      let commandRuntimeBoundary = false;
 
       let validated: z.infer<typeof execCommandSchema>;
       try {
@@ -1898,7 +2022,6 @@ export class AgentService_v2 {
         let autoSwitchToNowait = false;
         let autoSwitchReason = "";
         let waitActive = true;
-
         const actionDecisionController = new AbortController();
         const forwardAbortToActionModel = () =>
           actionDecisionController.abort();
@@ -1917,9 +2040,7 @@ export class AgentService_v2 {
             ? (async () => {
                 // Keep action-model judgment independent: do not include global waitMode choice in prompt.
                 const finalActionMessages =
-                  this.helpers.buildActionModelHistory(
-                    state.messages as BaseMessage[],
-                  );
+                  this.buildActionModelHistoryBeforeActiveToolBatch(state);
                 const user = createCommandPolicyUserPrompt({
                   tabTitle: bestMatch.title,
                   tabId: bestMatch.id,
@@ -1982,6 +2103,12 @@ export class AgentService_v2 {
                   ? autoSwitchReason ||
                     "action model decided this command should not block"
                   : undefined,
+              onContinuesInBackground: () => {
+                commandContinuesInBackground = true;
+              },
+              onRuntimeBoundary: () => {
+                commandRuntimeBoundary = true;
+              },
             },
           );
         } finally {
@@ -1995,6 +2122,25 @@ export class AgentService_v2 {
           }
           await actionDecisionTask;
         }
+
+      }
+
+      const activeTaskId =
+        typeof (this.terminalService as any).getActiveTaskId === "function"
+          ? this.terminalService.getActiveTaskId(bestMatch.id)
+          : undefined;
+      if (
+        commandContinuesInBackground ||
+        commandRuntimeBoundary ||
+        activeTaskId
+      ) {
+        runtimeTerminalBoundaryId = bestMatch.id;
+        deferTerminalMutationsAfterRuntimeBoundary(
+          queue.slice(1),
+          bestMatch.id,
+          toolCall,
+          this.createToolBatchPlanningEnvironment(),
+        );
       }
 
       toolMessage.content = resultText;
@@ -2002,6 +2148,13 @@ export class AgentService_v2 {
         messages: [...messageHistory, toolMessage],
         sessionId,
         pendingToolCalls: queue.slice(1),
+        ...(state._gyshellParallelToolIsolation === true &&
+        runtimeTerminalBoundaryId
+          ? {
+              _gyshellRuntimeTerminalBoundaryId:
+                runtimeTerminalBoundaryId,
+            }
+          : {}),
       };
     });
   }
@@ -2010,6 +2163,7 @@ export class AgentService_v2 {
     return RunnableLambda.from(async (state: any, config: any) => {
       const sessionId = state.sessionId;
       if (!sessionId) throw new Error("No session ID in state");
+      this.throwIfAborted(config?.signal);
 
       const queue: any[] = Array.isArray(state.pendingToolCalls)
         ? state.pendingToolCalls
@@ -2017,45 +2171,68 @@ export class AgentService_v2 {
       const toolCall = queue[0];
       if (!toolCall || !isFileMutationToolName(toolCall.name)) return state;
 
-      const toolMessage = this.createToolMessage(toolCall);
-      const executionContext = this.createExecutionContext(
-        sessionId,
-        toolMessage.additional_kwargs._gyshellMessageId as string,
-        config,
-      );
-      const messageHistory: BaseMessage[] = state.messages;
-
-      let result: string;
+      const releaseMutationTurn = await this.acquireFileMutationTurn(toolCall);
       try {
-        if (toolCall.name === WRITE_FILE_TOOL_NAME) {
-          const validatedArgs = writeFileSchema.parse(toolCall.args || {});
-          result = await toolImplementations.writeFile(
-            validatedArgs,
-            executionContext,
-          );
-        } else if (toolCall.name === EDIT_FILE_TOOL_NAME) {
-          const validatedArgs = editFileSchema.parse(toolCall.args || {});
-          result = await toolImplementations.editFile(
-            validatedArgs,
-            executionContext,
-          );
-        } else {
-          const validatedArgs = writeAndEditSchema.parse(toolCall.args || {});
-          result = await toolImplementations.writeAndEdit(
-            validatedArgs,
-            executionContext,
+        this.throwIfAborted(config?.signal);
+        if (
+          !this.helpers.isBuiltInToolEnabled(
+            toolCall.name,
+            this.builtInToolEnabled,
+          )
+        ) {
+          return this.completeToolCallWithoutExecution(
+            state,
+            queue,
+            toolCall,
+            `Tool "${toolCall.name}" was disabled before execution.`,
           );
         }
-      } catch (err) {
-        result = `Parameter validation or execution error for ${toolCall.name}: ${(err as Error).message}`;
-      }
 
-      toolMessage.content = result;
-      return {
-        messages: [...messageHistory, toolMessage],
-        sessionId,
-        pendingToolCalls: queue.slice(1),
-      };
+        const toolMessage = this.createToolMessage(toolCall);
+        const executionContext = this.createExecutionContext(
+          sessionId,
+          toolMessage.additional_kwargs._gyshellMessageId as string,
+          config,
+        );
+        const messageHistory: BaseMessage[] = state.messages;
+
+        let result: string;
+        try {
+          if (toolCall.name === WRITE_FILE_TOOL_NAME) {
+            const validatedArgs = writeFileSchema.parse(toolCall.args || {});
+            result = await toolImplementations.writeFile(
+              validatedArgs,
+              executionContext,
+            );
+          } else if (toolCall.name === EDIT_FILE_TOOL_NAME) {
+            const validatedArgs = editFileSchema.parse(toolCall.args || {});
+            result = await toolImplementations.editFile(
+              validatedArgs,
+              executionContext,
+            );
+          } else {
+            const validatedArgs = writeAndEditSchema.parse(toolCall.args || {});
+            result = await toolImplementations.writeAndEdit(
+              validatedArgs,
+              executionContext,
+            );
+          }
+        } catch (err) {
+          if (this.helpers.isAbortError(err)) throw err;
+          this.throwIfAborted(config?.signal);
+          result = `Parameter validation or execution error for ${toolCall.name}: ${(err as Error).message}`;
+        }
+
+        this.throwIfAborted(config?.signal);
+        toolMessage.content = result;
+        return {
+          messages: [...messageHistory, toolMessage],
+          sessionId,
+          pendingToolCalls: queue.slice(1),
+        };
+      } finally {
+        releaseMutationTurn();
+      }
     });
   }
 
@@ -2063,13 +2240,27 @@ export class AgentService_v2 {
     return RunnableLambda.from(async (state: any, config: any) => {
       const sessionId = state.sessionId;
       if (!sessionId) throw new Error("No session ID in state");
-      const sessionBinding = this.getSessionModelBinding(sessionId);
+      this.throwIfAborted(config?.signal);
 
       const queue: any[] = Array.isArray(state.pendingToolCalls)
         ? state.pendingToolCalls
         : [];
       const toolCall = queue[0];
       if (!toolCall || toolCall.name !== "read_file") return state;
+      if (
+        !this.helpers.isBuiltInToolEnabled(
+          toolCall.name,
+          this.builtInToolEnabled,
+        )
+      ) {
+        return this.completeToolCallWithoutExecution(
+          state,
+          queue,
+          toolCall,
+          `Tool "${toolCall.name}" was disabled before execution.`,
+        );
+      }
+      const sessionBinding = this.getSessionModelBinding(sessionId);
 
       const toolMessage = this.createToolMessage(toolCall);
       const messageId = toolMessage.additional_kwargs
@@ -2092,10 +2283,13 @@ export class AgentService_v2 {
           executionContext,
           sessionBinding.readFileSupport,
         );
+        this.throwIfAborted(config?.signal);
         resultText = result.resultText;
         imageMessage = result.imageMessage ?? null;
         meaningLessAIMessage = result.meaningLessAIMessage ?? null;
       } catch (err) {
+        if (this.helpers.isAbortError(err)) throw err;
+        this.throwIfAborted(config?.signal);
         resultText = err instanceof Error ? err.message : String(err);
         // Ensure frontend gets a banner even on validation errors / unexpected failures.
         this.helpers.sendEvent(sessionId, {
@@ -2110,14 +2304,27 @@ export class AgentService_v2 {
 
       toolMessage.content = resultText;
 
-      const updates = imageMessage
-        ? [toolMessage, meaningLessAIMessage, imageMessage]
-        : [toolMessage];
+      const supplementalMessages: BaseMessage[] = [];
+      if (imageMessage) {
+        if (meaningLessAIMessage) {
+          supplementalMessages.push(meaningLessAIMessage);
+        }
+        supplementalMessages.push(imageMessage);
+      }
+      const existingSupplementalMessages: BaseMessage[] = Array.isArray(
+        state.pendingToolSupplementMessages,
+      )
+        ? state.pendingToolSupplementMessages
+        : [];
 
       return {
-        messages: [...messageHistory, ...updates],
+        messages: [...messageHistory, toolMessage],
         sessionId,
         pendingToolCalls: queue.slice(1),
+        pendingToolSupplementMessages: [
+          ...existingSupplementalMessages,
+          ...supplementalMessages,
+        ],
       };
     });
   }
@@ -2126,13 +2333,21 @@ export class AgentService_v2 {
     return RunnableLambda.from(async (state: any, config: any) => {
       const sessionId = state.sessionId;
       if (!sessionId) throw new Error("No session ID in state");
+      this.throwIfAborted(config?.signal);
 
       const queue: any[] = Array.isArray(state.pendingToolCalls)
         ? state.pendingToolCalls
         : [];
       const toolCall = queue[0];
-      if (!toolCall || !this.mcpToolService.isMcpToolName(toolCall.name))
-        return state;
+      if (!toolCall) return state;
+      if (!this.mcpToolService.isMcpToolName(toolCall.name)) {
+        return this.completeToolCallWithoutExecution(
+          state,
+          queue,
+          toolCall,
+          `MCP tool "${toolCall.name}" is no longer active.`,
+        );
+      }
 
       const toolMessage = this.createToolMessage(toolCall);
       const messageId = toolMessage.additional_kwargs
@@ -2154,10 +2369,12 @@ export class AgentService_v2 {
           args,
           signal,
         );
+        this.throwIfAborted(signal);
         resultText =
           typeof result === "string" ? result : JSON.stringify(result, null, 2);
       } catch (err) {
         if (this.helpers.isAbortError(err)) throw err;
+        this.throwIfAborted(signal);
         resultText = err instanceof Error ? err.message : String(err);
       }
 
@@ -2174,6 +2391,254 @@ export class AgentService_v2 {
         messages: [...messageHistory, toolMessage],
         sessionId,
         pendingToolCalls: queue.slice(1),
+      };
+    });
+  }
+
+  private isMcpToolExplicitlyReadOnly(toolName: string): boolean {
+    const tool = this.mcpToolService
+      .getActiveTools()
+      .find((candidate: any) => candidate?.name === toolName) as any;
+    const annotations = tool?.metadata?.annotations ?? tool?.annotations;
+    return annotations?.readOnlyHint === true;
+  }
+
+  private createToolBatchPlanningEnvironment(): ToolBatchPlanningEnvironment {
+    const resolveTerminalId = (reference: string): string | null =>
+      this.terminalService.resolveTerminal(reference).bestMatch?.id || null;
+    return {
+      isToolEnabled: (toolName) => {
+        if (this.mcpToolService.isMcpToolName(toolName)) return true;
+        return this.helpers.isBuiltInToolEnabled(
+          toolName,
+          this.builtInToolEnabled,
+        );
+      },
+      isMcpTool: (toolName) => this.mcpToolService.isMcpToolName(toolName),
+      isMcpToolReadOnly: (toolName) =>
+        this.isMcpToolExplicitlyReadOnly(toolName),
+      resolveTerminalId,
+      resolveMachineId: (reference) => {
+        const terminalId = resolveTerminalId(reference);
+        return terminalId
+          ? this.terminalService.getTransferMachineIdentity(terminalId)
+          : null;
+      },
+      createParallelGroupId: uuidv4,
+    };
+  }
+
+  private getSingleToolNode(toolCall: PlannedToolCall): any {
+    if (this.mcpToolService.isMcpToolName(toolCall.name)) {
+      return this.createMcpToolsNode();
+    }
+    if (toolCall.name === "exec_command") {
+      return this.createCommandToolsNode();
+    }
+    if (isFileMutationToolName(toolCall.name)) {
+      return this.createFileToolsNode();
+    }
+    if (toolCall.name === "read_file") {
+      return this.createReadFileNode();
+    }
+    return this.createToolsNode();
+  }
+
+  private createParallelToolsNode() {
+    return RunnableLambda.from(async (state: any, config: any) => {
+      const sessionId = state.sessionId;
+      if (!sessionId) throw new Error("No session ID in state");
+      this.throwIfAborted(config?.signal);
+
+      const queue: PlannedToolCall[] = Array.isArray(state.pendingToolCalls)
+        ? state.pendingToolCalls
+        : [];
+      const parallelCalls = getParallelToolCallPrefix(queue);
+      if (parallelCalls.length < 2) return state;
+
+      // Planning and dispatch are separated by graph checkpoints. Revalidate
+      // every concurrency assumption against the current runtime before any
+      // call starts. On drift, remove only the parallel marker and let the
+      // existing sequential router preserve order and all call results.
+      const planningEnvironment = this.createToolBatchPlanningEnvironment();
+      if (
+        !isParallelToolCallPrefixStillSafe(
+          parallelCalls,
+          planningEnvironment,
+        )
+      ) {
+        for (const toolCall of parallelCalls) {
+          delete toolCall._gyshellExecution.parallelGroupId;
+        }
+        return { ...state, pendingToolCalls: queue };
+      }
+
+      const messageHistory: BaseMessage[] = Array.isArray(state.messages)
+        ? state.messages
+        : [];
+      const settled = await Promise.allSettled(
+        parallelCalls.map(async (toolCall) => {
+          // A final per-call check keeps a settings change from crossing the
+          // dispatch boundary between group validation and Runnable startup.
+          if (!planningEnvironment.isToolEnabled(toolCall.name)) {
+            const toolMessage = this.createSyntheticToolMessage(toolCall, {
+              status: "not_executed",
+              reason: `Tool "${toolCall.name}" was disabled before execution.`,
+              retryable: true,
+            });
+            return { toolCall, toolMessage, supplementalMessages: [] };
+          }
+          if (
+            planningEnvironment.isMcpTool(toolCall.name) &&
+            !planningEnvironment.isMcpToolReadOnly(toolCall.name) &&
+            toolCall.name !== "exec_command"
+          ) {
+            const toolMessage = this.createSyntheticToolMessage(toolCall, {
+              status: "not_executed",
+              reason: `MCP tool "${toolCall.name}" is no longer declared read-only; GyShell refused to dispatch it in parallel.`,
+              retryable: true,
+            });
+            return { toolCall, toolMessage, supplementalMessages: [] };
+          }
+          const isolatedState = {
+            ...state,
+            messages: messageHistory,
+            pendingToolCalls: [toolCall],
+            pendingToolSupplementMessages: [],
+            _gyshellParallelToolIsolation: true,
+          };
+          const isolatedResult = await this.getSingleToolNode(toolCall).invoke(
+            isolatedState,
+            config,
+          );
+          const resultMessages: BaseMessage[] = Array.isArray(
+            isolatedResult?.messages,
+          )
+            ? isolatedResult.messages.slice(messageHistory.length)
+            : [];
+          const toolMessage = resultMessages.find(
+            (message) =>
+              ToolMessage.isInstance(message) &&
+              String((message as ToolMessage).tool_call_id) === toolCall.id,
+          );
+          if (!toolMessage) {
+            throw new Error(
+              `Tool executor returned no result for call "${toolCall.id}".`,
+            );
+          }
+          const supplementalMessages: BaseMessage[] = Array.isArray(
+            isolatedResult?.pendingToolSupplementMessages,
+          )
+            ? isolatedResult.pendingToolSupplementMessages
+            : [];
+          const runtimeTerminalBoundaryId =
+            typeof isolatedResult?._gyshellRuntimeTerminalBoundaryId ===
+            "string"
+              ? isolatedResult._gyshellRuntimeTerminalBoundaryId
+              : null;
+          return {
+            toolCall,
+            toolMessage,
+            supplementalMessages,
+            runtimeTerminalBoundaryId,
+          };
+        }),
+      );
+      this.throwIfAborted(config?.signal);
+
+      const toolMessages: ToolMessage[] = [];
+      const supplementalMessages: BaseMessage[] = [];
+      for (let index = 0; index < settled.length; index += 1) {
+        const outcome = settled[index];
+        const toolCall = parallelCalls[index];
+        if (outcome.status === "fulfilled") {
+          if (outcome.value.runtimeTerminalBoundaryId) {
+            deferTerminalMutationsAfterRuntimeBoundary(
+              queue.slice(parallelCalls.length),
+              outcome.value.runtimeTerminalBoundaryId,
+              toolCall,
+              planningEnvironment,
+            );
+          }
+          toolMessages.push(outcome.value.toolMessage as ToolMessage);
+          supplementalMessages.push(...outcome.value.supplementalMessages);
+          continue;
+        }
+
+        const aborted = this.helpers.isAbortError(outcome.reason);
+        const isCommand = toolCall.name === "exec_command";
+        if (isCommand) {
+          const terminalId = resolveToolCallTerminalIds(
+            toolCall,
+            planningEnvironment,
+          )[0];
+          if (terminalId) {
+            deferTerminalMutationsAfterRuntimeBoundary(
+              queue.slice(parallelCalls.length),
+              terminalId,
+              toolCall,
+              planningEnvironment,
+            );
+          }
+        }
+        const status = isCommand
+          ? "unknown_outcome"
+          : aborted
+            ? "cancelled"
+            : "error";
+        const reason = isCommand
+          ? aborted
+            ? "The run stopped while this cross-machine command was in flight. Its external outcome is unknown and it must not be replayed automatically."
+            : "The cross-machine command executor rejected without a definitive pre-dispatch result. Its external outcome is unknown and it must not be replayed automatically."
+          : aborted
+            ? "The run stopped before this read-only call returned a definitive result."
+            : outcome.reason instanceof Error
+              ? outcome.reason.message
+              : String(outcome.reason);
+        const toolMessage = this.createSyntheticToolMessage(toolCall, {
+          status,
+          reason,
+          retryable: !isCommand,
+        });
+        toolMessages.push(toolMessage);
+        this.helpers.sendEvent(sessionId, {
+          messageId: (toolMessage as any).additional_kwargs?._gyshellMessageId,
+          type: "tool_call",
+          toolName: toolCall.name,
+          input: JSON.stringify(toolCall.args || {}),
+          output: String(toolMessage.content),
+        });
+      }
+
+      const existingSupplementalMessages: BaseMessage[] = Array.isArray(
+        state.pendingToolSupplementMessages,
+      )
+        ? state.pendingToolSupplementMessages
+        : [];
+      return {
+        messages: [...messageHistory, ...toolMessages],
+        sessionId,
+        pendingToolCalls: queue.slice(parallelCalls.length),
+        pendingToolSupplementMessages: [
+          ...existingSupplementalMessages,
+          ...supplementalMessages,
+        ],
+      };
+    });
+  }
+
+  private createFlushToolSupplementsNode() {
+    return RunnableLambda.from(async (state: any) => {
+      const supplementalMessages: BaseMessage[] = Array.isArray(
+        state.pendingToolSupplementMessages,
+      )
+        ? state.pendingToolSupplementMessages
+        : [];
+      if (supplementalMessages.length === 0) return state;
+      return {
+        ...state,
+        messages: [...state.messages, ...supplementalMessages],
+        pendingToolSupplementMessages: [],
       };
     });
   }
@@ -2484,6 +2949,81 @@ export class AgentService_v2 {
     const messageId = uuidv4();
     (toolMessage as any).additional_kwargs = { _gyshellMessageId: messageId };
     return toolMessage;
+  }
+
+  private createSyntheticToolMessage(
+    toolCall: any,
+    outcome: Parameters<typeof createSyntheticToolOutcomeContent>[0],
+  ): ToolMessage {
+    const toolMessage = this.createToolMessage(toolCall);
+    toolMessage.content = createSyntheticToolOutcomeContent(outcome);
+    return toolMessage;
+  }
+
+  private completeToolCallWithoutExecution(
+    state: any,
+    queue: any[],
+    toolCall: any,
+    reason: string,
+    retryable = true,
+  ): any {
+    const sessionId = state.sessionId;
+    const toolMessage = this.createSyntheticToolMessage(toolCall, {
+      status: "not_executed",
+      reason,
+      retryable,
+    });
+    this.helpers.sendEvent(sessionId, {
+      messageId: (toolMessage as any).additional_kwargs?._gyshellMessageId,
+      type: "tool_call",
+      toolName: toolCall.name,
+      input: JSON.stringify(toolCall.args || {}),
+      output: String(toolMessage.content),
+    });
+    return {
+      messages: [...state.messages, toolMessage],
+      sessionId,
+      pendingToolCalls: queue.slice(1),
+    };
+  }
+
+  private getFileMutationMachineKey(toolCall: PlannedToolCall): string {
+    try {
+      const environment = this.createToolBatchPlanningEnvironment();
+      const terminalId = resolveToolCallTerminalIds(toolCall, environment)[0];
+      if (!terminalId) return "unknown-machine";
+      const machineId = this.terminalService.getTransferMachineIdentity(terminalId);
+      return machineId ? `machine:${machineId}` : `terminal:${terminalId}`;
+    } catch {
+      return "unknown-machine";
+    }
+  }
+
+  private async acquireFileMutationTurn(
+    toolCall: PlannedToolCall,
+  ): Promise<() => void> {
+    const machineKey = this.getFileMutationMachineKey(toolCall);
+    const predecessor =
+      this.fileMutationTailByMachine.get(machineKey) ?? Promise.resolve();
+    let releaseTurn: () => void = () => {};
+    const turn = new Promise<void>((resolve) => {
+      releaseTurn = resolve;
+    });
+    const queuedTail = predecessor.catch(() => {}).then(() => turn);
+    this.fileMutationTailByMachine.set(machineKey, queuedTail);
+
+    await predecessor.catch(() => {});
+    let released = false;
+    return () => {
+      if (released) return;
+      released = true;
+      releaseTurn();
+      void queuedTail.then(() => {
+        if (this.fileMutationTailByMachine.get(machineKey) === queuedTail) {
+          this.fileMutationTailByMachine.delete(machineKey);
+        }
+      });
+    };
   }
 
   private consumeQueuedInsertionMessages(sessionId: string): HumanMessage[] {
@@ -3127,6 +3667,9 @@ export class AgentService_v2 {
       : [];
     const first = queue[0];
 
+    if (first?._gyshellExecution?.mode === "not_executed") {
+      return "tools";
+    }
     if (first?.name) {
       // Security: Double-check if the tool is actually enabled before routing.
       // This prevents the Agent from calling tools that were disabled during the session.
@@ -3140,13 +3683,16 @@ export class AgentService_v2 {
         console.warn(
           `[AgentService_v2] LLM tried to call disabled tool: ${first.name} (capability=${capabilityName})`,
         );
-        if (
-          first.name === "create_terminal_tab" ||
-          first.name === "close_terminal_tab"
-        ) {
-          return "tools";
-        }
-        return "final_output";
+        first._gyshellExecution = {
+          ...(first._gyshellExecution || { ordinal: 0 }),
+          mode: "not_executed",
+          reason: `Tool "${first.name}" was disabled before execution.`,
+          retryable: true,
+        };
+        return "tools";
+      }
+      if (getParallelToolCallPrefix(queue).length >= 2) {
+        return "parallel_tools";
       }
 
       if (first.name === "skill" || first.name === "create_skill")
@@ -3194,9 +3740,33 @@ export class AgentService_v2 {
       : [];
     const first = queue[0];
     if (!first) {
+      const supplementalMessages: BaseMessage[] = Array.isArray(
+        state.pendingToolSupplementMessages,
+      )
+        ? state.pendingToolSupplementMessages
+        : [];
+      if (supplementalMessages.length > 0) {
+        return "flush_tool_supplements";
+      }
       return "token_pruner_runtime";
     }
+    if (first?._gyshellExecution?.mode === "not_executed") return "tools";
     if (first?.name) {
+      if (
+        !this.helpers.isBuiltInToolEnabled(
+          first.name,
+          this.builtInToolEnabled,
+        )
+      ) {
+        first._gyshellExecution = {
+          ...(first._gyshellExecution || { ordinal: 0 }),
+          mode: "not_executed",
+          reason: `Tool "${first.name}" was disabled before execution.`,
+          retryable: true,
+        };
+        return "tools";
+      }
+      if (getParallelToolCallPrefix(queue).length >= 2) return "parallel_tools";
       if (this.mcpToolService.isMcpToolName(first.name)) return "mcp_tools";
       if (first.name === "exec_command") return "command_tools";
       if (isFileMutationToolName(first.name)) return "file_tools";
@@ -3208,11 +3778,9 @@ export class AgentService_v2 {
     return "token_pruner_runtime";
   };
 
-  private cleanupModelToolCallMetadata(msg: any, keepToolCalls: any[]): void {
-    // Keep only chosen tool calls (0/1/many) while removing tool-call chunk/invalid artifacts.
-    if (Array.isArray(msg?.tool_calls)) {
-      msg.tool_calls = Array.isArray(keepToolCalls) ? keepToolCalls : [];
-    }
+  private cleanupModelToolCallMetadata(msg: any): void {
+    // Valid tool_calls are model output and must remain intact. Only redundant
+    // streaming/parser artifacts are removed before the message is persisted.
     if (Array.isArray(msg?.invalid_tool_calls)) {
       msg.invalid_tool_calls = [];
     }
@@ -3224,26 +3792,40 @@ export class AgentService_v2 {
     }
   }
 
-  private trimInterruptedToolCallHistory(
-    messages: BaseMessage[],
-    executedToolCall: any,
-  ): void {
-    const lastMessage = messages[messages.length - 1];
-    if (!AIMessage.isInstance(lastMessage)) {
-      return;
+  private buildActionModelHistoryBeforeActiveToolBatch(
+    state: any,
+  ): BaseMessage[] {
+    const messages: BaseMessage[] = Array.isArray(state.messages)
+      ? state.messages
+      : [];
+    const pendingCalls: any[] = Array.isArray(state.pendingToolCalls)
+      ? state.pendingToolCalls
+      : [];
+    const pendingIds = new Set(
+      pendingCalls
+        .map((call) => String(call?.id || ""))
+        .filter((id) => id.length > 0),
+    );
+    if (pendingIds.size === 0) {
+      return this.helpers.buildActionModelHistory(messages);
     }
 
-    const toolCalls = Array.isArray((lastMessage as any).tool_calls)
-      ? (lastMessage as any).tool_calls
-      : [];
-    const executedToolCallId = String(executedToolCall?.id ?? "");
-    const matchingToolCall = toolCalls.find(
-      (call: any) => String(call?.id ?? "") === executedToolCallId,
-    );
+    let sourceIndex = -1;
+    for (let index = messages.length - 1; index >= 0; index -= 1) {
+      const message = messages[index];
+      if (!AIMessage.isInstance(message)) continue;
+      const toolCalls: any[] = Array.isArray((message as any).tool_calls)
+        ? (message as any).tool_calls
+        : [];
+      if (toolCalls.some((call) => pendingIds.has(String(call?.id || "")))) {
+        sourceIndex = index;
+        break;
+      }
+    }
 
-    this.cleanupModelToolCallMetadata(lastMessage, [
-      matchingToolCall ?? executedToolCall,
-    ]);
+    const completedHistory =
+      sourceIndex >= 0 ? messages.slice(0, sourceIndex) : messages;
+    return this.helpers.buildActionModelHistory(completedHistory);
   }
 
   private shouldKeepDebugPayloadInPersistence(): boolean {
@@ -3598,7 +4180,6 @@ export class AgentService_v2 {
   ): Promise<void> {
     if (!this.graph) throw new Error("Graph not initialized");
 
-    this.lastAbortedMessage = null;
     const { sessionId } = context;
     const runId =
       typeof context?.metadata?.runId === "string"
@@ -3608,6 +4189,10 @@ export class AgentService_v2 {
       typeof context?.metadata?.agentRunId === "string"
         ? context.metadata.agentRunId
         : runId;
+    // A logical agentRunId can span inserted restarts. Partial model output is
+    // owned by one physical graph invocation, so it needs a fresh identity.
+    const physicalRunId = uuidv4();
+    this.abortedMessagesByRunId.delete(physicalRunId);
     if (agentRunId) {
       this.activeAgentRunIdsBySession.set(sessionId, agentRunId);
     }
@@ -3648,6 +4233,7 @@ export class AgentService_v2 {
     const initialState = {
       messages: [...baseMessages],
       sessionId: sessionId,
+      physicalRunId,
       startup_input: input,
       startup_mode: startMode,
       runtimeThinkingCorrectionEnabled:
@@ -3661,6 +4247,7 @@ export class AgentService_v2 {
         runExperimentalFlags.writeStdinActionModelEnabled,
     };
 
+    this.activePhysicalRunIds.add(physicalRunId);
     try {
       const result = await this.graph.invoke(initialState, {
         recursionLimit: recursionLimit,
@@ -3689,7 +4276,7 @@ export class AgentService_v2 {
       const isAbort = this.helpers.isAbortError(err);
 
       // For any stop path or internal failure, try to save all history in the current Checkpoint.
-      await this.trySaveSessionFromCheckpoint(sessionId);
+      await this.trySaveSessionFromCheckpoint(sessionId, physicalRunId);
 
       if (isAbort) {
         console.log(
@@ -3715,6 +4302,8 @@ export class AgentService_v2 {
 
       throw err; // Throw to Gateway for UI notification
     } finally {
+      this.activePhysicalRunIds.delete(physicalRunId);
+      this.abortedMessagesByRunId.delete(physicalRunId);
       this.selfCorrectionRuntimeManager.clearSession(sessionId);
       if (
         agentRunId &&
@@ -3735,7 +4324,10 @@ export class AgentService_v2 {
     }
   }
 
-  private async trySaveSessionFromCheckpoint(sessionId: string): Promise<void> {
+  private async trySaveSessionFromCheckpoint(
+    sessionId: string,
+    physicalRunId: string = sessionId,
+  ): Promise<void> {
     if (!this.graph) return;
     try {
       const snapshot = await this.graph.getState({
@@ -3744,16 +4336,29 @@ export class AgentService_v2 {
       let messages = (snapshot as any)?.values?.messages as
         | BaseMessage[]
         | undefined;
-      if (!messages || messages.length === 0) return;
+      messages = Array.isArray(messages) ? messages : [];
 
-      // Check if there's an aborted message captured in the instance variable
-      if (this.lastAbortedMessage) {
-        console.log(
-          "[AgentService_v2] Appending aborted message from instance variable to history.",
-        );
-        messages = [...messages, this.lastAbortedMessage];
-        this.lastAbortedMessage = null; // Clear after use
+      const pendingToolSupplementMessages = (snapshot as any)?.values
+        ?.pendingToolSupplementMessages as BaseMessage[] | undefined;
+      if (
+        Array.isArray(pendingToolSupplementMessages) &&
+        pendingToolSupplementMessages.length > 0
+      ) {
+        // A stop can land after a tool result was committed but before image
+        // bridge/supplement messages were flushed. Persist both; the history
+        // reconciler will keep all tool results before these supplements.
+        messages = [...messages, ...pendingToolSupplementMessages];
       }
+
+      const abortedMessage = this.abortedMessagesByRunId.get(physicalRunId);
+      if (abortedMessage) {
+        console.log(
+          "[AgentService_v2] Appending aborted message for this physical run to history.",
+        );
+        messages = [...messages, abortedMessage];
+        this.abortedMessagesByRunId.delete(physicalRunId);
+      }
+      if (messages.length === 0) return;
 
       const session = this.chatHistoryService.loadSession(sessionId) || {
         id: sessionId,
@@ -3784,12 +4389,62 @@ export class AgentService_v2 {
     lastProfileMaxTokens?: number,
   ): void {
     let persisted = messages.filter((m) => !this.helpers.isEphemeral(m));
-    const toolCallCleanResult = removeUnmatchedToolCallsFromHistory(persisted);
-    persisted = toolCallCleanResult.messages;
-    if (toolCallCleanResult.removedToolCallCount > 0) {
+    let repairedInvalidToolCallIdCount = 0;
+    let repairedInvalidToolCallNameCount = 0;
+    for (const message of persisted) {
+      if (!AIMessage.isInstance(message)) continue;
+      const toolCalls = Array.isArray((message as any).tool_calls)
+        ? (message as any).tool_calls
+        : [];
+      if (toolCalls.length === 0) continue;
+      const normalized = normalizeToolCallIds(toolCalls, uuidv4);
+      const normalizedNames = normalizeToolCallNames(normalized.toolCalls);
+      if (
+        normalized.repairs.length === 0 &&
+        normalizedNames.repairedOrdinals.length === 0
+      ) {
+        continue;
+      }
+      (message as any).tool_calls = normalizedNames.toolCalls;
+      repairedInvalidToolCallIdCount += normalized.repairs.length;
+      repairedInvalidToolCallNameCount +=
+        normalizedNames.repairedOrdinals.length;
+    }
+    if (repairedInvalidToolCallIdCount > 0) {
       console.warn(
-        `[AgentService_v2] Removed ${toolCallCleanResult.removedToolCallCount} orphan tool_calls before history persistence.`,
+        `[AgentService_v2] Repaired ${repairedInvalidToolCallIdCount} invalid tool-call id(s) before history persistence.`,
       );
+    }
+    if (repairedInvalidToolCallNameCount > 0) {
+      console.warn(
+        `[AgentService_v2] Repaired ${repairedInvalidToolCallNameCount} missing or blank tool-call name(s) before history persistence.`,
+      );
+    }
+    const toolCallCompletion = completeUnmatchedToolCallsInHistory(persisted, {
+      status: "unknown_outcome",
+      reason:
+        "The run ended before GyShell recorded a definitive result for this tool call. Do not assume success or replay a possible side effect automatically; inspect current state and replan.",
+      retryable: false,
+    });
+    persisted = toolCallCompletion.messages;
+    if (toolCallCompletion.addedToolMessageCount > 0) {
+      console.warn(
+        `[AgentService_v2] Completed ${toolCallCompletion.addedToolMessageCount} unresolved tool call(s) with unknown_outcome before history persistence.`,
+      );
+    }
+    if (
+      toolCallCompletion.invalidToolCallCount > 0 ||
+      toolCallCompletion.duplicateToolCallIdCount > 0 ||
+      toolCallCompletion.duplicateToolResponseCount > 0 ||
+      toolCallCompletion.orphanToolResponseCount > 0
+    ) {
+      console.warn("[AgentService_v2] Malformed tool-call history detected", {
+        invalidToolCallCount: toolCallCompletion.invalidToolCallCount,
+        duplicateToolCallIdCount: toolCallCompletion.duplicateToolCallIdCount,
+        duplicateToolResponseCount:
+          toolCallCompletion.duplicateToolResponseCount,
+        orphanToolResponseCount: toolCallCompletion.orphanToolResponseCount,
+      });
     }
 
     // Check if the last message is an empty AI message and remove it if so

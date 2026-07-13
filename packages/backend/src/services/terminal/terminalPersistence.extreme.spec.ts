@@ -1720,7 +1720,13 @@ const run = async (): Promise<void> => {
       terminal.runtimeState = 'ready'
       terminal.isInitializing = false
 
-      let completionResult: { exitCode?: number; history_command_match_id: string } | undefined
+      let completionResult:
+        | {
+            exitCode?: number
+            history_command_match_id: string
+            runtimeBoundary?: boolean
+          }
+        | undefined
       let callbackObservedCleanState = false
       const taskId = await service.runCommandNoWait(terminal.id, 'sleep 60', (result) => {
         completionResult = result
@@ -1736,6 +1742,11 @@ const run = async (): Promise<void> => {
         'terminal close should finish the registered command callback'
       )
       assertEqual(completionResult?.exitCode, -2, 'terminal close should report an aborted command exit code')
+      assertEqual(
+        completionResult?.runtimeBoundary,
+        true,
+        'terminal close should report that the active command did not reach a definitive completion boundary'
+      )
       assertEqual(
         (service as any).onTaskFinishedCallbacks.size,
         0,
@@ -1779,6 +1790,11 @@ const run = async (): Promise<void> => {
         'terminal close should settle the same in-flight command task'
       )
       assertEqual(result.exitCode, -2, 'terminal close should resolve a waiting command with the aborted exit code')
+      assertEqual(
+        result.runtimeBoundary,
+        true,
+        'terminal close should preserve the unknown command outcome boundary for waiters'
+      )
       assertCondition(
         /terminal tab was closed/i.test(result.stdoutDelta),
         'terminal close should explain why the waiting command was aborted'
