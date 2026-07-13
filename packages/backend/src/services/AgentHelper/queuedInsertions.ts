@@ -112,14 +112,22 @@ export function buildExecCommandNowaitCompletedInsertion(params: {
   historyCommandMatchId: string
   command: string
   exitCode?: number
+  runtimeBoundary?: boolean
 }): QueuedAgentInsertionInput {
   const terminalRef = params.terminalId || params.terminalName
-  const instruction =
-    'The nowait exec_command has completed. Do not infer or summarize command output from this notification. ' +
-    `Use read_command_output with tabIdOrName=${JSON.stringify(terminalRef)} and history_command_match_id=${JSON.stringify(params.historyCommandMatchId)} if you need to inspect the result.`
+  const outcomeUnknown = params.runtimeBoundary === true
+  const instruction = outcomeUnknown
+    ? 'The hidden completion tracker stopped before a definitive outcome was observed. Do not assume success or replay the command automatically. ' +
+      `Inspect the terminal and use read_command_output with tabIdOrName=${JSON.stringify(terminalRef)} and history_command_match_id=${JSON.stringify(params.historyCommandMatchId)} before planning later mutations.`
+    : 'The nowait exec_command has completed. Do not infer or summarize command output from this notification. ' +
+      `Use read_command_output with tabIdOrName=${JSON.stringify(terminalRef)} and history_command_match_id=${JSON.stringify(params.historyCommandMatchId)} if you need to inspect the result.`
   const payload = {
-    notification_type: 'exec_command_nowait_completed',
-    message: 'A background nowait exec_command has completed.',
+    notification_type: outcomeUnknown
+      ? 'exec_command_nowait_outcome_unknown'
+      : 'exec_command_nowait_completed',
+    message: outcomeUnknown
+      ? 'A background exec_command no longer has a definitive tracked outcome.'
+      : 'A background nowait exec_command has completed.',
     history_command_match_id: params.historyCommandMatchId,
     terminal_id: params.terminalId,
     terminal_name: params.terminalName,
@@ -131,7 +139,9 @@ export function buildExecCommandNowaitCompletedInsertion(params: {
   }
   const content = `${AGENT_NOTIFICATION_TAG}${JSON.stringify(payload, null, 2)}`
   return {
-    kind: 'exec_command_nowait_completed',
+    kind: outcomeUnknown
+      ? 'exec_command_nowait_outcome_unknown'
+      : 'exec_command_nowait_completed',
     content,
     dedupeKey: `exec_command_nowait_completed:${params.terminalId}:${params.historyCommandMatchId}`
   }

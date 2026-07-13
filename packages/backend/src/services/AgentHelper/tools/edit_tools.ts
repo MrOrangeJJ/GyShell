@@ -761,10 +761,24 @@ async function runFileMutationTool(
     action = result.action
     filePath = result.filePath
   } catch (err) {
+    if (
+      context.signal?.aborted ||
+      (err instanceof Error &&
+        (err.name === 'AbortError' || err.message === 'AbortError'))
+    ) {
+      const abortError = new Error('AbortError')
+      abortError.name = 'AbortError'
+      throw abortError
+    }
     outputText = err instanceof Error ? err.message : String(err)
     action = 'error'
   }
 
+  if (context.signal?.aborted) {
+    const abortError = new Error('AbortError')
+    abortError.name = 'AbortError'
+    throw abortError
+  }
   sendEvent(sessionId, {
     messageId,
     type: 'file_edit',
