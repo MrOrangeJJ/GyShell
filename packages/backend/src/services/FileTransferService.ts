@@ -82,6 +82,7 @@ export interface ListFileTransfersOptions {
 interface FileTransferTaskInternal {
   snapshot: FileTransferTaskSnapshot
   controller: AbortController
+  allowPeerDirect: boolean
   chunkSize?: number
   onSettled?: (task: FileTransferTaskSnapshot) => void
   cleanupTimer?: ReturnType<typeof setTimeout>
@@ -119,7 +120,10 @@ export class FileTransferService extends EventEmitter {
     this.rawEventPublisher = publisher
   }
 
-  startTransfer(input: StartFileTransferInput): FileTransferTaskSnapshot {
+  startTransfer(
+    input: StartFileTransferInput,
+    options?: { allowPeerDirect?: boolean },
+  ): FileTransferTaskSnapshot {
     const sourcePaths = this.normalizeSourcePaths(input.sourcePaths)
     const targetDirPath = this.normalizeTargetDirPath(input.targetDirPath)
     const mode = input.mode === 'move' ? 'move' : 'copy'
@@ -195,6 +199,8 @@ export class FileTransferService extends EventEmitter {
     this.tasks.set(id, {
       snapshot,
       controller: new AbortController(),
+      allowPeerDirect:
+        options?.allowPeerDirect === true && input.origin === 'user',
       chunkSize: input.chunkSize,
       onSettled: input.onSettled,
     })
@@ -318,6 +324,7 @@ export class FileTransferService extends EventEmitter {
           conflictStrategy: task.snapshot.conflictStrategy,
           chunkSize: task.chunkSize,
           transferId: task.snapshot.id,
+          allowPeerDirect: task.allowPeerDirect,
           signal: task.controller.signal,
           onProgress: (progress) => {
             if (this.isTaskTerminal(taskId)) return
@@ -326,6 +333,15 @@ export class FileTransferService extends EventEmitter {
               0,
               Number(progress.bytesTransferred) || 0,
             )
+            const percent =
+              totalBytes > 0
+                ? Math.min(
+                    progress.eof ? 100 : 99,
+                    Math.round((bytesDone / totalBytes) * 100),
+                  )
+                : progress.eof
+                  ? 100
+                  : 0
             this.updateTask(taskId, {
               status: 'running',
               bytesDone,
@@ -335,15 +351,10 @@ export class FileTransferService extends EventEmitter {
                 Number(progress.transferredFiles) || 0,
               ),
               totalFiles: Math.max(0, Number(progress.totalFiles) || 0),
-              percent:
-                totalBytes > 0
-                  ? Math.min(100, Math.round((bytesDone / totalBytes) * 100))
-                  : progress.eof
-                    ? 100
-                    : 0,
+              percent,
               message:
                 totalBytes > 0
-                  ? `Transferring files (${totalBytes > 0 ? Math.min(100, Math.round((bytesDone / totalBytes) * 100)) : 0}%).`
+                  ? `Transferring files (${percent}%).`
                   : 'Transferring files.',
             })
           },

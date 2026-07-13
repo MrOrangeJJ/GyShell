@@ -1033,7 +1033,12 @@ export class ElectronGatewayIpcAdapter {
     );
 
     ipcMain.handle("filesystem:startTransfer", async (_: any, input: any) => {
-      return requireFileTransferService().startTransfer(input);
+      // This IPC route is owned by the renderer's explicit file-transfer UI.
+      // Remote gateways and agent tools call FileTransferService without this
+      // internal capability and therefore remain on the local relay route.
+      return requireFileTransferService().startTransfer(input, {
+        allowPeerDirect: true,
+      });
     });
 
     ipcMain.handle(

@@ -11,6 +11,8 @@ import {
   type TerminalBackend,
   type TerminalConfig,
   type TerminalExecOptions,
+  type PeerFileTransferOptions,
+  type PeerFileTransferResult,
   type SSHConnectionConfig,
   type FileSystemEntry,
   type FileStatInfo,
@@ -21,6 +23,7 @@ import {
   type SftpTransferDirection,
   type SftpTransferProfile,
 } from "./ssh/SftpAdaptiveTransferTuner";
+import { SshDirectFileTransfer } from "./ssh/SshDirectFileTransfer";
 import {
   buildWindowsPowerShellEncodedCommand,
   WINDOWS_POWERSHELL_COMMAND_OUTPUT_FILE_PREFIX,
@@ -39,6 +42,19 @@ const GYSHELL_READY_MARKER = "__GYSHELL_READY__";
 const SSH_CONNECT_READY_TIMEOUT_MS = 20_000;
 const SSH_KEEPALIVE_INTERVAL_MS = 30_000;
 const SSH_KEEPALIVE_COUNT_MAX = 3;
+const SSH_DIRECT_CONTROL_READY_TIMEOUT_MS = 4_000;
+
+interface SshRouteConnectOptions {
+  signal?: AbortSignal;
+  readyTimeoutMs?: number;
+  forwardTimeoutMs?: number;
+}
+
+const createRouteAbortError = (): Error => {
+  const error = new Error("SSH route setup was cancelled.");
+  error.name = "AbortError";
+  return error;
+};
 
 interface TerminalWindowSize {
   cols: number;
@@ -62,6 +78,7 @@ interface SSHInstance {
   cwd?: string;
   homeDir?: string;
   remoteOs?: "unix" | "windows";
+  observedHostKey?: Buffer;
   systemInfo?: any;
   systemInfoPromise?: Promise<any>;
   systemInfoRetryTimer?: ReturnType<typeof setTimeout>;
@@ -108,6 +125,7 @@ export class SSHBackend implements TerminalBackend {
     preferredProfileId: "balanced-32x128k",
     explorationInterval: 8,
   });
+  private readonly directFileTransfer = new SshDirectFileTransfer();
   private static readonly CHUNK_SESSION_IDLE_MS = 8000;
   private static readonly MAX_SFTP_READ_REQUEST_BYTES = 64 * 1024;
   private static readonly FAST_TRANSFER_TIMEOUT_MIN_MS = 45_000;
@@ -116,6 +134,10 @@ export class SSHBackend implements TerminalBackend {
   private static readonly SYSTEM_INFO_RETRY_BASE_MS = 1500;
   private static readonly SYSTEM_INFO_RETRY_MAX_MS = 8000;
   private static readonly SYSTEM_INFO_RETRY_MAX_ATTEMPTS = 6;
+
+  private createSshClient(): ssh2.Client {
+    return new ssh2.Client();
+  }
 
   private buildBaseConnectConfig(
     sshConfig: SSHConnectionConfig,
@@ -130,6 +152,155 @@ export class SSHBackend implements TerminalBackend {
       keepaliveCountMax: SSH_KEEPALIVE_COUNT_MAX,
       ...(sock ? { sock } : {}),
     };
+  }
+
+  private async openAgentExecutorClient(
+    instance: SSHInstance,
+    agentSocketPath: string,
+    signal?: AbortSignal,
+  ): Promise<ssh2.Client | null> {
+    const sshConfig = instance.sshConfig;
+    const expectedHostKey = instance.observedHostKey;
+    if (signal?.aborted) throw createRouteAbortError();
+    if (!sshConfig || !expectedHostKey || sshConfig.proxy) {
+      return null;
+    }
+
+    let executorPrivateKey: Buffer | string | undefined;
+    if (sshConfig.authMethod === "password") {
+      if (!sshConfig.password) return null;
+    } else {
+      executorPrivateKey = sshConfig.privateKey;
+      if (!executorPrivateKey && sshConfig.privateKeyPath) {
+        try {
+          executorPrivateKey = fs.readFileSync(sshConfig.privateKeyPath);
+        } catch {
+          return null;
+        }
+      }
+      if (!executorPrivateKey) return null;
+    }
+
+    let controlSocket: net.Socket | undefined;
+    if (sshConfig.jumpHost) {
+      const routedSocket = await this.openDirectControlRouteSocket(
+        sshConfig,
+        signal,
+      );
+      if (!routedSocket) return null;
+      controlSocket = routedSocket;
+    }
+
+    const connectConfig = this.buildBaseConnectConfig(sshConfig, controlSocket);
+    connectConfig.readyTimeout = SSH_DIRECT_CONTROL_READY_TIMEOUT_MS;
+    connectConfig.agent = agentSocketPath;
+    connectConfig.agentForward = true;
+    connectConfig.hostVerifier = (hostKey: Buffer) =>
+      Buffer.from(hostKey).equals(expectedHostKey);
+
+    if (sshConfig.authMethod === "password") {
+      connectConfig.password = sshConfig.password;
+      connectConfig.authHandler = ["password"];
+    } else {
+      connectConfig.privateKey = executorPrivateKey;
+      if (sshConfig.passphrase) {
+        connectConfig.passphrase = sshConfig.passphrase;
+      }
+      connectConfig.authHandler = ["publickey"];
+    }
+
+    const client = this.createSshClient();
+    return await new Promise<ssh2.Client | null>((resolve, reject) => {
+      let settled = false;
+      const finish = (result: ssh2.Client | null, error?: Error): void => {
+        if (settled) {
+          if (result) {
+            try {
+              result.end();
+            } catch {
+              // A late-ready connection after cancellation is cleanup-only.
+            }
+          }
+          return;
+        }
+        settled = true;
+        signal?.removeEventListener("abort", onAbort);
+        if (!result) {
+          try {
+            client.end();
+          } catch {
+            // Failed short-lived connections have no further cleanup contract.
+          }
+          try {
+            controlSocket?.destroy();
+          } catch {
+            // The routed socket may already have closed with the SSH client.
+          }
+        }
+        if (error) reject(error);
+        else resolve(result);
+      };
+      const onAbort = (): void => finish(null, createRouteAbortError());
+      client.once("ready", () => finish(client));
+      client.once("error", () => finish(null));
+      client.once("close", () => finish(null));
+      signal?.addEventListener("abort", onAbort, { once: true });
+      if (signal?.aborted) {
+        onAbort();
+        return;
+      }
+      try {
+        client.connect(connectConfig);
+      } catch {
+        finish(null);
+      }
+    });
+  }
+
+  private async openDirectControlRouteSocket(
+    sshConfig: SSHConnectionConfig,
+    signal?: AbortSignal,
+  ): Promise<net.Socket | null> {
+    if (signal?.aborted) throw createRouteAbortError();
+    return await new Promise<net.Socket | null>((resolve, reject) => {
+      let settled = false;
+      const finish = (socket: net.Socket | null, error?: Error): void => {
+        if (settled) {
+          try {
+            socket?.destroy();
+          } catch {
+            // A late route socket after cancellation is cleanup-only.
+          }
+          return;
+        }
+        settled = true;
+        signal?.removeEventListener("abort", onAbort);
+        if (error) reject(error);
+        else resolve(socket);
+      };
+      const onAbort = (): void => finish(null, createRouteAbortError());
+      signal?.addEventListener("abort", onAbort, { once: true });
+      if (signal?.aborted) {
+        onAbort();
+        return;
+      }
+      void this.buildConnectSocketIfNeeded(sshConfig, () => {}, {
+        signal,
+        readyTimeoutMs: SSH_DIRECT_CONTROL_READY_TIMEOUT_MS,
+        forwardTimeoutMs: SSH_DIRECT_CONTROL_READY_TIMEOUT_MS,
+      })
+        .then((socket) => finish(socket ?? null))
+        .catch((error: unknown) => {
+          if (
+            signal?.aborted ||
+            (error as { name?: unknown } | null)?.name === "AbortError"
+          ) {
+            finish(null, createRouteAbortError());
+            return;
+          }
+          finish(null);
+        });
+    });
   }
 
   private normalizeWindowSize(
@@ -216,6 +387,49 @@ export class SSHBackend implements TerminalBackend {
     } catch {
       return null;
     }
+  }
+
+  async tryPeerFileTransfer(
+    sourcePtyId: string,
+    sourcePath: string,
+    targetPtyId: string,
+    targetPath: string,
+    options: PeerFileTransferOptions,
+  ): Promise<PeerFileTransferResult> {
+    const source = this.sessions.get(sourcePtyId);
+    const target = this.sessions.get(targetPtyId);
+    if (!source || !target) {
+      return { status: "fallback", reason: "unavailable" };
+    }
+    if (source.remoteOs !== "unix" || target.remoteOs !== "unix") {
+      return { status: "fallback", reason: "unsupported-os" };
+    }
+    if (
+      !source.sshConfig ||
+      !target.sshConfig ||
+      !source.observedHostKey ||
+      !target.observedHostKey
+    ) {
+      return { status: "fallback", reason: "missing-host-key" };
+    }
+
+    return await this.directFileTransfer.tryTransfer({
+      sourceClient: source.client,
+      sourceConfig: source.sshConfig,
+      sourceObservedHostKey: source.observedHostKey,
+      sourcePath,
+      targetClient: target.client,
+      targetConfig: target.sshConfig,
+      targetObservedHostKey: target.observedHostKey,
+      targetPath,
+      openAgentExecutorClient: async (side, socketPath, signal) =>
+        await this.openAgentExecutorClient(
+          side === "source" ? source : target,
+          socketPath,
+          signal,
+        ),
+      options,
+    });
   }
 
   async prepareCommandTracking(
@@ -981,6 +1195,7 @@ export class SSHBackend implements TerminalBackend {
         host: opts.dstHost,
         port: opts.dstPort,
       },
+      timeout: 10000,
     }).catch(async (err) => {
       // If socks library fails or doesn't support the specific HTTP proxy,
       // we could fallback to a specialized HTTP tunnel library if needed.
@@ -991,10 +1206,48 @@ export class SSHBackend implements TerminalBackend {
     return info.socket;
   }
 
+  private async awaitRouteSocketWithCancellation(
+    socketPromise: Promise<net.Socket>,
+    signal?: AbortSignal,
+  ): Promise<net.Socket> {
+    if (!signal) return await socketPromise;
+    if (signal.aborted) throw createRouteAbortError();
+    return await new Promise<net.Socket>((resolve, reject) => {
+      let settled = false;
+      const finish = (socket?: net.Socket, error?: Error): void => {
+        if (settled) {
+          try {
+            socket?.destroy();
+          } catch {}
+          return;
+        }
+        settled = true;
+        signal.removeEventListener("abort", onAbort);
+        if (error || !socket) reject(error || createRouteAbortError());
+        else resolve(socket);
+      };
+      const onAbort = (): void => finish(undefined, createRouteAbortError());
+      signal.addEventListener("abort", onAbort, { once: true });
+      if (signal.aborted) {
+        onAbort();
+        return;
+      }
+      void socketPromise
+        .then((socket) => finish(socket))
+        .catch((error) => finish(undefined, error as Error));
+    });
+  }
+
   private async buildConnectSocketIfNeeded(
     sshConfig: SSHConnectionConfig,
     emit: (data: string) => void,
+    options: SshRouteConnectOptions = {},
   ): Promise<net.Socket | undefined> {
+    if (options.signal?.aborted) throw createRouteAbortError();
+    const routeReadyTimeoutMs =
+      options.readyTimeoutMs ?? SSH_CONNECT_READY_TIMEOUT_MS;
+    const routeForwardTimeoutMs =
+      options.forwardTimeoutMs ?? routeReadyTimeoutMs;
     // 1. Handle Jump Host (Recursive)
     if (sshConfig.jumpHost) {
       const jumpId = `[Jump:${sshConfig.jumpHost.host}]`;
@@ -1003,12 +1256,13 @@ export class SSHBackend implements TerminalBackend {
         `\x1b[36m▹ ${jumpId} Establishing tunnel via jump host ${sshConfig.jumpHost.host}...\x1b[0m\r\n`,
       );
 
-      const jumpClient = new ssh2.Client();
+      const jumpClient = this.createSshClient();
 
       // Recursive call to handle nested jump hosts or proxies for the jump host itself
       const jumpSock = await this.buildConnectSocketIfNeeded(
         sshConfig.jumpHost,
         emit,
+        options,
       );
       if (jumpSock) {
         console.log(
@@ -1017,10 +1271,34 @@ export class SSHBackend implements TerminalBackend {
       }
 
       await new Promise<void>((resolve, reject) => {
+        let settled = false;
+        let timer: ReturnType<typeof setTimeout> | null = null;
+        const closeRoute = (): void => {
+          try {
+            jumpClient.end();
+          } catch {}
+          try {
+            jumpSock?.destroy();
+          } catch {}
+        };
+        const finish = (error?: Error): void => {
+          if (settled) return;
+          settled = true;
+          if (timer) clearTimeout(timer);
+          options.signal?.removeEventListener("abort", onAbort);
+          if (error) {
+            closeRoute();
+            reject(error);
+          } else {
+            resolve();
+          }
+        };
+        const onAbort = (): void => finish(createRouteAbortError());
         const jumpConnectConfig = this.buildBaseConnectConfig(
           sshConfig.jumpHost!,
           jumpSock,
         );
+        jumpConnectConfig.readyTimeout = routeReadyTimeoutMs;
 
         if (sshConfig.jumpHost!.authMethod === "password") {
           jumpConnectConfig.password = sshConfig.jumpHost!.password;
@@ -1033,7 +1311,7 @@ export class SSHBackend implements TerminalBackend {
                 sshConfig.jumpHost!.privateKeyPath,
               );
             } catch (e: any) {
-              reject(
+              finish(
                 new Error(`${jumpId} Failed to read private key: ${e.message}`),
               );
               return;
@@ -1044,17 +1322,34 @@ export class SSHBackend implements TerminalBackend {
           }
         }
 
-        jumpClient.on("ready", () => {
+        jumpClient.once("ready", () => {
           console.log(`${jumpId} Jump host connection READY.`);
-          resolve();
+          finish();
         });
 
-        jumpClient.on("error", (err) => {
+        jumpClient.once("error", (err) => {
           console.error(`${jumpId} Jump host connection ERROR:`, err);
-          reject(err);
+          finish(err);
         });
-
-        jumpClient.connect(jumpConnectConfig);
+        jumpClient.once("close", () => {
+          finish(
+            new Error(`${jumpId} Jump host closed before becoming ready.`),
+          );
+        });
+        timer = setTimeout(
+          () => finish(new Error(`${jumpId} Jump host connection timed out.`)),
+          routeReadyTimeoutMs,
+        );
+        options.signal?.addEventListener("abort", onAbort, { once: true });
+        if (options.signal?.aborted) {
+          onAbort();
+          return;
+        }
+        try {
+          jumpClient.connect(jumpConnectConfig);
+        } catch (error) {
+          finish(error as Error);
+        }
       });
 
       emit(
@@ -1066,38 +1361,78 @@ export class SSHBackend implements TerminalBackend {
 
       // Create stream to target
       return await new Promise((resolve, reject) => {
-        jumpClient.forwardOut(
-          "127.0.0.1",
-          0,
-          sshConfig.host,
-          sshConfig.port,
-          (err, stream) => {
-            if (err) {
-              console.error(
-                `${jumpId} forwardOut FAILED to ${sshConfig.host}:`,
-                err,
-              );
+        let settled = false;
+        let timer: ReturnType<typeof setTimeout> | null = null;
+        const finish = (stream?: ssh2.ClientChannel, error?: Error): void => {
+          if (settled) {
+            try {
+              stream?.close();
+            } catch {}
+            return;
+          }
+          settled = true;
+          if (timer) clearTimeout(timer);
+          options.signal?.removeEventListener("abort", onAbort);
+          if (error || !stream) {
+            try {
               jumpClient.end();
-              reject(
-                new Error(
-                  `${jumpId} Jump host failed to forward to ${sshConfig.host}: ${err.message}`,
-                ),
-              );
-            } else {
-              console.log(`${jumpId} forwardOut SUCCESS. Tunnel established.`);
-              // We need to keep jumpClient alive as long as the stream is alive
-              stream.on("close", () => {
-                console.log(
-                  `${jumpId} Tunnel stream closed, ending jump client connection.`,
-                );
-                jumpClient.end();
-              });
-              // In ssh2, the stream returned by forwardOut satisfies the Duplex stream interface
-              // which is what 'sock' expects.
-              resolve(stream as unknown as net.Socket);
-            }
-          },
+            } catch {}
+            try {
+              jumpSock?.destroy();
+            } catch {}
+            reject(error || new Error(`${jumpId} Jump forwarding failed.`));
+            return;
+          }
+          console.log(`${jumpId} forwardOut SUCCESS. Tunnel established.`);
+          // Keep the jump chain alive exactly as long as the returned stream.
+          stream.once("close", () => {
+            console.log(
+              `${jumpId} Tunnel stream closed, ending jump client connection.`,
+            );
+            jumpClient.end();
+          });
+          resolve(stream as unknown as net.Socket);
+        };
+        const onAbort = (): void => finish(undefined, createRouteAbortError());
+        timer = setTimeout(
+          () =>
+            finish(
+              undefined,
+              new Error(`${jumpId} Jump forwarding timed out.`),
+            ),
+          routeForwardTimeoutMs,
         );
+        options.signal?.addEventListener("abort", onAbort, { once: true });
+        if (options.signal?.aborted) {
+          onAbort();
+          return;
+        }
+        try {
+          jumpClient.forwardOut(
+            "127.0.0.1",
+            0,
+            sshConfig.host,
+            sshConfig.port,
+            (err, stream) => {
+              if (err) {
+                console.error(
+                  `${jumpId} forwardOut FAILED to ${sshConfig.host}:`,
+                  err,
+                );
+                finish(
+                  undefined,
+                  new Error(
+                    `${jumpId} Jump host failed to forward to ${sshConfig.host}: ${err.message}`,
+                  ),
+                );
+                return;
+              }
+              finish(stream);
+            },
+          );
+        } catch (error) {
+          finish(undefined, error as Error);
+        }
       });
     }
 
@@ -1106,24 +1441,30 @@ export class SSHBackend implements TerminalBackend {
     if (!proxy) return undefined;
 
     if (proxy.type === "socks5") {
-      return await this.connectViaSocks5Proxy({
-        proxyHost: proxy.host,
-        proxyPort: proxy.port,
-        proxyUsername: proxy.username,
-        proxyPassword: proxy.password,
-        dstHost: sshConfig.host,
-        dstPort: sshConfig.port,
-      });
+      return await this.awaitRouteSocketWithCancellation(
+        this.connectViaSocks5Proxy({
+          proxyHost: proxy.host,
+          proxyPort: proxy.port,
+          proxyUsername: proxy.username,
+          proxyPassword: proxy.password,
+          dstHost: sshConfig.host,
+          dstPort: sshConfig.port,
+        }),
+        options.signal,
+      );
     }
     if (proxy.type === "http") {
-      return await this.connectViaHttpProxy({
-        proxyHost: proxy.host,
-        proxyPort: proxy.port,
-        proxyUsername: proxy.username,
-        proxyPassword: proxy.password,
-        dstHost: sshConfig.host,
-        dstPort: sshConfig.port,
-      });
+      return await this.awaitRouteSocketWithCancellation(
+        this.connectViaHttpProxy({
+          proxyHost: proxy.host,
+          proxyPort: proxy.port,
+          proxyUsername: proxy.username,
+          proxyPassword: proxy.password,
+          dstHost: sshConfig.host,
+          dstPort: sshConfig.port,
+        }),
+        options.signal,
+      );
     }
 
     return undefined;
@@ -1629,6 +1970,10 @@ export class SSHBackend implements TerminalBackend {
       });
 
       const connectConfig = this.buildBaseConnectConfig(sshConfig);
+      connectConfig.hostVerifier = (hostKey: Buffer) => {
+        instance.observedHostKey = Buffer.from(hostKey);
+        return true;
+      };
 
       if (sshConfig.authMethod === "password") {
         connectConfig.password = sshConfig.password;

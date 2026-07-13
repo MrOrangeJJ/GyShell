@@ -90,6 +90,7 @@ const createTerminalService = (
 const createFileSystemService = (options?: {
   delayMs?: number
   onStarted?: () => void
+  onTransferOptions?: (options: { allowPeerDirect?: boolean }) => void
 }): FileSystemService =>
   ({
     transferEntries: async (
@@ -99,11 +100,13 @@ const createFileSystemService = (options?: {
       _targetDirPath: string,
       transferOptions?: {
         transferId?: string
+        allowPeerDirect?: boolean
         signal?: AbortSignal
         onProgress?: (progress: TransferEntriesProgress) => void
       },
     ) => {
       options?.onStarted?.()
+      options?.onTransferOptions?.(transferOptions || {})
       transferOptions?.onProgress?.({
         transferId: transferOptions.transferId,
         mode: 'copy',
@@ -193,6 +196,63 @@ const createHangingFileSystemService = (options?: {
 
 const run = async (): Promise<void> => {
   await runCase(
+    'trusted UI capability and user origin are both required for peer delegation',
+    async () => {
+      const observed: boolean[] = []
+      const service = new FileTransferService(
+        createFileSystemService({
+          onTransferOptions: (options) =>
+            observed.push(options.allowPeerDirect === true),
+        }),
+        createTerminalService({
+          'remote-a': 'ssh://remote-a:22',
+          'remote-b': 'ssh://remote-b:22',
+        }),
+      )
+
+      const userTask = service.startTransfer(
+        {
+          origin: 'user',
+          sourceTerminalId: 'remote-a',
+          sourcePaths: ['/tmp/user.bin'],
+          targetTerminalId: 'remote-b',
+          targetDirPath: '/tmp',
+        },
+        { allowPeerDirect: true },
+      )
+      const agentTask = service.startTransfer(
+        {
+          origin: 'agent',
+          sourceTerminalId: 'remote-a',
+          sourcePaths: ['/tmp/agent.bin'],
+          targetTerminalId: 'remote-b',
+          targetDirPath: '/tmp',
+        },
+        { allowPeerDirect: true },
+      )
+      const untrustedUserTask = service.startTransfer({
+        origin: 'user',
+        sourceTerminalId: 'remote-a',
+        sourcePaths: ['/tmp/untrusted-user.bin'],
+        targetTerminalId: 'remote-b',
+        targetDirPath: '/tmp',
+      })
+      await waitFor(
+        () =>
+          service.getTransfer(userTask.id)?.status === 'success' &&
+          service.getTransfer(agentTask.id)?.status === 'success' &&
+          service.getTransfer(untrustedUserTask.id)?.status === 'success',
+        'all trust-boundary tasks should complete',
+      )
+
+      assertEqual(observed.length, 3, 'all tasks should reach filesystem service')
+      assertEqual(observed[0], true, 'trusted user task should authorize peer route')
+      assertEqual(observed[1], false, 'agent origin should remain on relay')
+      assertEqual(observed[2], false, 'untrusted user label should remain on relay')
+    },
+  )
+
+  await runCase(
     'startTransfer rejects same machine when required',
     async () => {
       const service = new FileTransferService(
@@ -277,6 +337,93 @@ const run = async (): Promise<void> => {
       assertCondition(
         updates.includes('success'),
         'transfer should publish success state',
+      )
+    },
+  )
+
+  await runCase(
+    'running progress stays below 100 percent until eof',
+    async () => {
+      let releaseTransfer: () => void = () => undefined
+      const releaseGate = new Promise<void>((resolve) => {
+        releaseTransfer = resolve
+      })
+      const fileSystemService = {
+        transferEntries: async (
+          _sourceTerminalId: string,
+          _sourcePaths: string[],
+          _targetTerminalId: string,
+          _targetDirPath: string,
+          options?: {
+            transferId?: string
+            onProgress?: (progress: TransferEntriesProgress) => void
+          },
+        ) => {
+          options?.onProgress?.({
+            transferId: options.transferId,
+            mode: 'copy',
+            bytesTransferred: 10,
+            totalBytes: 10,
+            transferredFiles: 0,
+            totalFiles: 1,
+            eof: false,
+          })
+          await releaseGate
+          options?.onProgress?.({
+            transferId: options.transferId,
+            mode: 'copy',
+            bytesTransferred: 10,
+            totalBytes: 10,
+            transferredFiles: 1,
+            totalFiles: 1,
+            eof: true,
+          })
+          return {
+            mode: 'copy',
+            totalBytes: 10,
+            transferredFiles: 1,
+            totalFiles: 1,
+          }
+        },
+      } as unknown as FileSystemService
+      const service = new FileTransferService(
+        fileSystemService,
+        createTerminalService({
+          'local-a': 'local://default',
+          'remote-a': 'ssh://remote-a:22',
+        }),
+      )
+
+      const task = service.startTransfer({
+        origin: 'user',
+        mode: 'copy',
+        sourceTerminalId: 'local-a',
+        sourcePaths: ['/tmp/a.txt'],
+        targetTerminalId: 'remote-a',
+        targetDirPath: '/tmp',
+      })
+      await waitFor(
+        () => service.getTransfer(task.id)?.bytesDone === 10,
+        'transfer should report all staged bytes before eof',
+      )
+      const pending = service.getTransfer(task.id)
+      assertEqual(pending?.status, 'running', 'transfer should still be running')
+      assertEqual(pending?.percent, 99, 'non-eof progress must stay below 100')
+      assertEqual(
+        pending?.message,
+        'Transferring files (99%).',
+        'progress message should use the capped running percentage',
+      )
+
+      releaseTransfer()
+      await waitFor(
+        () => service.getTransfer(task.id)?.status === 'success',
+        'transfer should complete after eof',
+      )
+      assertEqual(
+        service.getTransfer(task.id)?.percent,
+        100,
+        'completed transfer should report 100 percent',
       )
     },
   )

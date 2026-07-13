@@ -37,7 +37,154 @@ const createSession = () =>
     initializationState: "initializing",
   }) as any;
 
+class StalledJumpClient extends EventEmitter {
+  ends = 0;
+  forwardCallback:
+    | ((error: Error | undefined, stream?: EventEmitter) => void)
+    | null = null;
+
+  connect(): void {
+    queueMicrotask(() => this.emit("ready"));
+  }
+
+  forwardOut(
+    _sourceHost: string,
+    _sourcePort: number,
+    _targetHost: string,
+    _targetPort: number,
+    callback: (error: Error | undefined, stream?: EventEmitter) => void,
+  ): void {
+    this.forwardCallback = callback;
+  }
+
+  end(): void {
+    this.ends += 1;
+  }
+}
+
 const run = async (): Promise<void> => {
+  await runCase(
+    "peer transfer passes only active Unix SSH session descriptors",
+    async () => {
+      const backend = new SSHBackend() as any;
+      const source = createSession();
+      const target = createSession();
+      source.remoteOs = "unix";
+      target.remoteOs = "unix";
+      source.observedHostKey = Buffer.from("source-host-key");
+      target.observedHostKey = Buffer.from("target-host-key");
+      source.sshConfig = {
+        type: "ssh",
+        id: "source",
+        title: "Source",
+        cols: 80,
+        rows: 24,
+        host: "source.example.test",
+        port: 22,
+        username: "source-user",
+        authMethod: "password",
+        password: "source-password",
+      };
+      target.sshConfig = {
+        type: "ssh",
+        id: "target",
+        title: "Target",
+        cols: 80,
+        rows: 24,
+        host: "target.example.test",
+        port: 22,
+        username: "target-user",
+        authMethod: "password",
+        password: "target-password",
+      };
+      backend.sessions.set("source-pty", source);
+      backend.sessions.set("target-pty", target);
+
+      let captured: any = null;
+      backend.directFileTransfer.tryTransfer = async (request: any) => {
+        captured = request;
+        return { status: "transferred", transferredBytes: 99 };
+      };
+      const result = await backend.tryPeerFileTransfer(
+        "source-pty",
+        "/src/file.bin",
+        "target-pty",
+        "/dst/file.bin",
+        { expectedBytes: 99 },
+      );
+
+      assertEqual(
+        result.status,
+        "transferred",
+        "eligible sessions should reach direct service",
+      );
+      assertEqual(
+        captured.sourceClient,
+        source.client,
+        "source client should come from active tab",
+      );
+      assertEqual(
+        captured.targetClient,
+        target.client,
+        "target client should come from active tab",
+      );
+      assertCondition(
+        captured.targetObservedHostKey.equals(target.observedHostKey),
+        "target host pin should be the active session key",
+      );
+    },
+  );
+
+  await runCase(
+    "peer transfer fails closed for Windows or unobserved host keys",
+    async () => {
+      const backend = new SSHBackend() as any;
+      const source = createSession();
+      const target = createSession();
+      source.remoteOs = "unix";
+      target.remoteOs = "windows";
+      backend.sessions.set("source-pty", source);
+      backend.sessions.set("target-pty", target);
+
+      const windowsResult = await backend.tryPeerFileTransfer(
+        "source-pty",
+        "/src/file.bin",
+        "target-pty",
+        "C:/dst/file.bin",
+        { expectedBytes: 99 },
+      );
+      assertEqual(
+        windowsResult.status,
+        "fallback",
+        "Windows target should use relay",
+      );
+      assertEqual(
+        (windowsResult as any).reason,
+        "unsupported-os",
+        "Windows fallback should be typed",
+      );
+
+      target.remoteOs = "unix";
+      const missingKeyResult = await backend.tryPeerFileTransfer(
+        "source-pty",
+        "/src/file.bin",
+        "target-pty",
+        "/dst/file.bin",
+        { expectedBytes: 99 },
+      );
+      assertEqual(
+        missingKeyResult.status,
+        "fallback",
+        "missing host key should use relay",
+      );
+      assertEqual(
+        (missingKeyResult as any).reason,
+        "missing-host-key",
+        "missing host key fallback should be typed",
+      );
+    },
+  );
+
   await runCase(
     "base ssh connect config enables protocol keepalive for direct connections",
     () => {
@@ -109,6 +256,272 @@ const run = async (): Promise<void> => {
         sock,
         "jump SSH connections should preserve the tunnel socket",
       );
+    },
+  );
+
+  await runCase(
+    "direct key control route reuses jump ingress with a short timeout",
+    async () => {
+      const backend = new SSHBackend() as any;
+      const socket = new EventEmitter();
+      let capturedTimeout = 0;
+      backend.buildConnectSocketIfNeeded = async (
+        _config: unknown,
+        _emit: unknown,
+        options: { readyTimeoutMs: number },
+      ) => {
+        capturedTimeout = options.readyTimeoutMs;
+        return socket;
+      };
+
+      const result = await backend.openDirectControlRouteSocket({
+        type: "ssh",
+        id: "private-endpoint",
+        title: "Private Endpoint",
+        host: "10.0.0.2",
+        port: 22,
+        username: "endpoint-user",
+        authMethod: "privateKey",
+        privateKey: "key",
+        cols: 80,
+        rows: 24,
+        jumpHost: {
+          type: "ssh",
+          id: "jump",
+          title: "Jump",
+          host: "jump.example.test",
+          port: 22,
+          username: "jump-user",
+          authMethod: "password",
+          password: "secret",
+          cols: 80,
+          rows: 24,
+        },
+      });
+
+      assertEqual(
+        result,
+        socket,
+        "direct control should use the routed socket",
+      );
+      assertEqual(
+        capturedTimeout,
+        4_000,
+        "direct control jump setup should use the short ready timeout",
+      );
+    },
+  );
+
+  await runCase(
+    "cancelled direct control route destroys a late jump socket",
+    async () => {
+      const backend = new SSHBackend() as any;
+      let resolveRoute!: (socket: unknown) => void;
+      backend.buildConnectSocketIfNeeded = () =>
+        new Promise((resolve) => {
+          resolveRoute = resolve;
+        });
+      const controller = new AbortController();
+      const pending = backend.openDirectControlRouteSocket(
+        {
+          type: "ssh",
+          id: "private-endpoint",
+          title: "Private Endpoint",
+          host: "10.0.0.2",
+          port: 22,
+          username: "endpoint-user",
+          authMethod: "privateKey",
+          privateKey: "key",
+          cols: 80,
+          rows: 24,
+        },
+        controller.signal,
+      );
+      controller.abort();
+      let caught: Error | null = null;
+      try {
+        await pending;
+      } catch (error) {
+        caught = error as Error;
+      }
+      assertEqual(caught?.name, "AbortError", "cancelled route should reject");
+
+      let destroys = 0;
+      resolveRoute({
+        destroy: () => {
+          destroys += 1;
+        },
+      });
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      assertEqual(destroys, 1, "late route socket should be destroyed once");
+    },
+  );
+
+  await runCase(
+    "cancelled private-key executor connection rejects and closes the client",
+    async () => {
+      const backend = new SSHBackend() as any;
+      const client = new EventEmitter() as EventEmitter & {
+        connect: () => void;
+        end: () => void;
+      };
+      let ends = 0;
+      client.connect = () => undefined;
+      client.end = () => {
+        ends += 1;
+      };
+      backend.createSshClient = () => client;
+      const instance = createSession();
+      instance.observedHostKey = Buffer.from("executor-host-key");
+      instance.sshConfig = {
+        type: "ssh",
+        id: "executor",
+        title: "Executor",
+        host: "executor.example.test",
+        port: 22,
+        username: "executor-user",
+        authMethod: "privateKey",
+        privateKey: "private-key",
+        cols: 80,
+        rows: 24,
+      };
+      const controller = new AbortController();
+      const pending = backend.openAgentExecutorClient(
+        instance,
+        "/tmp/gyshell-test-agent.sock",
+        controller.signal,
+      );
+      controller.abort();
+
+      let caught: Error | null = null;
+      try {
+        await pending;
+      } catch (error) {
+        caught = error as Error;
+      }
+      assertEqual(
+        caught?.name,
+        "AbortError",
+        "cancelled executor connection should reject",
+      );
+      assertCondition(ends >= 1, "cancelled executor client should close");
+    },
+  );
+
+  await runCase(
+    "jump forward timeout closes the route and any late stream",
+    async () => {
+      const backend = new SSHBackend() as any;
+      const jumpClient = new StalledJumpClient();
+      backend.createSshClient = () => jumpClient;
+      const startedAt = Date.now();
+      let caught: Error | null = null;
+      try {
+        await backend.buildConnectSocketIfNeeded(
+          {
+            type: "ssh",
+            id: "private-endpoint",
+            title: "Private Endpoint",
+            host: "10.0.0.2",
+            port: 22,
+            username: "endpoint-user",
+            authMethod: "password",
+            password: "endpoint-secret",
+            cols: 80,
+            rows: 24,
+            jumpHost: {
+              type: "ssh",
+              id: "jump",
+              title: "Jump",
+              host: "jump.example.test",
+              port: 22,
+              username: "jump-user",
+              authMethod: "password",
+              password: "jump-secret",
+              cols: 80,
+              rows: 24,
+            },
+          },
+          () => {},
+          { readyTimeoutMs: 50, forwardTimeoutMs: 20 },
+        );
+      } catch (error) {
+        caught = error as Error;
+      }
+
+      assertCondition(!!caught, "stalled forward should reject");
+      assertCondition(
+        Date.now() - startedAt < 500,
+        "stalled forward should respect its short deadline",
+      );
+      assertCondition(jumpClient.ends >= 1, "timeout should close jump client");
+
+      let lateCloses = 0;
+      const lateStream = new EventEmitter() as EventEmitter & {
+        close: () => void;
+      };
+      lateStream.close = () => {
+        lateCloses += 1;
+      };
+      jumpClient.forwardCallback?.(undefined, lateStream);
+      assertEqual(lateCloses, 1, "late forward stream should close once");
+    },
+  );
+
+  await runCase(
+    "jump forward cancellation closes the underlying jump client",
+    async () => {
+      const backend = new SSHBackend() as any;
+      const jumpClient = new StalledJumpClient();
+      backend.createSshClient = () => jumpClient;
+      const controller = new AbortController();
+      const pending = backend.buildConnectSocketIfNeeded(
+        {
+          type: "ssh",
+          id: "private-endpoint",
+          title: "Private Endpoint",
+          host: "10.0.0.2",
+          port: 22,
+          username: "endpoint-user",
+          authMethod: "password",
+          password: "endpoint-secret",
+          cols: 80,
+          rows: 24,
+          jumpHost: {
+            type: "ssh",
+            id: "jump",
+            title: "Jump",
+            host: "jump.example.test",
+            port: 22,
+            username: "jump-user",
+            authMethod: "password",
+            password: "jump-secret",
+            cols: 80,
+            rows: 24,
+          },
+        },
+        () => {},
+        {
+          signal: controller.signal,
+          readyTimeoutMs: 1_000,
+          forwardTimeoutMs: 1_000,
+        },
+      );
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      controller.abort();
+      let caught: Error | null = null;
+      try {
+        await pending;
+      } catch (error) {
+        caught = error as Error;
+      }
+
+      assertEqual(
+        caught?.name,
+        "AbortError",
+        "route cancellation should abort",
+      );
+      assertCondition(jumpClient.ends >= 1, "abort should close jump client");
     },
   );
 

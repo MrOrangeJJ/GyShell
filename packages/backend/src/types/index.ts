@@ -735,6 +735,19 @@ export interface TerminalSessionBackend {
   ): Promise<{ stdout: string; stderr: string } | null>
 
   /**
+   * Attempt a backend-native file transfer between two sessions of this
+   * backend. Returning `fallback` leaves the caller free to use its normal
+   * relay path; cancellation must reject instead.
+   */
+  tryPeerFileTransfer?(
+    sourcePtyId: string,
+    sourcePath: string,
+    targetPtyId: string,
+    targetPath: string,
+    options: PeerFileTransferOptions,
+  ): Promise<PeerFileTransferResult>
+
+  /**
    * Capture backend-specific command tracking state before dispatching a command.
    * Backends return undefined when the normal shell integration path remains sufficient.
    */
@@ -764,6 +777,32 @@ export interface TerminalExecOptions {
    */
   stdin?: string
 }
+
+export interface PeerFileTransferOptions {
+  expectedBytes: number
+  signal?: AbortSignal
+  onProgress?: (bytesTransferred: number) => void
+}
+
+export type PeerFileTransferFallbackReason =
+  | 'unavailable'
+  | 'unsupported-os'
+  | 'unsupported-auth'
+  | 'unsupported-route'
+  | 'missing-host-key'
+  | 'local-openssh-unsupported'
+  | 'remote-openssh-unsupported'
+  | 'remote-capability-unavailable'
+  | 'agent-forwarding-denied'
+  | 'direct-connection-failed'
+  | 'direct-authentication-failed'
+  | 'direct-copy-failed'
+  | 'size-verification-failed'
+  | 'commit-failed'
+
+export type PeerFileTransferResult =
+  | { status: 'transferred'; transferredBytes: number }
+  | { status: 'fallback'; reason: PeerFileTransferFallbackReason }
 
 export interface TerminalFileSystemBackend {
   /**
