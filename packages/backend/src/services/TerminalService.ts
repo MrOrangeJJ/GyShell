@@ -8,6 +8,8 @@ import type {
   TerminalCommandTrackingToken,
   TerminalCommandTrackingUpdate,
   TerminalExecOptions,
+  PeerFileTransferOptions,
+  PeerFileTransferResult,
   TerminalFileSystemBackend,
   TerminalConfig,
   TerminalTab,
@@ -1780,6 +1782,41 @@ export class TerminalService {
     }
 
     return null
+  }
+
+  async tryPeerFileTransfer(
+    sourceTerminalId: string,
+    sourcePath: string,
+    targetTerminalId: string,
+    targetPath: string,
+    options: PeerFileTransferOptions
+  ): Promise<PeerFileTransferResult> {
+    const source = this.terminals.get(sourceTerminalId)
+    const target = this.terminals.get(targetTerminalId)
+    if (!source || !target || sourceTerminalId === targetTerminalId) {
+      return { status: 'fallback', reason: 'unavailable' }
+    }
+    if (source.type !== 'ssh' || target.type !== 'ssh') {
+      return { status: 'fallback', reason: 'unavailable' }
+    }
+    if (
+      this.getRemoteOs(sourceTerminalId) !== 'unix' ||
+      this.getRemoteOs(targetTerminalId) !== 'unix'
+    ) {
+      return { status: 'fallback', reason: 'unsupported-os' }
+    }
+
+    const backend = this.getBackend('ssh')
+    if (typeof backend.tryPeerFileTransfer !== 'function') {
+      return { status: 'fallback', reason: 'unavailable' }
+    }
+    return await backend.tryPeerFileTransfer(
+      source.ptyId,
+      sourcePath,
+      target.ptyId,
+      targetPath,
+      options
+    )
   }
 
   getDisplayTerminals(): TerminalTab[] {

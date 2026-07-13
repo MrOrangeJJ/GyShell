@@ -9,6 +9,7 @@ const MIN_TRANSFER_CHUNK_SIZE = 16 * 1024
 // MAX intentionally equals DEFAULT: callers cannot request larger chunks so that
 // per-chunk memory allocation stays bounded regardless of what the UI sends.
 const MAX_TRANSFER_CHUNK_SIZE = 1024 * 1024
+export const DIRECT_SSH_TRANSFER_MIN_BYTES = 32 * 1024 * 1024
 const DUPLICATE_NAME_SEARCH_LIMIT = 10000
 const MAX_SAFE_DUPLICATE_START_INDEX = Number.MAX_SAFE_INTEGER - DUPLICATE_NAME_SEARCH_LIMIT
 export const FILESYSTEM_TRANSFER_CANCELLED_CODE = 'GYSHELL_FS_TRANSFER_CANCELLED'
@@ -224,6 +225,8 @@ export class FileSystemService {
       conflictStrategy?: FileTransferConflictStrategy
       chunkSize?: number
       transferId?: string
+      /** Internal trust boundary: only explicit user-owned tasks may delegate credentials. */
+      allowPeerDirect?: boolean
       signal?: AbortSignal
       onProgress?: (progress: TransferEntriesProgress) => void
     }
@@ -370,11 +373,16 @@ export class FileSystemService {
       bytesTransferred: 0,
       transferredFiles: 0
     }
+    let reportedBytesHighWatermark = 0
     const notifyProgress = (eof: boolean): void => {
+      const reportableBytes = eof
+        ? progressState.bytesTransferred
+        : Math.max(reportedBytesHighWatermark, progressState.bytesTransferred)
+      reportedBytesHighWatermark = Math.max(reportedBytesHighWatermark, reportableBytes)
       options?.onProgress?.({
         transferId: options?.transferId,
         mode,
-        bytesTransferred: progressState.bytesTransferred,
+        bytesTransferred: reportableBytes,
         totalBytes,
         transferredFiles: progressState.transferredFiles,
         totalFiles,
@@ -384,6 +392,67 @@ export class FileSystemService {
 
     try {
       notifyProgress(false)
+      const peerPlan = this.resolvePeerTransferPlan({
+        allowPeerDirect: options?.allowPeerDirect === true,
+        sourceTerminalId,
+        targetTerminalId,
+        sourceType,
+        targetType,
+        sourceOs,
+        targetOs,
+        sourceFileSystemIdentity,
+        targetFileSystemIdentity,
+        rootPlans
+      })
+      if (peerPlan) {
+        ensureNotCancelled()
+        if (peerPlan.removeExistingTarget) {
+          await this.terminalService.deletePath(targetTerminalId, peerPlan.targetPath, {
+            recursive: true
+          })
+          peerPlan.removeExistingTarget = false
+        }
+
+        const peerResult = await this.terminalService.tryPeerFileTransfer(
+          sourceTerminalId,
+          peerPlan.sourcePath,
+          targetTerminalId,
+          peerPlan.targetPath,
+          {
+            expectedBytes: peerPlan.node.size,
+            signal,
+            onProgress: (currentFileBytes) => {
+              progressState.bytesTransferred = Math.min(
+                peerPlan.node.size,
+                Math.max(0, Number(currentFileBytes) || 0)
+              )
+              notifyProgress(false)
+            }
+          }
+        )
+        if (peerResult.status === 'transferred') {
+          progressState.bytesTransferred = peerPlan.node.size
+          progressState.transferredFiles = 1
+          if (mode === 'move') {
+            ensureNotCancelled()
+            await this.terminalService.deletePath(sourceTerminalId, peerPlan.sourcePath, {
+              recursive: true
+            })
+          }
+          notifyProgress(true)
+          return {
+            mode,
+            totalBytes,
+            transferredFiles: 1,
+            totalFiles
+          }
+        }
+
+        // Relay progress restarts from zero internally. The reporting high-water
+        // mark above keeps the UI monotonic until the relay catches up.
+        progressState.bytesTransferred = 0
+      }
+
       for (const plan of rootPlans) {
         ensureNotCancelled()
         if (plan.removeExistingTarget) {
@@ -426,6 +495,45 @@ export class FileSystemService {
       }
       throw error
     }
+  }
+
+  private resolvePeerTransferPlan(input: {
+    allowPeerDirect: boolean
+    sourceTerminalId: string
+    targetTerminalId: string
+    sourceType: string
+    targetType: string
+    sourceOs: 'unix' | 'windows' | undefined
+    targetOs: 'unix' | 'windows' | undefined
+    sourceFileSystemIdentity: string | null
+    targetFileSystemIdentity: string | null
+    rootPlans: TransferRootPlan[]
+  }): TransferRootPlan | null {
+    if (
+      !input.allowPeerDirect ||
+      input.sourceTerminalId === input.targetTerminalId ||
+      input.sourceType !== 'ssh' ||
+      input.targetType !== 'ssh' ||
+      input.sourceOs !== 'unix' ||
+      input.targetOs !== 'unix' ||
+      !input.sourceFileSystemIdentity ||
+      !input.targetFileSystemIdentity ||
+      input.sourceFileSystemIdentity === input.targetFileSystemIdentity ||
+      input.rootPlans.length !== 1
+    ) {
+      return null
+    }
+
+    const [plan] = input.rootPlans
+    if (
+      !plan ||
+      plan.node.isDirectory ||
+      plan.node.fileCount !== 1 ||
+      plan.node.size <= DIRECT_SSH_TRANSFER_MIN_BYTES
+    ) {
+      return null
+    }
+    return plan
   }
 
   private resolveConflictStrategy(
