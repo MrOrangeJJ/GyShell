@@ -5,6 +5,7 @@ import {
   AIMessage,
   AIMessageChunk,
   ChatMessageChunk,
+  HumanMessage,
 } from "@langchain/core/messages";
 import { AgentService_v2 } from "../../AgentService_v2";
 import { ChatHistoryService } from "../../ChatHistoryService";
@@ -350,6 +351,124 @@ class FakeEmptyErrorThenTextModel extends FakeStreamingModel {
   }
 }
 
+class FakePartialToolFailureThenTextModel extends FakeStreamingModel {
+  bindTools(): {
+    stream: (messages?: any[]) => AsyncGenerator<any>;
+    invoke: () => Promise<never>;
+  } {
+    const self = this;
+    return {
+      stream: async function* (messages?: any[]) {
+        self.streamCalls += 1;
+        self.requests.push(Array.isArray(messages) ? messages : []);
+        if (self.streamCalls === 1) {
+          yield new AIMessageChunk({
+            content: "",
+            tool_call_chunks: [
+              {
+                id: "stale-retry-call",
+                name: "read_file",
+                args: '{"filePath":"/tmp/stale-retry.txt"}',
+                index: 0,
+                type: "tool_call_chunk",
+              },
+            ],
+            additional_kwargs: {
+              __raw_response: {
+                id: "chatcmpl-stale-retry",
+                choices: [
+                  {
+                    index: 0,
+                    delta: {
+                      tool_calls: [
+                        {
+                          index: 0,
+                          id: "stale-retry-call",
+                          type: "function",
+                          function: {
+                            name: "read_file",
+                            arguments: '{"filePath":"/tmp/stale-retry.txt"}',
+                          },
+                        },
+                      ],
+                    },
+                    finish_reason: null,
+                  },
+                ],
+              },
+            },
+          });
+          throw new Error("synthetic stream transport failure");
+        }
+
+        yield new AIMessageChunk({
+          content: "Accepted retry answer.",
+          response_metadata: {
+            model_name: "ZHIPU/GLM-5.2",
+            finish_reason: "stop",
+          },
+        });
+      },
+      invoke: async () => {
+        self.invokeCalls += 1;
+        throw new Error("transport retry should remain on the stream path");
+      },
+    };
+  }
+}
+
+const createUnidentifiedToolCallRawResponse = (): Record<string, any> => ({
+  id: "chatcmpl-unidentified-tool-call",
+  model: "ZHIPU/GLM-5.2",
+  choices: [
+    {
+      index: 0,
+      delta: {
+        tool_calls: [
+          {
+            type: "function",
+            function: {
+              name: "read_file",
+              arguments: '{"filePath":"/tmp/no-identity.txt"}',
+            },
+          },
+        ],
+      },
+      finish_reason: "tool_calls",
+    },
+  ],
+});
+
+class FakeUnidentifiedToolCallFallbackModel extends FakeStreamingModel {
+  bindTools(): {
+    stream: (messages?: any[]) => AsyncGenerator<any>;
+    invoke: (messages?: any[]) => Promise<any>;
+  } {
+    const self = this;
+    return {
+      stream: async function* (messages?: any[]) {
+        self.streamCalls += 1;
+        self.requests.push(Array.isArray(messages) ? messages : []);
+        yield new AIMessageChunk({
+          content: "",
+          response_metadata: { finish_reason: "tool_calls" },
+          additional_kwargs: {
+            __raw_response: createUnidentifiedToolCallRawResponse(),
+          },
+        });
+      },
+      invoke: async (messages?: any[]) => {
+        self.invokeCalls += 1;
+        self.invokeRequests.push(Array.isArray(messages) ? messages : []);
+        return new AIMessage({
+          content: "",
+          response_metadata: { finish_reason: "stop" },
+        });
+      },
+    };
+  }
+}
+
 class GuardShouldNotRunModel extends FakeStreamingModel {
   public streamCalls = 0;
   public invokeCalls = 0;
@@ -543,7 +662,11 @@ const run = async (): Promise<void> => {
         "raw response capture should remove the raw payload before append runs",
       );
 
-      const appended = appendStreamedModelResponseChunk(null, chunk, rawChunk);
+      const appended = appendStreamedModelResponseChunk(
+        null,
+        chunk,
+        rawChunk,
+      );
 
       assertEqual(
         appended.skippedEmptyGenericChunk,
@@ -596,16 +719,90 @@ const run = async (): Promise<void> => {
   });
 
   await runCase(
+    "finish and payload checks ignore unselected streaming choices",
+    () => {
+      const raw = {
+        id: "chatcmpl-multiple-choices",
+        choices: [
+          {
+            index: 0,
+            delta: { content: "Selected answer." },
+            finish_reason: "stop",
+          },
+          {
+            index: 1,
+            delta: {
+              tool_calls: [
+                {
+                  index: 0,
+                  id: "unselected-tool-call",
+                  type: "function",
+                  function: {
+                    name: "read_file",
+                    arguments: '{"filePath":"/tmp/unselected.txt"}',
+                  },
+                },
+              ],
+            },
+            finish_reason: "tool_calls",
+          },
+        ],
+      };
+      const selectedResponse = new AIMessage({
+        content: "Selected answer.",
+        response_metadata: { finish_reason: "stop" },
+      });
+
+      assertEqual(
+        isEmptyMalformedToolCallFinish(selectedResponse, [raw]),
+        false,
+        "an unselected tool_calls finish must not request fallback",
+      );
+      assertEqual(
+        isEmptyUnusableModelResponse(selectedResponse, [raw]),
+        false,
+        "the selected answer must remain usable",
+      );
+      assertEqual(
+        isEmptyUnusableModelResponse(
+          new AIMessage({
+            content: "",
+            response_metadata: { finish_reason: "stop" },
+          }),
+          [raw],
+        ),
+        true,
+        "an unselected tool payload must not make an empty selected response usable",
+      );
+
+      const rawOnlyGeneric = new ChatMessageChunk({
+        content: "",
+        role: "",
+        additional_kwargs: { __raw_response: raw },
+      } as any);
+      const captured: any[] = [];
+      const rawChunk = captureRawResponseChunk(rawOnlyGeneric, captured);
+      const appended = appendStreamedModelResponseChunk(
+        null,
+        rawOnlyGeneric,
+        rawChunk,
+      );
+      assertEqual(
+        appended.response,
+        null,
+        "an unselected tool_calls finish must not initialize an assistant response",
+      );
+      assertEqual(appended.skippedEmptyGenericChunk, true, "chunk should skip");
+    },
+  );
+
+  await runCase(
     "empty provider error finishes are treated as unusable model responses",
     () => {
       const rawChunks: any[] = [];
       const chunk = createEmptyErrorAssistantChunk();
       const rawChunk = captureRawResponseChunk(chunk, rawChunks);
-      const appended = appendStreamedModelResponseChunk(
-        null,
-        chunk,
-        rawChunk,
-      );
+      const appended = appendStreamedModelResponseChunk(null, chunk, rawChunk);
 
       assertEqual(
         isEmptyMalformedToolCallFinish(appended.response, rawChunks),
@@ -1077,6 +1274,213 @@ const run = async (): Promise<void> => {
         emptyErrorStored,
         false,
         "backend history should not persist the transient empty provider error response",
+      );
+    },
+  );
+
+  await runCase(
+    "an unidentified call receives an error result when fallback is unusable",
+    async () => {
+      const tempDir = fs.mkdtempSync(
+        path.join(os.tmpdir(), "gyshell-stream-response-extreme-"),
+      );
+      const store = new HistorySqliteStore({
+        filePath: path.join(tempDir, "history.sqlite3"),
+      });
+      const chatHistory = new ChatHistoryService({ store });
+      const uiHistory = new UIHistoryService({ store });
+      const agent = createAgentService(chatHistory, uiHistory);
+      agent.setEventPublisher(() => {});
+      const sessionId = "unidentified-tool-call-fallback";
+      const profileId = "unidentified-profile";
+      const mainModel = new FakeUnidentifiedToolCallFallbackModel();
+      const guardModel = new GuardShouldNotRunModel();
+      (agent as any).sessionModelBindings.set(sessionId, {
+        profileId,
+        model: mainModel,
+        actionModel: guardModel,
+        thinkingModel: guardModel,
+        compactionModel: guardModel,
+        actionModelSupportsStructuredOutput: true,
+        actionModelSupportsObjectToolChoice: false,
+        thinkingModelSupportsStructuredOutput: true,
+        thinkingModelSupportsObjectToolChoice: false,
+        compactionModelSupportsStructuredOutput: true,
+        compactionModelSupportsObjectToolChoice: false,
+        readFileSupport: { image: false },
+        toolsForModel: [],
+        globalMaxTokens: 1000000,
+        thinkingMaxTokens: 1000000,
+        compactionMaxTokens: 1000000,
+      });
+
+      const modelState = await (
+        agent as any
+      ).createModelRequestNode().invoke(
+        {
+          sessionId,
+          physicalRunId: "unidentified-physical-run",
+          messages: [new HumanMessage("read the file")],
+          token_state: { current_tokens: 0, max_tokens: 1000000 },
+          modelRequestPassCount: 0,
+          runtimeThinkingCorrectionEnabled: false,
+          firstTurnThinkingModelEnabled: false,
+        },
+        { signal: new AbortController().signal },
+      );
+
+      assertEqual(mainModel.streamCalls, 1, "stream should run once");
+      assertEqual(mainModel.invokeCalls, 1, "fallback should run once");
+      const assistant = modelState.messages.at(-1) as AIMessage;
+      assertEqual(
+        assistant.tool_calls?.length,
+        1,
+        "the failed stream call must remain materialized",
+      );
+
+      const batch = await (
+        agent as any
+      ).createBatchToolcallExecutorNode().invoke(modelState);
+      assertEqual(batch.pendingToolCalls.length, 1, "call must reach planner");
+      assertEqual(
+        batch.pendingToolCalls[0]._gyshellExecution.mode,
+        "not_executed",
+        "an unidentified call must never execute",
+      );
+      assertEqual(
+        batch.pendingToolCalls[0]._gyshellExecution.outcomeStatus,
+        "error",
+        "integrity failure must use an error outcome",
+      );
+
+      const completed = await (agent as any).createToolsNode().invoke(batch);
+      const toolResult = completed.messages.at(-1);
+      assertCondition(
+        typeof toolResult?.tool_call_id === "string" &&
+          toolResult.tool_call_id.length > 0,
+        "the repaired call and result must share a non-empty synthetic ID",
+      );
+      assertEqual(
+        toolResult.tool_call_id,
+        assistant.tool_calls?.[0]?.id,
+        "assistant call and explicit result IDs must match",
+      );
+      assertEqual(
+        JSON.parse(String(toolResult.content)).status,
+        "error",
+        "fallback failure must produce an explicit error result",
+      );
+    },
+  );
+
+  await runCase(
+    "an accepted retry clears a failed stream attempt before later stop persistence",
+    async () => {
+      const tempDir = fs.mkdtempSync(
+        path.join(os.tmpdir(), "gyshell-stream-response-extreme-"),
+      );
+      const store = new HistorySqliteStore({
+        filePath: path.join(tempDir, "history.sqlite3"),
+      });
+      const chatHistory = new ChatHistoryService({ store });
+      const uiHistory = new UIHistoryService({ store });
+      const agent = createAgentService(chatHistory, uiHistory);
+      agent.setEventPublisher(() => {});
+      const sessionId = "accepted-stream-retry";
+      const physicalRunId = "accepted-stream-retry-run";
+      const profileId = "retry-profile";
+      const mainModel = new FakePartialToolFailureThenTextModel();
+      const guardModel = new GuardShouldNotRunModel();
+      (agent as any).sessionModelBindings.set(sessionId, {
+        profileId,
+        model: mainModel,
+        actionModel: guardModel,
+        thinkingModel: guardModel,
+        compactionModel: guardModel,
+        actionModelSupportsStructuredOutput: true,
+        actionModelSupportsObjectToolChoice: false,
+        thinkingModelSupportsStructuredOutput: true,
+        thinkingModelSupportsObjectToolChoice: false,
+        compactionModelSupportsStructuredOutput: true,
+        compactionModelSupportsObjectToolChoice: false,
+        readFileSupport: { image: false },
+        toolsForModel: [],
+        globalMaxTokens: 1000000,
+        thinkingMaxTokens: 1000000,
+        compactionMaxTokens: 1000000,
+      });
+      (agent as any).activePhysicalRunIds.add(physicalRunId);
+
+      let observedFailedAttempt = false;
+      (agent as any).helpers.invokeWithRetry = async (operation: any) => {
+        try {
+          return await operation(0);
+        } catch {
+          const captured = (agent as any).abortedMessagesByRunId.get(
+            physicalRunId,
+          );
+          assertEqual(
+            captured?.length,
+            2,
+            "failed attempt should temporarily retain its assistant call and cancelled result",
+          );
+          assertEqual(
+            captured?.[1]?.tool_call_id,
+            "stale-retry-call",
+            "temporary failed-attempt result should retain the original call ID",
+          );
+          observedFailedAttempt = true;
+          return await operation(1);
+        }
+      };
+
+      const result = await (agent as any).createModelRequestNode().invoke(
+        {
+          sessionId,
+          physicalRunId,
+          messages: [new HumanMessage("retry the failed request")],
+          token_state: { current_tokens: 0, max_tokens: 1000000 },
+          modelRequestPassCount: 0,
+          runtimeThinkingCorrectionEnabled: false,
+          firstTurnThinkingModelEnabled: false,
+        },
+        { signal: new AbortController().signal },
+      );
+
+      assertEqual(
+        observedFailedAttempt,
+        true,
+        "the first failed stream should exercise interrupted-attempt capture",
+      );
+      assertEqual(
+        mainModel.streamCalls,
+        2,
+        "the accepted response should come from the second stream attempt",
+      );
+      assertEqual(
+        (agent as any).abortedMessagesByRunId.has(physicalRunId),
+        false,
+        "an accepted retry must clear the superseded failed-attempt bundle",
+      );
+
+      (agent as any).graph = {
+        getState: async () => ({ values: { messages: result.messages } }),
+      };
+      await (agent as any).trySaveSessionFromCheckpoint(
+        sessionId,
+        physicalRunId,
+      );
+      const persisted = JSON.stringify(
+        Array.from(chatHistory.loadSession(sessionId)?.messages.values() ?? []),
+      );
+      assertCondition(
+        persisted.includes("Accepted retry answer."),
+        "later stop persistence should retain the accepted retry response",
+      );
+      assertEqual(
+        persisted.includes("stale-retry-call"),
+        false,
+        "later stop persistence must not resurrect the superseded attempt",
       );
     },
   );

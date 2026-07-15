@@ -1,4 +1,5 @@
 import { parseTerminalScopedFilePath } from './terminalScopedFilePath'
+import { getStreamToolCallIntegrityError } from './utils/streamed_tool_call_integrity'
 
 export type ToolCallExecutionStatus =
   | 'completed'
@@ -22,6 +23,7 @@ export interface PlannedToolCall extends ModelToolCall {
     mode: 'execute' | 'not_executed'
     reason?: string
     retryable?: boolean
+    outcomeStatus?: Exclude<ToolCallExecutionStatus, 'completed'>
     parallelGroupId?: string
   }
 }
@@ -179,10 +181,20 @@ function isExplicitReadOnlyCall(
   )
 }
 
-function markNotExecuted(toolCall: PlannedToolCall, reason: string): void {
+function markNotExecuted(
+  toolCall: PlannedToolCall,
+  reason: string,
+  options?: {
+    retryable?: boolean
+    outcomeStatus?: Exclude<ToolCallExecutionStatus, 'completed'>
+  }
+): void {
   toolCall._gyshellExecution.mode = 'not_executed'
   toolCall._gyshellExecution.reason = reason
-  toolCall._gyshellExecution.retryable = true
+  toolCall._gyshellExecution.retryable = options?.retryable ?? true
+  if (options?.outcomeStatus) {
+    toolCall._gyshellExecution.outcomeStatus = options.outcomeStatus
+  }
   delete toolCall._gyshellExecution.parallelGroupId
 }
 
@@ -375,7 +387,13 @@ export function planToolCallBatch(
   })
 
   for (const call of planned) {
-    if (call.name === INVALID_TOOL_CALL_NAME) {
+    const integrityError = getStreamToolCallIntegrityError(call)
+    if (integrityError) {
+      markNotExecuted(call, integrityError.reason, {
+        outcomeStatus: 'error',
+        retryable: true
+      })
+    } else if (call.name === INVALID_TOOL_CALL_NAME) {
       markNotExecuted(
         call,
         'The model emitted a tool call with a missing or blank function name.'

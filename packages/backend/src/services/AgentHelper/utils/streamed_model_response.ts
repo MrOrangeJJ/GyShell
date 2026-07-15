@@ -161,7 +161,10 @@ function hasMergeableMetadata(message: any): boolean {
   );
 }
 
-function createAssistantMetadataChunk(chunk: any, rawChunk?: any): AIMessageChunk {
+function createAssistantMetadataChunk(
+  chunk: any,
+  rawChunk?: any,
+): AIMessageChunk {
   const rawMetadata = extractRawResponseMetadata(rawChunk);
   return new AIMessageChunk({
     content: chunk?.content ?? "",
@@ -181,7 +184,9 @@ function extractRawResponseMetadata(rawChunk: any): Record<string, any> {
 
   const finishReason = getRawFinishReason(rawChunk);
   return {
-    ...(hasNonEmptyString(rawChunk.model) ? { model_name: rawChunk.model } : {}),
+    ...(hasNonEmptyString(rawChunk.model)
+      ? { model_name: rawChunk.model }
+      : {}),
     ...(hasNonEmptyString(finishReason) ? { finish_reason: finishReason } : {}),
     ...(hasNonEmptyObject(rawChunk.usage) ? { usage: rawChunk.usage } : {}),
   };
@@ -189,9 +194,9 @@ function extractRawResponseMetadata(rawChunk: any): Record<string, any> {
 
 function getRawFinishReason(rawChunk: any): string | undefined {
   const choices = Array.isArray(rawChunk?.choices) ? rawChunk.choices : [];
-  return choices
-    .map((choice: any) => choice?.finish_reason ?? choice?.finishReason)
-    .find((reason: any) => hasNonEmptyString(reason));
+  const selectedChoice = choices[0];
+  const reason = selectedChoice?.finish_reason ?? selectedChoice?.finishReason;
+  return hasNonEmptyString(reason) ? reason : undefined;
 }
 
 function getFinishReasons(response: any, rawChunks: any[]): string[] {
@@ -200,13 +205,12 @@ function getFinishReasons(response: any, rawChunks: any[]): string[] {
     response?.response_metadata?.finishReason,
     response?.generationInfo?.finish_reason,
     response?.generationInfo?.finishReason,
-    ...rawChunks.flatMap((chunk) =>
-      Array.isArray(chunk?.choices)
-        ? chunk.choices.map(
-            (choice: any) => choice?.finish_reason ?? choice?.finishReason,
-          )
-        : [],
-    ),
+    ...rawChunks.map((chunk) => {
+      const selectedChoice = Array.isArray(chunk?.choices)
+        ? chunk.choices[0]
+        : undefined;
+      return selectedChoice?.finish_reason ?? selectedChoice?.finishReason;
+    }),
   ];
 
   return candidates.filter(hasNonEmptyString);
@@ -247,15 +251,14 @@ function hasAnyToolCallPayload(response: any, rawChunks: any[]): boolean {
 
   return rawChunks.some((chunk) => {
     const choices = Array.isArray(chunk?.choices) ? chunk.choices : [];
-    return choices.some((choice: any) => {
-      const delta = choice?.delta;
-      const message = choice?.message;
-      return (
-        isNonEmptyArray(delta?.tool_calls) ||
-        isNonEmptyArray(message?.tool_calls) ||
-        isNonEmptyArray(choice?.tool_calls)
-      );
-    });
+    const selectedChoice = choices[0];
+    const delta = selectedChoice?.delta;
+    const message = selectedChoice?.message;
+    return (
+      isNonEmptyArray(delta?.tool_calls) ||
+      isNonEmptyArray(message?.tool_calls) ||
+      isNonEmptyArray(selectedChoice?.tool_calls)
+    );
   });
 }
 

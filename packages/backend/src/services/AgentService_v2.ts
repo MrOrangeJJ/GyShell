@@ -84,6 +84,11 @@ import {
   isEmptyUnusableModelResponse,
 } from "./AgentHelper/utils/streamed_model_response";
 import {
+  buildToolArgumentContracts,
+  reconcileStreamedToolCalls,
+  type ToolArgumentContracts,
+} from "./AgentHelper/utils/streamed_tool_call_integrity";
+import {
   buildDynamicRequestHistory,
   invokeWithRetryAndSanitizedInput,
   sanitizeStoredMessagesForChatRuntime,
@@ -320,7 +325,7 @@ export class AgentService_v2 {
   private helpers: AgentHelpers;
   private checkpointer: MemorySaver;
   private builtInToolEnabled: Record<string, boolean> = {};
-  private abortedMessagesByRunId: Map<string, BaseMessage> = new Map();
+  private abortedMessagesByRunId: Map<string, BaseMessage[]> = new Map();
   private activePhysicalRunIds: Set<string> = new Set();
   private sessionModelBindings: Map<string, SessionModelBinding> = new Map();
   private fileMutationTailByMachine: Map<string, Promise<void>> = new Map();
@@ -354,11 +359,65 @@ export class AgentService_v2 {
 
   private captureAbortedMessageForActiveRun(
     physicalRunId: string,
-    message: BaseMessage,
+    messages: BaseMessage | BaseMessage[],
   ): boolean {
     if (!this.activePhysicalRunIds.has(physicalRunId)) return false;
-    this.abortedMessagesByRunId.set(physicalRunId, message);
+    this.abortedMessagesByRunId.set(
+      physicalRunId,
+      Array.isArray(messages) ? messages : [messages],
+    );
     return true;
+  }
+
+  private buildAbortedModelStreamMessages(options: {
+    response: any;
+    rawChunks: any[];
+    contracts: ToolArgumentContracts;
+    partialText: string;
+    messageId: string;
+  }): BaseMessage[] {
+    const reconciled = reconcileStreamedToolCalls(
+      options.response,
+      options.rawChunks,
+      options.contracts,
+    );
+    let assistant = reconciled.response;
+    if (!assistant && options.partialText.trim()) {
+      assistant = new AIMessage({ content: options.partialText });
+    }
+    if (!assistant) return [];
+
+    const toolCalls: any[] = Array.isArray(assistant.tool_calls)
+      ? assistant.tool_calls
+      : [];
+    const assistantText = this.helpers.extractText(assistant.content);
+    if (!assistantText && options.partialText) {
+      assistant.content = options.partialText;
+    }
+    if (!options.partialText.trim() && toolCalls.length === 0) return [];
+
+    assistant.additional_kwargs = {
+      ...(assistant.additional_kwargs || {}),
+      _gyshellMessageId: options.messageId,
+      _gyshellAborted: true,
+    };
+
+    if (toolCalls.length === 0) return [assistant];
+
+    const normalizedIds = normalizeToolCallIds(toolCalls, uuidv4);
+    const normalizedNames = normalizeToolCallNames(normalizedIds.toolCalls);
+    assistant.tool_calls = normalizedNames.toolCalls;
+    this.cleanupModelToolCallMetadata(assistant);
+
+    const cancelledResults = normalizedNames.toolCalls.map((toolCall) =>
+      this.createSyntheticToolMessage(toolCall, {
+        status: "cancelled",
+        reason:
+          "The model stream stopped before GyShell dispatched this tool call. The call identity was preserved and no tool execution was attempted.",
+        retryable: true,
+      }),
+    );
+    return [assistant, ...cancelledResults];
   }
 
   constructor(
@@ -1214,14 +1273,13 @@ export class AgentService_v2 {
       const baseModel = shouldUseThinkingModelOnThisPass
         ? sessionBinding.thinkingModel || sessionBinding.model
         : sessionBinding.model;
-      const modelWithTools = baseModel.bindTools([
-        ...builtInTools,
-        ...mcpTools,
-      ]);
+      const toolsForThisPass = [...builtInTools, ...mcpTools];
+      const toolArgumentContracts =
+        buildToolArgumentContracts(toolsForThisPass);
+      const modelWithTools = baseModel.bindTools(toolsForThisPass);
 
       const messageId = uuidv4();
 
-      let partialText = "";
       let reasoningContent = "";
       let debugRawChunks: any[] = [];
       const fullResponse = await invokeWithRetryAndSanitizedInput({
@@ -1238,6 +1296,7 @@ export class AgentService_v2 {
           let skippedEmptyGenericChunks = 0;
           const streamReasoningExtractor = createStreamReasoningExtractor();
           const attemptDebugRawChunks: any[] = [];
+          let attemptPartialText = "";
           let activeReasoningBannerId: string | null = null;
 
           const startReasoningBanner = () => {
@@ -1269,6 +1328,48 @@ export class AgentService_v2 {
             });
             activeReasoningBannerId = null;
           };
+
+          const captureInterruptedAttempt = () => {
+            let abortedMessages: BaseMessage[] = [];
+            try {
+              abortedMessages = this.buildAbortedModelStreamMessages({
+                response,
+                rawChunks: attemptDebugRawChunks,
+                contracts: toolArgumentContracts,
+                partialText: attemptPartialText,
+                messageId,
+              });
+            } catch (integrityError) {
+              console.warn(
+                "[AgentService_v2] Failed to reconcile an interrupted model stream; preserving text-only output.",
+                integrityError,
+              );
+              if (attemptPartialText.trim()) {
+                abortedMessages = [
+                  new AIMessage({
+                    content: attemptPartialText,
+                    additional_kwargs: {
+                      _gyshellMessageId: messageId,
+                      _gyshellAborted: true,
+                    },
+                  }),
+                ];
+              }
+            }
+            const physicalRunId = String(state.physicalRunId || sessionId);
+            if (
+              abortedMessages.length > 0 &&
+              this.captureAbortedMessageForActiveRun(
+                physicalRunId,
+                abortedMessages,
+              )
+            ) {
+              console.log(
+                `[AgentService_v2] Captured ${abortedMessages.length} interrupted model-stream message(s) for checkpoint persistence.`,
+              );
+            }
+          };
+
           try {
             for await (const chunk of stream) {
               const rawChunk = captureRawResponseChunk(
@@ -1290,7 +1391,7 @@ export class AgentService_v2 {
               }
               const rawDelta = this.helpers.extractText(chunk.content);
               if (rawDelta) {
-                partialText += rawDelta;
+                attemptPartialText += rawDelta;
               }
               if (extracted.reasoning) {
                 appendReasoningDelta(extracted.reasoning);
@@ -1317,24 +1418,7 @@ export class AgentService_v2 {
             finishReasoningBanner();
           } catch (err) {
             finishReasoningBanner();
-            if (partialText.trim()) {
-              const physicalRunId = String(state.physicalRunId || sessionId);
-              const captured = this.captureAbortedMessageForActiveRun(
-                physicalRunId,
-                new AIMessage({
-                  content: partialText,
-                  additional_kwargs: {
-                    _gyshellMessageId: messageId,
-                    _gyshellAborted: true,
-                  },
-                }),
-              );
-              if (captured) {
-                console.log(
-                  "[AgentService_v2] Captured partial message from error/abort in instance variable.",
-                );
-              }
-            }
+            captureInterruptedAttempt();
             throw err;
           }
           if (!response) {
@@ -1348,31 +1432,75 @@ export class AgentService_v2 {
           }
           reasoningContent = streamReasoningExtractor.getReasoningContent();
 
+          const streamIntegrity = reconcileStreamedToolCalls(
+            response,
+            attemptDebugRawChunks,
+            toolArgumentContracts,
+          );
+          response = streamIntegrity.response;
+          if (streamIntegrity.status === "malformed_with_identity") {
+            console.warn(
+              `[AgentService_v2] Preserved ${streamIntegrity.rawCallCount} malformed streamed tool call(s) as explicit error results (sessionId=${sessionId}).`,
+              streamIntegrity.issues,
+            );
+            this.helpers.sendEvent(sessionId, {
+              type: "alert",
+              message:
+                "The model provider returned an inconsistent tool-call stream. GyShell preserved every identifiable call and will return explicit error results without executing malformed calls.",
+              level: "warning",
+              messageId: `stream-tool-integrity-${messageId}`,
+            });
+          } else if (streamIntegrity.issues.length > 0) {
+            console.warn(
+              `[AgentService_v2] Reconstructed streamed tool calls from raw SSE (sessionId=${sessionId}).`,
+              streamIntegrity.issues,
+            );
+          }
+
           if (
-            isEmptyMalformedToolCallFinish(response, attemptDebugRawChunks) &&
+            (streamIntegrity.requiresNonStreamingFallback ||
+              isEmptyMalformedToolCallFinish(
+                response,
+                attemptDebugRawChunks,
+              )) &&
             typeof (modelWithTools as any).invoke === "function"
           ) {
             console.warn(
               `[AgentService_v2] Stream ended with malformed empty tool-call finish; retrying same request with non-stream invoke (sessionId=${sessionId}).`,
             );
-            const invokeResponse = await modelWithTools.invoke(
-              streamInputMessages,
-              {
-                signal: config?.signal,
-              },
-            );
-            captureRawResponseChunk(
-              invokeResponse as any,
-              attemptDebugRawChunks,
+            let invokeResponse: any;
+            try {
+              invokeResponse = await modelWithTools.invoke(
+                streamInputMessages,
+                {
+                  signal: config?.signal,
+                },
+              );
+            } catch (invokeError) {
+              captureInterruptedAttempt();
+              throw invokeError;
+            }
+            const invokeRawChunks: any[] = [];
+            captureRawResponseChunk(invokeResponse as any, invokeRawChunks);
+            attemptDebugRawChunks.push(...invokeRawChunks);
+            const invokeIntegrity = reconcileStreamedToolCalls(
+              invokeResponse,
+              invokeRawChunks,
+              toolArgumentContracts,
             );
             if (
+              !invokeIntegrity.requiresNonStreamingFallback &&
               !isEmptyMalformedToolCallFinish(
-                invokeResponse,
-                attemptDebugRawChunks,
+                invokeIntegrity.response,
+                invokeRawChunks,
+              ) &&
+              !isEmptyUnusableModelResponse(
+                invokeIntegrity.response,
+                invokeRawChunks,
               )
             ) {
               const invokeText = this.helpers.extractText(
-                invokeResponse.content,
+                invokeIntegrity.response.content,
               );
               if (invokeText) {
                 this.helpers.sendEvent(sessionId, {
@@ -1381,7 +1509,7 @@ export class AgentService_v2 {
                   content: invokeText,
                 });
               }
-              response = invokeResponse;
+              response = invokeIntegrity.response;
             }
           }
 
@@ -1412,6 +1540,13 @@ export class AgentService_v2 {
         maxRetries: MODEL_RETRY_MAX,
         delaysMs: MODEL_RETRY_DELAYS_MS,
       });
+
+      // A successful attempt supersedes any interrupted attempt captured under
+      // the same physical run. Keeping the stale bundle would let a later stop
+      // append obsolete assistant/tool messages to the accepted checkpoint.
+      this.abortedMessagesByRunId.delete(
+        String(state.physicalRunId || sessionId),
+      );
 
       fullResponse.additional_kwargs = {
         ...(fullResponse.additional_kwargs || {}),
@@ -1509,6 +1644,21 @@ export class AgentService_v2 {
 
       if (!AIMessage.isInstance(lastMessage)) {
         return { messages, sessionId, pendingToolCalls };
+      }
+
+      const invalidToolCalls = Array.isArray(
+        (lastMessage as any).invalid_tool_calls,
+      )
+        ? (lastMessage as any).invalid_tool_calls
+        : [];
+      if (invalidToolCalls.length > 0) {
+        const finalIntegrity = reconcileStreamedToolCalls(lastMessage, []);
+        (lastMessage as any).tool_calls = finalIntegrity.response.tool_calls;
+        (lastMessage as any).invalid_tool_calls = [];
+        (lastMessage as any).tool_call_chunks =
+          finalIntegrity.response.tool_call_chunks;
+        (lastMessage as any).additional_kwargs =
+          finalIntegrity.response.additional_kwargs;
       }
 
       const toolCalls: any[] = Array.isArray((lastMessage as any).tool_calls)
@@ -2969,7 +3119,7 @@ export class AgentService_v2 {
   ): any {
     const sessionId = state.sessionId;
     const toolMessage = this.createSyntheticToolMessage(toolCall, {
-      status: "not_executed",
+      status: toolCall?._gyshellExecution?.outcomeStatus || "not_executed",
       reason,
       retryable,
     });
@@ -3781,6 +3931,14 @@ export class AgentService_v2 {
   private cleanupModelToolCallMetadata(msg: any): void {
     // Valid tool_calls are model output and must remain intact. Only redundant
     // streaming/parser artifacts are removed before the message is persisted.
+    if (
+      Array.isArray(msg?.invalid_tool_calls) &&
+      msg.invalid_tool_calls.length > 0
+    ) {
+      throw new Error(
+        "Tool-call integrity invariant failed: invalid_tool_calls reached metadata cleanup without an explicit result.",
+      );
+    }
     if (Array.isArray(msg?.invalid_tool_calls)) {
       msg.invalid_tool_calls = [];
     }
@@ -4350,12 +4508,12 @@ export class AgentService_v2 {
         messages = [...messages, ...pendingToolSupplementMessages];
       }
 
-      const abortedMessage = this.abortedMessagesByRunId.get(physicalRunId);
-      if (abortedMessage) {
+      const abortedMessages = this.abortedMessagesByRunId.get(physicalRunId);
+      if (abortedMessages && abortedMessages.length > 0) {
         console.log(
-          "[AgentService_v2] Appending aborted message for this physical run to history.",
+          `[AgentService_v2] Appending ${abortedMessages.length} interrupted message(s) for this physical run to history.`,
         );
-        messages = [...messages, abortedMessage];
+        messages = [...messages, ...abortedMessages];
         this.abortedMessagesByRunId.delete(physicalRunId);
       }
       if (messages.length === 0) return;

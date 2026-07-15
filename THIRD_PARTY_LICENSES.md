@@ -15,7 +15,7 @@ The following software may be included in this product:
 
 | Package | Version | License | Repository |
 | :--- | :--- | :--- | :--- |
-| @langchain/core | 1.1.8 | MIT | https://github.com/langchain-ai/langchainjs |
+| @langchain/core | 1.2.3 | MIT | https://github.com/langchain-ai/langchainjs |
 | @langchain/langgraph | 1.0.7 | MIT | https://github.com/langchain-ai/langgraphjs |
 | @langchain/mcp-adapters | 1.1.1 | MIT | https://github.com/langchain-ai/langchainjs |
 | @langchain/openai | 1.2.0 | MIT | https://github.com/langchain-ai/langchainjs |
@@ -32,7 +32,6 @@ The following software may be included in this product:
 | electron-store | 10.0.0 | MIT | https://github.com/sindresorhus/electron-store |
 | electron-updater | 6.6.0 | MIT | https://github.com/electron-userland/electron-builder |
 | i18next | 25.7.4 | MIT | https://github.com/i18next/i18next |
-| langchain | 1.2.3 | MIT | https://github.com/langchain-ai/langchainjs |
 | lucide-react | 0.562.0 | ISC | https://github.com/lucide-icons/lucide |
 | mobx | 6.13.5 | MIT | https://github.com/mobxjs/mobx |
 | mobx-react-lite | 4.0.7 | MIT | https://github.com/mobxjs/mobx |
@@ -79,7 +78,7 @@ GyShell 采用 **知识共享署名-非商业性使用 4.0 国际许可协议 (C
 
 | 软件包 | 版本 | 协议 | 仓库地址 |
 | :--- | :--- | :--- | :--- |
-| @langchain/core | 1.1.8 | MIT | https://github.com/langchain-ai/langchainjs |
+| @langchain/core | 1.2.3 | MIT | https://github.com/langchain-ai/langchainjs |
 | @langchain/langgraph | 1.0.7 | MIT | https://github.com/langchain-ai/langgraphjs |
 | @langchain/mcp-adapters | 1.1.1 | MIT | https://github.com/langchain-ai/langchainjs |
 | @langchain/openai | 1.2.0 | MIT | https://github.com/langchain-ai/langchainjs |
@@ -96,7 +95,6 @@ GyShell 采用 **知识共享署名-非商业性使用 4.0 国际许可协议 (C
 | electron-store | 10.0.0 | MIT | https://github.com/sindresorhus/electron-store |
 | electron-updater | 6.6.0 | MIT | https://github.com/electron-userland/electron-builder |
 | i18next | 25.7.4 | MIT | https://github.com/i18next/i18next |
-| langchain | 1.2.3 | MIT | https://github.com/langchain-ai/langchainjs |
 | lucide-react | 0.562.0 | ISC | https://github.com/lucide-icons/lucide |
 | mobx | 6.13.5 | MIT | https://github.com/mobxjs/mobx |
 | mobx-react-lite | 4.0.7 | MIT | https://github.com/mobxjs/mobx |

@@ -3,6 +3,7 @@ import {
   AIMessage,
   HumanMessage,
   ToolMessage,
+  mapChatMessagesToStoredMessages,
   mapStoredMessagesToChatMessages
 } from '@langchain/core/messages'
 import { AgentService_v2 } from '../AgentService_v2'
@@ -517,6 +518,117 @@ await runCase('a malformed blank-name call is preserved and explicitly completed
   assert.equal(JSON.parse(String(result.messages[1].content)).status, 'not_executed')
 })
 
+await runCase('invalid streamed calls retain their IDs and receive explicit error results', async () => {
+  const agent = createAgent()
+  const source = new AIMessage({
+    content: '',
+    tool_calls: [],
+    invalid_tool_calls: [
+      {
+        id: 'invalid-stream-call',
+        name: 'read_file',
+        args: '{"filePath":',
+        error: 'Malformed JSON',
+        type: 'invalid_tool_call'
+      }
+    ]
+  } as any)
+  const batch = await (agent as any).createBatchToolcallExecutorNode().invoke({
+    sessionId: 'invalid-stream-call',
+    messages: [source]
+  })
+
+  assert.equal(source.invalid_tool_calls?.length, 0)
+  assert.equal(source.tool_calls?.length, 1)
+  assert.equal(source.tool_calls?.[0].id, 'invalid-stream-call')
+  assert.equal(batch.pendingToolCalls[0].id, 'invalid-stream-call')
+  assert.equal(batch.pendingToolCalls[0]._gyshellExecution.mode, 'not_executed')
+  assert.equal(batch.pendingToolCalls[0]._gyshellExecution.outcomeStatus, 'error')
+
+  const result = await (agent as any).createToolsNode().invoke(batch)
+  const toolMessage = result.messages[1] as ToolMessage
+  assert.equal(toolMessage.tool_call_id, 'invalid-stream-call')
+  assert.deepEqual(JSON.parse(String(toolMessage.content)), {
+    status: 'error',
+    reason: 'LangChain reported an invalid tool call: Malformed JSON',
+    retryable: true
+  })
+})
+
+await runCase('stop during a multi-call stream preserves every call and cancelled result', () => {
+  const agent = createAgent()
+  const rawChunks = [
+    {
+      choices: [
+        {
+          index: 0,
+          delta: {
+            tool_calls: [
+              {
+                index: 0,
+                id: 'stop-complete',
+                function: {
+                  name: 'read_file',
+                  arguments: '{"filePath":"/tmp/complete.txt"}'
+                }
+              },
+              {
+                index: 1,
+                id: 'stop-partial',
+                function: {
+                  name: 'read_file',
+                  arguments: '{"filePath":"/tmp/partial'
+                }
+              }
+            ]
+          },
+          finish_reason: null
+        }
+      ]
+    }
+  ]
+  const messages = (agent as any).buildAbortedModelStreamMessages({
+    response: new AIMessage('partial assistant text'),
+    rawChunks,
+    contracts: new Map([['read_file', ['filePath']]]),
+    partialText: 'partial assistant text',
+    messageId: 'stopped-assistant'
+  })
+
+  assert.deepEqual(
+    messages.map((message: any) => message.getType()),
+    ['ai', 'tool', 'tool']
+  )
+  assert.deepEqual(
+    messages[0].tool_calls.map((call: any) => [call.id, call.index]),
+    [
+      ['stop-complete', 0],
+      ['stop-partial', 1]
+    ]
+  )
+  assert.deepEqual(
+    messages.slice(1).map((message: any) => message.tool_call_id),
+    ['stop-complete', 'stop-partial']
+  )
+  assert.deepEqual(
+    messages.slice(1).map((message: any) => JSON.parse(String(message.content)).status),
+    ['cancelled', 'cancelled']
+  )
+
+  const restored = mapStoredMessagesToChatMessages(mapChatMessagesToStoredMessages(messages))
+  assert.deepEqual(
+    (restored[0] as any).tool_calls?.map((call: any) => [call.id, call.index]),
+    [
+      ['stop-complete', 0],
+      ['stop-partial', 1]
+    ]
+  )
+  assert.deepEqual(
+    restored.slice(1).map((message: any) => message.tool_call_id),
+    ['stop-complete', 'stop-partial']
+  )
+})
+
 await runCase('default-disabled lifecycle tools retain their call id and structured result', async () => {
   const agent = createAgent()
   const source = new AIMessage({
@@ -981,8 +1093,8 @@ await runCase('checkpoint stop preserves image supplements and isolates partial 
 
   snapshots.set('session-a', { values: { messages: [new HumanMessage('A')] } })
   snapshots.set('session-b', { values: { messages: [new HumanMessage('B')] } })
-  ;(agent as any).abortedMessagesByRunId.set('run-a', new AIMessage('partial A'))
-  ;(agent as any).abortedMessagesByRunId.set('run-b', new AIMessage('partial B'))
+  ;(agent as any).abortedMessagesByRunId.set('run-a', [new AIMessage('partial A')])
+  ;(agent as any).abortedMessagesByRunId.set('run-b', [new AIMessage('partial B')])
   await (agent as any).trySaveSessionFromCheckpoint('session-a', 'run-a')
   await (agent as any).trySaveSessionFromCheckpoint('session-b', 'run-b')
 
