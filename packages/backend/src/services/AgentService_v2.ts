@@ -4415,6 +4415,7 @@ export class AgentService_v2 {
       const result = await this.graph.invoke(initialState, {
         recursionLimit: recursionLimit,
         signal,
+        durability: "exit",
         configurable: { thread_id: sessionId },
       });
 
