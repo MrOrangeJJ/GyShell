@@ -154,14 +154,32 @@ export const ChatMessageList: React.FC<ChatMessageListProps> = observer(
       : null;
     const chatDisplayMode = store.chatDisplayMode;
     const lastMessageStreaming = lastMessage?.streaming === true;
+    const expandedSeamlessGroupIds = React.useMemo(() => {
+      const expandedIds = new Set<string>();
+      const sessionKeyPrefix = sessionId ? `${sessionId}::` : null;
+      if (!sessionKeyPrefix) return expandedIds;
+      Object.entries(bannerUiStateByKey).forEach(([key, state]) => {
+        if (state.expanded && key.startsWith(sessionKeyPrefix)) {
+          expandedIds.add(key.slice(sessionKeyPrefix.length));
+        }
+      });
+      return expandedIds;
+    }, [bannerUiStateByKey, sessionId]);
     const renderItems = React.useMemo(
-      () => buildChatRenderItems(session, isThinking, chatDisplayMode),
+      () =>
+        buildChatRenderItems(
+          session,
+          isThinking,
+          chatDisplayMode,
+          expandedSeamlessGroupIds,
+        ),
       // messageCount and lastMessageStreaming ensure recomputation when the
       // session content changes even if renderListVersion is not yet bumped
       // (e.g. during initial auto-restore before hydration completes).
       // eslint-disable-next-line react-hooks/exhaustive-deps
       [
         chatDisplayMode,
+        expandedSeamlessGroupIds,
         isThinking,
         messageCount,
         lastMessageStreaming,

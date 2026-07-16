@@ -234,6 +234,22 @@ runCase(
       ['tool1', 'cmd1'],
       'seamless grouped tool row should include consecutive tool activity',
     )
+    assertEqual(
+      items[1]?.estimatedHeight,
+      72,
+      'collapsed seamless groups should keep a compact estimate independent of step count',
+    )
+    const restoredExpandedItems = buildChatRenderItems(
+      session,
+      false,
+      'seamless',
+      new Set(['tool1']),
+    )
+    assertEqual(
+      (restoredExpandedItems[1]?.estimatedHeight || 0) > 72,
+      true,
+      'restored expanded groups should retain a disclosure-aware estimate before measurement',
+    )
     assertDeepEqual(
       items.map((item) => item.showAssistantRoleLabel),
       [false, true, false],
@@ -310,6 +326,35 @@ runCase(
     )
   },
 )
+
+runCase('expanded seamless estimates track compact disclosure rows', () => {
+  const session = createSession([
+    createMessage({ id: 'u1', role: 'user', type: 'text', content: 'run' }),
+    ...Array.from({ length: 20 }, (_, index) =>
+      createMessage({
+        id: `tool-${index}`,
+        role: 'assistant',
+        type: 'tool_call',
+        content: JSON.stringify({ index }),
+        metadata: { output: 'x'.repeat(12_000) },
+        streaming: false,
+      }),
+    ),
+  ])
+
+  const items = buildChatRenderItems(
+    session,
+    false,
+    'seamless',
+    new Set(['tool-0']),
+  )
+
+  assertEqual(
+    items[1]?.estimatedHeight,
+    524,
+    'the expanded fallback should estimate 20 compact rows without sizing for hidden detail payloads',
+  )
+})
 
 runCase(
   'streaming seamless tool group tail keeps copy/branch hidden until settled',

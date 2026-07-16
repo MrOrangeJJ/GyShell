@@ -1,10 +1,22 @@
 export interface ChatBannerUiState {
   expanded?: boolean
+  expandedStepIds?: string[]
+  expandedDetailIds?: string[]
   showDetails?: boolean
   isSkipping?: boolean
 }
 
 export type ChatBannerUiStateMap = Record<string, ChatBannerUiState>
+
+const areOptionalStringArraysEqual = (
+  left: readonly string[] | undefined,
+  right: readonly string[] | undefined,
+): boolean =>
+  left === right ||
+  (!!left &&
+    !!right &&
+    left.length === right.length &&
+    left.every((value, index) => value === right[index]))
 
 export const getChatBannerUiStateKey = (
   sessionId: string | null,
@@ -32,6 +44,14 @@ export const mergeChatBannerUiState = (
   }
   if (
     current.expanded === next.expanded &&
+    areOptionalStringArraysEqual(
+      current.expandedStepIds,
+      next.expandedStepIds,
+    ) &&
+    areOptionalStringArraysEqual(
+      current.expandedDetailIds,
+      next.expandedDetailIds,
+    ) &&
     current.showDetails === next.showDetails &&
     current.isSkipping === next.isSkipping
   ) {

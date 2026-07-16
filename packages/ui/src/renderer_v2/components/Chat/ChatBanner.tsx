@@ -13,9 +13,14 @@ import {
   AlertTriangle,
   XCircle,
   FastForward,
-  Check,
 } from 'lucide-react'
 import type { ChatMessage } from '../../stores/ChatStore'
+import {
+  buildSeamlessStepPresentation,
+  getSeamlessGroupTone,
+  type SeamlessStepDetail,
+  type SeamlessStepPresentation,
+} from './seamlessToolPresentation'
 import './chatBanner.scss'
 
 const useBannerSelection = <T extends HTMLElement>() => {
@@ -597,147 +602,337 @@ export const AlertBanner = observer(({
 
 // ─── Seamless mode components ────────────────────────────────────────────────
 
-const MAX_STEP_TEXT_LEN = 64
-
-function truncate(text: string, max: number): string {
-  if (text.length <= max) return text
-  return text.slice(0, max - 1) + '…'
+const getSeamlessStateMark = (
+  tone: SeamlessStepPresentation['tone'] | undefined,
+  isStreaming: boolean,
+): string => {
+  if (isStreaming) return '…'
+  return tone === 'neutral' ? '✓' : '!'
 }
 
-function getStepDescription(msg: ChatMessage): { text: string; fullText: string; info?: string } {
-  switch (msg.type) {
-    case 'command': {
-      const raw = msg.content || ''
-      return {
-        text: `$ ${truncate(raw, MAX_STEP_TEXT_LEN)}`,
-        fullText: `$ ${raw}`,
-      }
-    }
-    case 'tool_call': {
-      const toolName = msg.metadata?.toolName || 'tool'
-      const raw = msg.content || ''
-      const budget = Math.max(8, MAX_STEP_TEXT_LEN - toolName.length - 2)
-      return {
-        text: raw ? `${toolName}: ${truncate(raw, budget)}` : toolName,
-        fullText: raw ? `${toolName}: ${raw}` : toolName,
-      }
-    }
-    case 'file_edit': {
-      const action = msg.metadata?.action || 'edited'
-      const rawPath = msg.metadata?.filePath || msg.content || ''
-      const actionLabel = action === 'created' ? 'create' : action === 'error' ? 'error' : 'edit'
-      const diff = msg.metadata?.diff || ''
-      let info: string | undefined
-      if (diff) {
-        let added = 0
-        let removed = 0
-        diff.split('\n').forEach((line) => {
-          if (line.startsWith('+') && !line.startsWith('+++')) added++
-          else if (line.startsWith('-') && !line.startsWith('---')) removed++
-        })
-        if (added || removed) info = `+${added}/-${removed}`
-      }
-      return {
-        text: `${actionLabel} ${truncate(rawPath, MAX_STEP_TEXT_LEN - 8)}`,
-        fullText: `${actionLabel} ${rawPath}`,
-        info,
-      }
-    }
-    case 'sub_tool': {
-      const raw = msg.metadata?.subToolTitle || msg.content || 'sub_tool'
-      return {
-        text: truncate(raw, MAX_STEP_TEXT_LEN),
-        fullText: raw,
-      }
-    }
-    default: {
-      const raw = msg.content || ''
-      return {
-        text: truncate(raw, MAX_STEP_TEXT_LEN),
-        fullText: raw,
-      }
-    }
-  }
+const getCompactDetailPreview = (content: string): string => {
+  const compact = content.slice(0, 320).replace(/\s+/g, ' ').trim()
+  if (compact.length <= 88) return compact
+  return `${compact.slice(0, 87).trimEnd()}…`
 }
 
-export const SeamlessToolGroupBanner = observer(({
-  messages,
-  expanded: expandedProp,
-  onExpandedChange,
+type ExpandedKeySetter = (
+  updater: (current: ReadonlySet<string>) => Set<string>,
+) => void
+
+const useControllableStringSet = (
+  value: readonly string[] | undefined,
+  onChange: ((nextValue: string[]) => void) | undefined,
+): [ReadonlySet<string>, ExpandedKeySetter] => {
+  const [internalValue, setInternalValue] = React.useState<Set<string>>(
+    () => new Set(value),
+  )
+  const controlledValue = React.useMemo(
+    () => (value === undefined ? null : new Set(value)),
+    [value],
+  )
+  const currentValue = controlledValue ?? internalValue
+  const setValue = React.useCallback<ExpandedKeySetter>(
+    (updater) => {
+      const nextValue = updater(currentValue)
+      if (controlledValue === null) setInternalValue(nextValue)
+      onChange?.([...nextValue])
+    },
+    [controlledValue, currentValue, onChange],
+  )
+
+  return [currentValue, setValue]
+}
+
+const toggleExpandedKey = (
+  setter: ExpandedKeySetter,
+  key: string,
+): void => {
+  setter((current) => {
+    const next = new Set(current)
+    if (next.has(key)) next.delete(key)
+    else next.add(key)
+    return next
+  })
+}
+
+const clearExpandedDetailScope = (
+  setter: ExpandedKeySetter,
+  scopeId: string,
+): void => {
+  const prefix = `${scopeId}:`
+  setter(
+    (current) =>
+      new Set([...current].filter((detailId) => !detailId.startsWith(prefix))),
+  )
+}
+
+const SeamlessStepDetails = ({
+  scopeId,
+  details,
+  expandedDetailIds,
+  onToggleDetail,
 }: {
-  messages: ChatMessage[]
-  expanded?: boolean
-  onExpandedChange?: (nextValue: boolean) => void
+  scopeId: string
+  details: readonly SeamlessStepDetail[]
+  expandedDetailIds: ReadonlySet<string>
+  onToggleDetail: (detailId: string) => void
 }) => {
-  const [expanded, setExpanded] = useControllableBoolean(expandedProp, false, onExpandedChange)
-
-  const isStreaming = messages.some((m) => !!m.streaming)
-  const stepCount = messages.length
-
-  const lastMsg = messages[messages.length - 1]
-  const lastStep = lastMsg ? getStepDescription(lastMsg) : null
-
-  let headerText: string
-  if (isStreaming) {
-    headerText = lastStep ? truncate(lastStep.text, 48) : 'Working...'
-  } else if (stepCount === 1) {
-    headerText = lastStep ? lastStep.text : 'Done'
-  } else {
-    headerText = `Done · ${stepCount} steps`
-  }
-
-  const shouldSweep = isStreaming
-  const headerInfo =
-    !isStreaming && stepCount === 1 ? lastStep?.info : undefined
+  const contentIdPrefix = React.useId()
+  if (details.length === 0) return null
 
   return (
-    <div
-      className={`seamless-tool-group${isStreaming ? ' is-streaming' : ' is-done'}${stepCount === 1 ? ' is-single' : ''}${expanded ? ' is-expanded' : ''}`}
-    >
-      <div className="stg-header" onClick={() => setExpanded(!expanded)}>
-        <div className="stg-status-icon">
-          {isStreaming
-            ? <Loader2 size={12} className="spin" />
-            : <Check size={12} />}
-        </div>
-        <div className={`stg-title${shouldSweep ? ' stg-sweep' : ''}`}>
-          <span data-sweep-text={shouldSweep ? headerText : undefined}>
-            {headerText}
-          </span>
-        </div>
-        <div className="stg-meta">
-          {isStreaming && stepCount > 1 ? (
-            <span className="stg-count">{stepCount} steps</span>
-          ) : headerInfo ? (
-            <span className="stg-step-info">{headerInfo}</span>
-          ) : null}
-        </div>
-        <div className="stg-chevron">
-          {expanded ? <ChevronDown size={11} /> : <ChevronRight size={11} />}
-        </div>
-      </div>
-      {expanded && (
-        <div className="stg-steps">
-          {messages.map((msg, idx) => {
-            const { fullText, info } = getStepDescription(msg)
-            const isDone = !msg.streaming
-            const isLast = idx === messages.length - 1
-            return (
-              <div
-                key={msg.id}
-                className={`stg-step${isDone ? ' is-done' : ' is-active'}${isLast && isStreaming ? ' is-current' : ''}`}
-              >
-                <span className="stg-step-connector">{isLast ? '└' : '├'}</span>
-                <span className="stg-step-text">{fullText}</span>
-                {info && <span className="stg-step-info">{info}</span>}
-              </div>
-            )
-          })}
-        </div>
-      )}
+    <div className="stg-detail-list">
+      {details.map((detail, index) => {
+        const detailId = `${scopeId}:${detail.key}`
+        const isExpanded = expandedDetailIds.has(detailId)
+        const contentId = `${contentIdPrefix}-${index}`
+        return (
+          <div key={detail.key} className="stg-detail">
+            <button
+              type="button"
+              className="stg-detail-toggle"
+              onClick={() => onToggleDetail(detailId)}
+              aria-expanded={isExpanded}
+              aria-controls={contentId}
+              title={detail.label}
+            >
+              <span className="stg-tree-mark" aria-hidden="true">
+                {index === details.length - 1 ? '└' : '├'}
+              </span>
+              <span className="stg-detail-label">{detail.label}</span>
+              <span className="stg-detail-preview">
+                {getCompactDetailPreview(detail.content)}
+              </span>
+              {detail.truncated ? (
+                <span className="stg-detail-preview-label">preview</span>
+              ) : null}
+              <span className="stg-disclosure" aria-hidden="true">
+                {isExpanded ? '▾' : '▸'}
+              </span>
+            </button>
+            {isExpanded ? (
+              <pre id={contentId} className="stg-detail-content">
+                {detail.content}
+              </pre>
+            ) : null}
+          </div>
+        )
+      })}
     </div>
   )
-})
+}
+
+const getSeamlessStepState = (
+  message: ChatMessage,
+  presentation: SeamlessStepPresentation,
+): string | undefined => {
+  if (message.streaming) return 'running'
+  if (presentation.tone === 'error' && !presentation.meta) return 'error'
+  if (presentation.tone === 'warning') return 'warning'
+  return undefined
+}
+
+const SeamlessStepRow = ({
+  message,
+  presentation,
+  isLast,
+  expanded,
+  expandedDetailIds,
+  onToggleStep,
+  onToggleDetail,
+}: {
+  message: ChatMessage
+  presentation: SeamlessStepPresentation
+  isLast: boolean
+  expanded: boolean
+  expandedDetailIds: ReadonlySet<string>
+  onToggleStep: () => void
+  onToggleDetail: (detailId: string) => void
+}) => {
+  const hasDetails = presentation.details.length > 0
+  const detailsId = React.useId()
+  const state = getSeamlessStepState(message, presentation)
+
+  return (
+    <div className="stg-step">
+      <button
+        type="button"
+        className="stg-step-toggle"
+        onClick={onToggleStep}
+        aria-expanded={hasDetails ? expanded : undefined}
+        aria-controls={hasDetails ? detailsId : undefined}
+        disabled={!hasDetails}
+        title={presentation.fullSummary}
+      >
+        <span className="stg-tree-mark" aria-hidden="true">
+          {isLast ? '└' : '├'}
+        </span>
+        <span className="stg-step-text">{presentation.summary}</span>
+        {presentation.meta || state ? (
+          <span className="stg-step-info">
+            {[presentation.meta, state].filter(Boolean).join(' · ')}
+          </span>
+        ) : null}
+        {hasDetails ? (
+          <span className="stg-disclosure" aria-hidden="true">
+            {expanded ? '▾' : '▸'}
+          </span>
+        ) : null}
+      </button>
+      {hasDetails && expanded ? (
+        <div id={detailsId} className="stg-step-details">
+          <SeamlessStepDetails
+            scopeId={message.id}
+            details={presentation.details}
+            expandedDetailIds={expandedDetailIds}
+            onToggleDetail={onToggleDetail}
+          />
+        </div>
+      ) : null}
+    </div>
+  )
+}
+
+export const SeamlessToolGroupBanner = observer(
+  ({
+    messages,
+    expanded: expandedProp,
+    onExpandedChange,
+    expandedStepIds: expandedStepIdsProp,
+    onExpandedStepIdsChange,
+    expandedDetailIds: expandedDetailIdsProp,
+    onExpandedDetailIdsChange,
+  }: {
+    messages: ChatMessage[]
+    expanded?: boolean
+    onExpandedChange?: (nextValue: boolean) => void
+    expandedStepIds?: readonly string[]
+    onExpandedStepIdsChange?: (nextValue: string[]) => void
+    expandedDetailIds?: readonly string[]
+    onExpandedDetailIdsChange?: (nextValue: string[]) => void
+  }) => {
+    const [expanded, setExpanded] = useControllableBoolean(
+      expandedProp,
+      false,
+      onExpandedChange,
+    )
+    const [expandedStepIds, setExpandedStepIds] = useControllableStringSet(
+      expandedStepIdsProp,
+      onExpandedStepIdsChange,
+    )
+    const [expandedDetailIds, setExpandedDetailIds] = useControllableStringSet(
+      expandedDetailIdsProp,
+      onExpandedDetailIdsChange,
+    )
+
+    const isStreaming = messages.some((m) => !!m.streaming)
+    const stepCount = messages.length
+    const presentations = messages.map(buildSeamlessStepPresentation)
+    const lastStep = presentations[presentations.length - 1]
+    const headerTone = getSeamlessGroupTone(presentations)
+    const headerText = lastStep?.summary || 'Working…'
+    const headerInfo = stepCount > 1 ? `${stepCount} steps` : lastStep?.meta
+    const headerStateText = isStreaming
+      ? 'Running'
+      : headerTone === 'error'
+        ? 'Failed'
+        : headerTone === 'warning'
+          ? 'Warning'
+          : 'Completed'
+    const canExpand =
+      stepCount > 1 || presentations.some((step) => step.details.length > 0)
+    const isExpanded = canExpand && expanded
+    const detailsId = React.useId()
+
+    const handleGroupToggle = () => {
+      if (!canExpand) return
+      const nextExpanded = !isExpanded
+      if (!nextExpanded) {
+        setExpandedStepIds(() => new Set())
+        setExpandedDetailIds(() => new Set())
+      }
+      setExpanded(nextExpanded)
+    }
+
+    return (
+      <div
+        className={`seamless-tool-group is-${headerTone}${isStreaming ? ' is-streaming' : ' is-done'}${stepCount === 1 ? ' is-single' : ''}${isExpanded ? ' is-expanded' : ''}`}
+      >
+        <button
+          type="button"
+          className="stg-header"
+          onClick={handleGroupToggle}
+          aria-expanded={canExpand ? isExpanded : undefined}
+          aria-controls={canExpand ? detailsId : undefined}
+          aria-label={[headerStateText, headerText, headerInfo]
+            .filter(Boolean)
+            .join(' · ')}
+          disabled={!canExpand}
+          title={lastStep?.fullSummary || headerText}
+        >
+          <span className="stg-state-mark" aria-hidden="true">
+            {getSeamlessStateMark(headerTone, isStreaming)}
+          </span>
+          <span className="stg-title">
+            <span>{headerText}</span>
+          </span>
+          {headerInfo ? <span className="stg-meta">{headerInfo}</span> : null}
+          {canExpand ? (
+            <span className="stg-disclosure" aria-hidden="true">
+              {isExpanded ? '▾' : '▸'}
+            </span>
+          ) : null}
+        </button>
+        {isExpanded && (
+          <div
+            id={detailsId}
+            className={`stg-steps${stepCount === 1 ? ' is-single-detail' : ''}`}
+          >
+            {stepCount === 1 ? (
+              <SeamlessStepDetails
+                scopeId={messages[0]?.id || 'single'}
+                details={presentations[0]?.details || []}
+                expandedDetailIds={expandedDetailIds}
+                onToggleDetail={(detailId) =>
+                  toggleExpandedKey(setExpandedDetailIds, detailId)
+                }
+              />
+            ) : (
+              messages.map((message, index) => {
+                const presentation = presentations[index]
+                if (!presentation) return null
+                const stepExpanded = expandedStepIds.has(message.id)
+                return (
+                  <SeamlessStepRow
+                    key={message.id}
+                    message={message}
+                    presentation={presentation}
+                    isLast={index === messages.length - 1}
+                    expanded={stepExpanded}
+                    expandedDetailIds={expandedDetailIds}
+                    onToggleStep={() => {
+                      if (stepExpanded) {
+                        clearExpandedDetailScope(
+                          setExpandedDetailIds,
+                          message.id,
+                        )
+                      }
+                      toggleExpandedKey(setExpandedStepIds, message.id)
+                    }}
+                    onToggleDetail={(detailId) =>
+                      toggleExpandedKey(setExpandedDetailIds, detailId)
+                    }
+                  />
+                )
+              })
+            )}
+          </div>
+        )}
+      </div>
+    )
+  },
+)
 
 export const SeamlessOverlayCard = observer(({
   msg,

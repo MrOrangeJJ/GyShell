@@ -223,6 +223,7 @@ export async function copyBetweenTabs(
     sendEvent(sessionId, {
       messageId,
       type: 'sub_tool_finished',
+      level: 'error',
     })
     return `Error: ${message}`
   }

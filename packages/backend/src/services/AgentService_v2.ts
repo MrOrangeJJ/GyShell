@@ -2513,6 +2513,7 @@ export class AgentService_v2 {
 
       const signal = config?.signal;
       let resultText: string;
+      let resultLevel: "error" | undefined;
       try {
         const result = await this.mcpToolService.invokeTool(
           toolCall.name,
@@ -2526,6 +2527,7 @@ export class AgentService_v2 {
         if (this.helpers.isAbortError(err)) throw err;
         this.throwIfAborted(signal);
         resultText = err instanceof Error ? err.message : String(err);
+        resultLevel = "error";
       }
 
       this.helpers.sendEvent(sessionId, {
@@ -2534,6 +2536,7 @@ export class AgentService_v2 {
         toolName: toolCall.name,
         input: JSON.stringify(args ?? {}),
         output: resultText,
+        level: resultLevel,
       });
 
       toolMessage.content = resultText;
@@ -2757,6 +2760,7 @@ export class AgentService_v2 {
           toolName: toolCall.name,
           input: JSON.stringify(toolCall.args || {}),
           output: String(toolMessage.content),
+          level: status === "error" ? "error" : "warning",
         });
       }
 
@@ -3129,6 +3133,7 @@ export class AgentService_v2 {
       toolName: toolCall.name,
       input: JSON.stringify(toolCall.args || {}),
       output: String(toolMessage.content),
+      level: "error",
     });
     return {
       messages: [...state.messages, toolMessage],

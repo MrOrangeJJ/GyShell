@@ -1,4 +1,5 @@
 import type { ChatMessage, ChatSession } from '../../stores/ChatStore'
+import { buildSeamlessStepPresentation } from './seamlessToolPresentation'
 
 export type ChatVisibleRowKind = 'assistant' | 'user' | 'boundary'
 
@@ -44,6 +45,25 @@ const SEAMLESS_TOOL_TYPES: ReadonlySet<ChatMessage['type']> = new Set([
   'file_edit',
   'sub_tool',
 ])
+
+const SEAMLESS_COLLAPSED_ESTIMATED_HEIGHT = 72
+const SEAMLESS_DISCLOSURE_ROW_ESTIMATED_HEIGHT = 22
+const SEAMLESS_EXPANDED_VERTICAL_CHROME = 12
+const EMPTY_EXPANDED_SEAMLESS_GROUP_IDS: ReadonlySet<string> = new Set()
+
+const estimateExpandedSeamlessGroupHeight = (
+  messages: readonly ChatMessage[],
+): number => {
+  const disclosureRowCount =
+    messages.length === 1
+      ? buildSeamlessStepPresentation(messages[0]).details.length
+      : messages.length
+  return (
+    SEAMLESS_COLLAPSED_ESTIMATED_HEIGHT +
+    SEAMLESS_EXPANDED_VERTICAL_CHROME +
+    disclosureRowCount * SEAMLESS_DISCLOSURE_ROW_ESTIMATED_HEIGHT
+  )
+}
 
 const isCompletedWhitespaceAssistantText = (message: ChatMessage): boolean =>
   message.role === 'assistant' &&
@@ -177,6 +197,8 @@ export const buildChatRenderItems = (
   session: ChatSession | null,
   isThinking: boolean,
   displayMode: 'classic' | 'seamless' = 'classic',
+  expandedSeamlessGroupIds: ReadonlySet<string> =
+    EMPTY_EXPANDED_SEAMLESS_GROUP_IDS,
 ): ChatRenderItem[] => {
   if (!session) return []
 
@@ -232,6 +254,7 @@ export const buildChatRenderItems = (
     if (displayMode === 'seamless' && SEAMLESS_TOOL_TYPES.has(row.msg.type)) {
       const groupFirstId = row.id
       const seamlessGroupMessageIds: string[] = [row.id]
+      const seamlessGroupMessages: ChatMessage[] = [row.msg]
       let isGroupStreaming = !!row.msg.streaming
 
       while (
@@ -242,6 +265,7 @@ export const buildChatRenderItems = (
         visibleIndex += 1
         const nextRow = visibleRows[visibleIndex]
         seamlessGroupMessageIds.push(nextRow.id)
+        seamlessGroupMessages.push(nextRow.msg)
         if (nextRow.msg.streaming) isGroupStreaming = true
       }
 
@@ -267,7 +291,12 @@ export const buildChatRenderItems = (
       items.push({
         id: groupFirstId,
         kind: 'assistant',
-        estimatedHeight: 48 + seamlessGroupMessageIds.length * 22,
+        // Restored group state can outlive measured heights across session
+        // switches, so estimate the compact first disclosure level until the
+        // ResizeObserver reports its real size.
+        estimatedHeight: expandedSeamlessGroupIds.has(groupFirstId)
+          ? estimateExpandedSeamlessGroupHeight(seamlessGroupMessages)
+          : SEAMLESS_COLLAPSED_ESTIMATED_HEIGHT,
         mergeWithPreviousAssistant: prevIsAssistant,
         showAssistantRoleLabel: !turnAlreadyHasLabel,
         showAssistantGroupCopy: isTurnTail,

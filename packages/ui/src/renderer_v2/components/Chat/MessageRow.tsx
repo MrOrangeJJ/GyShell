@@ -211,6 +211,14 @@ export const MessageRow: React.FC<MessageRowProps> = observer(
             onExpandedChange={(expanded) =>
               onBannerUiStateChange?.({ expanded })
             }
+            expandedStepIds={bannerUiState?.expandedStepIds}
+            onExpandedStepIdsChange={(expandedStepIds) =>
+              onBannerUiStateChange?.({ expandedStepIds })
+            }
+            expandedDetailIds={bannerUiState?.expandedDetailIds}
+            onExpandedDetailIdsChange={(expandedDetailIds) =>
+              onBannerUiStateChange?.({ expandedDetailIds })
+            }
           />
           {assistantGroupActions}
         </div>

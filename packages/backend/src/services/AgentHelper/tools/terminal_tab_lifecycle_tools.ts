@@ -108,7 +108,10 @@ export async function createTerminalTab(
     input: JSON.stringify(args)
   })
 
-  const finish = (output: string): string => {
+  const finish = (
+    output: string,
+    level: 'info' | 'warning' | 'error' = 'info'
+  ): string => {
     sendEvent(sessionId, {
       messageId,
       type: 'sub_tool_delta',
@@ -116,14 +119,16 @@ export async function createTerminalTab(
     })
     sendEvent(sessionId, {
       messageId,
-      type: 'sub_tool_finished'
+      type: 'sub_tool_finished',
+      level
     })
     return output
   }
 
   if (!context.createTerminalFromSavedConnection) {
     return finish(
-      'Terminal tab creation is unavailable in this GyShell runtime.'
+      'Terminal tab creation is unavailable in this GyShell runtime.',
+      'error'
     )
   }
 
@@ -133,7 +138,8 @@ export async function createTerminalTab(
     abortIfNeeded(context.signal)
     if (!terminal) {
       return finish(
-        `Saved connection ${formatModelFacingValue(connectionId)} was not found or changed after the tool catalog was generated. Re-read the current create_terminal_tab description and use an exact connectionId.`
+        `Saved connection ${formatModelFacingValue(connectionId)} was not found or changed after the tool catalog was generated. Re-read the current create_terminal_tab description and use an exact connectionId.`,
+        'error'
       )
     }
 
@@ -144,7 +150,8 @@ export async function createTerminalTab(
           terminal.title || terminal.id
         )} was created with id=${formatModelFacingValue(
           terminal.id
-        )}, but it was closed before readiness could be confirmed.`
+        )}, but it was closed before readiness could be confirmed.`,
+        'error'
       )
     }
     const title = formatModelFacingValue(snapshot.title || snapshot.id)
@@ -157,19 +164,22 @@ export async function createTerminalTab(
     }
     if (snapshot.runtimeState === 'exited') {
       return finish(
-        `Created terminal tab ${title} (id=${terminalId}, type=${terminalType}), but its backend session exited before becoming ready.`
+        `Created terminal tab ${title} (id=${terminalId}, type=${terminalType}), but its backend session exited before becoming ready.`,
+        'error'
       )
     }
     return finish(
       `Created terminal tab ${title} (id=${terminalId}, type=${terminalType}). It is still initializing after ${Math.floor(
         TERMINAL_READY_TIMEOUT_MS / 1000
-      )} seconds; verify it with read_terminal_tab before using it.`
+      )} seconds; verify it with read_terminal_tab before using it.`,
+      'warning'
     )
   } catch (error) {
     if (isAbortError(error)) throw error
     const message = error instanceof Error ? error.message : String(error)
     return finish(
-      `Failed to create terminal tab: ${formatModelFacingValue(message)}`
+      `Failed to create terminal tab: ${formatModelFacingValue(message)}`,
+      'error'
     )
   }
 }

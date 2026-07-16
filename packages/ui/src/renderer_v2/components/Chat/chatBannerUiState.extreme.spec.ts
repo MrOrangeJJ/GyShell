@@ -46,6 +46,8 @@ runCase('partial merges preserve existing state fields for the same banner row',
   const initialState: ChatBannerUiStateMap = {
     'session-1::message-1': {
       expanded: true,
+      expandedStepIds: ['step-1'],
+      expandedDetailIds: ['step-1:output'],
     },
   }
 
@@ -65,6 +67,16 @@ runCase('partial merges preserve existing state fields for the same banner row',
     'merging showDetails should preserve existing expanded state',
   )
   assertEqual(
+    nextState['session-1::message-1']?.expandedStepIds?.[0],
+    'step-1',
+    'merging unrelated fields should preserve expanded step ids',
+  )
+  assertEqual(
+    nextState['session-1::message-1']?.expandedDetailIds?.[0],
+    'step-1:output',
+    'merging unrelated fields should preserve expanded detail ids',
+  )
+  assertEqual(
     nextState['session-1::message-1']?.showDetails,
     true,
     'merged state should store the new details flag',
@@ -80,6 +92,8 @@ runCase('no-op merges keep the same object identity on hot paths', () => {
   const initialState: ChatBannerUiStateMap = {
     'session-1::message-1': {
       expanded: false,
+      expandedStepIds: ['step-1'],
+      expandedDetailIds: [],
       showDetails: true,
       isSkipping: true,
     },
@@ -88,7 +102,12 @@ runCase('no-op merges keep the same object identity on hot paths', () => {
   const nextState = mergeChatBannerUiState(
     initialState,
     'session-1::message-1',
-    { expanded: false, isSkipping: true },
+    {
+      expanded: false,
+      expandedStepIds: ['step-1'],
+      expandedDetailIds: [],
+      isSkipping: true,
+    },
   )
 
   assertCondition(

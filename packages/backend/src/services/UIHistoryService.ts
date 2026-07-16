@@ -262,6 +262,7 @@ export class UIHistoryService {
           metadata: {
             output: event.output || "",
             toolName: event.toolName || "Tool Call",
+            subToolLevel: event.level,
           },
           streaming: false,
           backendMessageId: event.messageId,
@@ -408,12 +409,23 @@ export class UIHistoryService {
                 entry.streaming,
             );
       if (message) {
-        message.streaming = false;
+        const patch = {
+          ...(event.level
+            ? {
+                metadata: {
+                  ...message.metadata,
+                  subToolLevel: event.level,
+                },
+              }
+            : {}),
+          streaming: false,
+        };
+        Object.assign(message, patch);
         actions.push({
           type: "UPDATE_MESSAGE",
           sessionId,
           messageId: message.id,
-          patch: { streaming: false },
+          patch,
         });
       }
     } else if (type === "compaction_boundary") {

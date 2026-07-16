@@ -254,6 +254,31 @@ async function run(): Promise<void> {
   }
 
   {
+    const terminalService = new FakeTerminalService('ready')
+    const { context, events } = createContext(terminalService)
+    context.createTerminalFromSavedConnection = async () => {
+      throw new Error('connection refused')
+    }
+    const result = await createTerminalTab(
+      { connectionId: 'unavailable-connection' },
+      context
+    )
+    const finishedEvent = events.find(
+      (event) => event.type === 'sub_tool_finished'
+    )
+    assertIncludes(
+      result,
+      'Failed to create terminal tab',
+      'create tool should return the failure reason'
+    )
+    assertEqual(
+      finishedEvent?.level,
+      'error',
+      'create tool should finish failed UI activity with error severity'
+    )
+  }
+
+  {
     const terminalService = new FakeTerminalService('exited')
     const { context, events } = createContext(terminalService)
     const result = await readTerminalTab(
@@ -698,7 +723,7 @@ async function run(): Promise<void> {
     )
   }
 
-  console.log('PASS terminal_tools.extreme.spec: all 12 cases passed')
+  console.log('PASS terminal_tools.extreme.spec: all 13 cases passed')
 }
 
 void run().catch((error) => {
