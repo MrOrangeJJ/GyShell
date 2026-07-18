@@ -36,6 +36,7 @@ import { Select } from "../../platform/Select";
 import { ShortcutRecorder } from "./ShortcutRecorder";
 import { getDefaultCommandDraftShortcut } from "../../lib/commandDraftShortcut";
 import { AgentSettingRailControls } from "./AgentSettingRailControls";
+import { ModelRequestParametersEditor } from "./ModelRequestParametersEditor";
 
 function ThemeTile(props: {
   active?: boolean;
@@ -175,8 +176,31 @@ const ModelEditor = observer(
       };
     });
     const [isSaving, setIsSaving] = useState(false);
+    const [requestParametersValid, setRequestParametersValid] = useState(true);
+
+    const updateRequestParameters = React.useCallback(
+      (requestParameters: ModelDefinition["requestParameters"]) => {
+        setDraft((current) => ({ ...current, requestParameters }));
+      },
+      [],
+    );
+    const updateRequestParametersValidity = React.useCallback(
+      (valid: boolean) => {
+        setRequestParametersValid(valid);
+      },
+      [],
+    );
+
+    React.useEffect(() => {
+      const handleKeyDown = (event: KeyboardEvent) => {
+        if (event.key === "Escape" && !isSaving) onClose();
+      };
+      window.addEventListener("keydown", handleKeyDown);
+      return () => window.removeEventListener("keydown", handleKeyDown);
+    }, [isSaving, onClose]);
 
     const save = async () => {
+      if (!requestParametersValid) return;
       setIsSaving(true);
         try {
         await store.saveModel(draft);
@@ -187,14 +211,27 @@ const ModelEditor = observer(
     };
 
     return (
-        <div className="model-editor-overlay">
-            <div className="model-editor-card">
+        <div
+          className="model-editor-overlay"
+          role="presentation"
+          onMouseDown={(event) => {
+            if (event.target === event.currentTarget && !isSaving) onClose();
+          }}
+        >
+            <div
+              className="model-editor-card"
+              role="dialog"
+              aria-modal="true"
+              aria-labelledby="model-editor-title"
+            >
                 <div className="editor-header">
-                    <h3>{modelId ? t.settings.editModel : t.settings.addModel}</h3>
+                    <h3 id="model-editor-title">{modelId ? t.settings.editModel : t.settings.addModel}</h3>
             <button
               className="icon-btn-sm"
               onClick={onClose}
               disabled={isSaving}
+              title={t.common.close}
+              aria-label={t.common.close}
             >
               <X size={16} />
             </button>
@@ -208,6 +245,7 @@ const ModelEditor = observer(
                       <input
                         className="editor-input"
                         placeholder={t.common.name}
+                        autoFocus
                         value={draft.name}
                         onChange={(e) => setDraft({ ...draft, name: e.target.value })}
                         disabled={isSaving}
@@ -300,6 +338,13 @@ const ModelEditor = observer(
                         })}
                       </div>
                     </div>
+                    <ModelRequestParametersEditor
+                      t={t}
+                      value={draft.requestParameters}
+                      disabled={isSaving}
+                      onChange={updateRequestParameters}
+                      onValidationChange={updateRequestParametersValidity}
+                    />
                 </div>
                 <div className="editor-footer">
             <button
@@ -312,7 +357,7 @@ const ModelEditor = observer(
             <button
               className="btn-primary"
               onClick={save}
-              disabled={!draft.name || !draft.model || isSaving}
+              disabled={!draft.name || !draft.model || !requestParametersValid || isSaving}
             >
               {isSaving ? (
                 <Loader2 size={16} className="spin" />

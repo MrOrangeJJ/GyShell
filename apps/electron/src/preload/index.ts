@@ -6,8 +6,10 @@ import {
 } from "electron";
 
 // Types (duplicated to avoid cross-project imports)
+type JsonValue = string | number | boolean | null | JsonValue[] | { [key: string]: JsonValue };
+
 interface BackendSettings {
-  schemaVersion: 4;
+  schemaVersion: 5;
   commandPolicyMode: "safe" | "standard" | "smart";
   memory?: {
     enabled: boolean;
@@ -25,6 +27,7 @@ interface BackendSettings {
       apiKey?: string;
       baseUrl?: string;
       maxTokens: number;
+      requestParameters?: Record<string, JsonValue>;
       structuredOutputMode?: "auto" | "on" | "off";
       supportsStructuredOutput: boolean;
       supportsObjectToolChoice: boolean;

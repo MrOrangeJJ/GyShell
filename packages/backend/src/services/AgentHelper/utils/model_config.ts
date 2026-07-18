@@ -1,5 +1,6 @@
 import { ChatOpenAI } from '@langchain/openai'
 import type { BackendSettings, ModelDefinition } from '../../../types'
+import { createOpenAIClientConfiguration } from '../../openaiRequestParameters'
 import { resolveBuiltInToolCapabilityName } from '../tool_capabilities'
 import { BUILTIN_TOOL_INFO } from '../builtInToolMetadata'
 
@@ -7,14 +8,11 @@ export function createChatModel(item: ModelDefinition, temperature: number): Cha
   return new ChatOpenAI({
     model: item.model,
     apiKey: item.apiKey,
-    configuration: {
-      baseURL: item.baseUrl
-    },
+    configuration: createOpenAIClientConfiguration(item),
     __includeRawResponse: true,
     temperature,
     maxRetries: 0,
-    modelKwargs: {
-    }
+    modelKwargs: {}
   })
 }
 

@@ -10,6 +10,7 @@ import { v4 as uuidv4 } from "uuid";
 import type { ITheme } from "@xterm/xterm";
 import {
   DEFAULT_PANEL_TAB_DISPLAY_MODE,
+  normalizeModelRequestParameters,
   type PanelTabDisplayModePreference,
 } from "@gyshell/shared";
 import type {
@@ -3023,6 +3024,12 @@ export class AppStore {
         : "auto";
     const plainModel: ModelDefinition = {
       ...modelSnapshot,
+      requestParameters: (() => {
+        const normalized = normalizeModelRequestParameters(
+          modelSnapshot.requestParameters,
+        );
+        return Object.keys(normalized).length > 0 ? normalized : undefined;
+      })(),
       structuredOutputMode,
       supportsStructuredOutput: structuredOutputMode === "on",
       supportsObjectToolChoice: false,

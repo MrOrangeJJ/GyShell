@@ -1,4 +1,7 @@
-import type { TerminalConnectionCapabilities } from '@gyshell/shared'
+import type {
+  ModelRequestParameters,
+  TerminalConnectionCapabilities,
+} from '@gyshell/shared'
 
 // ============ Settings Types ============
 export interface ModelDefinition {
@@ -14,6 +17,8 @@ export interface ModelDefinition {
   baseUrl?: string
   /** Max tokens for context management */
   maxTokens: number
+  /** Optional OpenAI-compatible request body overrides applied to every POST request */
+  requestParameters?: ModelRequestParameters
   /** Structured output mode: auto probe or manual override */
   structuredOutputMode?: 'auto' | 'on' | 'off'
   /** Whether this model supports OpenAI JSON Schema structured output */
@@ -167,7 +172,7 @@ export interface WsGatewaySettings {
 
 export interface BackendSettings {
   /** Settings schema version, used for migrations */
-  schemaVersion: 4
+  schemaVersion: 5
 
   /** Command policy mode */
   commandPolicyMode: CommandPolicyMode

@@ -125,7 +125,11 @@ export const WindowsSelect = forwardRef<SelectHandle, WindowsSelectProps>(
         }
       };
       const onKeyDown = (e: KeyboardEvent) => {
-        if (e.key === "Escape") setOpen(false);
+        if (e.key !== "Escape") return;
+        e.preventDefault();
+        e.stopPropagation();
+        setOpen(false);
+        triggerRef.current?.focus();
       };
       document.addEventListener("mousedown", onDocMouseDown);
       document.addEventListener("keydown", onKeyDown);

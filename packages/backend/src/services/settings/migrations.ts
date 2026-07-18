@@ -1,9 +1,10 @@
 import type { BackendSettings, WsGatewayAccess } from "../../types";
+import { normalizeModelRequestParameters } from "@gyshell/shared";
 import { BUILTIN_TOOL_INFO } from "../AgentHelper/builtInToolMetadata";
 import { normalizeAgentSettingState } from "./agentSettings";
 import { deepMerge, isObject } from "./objectMerge";
 
-export const BACKEND_SETTINGS_SCHEMA_VERSION = 4;
+export const BACKEND_SETTINGS_SCHEMA_VERSION = 5;
 
 const DEFAULT_BUILTIN_TOOLS = BUILTIN_TOOL_INFO.reduce(
   (acc: Record<string, boolean>, tool) => {
@@ -97,6 +98,10 @@ function normalizeBackendSettings(settings: BackendSettings): BackendSettings {
       typeof item.maxTokens === "number" && item.maxTokens > 0
         ? item.maxTokens
         : 200000,
+    requestParameters: (() => {
+      const normalized = normalizeModelRequestParameters(item.requestParameters);
+      return Object.keys(normalized).length > 0 ? normalized : undefined;
+    })(),
     structuredOutputMode:
       item.structuredOutputMode === "on" || item.structuredOutputMode === "off"
         ? item.structuredOutputMode
@@ -228,6 +233,12 @@ function migrateBackendToV4(
   return next;
 }
 
+function migrateBackendToV5(
+  settings: Partial<BackendSettings>,
+): Partial<BackendSettings> {
+  return { ...(settings as any), schemaVersion: 5 };
+}
+
 export function migrateBackendSettings(
   raw: unknown,
   legacyRaw?: unknown,
@@ -253,6 +264,9 @@ export function migrateBackendSettings(
   }
   if (fromVersion < 4) {
     merged = deepMerge(merged, migrateBackendToV4(merged as any) as any);
+  }
+  if (fromVersion < 5) {
+    merged = deepMerge(merged, migrateBackendToV5(merged as any) as any);
   }
 
   return normalizeBackendSettings(merged);

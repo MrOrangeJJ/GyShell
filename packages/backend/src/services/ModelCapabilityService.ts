@@ -2,6 +2,7 @@ import { ChatOpenAI } from '@langchain/openai'
 import { HumanMessage } from '@langchain/core/messages'
 import { convertToOpenAITool } from '@langchain/core/utils/function_calling'
 import type { ModelDefinition } from '../types'
+import { createOpenAIClientConfiguration } from './openaiRequestParameters'
 
 export interface ModelCapabilityProfile {
   imageInputs: boolean
@@ -122,9 +123,7 @@ export class ModelCapabilityService {
     return new ChatOpenAI({
       model: model.model,
       apiKey: model.apiKey,
-      configuration: {
-        baseURL: model.baseUrl
-      },
+      configuration: createOpenAIClientConfiguration(model),
       temperature: 0
     })
   }

@@ -40,14 +40,14 @@ const defaults = {
   },
 }
 
-runCase('migrates v3 settings to schema v4 with empty agent settings', () => {
+runCase('migrates v3 settings to schema v5 with empty agent settings', () => {
   const migrated = migrateBackendSettings({
     schemaVersion: 3,
     commandPolicyMode: 'safe',
     memory: { enabled: false },
   })
 
-  assertEqual(migrated.schemaVersion, 4, 'schema version should be v4')
+  assertEqual(migrated.schemaVersion, 5, 'schema version should be v5')
   assertDeepEqual(
     migrated.agentSettings,
     { profiles: [], activeProfileId: null },
@@ -57,6 +57,38 @@ runCase('migrates v3 settings to schema v4 with empty agent settings', () => {
     migrated.memory?.enabled,
     false,
     'memory enabled flag should be preserved',
+  )
+})
+
+runCase('normalizes model request parameters during schema migration', () => {
+  const migrated = migrateBackendSettings({
+    schemaVersion: 4,
+    models: {
+      items: [
+        {
+          id: 'model-1',
+          name: 'Model',
+          model: 'provider-model',
+          maxTokens: 128000,
+          requestParameters: {
+            temperature: 0.65,
+            max_completion_tokens: 2048,
+            tools: [],
+          },
+          supportsStructuredOutput: false,
+          supportsObjectToolChoice: false,
+        },
+      ],
+      profiles: [],
+      activeProfileId: '',
+    },
+  } as any)
+
+  assertEqual(migrated.schemaVersion, 5, 'model parameter migration should reach v5')
+  assertDeepEqual(
+    migrated.models.items[0].requestParameters,
+    { temperature: 0.65, max_completion_tokens: 2048 },
+    'migration should preserve safe parameters and remove runtime-owned fields',
   )
 })
 
