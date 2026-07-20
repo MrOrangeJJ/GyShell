@@ -65,6 +65,16 @@ class StalledJumpClient extends EventEmitter {
   }
 }
 
+class PendingSshClient extends EventEmitter {
+  ends = 0;
+
+  connect(): void {}
+
+  end(): void {
+    this.ends += 1;
+  }
+}
+
 const run = async (): Promise<void> => {
   await runCase(
     "peer transfer passes only active Unix SSH session descriptors",
@@ -408,6 +418,124 @@ const run = async (): Promise<void> => {
         "cancelled executor connection should reject",
       );
       assertCondition(ends >= 1, "cancelled executor client should close");
+    },
+  );
+
+  await runCase(
+    "executor client retains its error sink after a failed handshake settles",
+    async () => {
+      const backend = new SSHBackend() as any;
+      const client = new PendingSshClient();
+      backend.createSshClient = () => client;
+      const instance = createSession();
+      instance.observedHostKey = Buffer.from("executor-host-key");
+      instance.sshConfig = {
+        type: "ssh",
+        id: "executor-double-error",
+        title: "Executor Double Error",
+        host: "executor.example.test",
+        port: 22,
+        username: "executor-user",
+        authMethod: "privateKey",
+        privateKey: "private-key",
+        cols: 80,
+        rows: 24,
+      };
+
+      const pending = backend.openAgentExecutorClient(
+        instance,
+        "/tmp/gyshell-test-agent.sock",
+      );
+      client.emit("error", new Error("simulated socket reset"));
+      assertEqual(
+        await pending,
+        null,
+        "the first executor error should settle as unavailable",
+      );
+      assertEqual(
+        client.listenerCount("error"),
+        1,
+        "the executor error sink must survive settlement",
+      );
+
+      let secondError: Error | null = null;
+      try {
+        client.emit("error", new Error("Connection lost before handshake"));
+      } catch (error) {
+        secondError = error as Error;
+      }
+      assertEqual(
+        secondError,
+        null,
+        "a second executor handshake error must remain handled",
+      );
+    },
+  );
+
+  await runCase(
+    "jump client retains its error sink after route setup rejects",
+    async () => {
+      const backend = new SSHBackend() as any;
+      const jumpClient = new PendingSshClient();
+      backend.createSshClient = () => jumpClient;
+      const pending = backend.buildConnectSocketIfNeeded(
+        {
+          type: "ssh",
+          id: "private-endpoint-double-error",
+          title: "Private Endpoint Double Error",
+          host: "10.0.0.2",
+          port: 22,
+          username: "endpoint-user",
+          authMethod: "password",
+          password: "endpoint-secret",
+          cols: 80,
+          rows: 24,
+          jumpHost: {
+            type: "ssh",
+            id: "jump-double-error",
+            title: "Jump Double Error",
+            host: "jump.example.test",
+            port: 22,
+            username: "jump-user",
+            authMethod: "password",
+            password: "jump-secret",
+            cols: 80,
+            rows: 24,
+          },
+        },
+        () => {},
+      );
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      jumpClient.emit("error", new Error("simulated socket reset"));
+
+      let firstError: Error | null = null;
+      try {
+        await pending;
+      } catch (error) {
+        firstError = error as Error;
+      }
+      assertEqual(
+        firstError?.message,
+        "simulated socket reset",
+        "the first jump error should reject route setup",
+      );
+      assertEqual(
+        jumpClient.listenerCount("error"),
+        1,
+        "the jump error sink must survive settlement",
+      );
+
+      let secondError: Error | null = null;
+      try {
+        jumpClient.emit("error", new Error("Connection lost before handshake"));
+      } catch (error) {
+        secondError = error as Error;
+      }
+      assertEqual(
+        secondError,
+        null,
+        "a second jump handshake error must remain handled",
+      );
     },
   );
 

@@ -307,7 +307,10 @@ export class SSHBackend implements TerminalBackend {
       };
       const onAbort = (): void => finish(null, createRouteAbortError());
       client.once("ready", () => finish(client));
-      client.once("error", () => finish(null));
+      // ssh2 can emit a socket error followed by a protocol error while a
+      // handshake is failing. Keep the listener for the client's full
+      // lifetime; finish remains the one-shot settlement gate.
+      client.on("error", () => finish(null));
       client.once("close", () => finish(null));
       signal?.addEventListener("abort", onAbort, { once: true });
       if (signal?.aborted) {
@@ -1837,7 +1840,11 @@ export class SSHBackend implements TerminalBackend {
           finish();
         });
 
-        jumpClient.once("error", (err) => {
+        // A failed handshake may emit both the underlying socket error and a
+        // later "Connection lost before handshake" protocol error. The
+        // promise settles once, but the client must retain an error listener
+        // until it is fully closed.
+        jumpClient.on("error", (err) => {
           console.error(`${jumpId} Jump host connection ERROR:`, err);
           finish(err);
         });
