@@ -12,6 +12,8 @@ export const WINDOWS_POWERSHELL_REQUEST_MARKER_MAX_UTF8_BYTES = 16 * 1024
 const WINDOWS_POWERSHELL_DISPATCH_VARIABLE = '__GyShell_InternalDispatch'
 const WINDOWS_POWERSHELL_OUTCOME_RECORDER_VARIABLE = '__GyShell_InternalRecordOutcome'
 const WINDOWS_POWERSHELL_USER_BLOCK_VARIABLE = '__GyShell_InternalUserCommandBlock'
+const WINDOWS_POWERSHELL_INITIALIZATION_READY_VARIABLE_SUFFIX =
+  'initialization_ready_marker'
 
 export type WindowsCommandTrackingMode = 'shell-integration' | 'windows-powershell-sidecar'
 export type WindowsPowerShellDispatchRequestKind = 'probe' | 'command'
@@ -53,6 +55,15 @@ export const shouldUseWindowsPowerShellSidecar = (options: {
 export const escapePowerShellSingleQuotedString = (value: string): string =>
   value.replace(/'/g, "''")
 
+export const buildWindowsPowerShellInitializationReadyVariableName = (
+  runtimeToken: string
+): string => {
+  if (!/^[a-f0-9]{32}$/i.test(runtimeToken)) {
+    throw new Error('Invalid Windows PowerShell initialization runtime token.')
+  }
+  return `__gyshell_${runtimeToken.toLowerCase()}_${WINDOWS_POWERSHELL_INITIALIZATION_READY_VARIABLE_SUFFIX}`
+}
+
 export const buildWindowsPowerShellRequestMarkerPath = (
   promptMarkerPath: string,
   requestId: string
@@ -84,6 +95,7 @@ export const buildWindowsPowerShellDispatchRequest = (options: {
 
 export const buildWindowsPowerShellBootstrapScript = (options: {
   readyMarker: string
+  readyMarkerFromRuntimeVariable?: boolean
   commandTrackingMode: WindowsCommandTrackingMode
   promptMarkerPath?: string
   commandRequestPath?: string
@@ -99,6 +111,11 @@ export const buildWindowsPowerShellBootstrapScript = (options: {
   const privateIdentifierPrefix = runtimeToken
     ? `__gyshell_${runtimeToken}`
     : '__gyshell'
+  if (options.readyMarkerFromRuntimeVariable && !runtimeToken) {
+    throw new Error(
+      'A runtime-scoped PowerShell ready variable requires a command protocol token.'
+    )
+  }
   // These values are interpolated into a script that is subsequently
   // namespaced by replacing private helper identifiers. Base64 keeps
   // arbitrary path text out of that replacement domain (a legitimate temp
@@ -172,6 +189,9 @@ export const buildWindowsPowerShellBootstrapScript = (options: {
     '$global:__gyshell_last_error_count=$__gyshell_error_count;$global:__gyshell_last_error_ref=$__gyshell_error_ref;$global:__gyshell_prompt_seq=[int]$global:__gyshell_prompt_seq+1;$__gyshell_cwd_b64=[Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($PWD.Path));$__gyshell_home_b64=[Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($HOME));$__gyshell_ec_field=if($__gyshell_outcome_known){\';ec=\'+$__gyshell_ec}else{\'\'}',
     `Write-Host -NoNewline "$([char]27)]1337;${commandProtocolNamespace}precmd;seq=$($global:__gyshell_prompt_seq)$__gyshell_ec_field;cwd_b64=$__gyshell_cwd_b64;home_b64=$__gyshell_home_b64$([char]7)";"PS $($PWD.Path)> "`,
   ].join(';')
+  const readyOutputStatement = options.readyMarkerFromRuntimeVariable
+    ? `Write-Output '';Write-Output ([string]$global:__gyshell_${WINDOWS_POWERSHELL_INITIALIZATION_READY_VARIABLE_SUFFIX})`
+    : `Write-Output '';Write-Output '${escapePowerShellSingleQuotedString(options.readyMarker)}'`
   const psInit =
     options.commandTrackingMode === 'windows-powershell-sidecar' && options.promptMarkerPath
       ? [
@@ -206,11 +226,13 @@ export const buildWindowsPowerShellBootstrapScript = (options: {
           `Set-Variable -Scope Global -Name '${WINDOWS_POWERSHELL_DISPATCH_VARIABLE}' -Value ([scriptblock]::Create(@'\n${sidecarDispatchBody}\n'@\n)) -Option ReadOnly -Force`,
           `Set-Item -Path Function:\\Global:prompt -Value {${sidecarPromptBody}} -Force -Options 'AllScope,ReadOnly'`,
           'Clear-Host',
-          `Write-Output '${escapePowerShellSingleQuotedString(options.readyMarker)}'`,
+          // Make the first verifiable sidecar prompt a readiness prerequisite.
+          'prompt|Out-Null',
+          readyOutputStatement,
         ]
           .filter(Boolean)
           .join(';')
-      : `${utf8ConsoleInit};$global:__gyshell_prompt_seq=0;$global:__gyshell_last_error_count=@($Error).Count;$global:__gyshell_last_error_ref=if($Error.Count -gt 0){$Error[0]}else{$null};Set-Item -Path Function:\\Global:prompt -Value {${inBandPromptBody}} -Force -Options 'AllScope,ReadOnly';Clear-Host;Write-Output '${escapePowerShellSingleQuotedString(options.readyMarker)}'`
+      : `${utf8ConsoleInit};$global:__gyshell_prompt_seq=0;$global:__gyshell_last_error_count=@($Error).Count;$global:__gyshell_last_error_ref=if($Error.Count -gt 0){$Error[0]}else{$null};Set-Item -Path Function:\\Global:prompt -Value {${inBandPromptBody}} -Force -Options 'AllScope,ReadOnly';Clear-Host;${readyOutputStatement}`
 
   // The user command is dot-sourced into this runspace, so fixed state names
   // are collision-prone even when the OSC frame itself is namespaced. Apply a
@@ -234,10 +256,23 @@ export const buildWindowsPowerShellEncodedCommand = (
   )
 
 export const buildWindowsPowerShellBootstrapLoaderEncodedCommand = (
-  bootstrapPath: string
+  bootstrapPath: string,
+  options?: {
+    readyMarker: string
+    readyMarkerVariableName: string
+  }
 ): string => {
+  if (
+    options &&
+    !/^[A-Za-z_][A-Za-z0-9_]*$/.test(options.readyMarkerVariableName)
+  ) {
+    throw new Error('Invalid Windows PowerShell initialization variable name.')
+  }
   const encodedPath = Buffer.from(bootstrapPath, 'utf8').toString('base64')
   const loader =
+    (options
+      ? `$global:${options.readyMarkerVariableName}='${escapePowerShellSingleQuotedString(options.readyMarker)}';`
+      : '') +
     `$__gyshell_bootstrap_path=[Text.Encoding]::UTF8.GetString(` +
     `[Convert]::FromBase64String('${encodedPath}'));. $__gyshell_bootstrap_path`
   return Buffer.from(loader, 'utf16le').toString('base64')

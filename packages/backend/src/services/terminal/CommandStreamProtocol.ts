@@ -11,26 +11,64 @@ const INITIALIZATION_READY_MARKER_PREFIX = '__GYSHELL_READY__'
  * initialization output. Runtime scoping prevents an unrelated banner from
  * being mistaken for the completion of the current bootstrap.
  */
-export const buildInitializationReadyMarker = (runtimeToken?: string): string => {
+export const buildInitializationReadyMarker = (
+  runtimeToken?: string,
+  attempt?: number
+): string => {
   if (runtimeToken === undefined) {
+    if (attempt !== undefined) {
+      throw new Error('Initialization attempt requires a runtime token')
+    }
     return INITIALIZATION_READY_MARKER_PREFIX
   }
   if (!COMMAND_PROTOCOL_TOKEN_PATTERN.test(runtimeToken)) {
     throw new Error('Invalid command protocol runtime token')
   }
-  return `${INITIALIZATION_READY_MARKER_PREFIX}:${runtimeToken}`
+  const runtimeMarker = `${INITIALIZATION_READY_MARKER_PREFIX}:${runtimeToken}`
+  if (attempt === undefined) return runtimeMarker
+  if (!Number.isSafeInteger(attempt) || attempt < 1) {
+    throw new Error('Invalid shell initialization attempt')
+  }
+  return `${runtimeMarker}:${attempt}`
 }
 
 /**
- * Consumes exactly the first expected marker from an initialization buffer.
- * Bytes after it are ordinary terminal data, including any later text that
- * happens to contain the same marker literal.
+ * Locates a ready marker only when it is framed as a complete terminal line.
+ * Shell echo or tracing may contain the marker text, but not as the isolated
+ * protocol record emitted by the bootstrap.
+ */
+export const findInitializationReadyMarkerLine = (
+  buffer: string,
+  marker: string
+): number => {
+  if (!marker) return -1
+  let searchOffset = 0
+  while (searchOffset < buffer.length) {
+    const markerOffset = buffer.indexOf(marker, searchOffset)
+    if (markerOffset < 0) return -1
+    const preceding = buffer[markerOffset - 1]
+    const following = buffer[markerOffset + marker.length]
+    if (
+      (preceding === '\r' || preceding === '\n') &&
+      (following === '\r' || following === '\n')
+    ) {
+      return markerOffset
+    }
+    searchOffset = markerOffset + 1
+  }
+  return -1
+}
+
+/**
+ * Consumes exactly the first complete expected marker line from an
+ * initialization buffer. Bytes after it are ordinary terminal data,
+ * including any later text that happens to contain the same marker literal.
  */
 export const consumeInitializationReadyMarker = (
   buffer: string,
   marker: string
 ): string | undefined => {
-  const markerOffset = buffer.indexOf(marker)
+  const markerOffset = findInitializationReadyMarkerLine(buffer, marker)
   return markerOffset === -1
     ? undefined
     : buffer.slice(markerOffset + marker.length)

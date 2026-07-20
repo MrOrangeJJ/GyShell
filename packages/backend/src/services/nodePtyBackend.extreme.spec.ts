@@ -63,7 +63,7 @@ const run = async (): Promise<void> => {
     const runtimeToken = '0123456789abcdef0123456789abcdef'
     const marker = buildInitializationReadyMarker(runtimeToken)
     const remainder = consumeInitializationReadyMarker(
-      `discarded bootstrap output${marker}\r\nPS> before${marker}after`,
+      `discarded bootstrap output\r\n+ echo ${marker}\r\n${marker}\r\nPS> before${marker}after`,
       marker
     )
 
@@ -73,9 +73,9 @@ const run = async (): Promise<void> => {
       'only the first expected initialization marker may be consumed'
     )
     assertEqual(
-      consumeInitializationReadyMarker(`partial${marker.slice(0, -1)}`, marker),
+      consumeInitializationReadyMarker(`\r\n${marker}`, marker),
       undefined,
-      'a split initialization marker must stay buffered until it is complete'
+      'a marker without its trailing line boundary must stay buffered'
     )
   })
 

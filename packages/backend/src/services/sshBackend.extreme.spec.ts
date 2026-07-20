@@ -1,8 +1,12 @@
 import { SSHBackend } from "./SSHBackend";
 import { EventEmitter } from "node:events";
 import { spawnSync } from "node:child_process";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { COMMAND_CAPTURE_MAX_UTF8_BYTES } from "@gyshell/shared";
 import { buildInitializationReadyMarker } from "./terminal/CommandStreamProtocol";
+import { PrivateShellInitializationGate } from "./terminal/PrivateShellInitializationGate";
 
 const assertEqual = <T>(actual: T, expected: T, message: string): void => {
   if (actual !== expected) {
@@ -31,13 +35,12 @@ const createSession = () =>
     client: {},
     dataCallbacks: new Set(),
     exitCallbacks: new Set(),
-    isInitializing: true,
-    buffer: "",
-    oscBuffer: "",
     forwardServers: [],
     remoteForwards: [],
     remoteForwardHandlerInstalled: false,
     initializationState: "initializing",
+    initializationGate: new PrivateShellInitializationGate(),
+    initializationAbortController: new AbortController(),
   }) as any;
 
 class StalledJumpClient extends EventEmitter {
@@ -76,6 +79,284 @@ class PendingSshClient extends EventEmitter {
 }
 
 const run = async (): Promise<void> => {
+  await runCase(
+    "private SSH initialization gate opens only for the current retry",
+    async () => {
+      const token = "0123456789abcdef0123456789abcdef";
+      const firstMarker = buildInitializationReadyMarker(token, 1);
+      const secondMarker = buildInitializationReadyMarker(token, 2);
+      const gate = new PrivateShellInitializationGate();
+      const firstAttempt = gate.beginAttempt(firstMarker);
+
+      assertEqual(
+        gate.accept("private bootstrap prefix").kind,
+        "suppressed",
+        "bootstrap output must stay private before readiness",
+      );
+      const secondAttempt = gate.beginAttempt(secondMarker);
+      assertEqual(
+        await firstAttempt,
+        false,
+        "a newer retry must supersede the previous ready marker",
+      );
+      assertEqual(
+        gate.accept(
+          `late ${firstMarker}\r\ntrace ${secondMarker}\r\nprivate retry echo\r\n${secondMarker.slice(0, -3)}`,
+        ).kind,
+        "suppressed",
+        "a stale marker or a traced current marker must not open the privacy gate",
+      );
+
+      const opened = gate.accept(
+        `${secondMarker.slice(-3)}\r\nPS C:\\Users\\test> `,
+      );
+      assertEqual(
+        opened.kind,
+        "opened",
+        "the current retry marker should open the gate",
+      );
+      assertCondition(
+        opened.kind === "opened" &&
+          opened.suppressedData.includes(firstMarker) &&
+          opened.visibleData.includes("PS C:\\Users\\test>"),
+        "the gate should retain private history while returning only post-marker terminal data",
+      );
+      assertEqual(
+        await secondAttempt,
+        true,
+        "the current retry should resolve ready",
+      );
+
+      const visible = gate.accept("echo visible\r\n");
+      assertCondition(
+        visible.kind === "visible" &&
+          visible.visibleData === "echo visible\r\n",
+        "ordinary terminal output should pass through after readiness",
+      );
+    },
+  );
+
+  await runCase(
+    "failed SSH initialization remains private after late shell output",
+    async () => {
+      const token = "fedcba9876543210fedcba9876543210";
+      const marker = buildInitializationReadyMarker(token, 1);
+      const gate = new PrivateShellInitializationGate();
+      const attempt = gate.beginAttempt(marker);
+      gate.accept("private bootstrap data");
+      gate.fail();
+
+      assertEqual(
+        await attempt,
+        false,
+        "failure should settle the active attempt",
+      );
+      assertEqual(
+        gate.accept(`${marker}\r\nprivate late payload`).kind,
+        "suppressed",
+        "late output must never turn a failed initialization into raw passthrough",
+      );
+    },
+  );
+
+  await runCase(
+    "SSH readiness is committed before the marker-only chunk is published",
+    async () => {
+      const backend = new SSHBackend() as any;
+      const session = createSession();
+      session.commandProtocolToken = "10101010101010101010101010101010";
+      session.commandShellFamily = "powershell";
+      session.commandTrackingMode = "windows-powershell-sidecar";
+      session.windowsPromptMarkerPath = "C:/Temp/prompt.log";
+      session.windowsCommandRequestPath = "C:/Temp/request.b64";
+      session.windowsCommandOutputPath = "C:/Temp/output.txt";
+      session.windowsPowerShellBootstrapPath = "C:/Temp/bootstrap.ps1";
+      session.sftp = {};
+      const stream = new EventEmitter() as any;
+      session.stream = stream;
+      backend.sessions.set("marker-only", session);
+      const marker = buildInitializationReadyMarker(
+        session.commandProtocolToken,
+        1,
+      );
+      const opened = session.initializationGate.beginAttempt(marker);
+      const observedStates: string[] = [];
+      const observedProtocolAvailability: boolean[] = [];
+
+      backend.handleShellStreamData(
+        "marker-only",
+        session,
+        stream,
+        `\r\n${marker}\r\n`,
+        () => {
+          observedStates.push(session.initializationState);
+          observedProtocolAvailability.push(
+            session.commandProtocolAvailable === true,
+          );
+        },
+      );
+
+      assertEqual(
+        await opened,
+        true,
+        "the final marker chunk should open the gate",
+      );
+      assertEqual(
+        session.initializationState,
+        "ready",
+        "marker-only readiness should not depend on a later shell chunk",
+      );
+      assertEqual(
+        observedStates[0],
+        "ready",
+        "the first public event must observe the committed backend ready state",
+      );
+      assertEqual(
+        observedProtocolAvailability[0],
+        true,
+        "the first public event must observe the committed command protocol state",
+      );
+    },
+  );
+
+  await runCase(
+    "SSH initialization retries wait for each complete write and use a fresh marker",
+    async () => {
+      class DelayedShellStream extends EventEmitter {
+        writes: string[] = [];
+        writeInProgress = false;
+        observedOverlap = false;
+        launchCount = 0;
+
+        write(
+          input: string,
+          callback?: (error?: Error | null) => void,
+        ): boolean {
+          if (this.writeInProgress) this.observedOverlap = true;
+          this.writeInProgress = true;
+          this.writes.push(input);
+          const launchAttempt = input.match(
+            /initialization_attempt=(\d+)/,
+          )?.[1];
+          setTimeout(() => {
+            this.writeInProgress = false;
+            callback?.(null);
+            if (!launchAttempt) return;
+            this.launchCount += 1;
+            if (this.launchCount === 2) {
+              const marker = buildInitializationReadyMarker(
+                session.commandProtocolToken,
+                Number(launchAttempt),
+              );
+              session.initializationGate.accept(`\r\n${marker}\r\n`);
+              session.initializationState = "ready";
+            }
+          }, 5);
+          return false;
+        }
+      }
+
+      const backend = new SSHBackend() as any;
+      const session = createSession();
+      session.commandProtocolToken = "11111111111111111111111111111111";
+      session.commandShellFamily = "unix";
+      session.unixShellBootstrapPath =
+        "/tmp/.gyshell-bootstrap-11111111111111111111111111111111.sh";
+      const stream = new DelayedShellStream();
+      session.stream = stream;
+      backend.sessions.set("retry-pty", session);
+      backend.waitForShellInitializationDelay = async () => true;
+      backend.getShellInitRetryIntervalMs = () => 10;
+      const emitted: string[] = [];
+      let exitCount = 0;
+
+      await backend.runShellInitializationAttempts(
+        "retry-pty",
+        session,
+        stream,
+        (data: string) => emitted.push(data),
+        () => {
+          exitCount += 1;
+        },
+      );
+
+      assertEqual(
+        stream.launchCount,
+        2,
+        "the second attempt should recover readiness",
+      );
+      assertEqual(
+        stream.observedOverlap,
+        false,
+        "a retry must never be written before the previous PTY write callback",
+      );
+      assertEqual(
+        exitCount,
+        0,
+        "a successful retry should keep the shell alive",
+      );
+      assertCondition(
+        emitted.some((data) =>
+          data.includes("Initialization timeout, retrying"),
+        ),
+        "a timed-out first attempt should report one public retry status",
+      );
+    },
+  );
+
+  await runCase("SSH initialization exhausts retries fail closed", async () => {
+    class SilentShellStream extends EventEmitter {
+      write(
+        _input: string,
+        callback?: (error?: Error | null) => void,
+      ): boolean {
+        callback?.(null);
+        return true;
+      }
+    }
+
+    const backend = new SSHBackend() as any;
+    const session = createSession();
+    session.commandProtocolToken = "22222222222222222222222222222222";
+    session.commandShellFamily = "unix";
+    session.unixShellBootstrapPath =
+      "/tmp/.gyshell-bootstrap-22222222222222222222222222222222.sh";
+    const stream = new SilentShellStream();
+    session.stream = stream;
+    backend.sessions.set("failed-pty", session);
+    backend.waitForShellInitializationDelay = async () => true;
+    backend.getShellInitRetryIntervalMs = () => 1;
+    let exitCount = 0;
+
+    await backend.runShellInitializationAttempts(
+      "failed-pty",
+      session,
+      stream,
+      () => {},
+      () => {
+        exitCount += 1;
+      },
+    );
+
+    assertEqual(
+      session.initializationState,
+      "failed",
+      "retry exhaustion should fail",
+    );
+    assertEqual(
+      exitCount,
+      1,
+      "retry exhaustion should close the unusable runtime",
+    );
+    assertEqual(
+      session.initializationGate.accept(
+        `${buildInitializationReadyMarker(session.commandProtocolToken, 3)}\r\nprivate late output`,
+      ).kind,
+      "suppressed",
+      "late bootstrap bytes must remain quarantined after retry exhaustion",
+    );
+  });
+
   await runCase(
     "peer transfer passes only active Unix SSH session descriptors",
     async () => {
@@ -755,6 +1036,12 @@ const run = async (): Promise<void> => {
         "sidecar init should journal prompt states so a later unrelated prompt cannot erase a matching completion",
       );
       assertCondition(
+        decoded.includes(
+          ";Clear-Host;prompt|Out-Null;Write-Output '';Write-Output",
+        ),
+        "sidecar readiness must follow a verified initial prompt marker instead of racing the host prompt",
+      );
+      assertCondition(
         decoded.includes("Set-Item -Path Function:\\Global:prompt") &&
           decoded.includes("-Options 'AllScope,ReadOnly'"),
         "the sidecar should protect its managed prompt from accidental replacement",
@@ -928,6 +1215,133 @@ const run = async (): Promise<void> => {
   );
 
   await runCase(
+    "staged Unix SSH initialization uses a short first command and an inline retry fallback",
+    () => {
+      const backend = new SSHBackend() as any;
+      const runtimeToken = "abcdef0123456789abcdef0123456789";
+      const session = createSession();
+      session.commandProtocolToken = runtimeToken;
+      const tempDirectory = mkdtempSync(
+        join(tmpdir(), "gyshell-staged-bootstrap-"),
+      );
+      session.unixShellBootstrapPath = join(
+        tempDirectory,
+        `.gyshell-bootstrap-${runtimeToken}.sh`,
+      );
+
+      const launchCommand = backend.buildUnixShellLaunchCommand(
+        session,
+        1,
+      ) as string;
+      const retryCommand = backend.buildUnixShellLaunchCommand(
+        session,
+        2,
+      ) as string;
+      const script = backend.getUnixInjectionScript(runtimeToken) as string;
+      const attemptMarker = buildInitializationReadyMarker(runtimeToken, 1);
+      const retryMarker = buildInitializationReadyMarker(runtimeToken, 2);
+
+      assertCondition(
+        launchCommand.length < 256 &&
+          launchCommand.includes("initialization_attempt=1") &&
+          launchCommand.includes(session.unixShellBootstrapPath) &&
+          !launchCommand.includes("base64") &&
+          !launchCommand.includes("__GYSHELL_READY__"),
+        "the interactive PTY should receive only a bounded source command without its completion marker",
+      );
+      assertCondition(
+        retryCommand.includes("initialization_attempt=2") &&
+          retryCommand.includes("base64") &&
+          !retryCommand.includes(session.unixShellBootstrapPath) &&
+          !retryCommand.includes("__GYSHELL_READY__"),
+        "a timed-out staged bootstrap should retry through the marker-free inline compatibility path",
+      );
+      assertCondition(
+        script.includes(buildInitializationReadyMarker(runtimeToken)) &&
+          !script.includes(attemptMarker),
+        "the staged script should compose readiness from a runtime marker and the active attempt number",
+      );
+      try {
+        writeFileSync(session.unixShellBootstrapPath, `${script}\n`, {
+          mode: 0o600,
+        });
+        const result = spawnSync("/bin/bash", ["--noprofile", "--norc"], {
+          input: launchCommand,
+          encoding: "utf8",
+        });
+        assertCondition(
+          result.status === 0 && result.stdout.includes(attemptMarker),
+          `a real Bash process should source the staged script and emit exactly the attempt marker: ${result.stderr}`,
+        );
+        const retryResult = spawnSync(
+          "/bin/bash",
+          ["--noprofile", "--norc"],
+          {
+            input: retryCommand,
+            encoding: "utf8",
+          },
+        );
+        assertCondition(
+          retryResult.status === 0 && retryResult.stdout.includes(retryMarker),
+          `a real Bash process should execute the inline fallback and emit the retry marker: ${retryResult.stderr}`,
+        );
+      } finally {
+        rmSync(tempDirectory, { recursive: true, force: true });
+      }
+    },
+  );
+
+  await runCase(
+    "Unix bootstrap staging is private at creation and cleans up a failed SFTP upload",
+    async () => {
+      const backend = new SSHBackend() as any;
+      const session = createSession();
+      session.commandProtocolToken = "bcdef0123456789abcdef0123456789a";
+      session.sftp = {};
+      let createMode: number | undefined;
+      let unlinkedPath = "";
+      let execFallbackUsed = false;
+      backend.sftpWriteFile = async (
+        _sftp: unknown,
+        _path: string,
+        _content: Buffer,
+        options?: { mode?: number },
+      ) => {
+        createMode = options?.mode;
+        throw new Error("simulated partial upload");
+      };
+      backend.sftpUnlink = async (_sftp: unknown, remotePath: string) => {
+        unlinkedPath = remotePath;
+      };
+      backend.execCollect = async () => {
+        execFallbackUsed = true;
+        return {
+          stdout: `__GYSHELL_BOOTSTRAP_STAGED__:${session.commandProtocolToken}`,
+          stderr: "",
+        };
+      };
+
+      await backend.stageUnixShellBootstrap(session);
+
+      assertEqual(
+        createMode,
+        0o600,
+        "the SFTP create request must make the private bootstrap owner-only immediately",
+      );
+      assertEqual(
+        unlinkedPath,
+        session.unixShellBootstrapPath,
+        "a partial SFTP bootstrap should be removed before falling back",
+      );
+      assertEqual(
+        execFallbackUsed,
+        true,
+        "failed SFTP staging should retain the existing exec-channel fallback",
+      );
+    },
+  );
+
+  await runCase(
     "repeated SSH Bash integration preserves a failing command exit code",
     () => {
       const backend = new SSHBackend() as any;
@@ -1047,12 +1461,14 @@ const run = async (): Promise<void> => {
       backend.cleanupStaleWindowsPromptMarkers = async () => {};
       backend.initializeSftp = async () => session.sftp;
       let uploadedPath = "";
+      let uploadedBootstrap = "";
       backend.sftpWriteFile = async (
         _sftp: unknown,
         remotePath: string,
-        _data: Buffer,
+        data: Buffer,
       ) => {
         uploadedPath = remotePath;
+        uploadedBootstrap = data.toString("utf8");
       };
 
       await backend.bootstrapWindowsSession(session);
@@ -1073,8 +1489,13 @@ const run = async (): Promise<void> => {
         invocations.every((command) => command.startsWith("pwsh ")),
         "every remote PowerShell helper must use pwsh on a Unix host",
       );
+      const readyMarker = buildInitializationReadyMarker(
+        session.commandProtocolToken,
+        2,
+      );
       const launchCommand = backend.buildWindowsPowerShellLaunchCommand(
         session,
+        readyMarker,
       ) as string;
       const loaderEncoded = launchCommand.split("-EncodedCommand ")[1] || "";
       const loader = Buffer.from(loaderEncoded, "base64").toString("utf16le");
@@ -1090,6 +1511,14 @@ const run = async (): Promise<void> => {
           decodedBootstrapPath.startsWith("/tmp/GyShell/prompt-markers/") &&
           !decodedBootstrapPath.includes("\\tmp\\GyShell"),
         "interactive Unix pwsh bootstrap must use pwsh and a native Unix path",
+      );
+      assertCondition(
+        loader.includes(readyMarker) &&
+          !uploadedBootstrap.includes(readyMarker) &&
+          uploadedBootstrap.includes(
+            `__gyshell_${session.commandProtocolToken}_initialization_ready_marker`,
+          ),
+        "the reusable sidecar must read an attempt-scoped marker supplied by its encoded loader",
       );
     },
   );
@@ -1244,7 +1673,14 @@ const run = async (): Promise<void> => {
             .includes(`gyshell_${first.commandProtocolToken}_preexec`),
         "bootstrap should be uploaded as BOM-tagged UTF-8 and scoped to the runtime token",
       );
-      const launchCommand = backend.buildWindowsPowerShellLaunchCommand(first) as string;
+      const readyMarker = buildInitializationReadyMarker(
+        first.commandProtocolToken,
+        1,
+      );
+      const launchCommand = backend.buildWindowsPowerShellLaunchCommand(
+        first,
+        readyMarker,
+      ) as string;
       const loaderEncoded = launchCommand.split("-EncodedCommand ")[1] || "";
       const loader = Buffer.from(loaderEncoded, "base64").toString("utf16le");
       assertCondition(
@@ -1252,6 +1688,7 @@ const run = async (): Promise<void> => {
           launchCommand.includes("-ExecutionPolicy Bypass") &&
           loader.includes("[Convert]::FromBase64String") &&
           loader.includes(". $__gyshell_bootstrap_path") &&
+          loader.includes(readyMarker) &&
           !loader.includes("Out-String -Stream"),
         "SSH startup should pass cmd.exe a short path loader, never the full sidecar program",
       );
@@ -2277,6 +2714,124 @@ const run = async (): Promise<void> => {
         false,
         "disconnect should remove the dead SSH runtime session",
       );
+      assertEqual(
+        session.client.endCalls,
+        1,
+        "a runtime without Unix bootstrap cleanup should close immediately",
+      );
+    },
+  );
+
+  await runCase(
+    "SSH shutdown waits for staged Unix bootstrap cleanup without delaying logical exit",
+    async () => {
+      const backend = new SSHBackend() as any;
+      const session = createSession();
+      let settleCleanup!: () => void;
+      let cleanupCalls = 0;
+      let exitCalls = 0;
+      let streamEnds = 0;
+      let sftpEnds = 0;
+      let clientEnds = 0;
+      session.unixShellBootstrapPath = "/tmp/.gyshell-bootstrap-test.sh";
+      session.stream = { end: () => (streamEnds += 1) };
+      session.sftp = { end: () => (sftpEnds += 1) };
+      session.client = {
+        end: () => (clientEnds += 1),
+        unforwardIn() {},
+      };
+      session.exitCallbacks.add(() => (exitCalls += 1));
+      backend.cleanupUnixShellBootstrap = () => {
+        cleanupCalls += 1;
+        return new Promise<void>((resolve) => {
+          settleCleanup = resolve;
+        });
+      };
+      backend.sessions.set("unix-cleanup-exit", session);
+
+      backend.emitExitOnce("unix-cleanup-exit", session, -1);
+      backend.emitExitOnce("unix-cleanup-exit", session, 0);
+
+      assertEqual(exitCalls, 1, "logical exit should still be synchronous");
+      assertEqual(
+        backend.sessions.has("unix-cleanup-exit"),
+        false,
+        "logical exit should remove the runtime immediately",
+      );
+      assertEqual(streamEnds, 1, "the interactive shell should stop immediately");
+      assertEqual(clientEnds, 0, "SSH must remain open while cleanup is pending");
+      settleCleanup();
+      await Promise.resolve();
+      await Promise.resolve();
+
+      assertEqual(cleanupCalls, 1, "shutdown cleanup should start only once");
+      assertEqual(sftpEnds, 1, "SFTP should close after cleanup settles");
+      assertEqual(clientEnds, 1, "SSH should close after cleanup settles");
+    },
+  );
+
+  await runCase(
+    "SSH shutdown closes once when Unix bootstrap cleanup rejects",
+    async () => {
+      const backend = new SSHBackend() as any;
+      const session = createSession();
+      let clientEnds = 0;
+      session.unixShellBootstrapPath = "/tmp/.gyshell-bootstrap-test.sh";
+      session.client = {
+        end: () => (clientEnds += 1),
+        unforwardIn() {},
+      };
+      backend.cleanupUnixShellBootstrap = async () => {
+        throw new Error("simulated cleanup failure");
+      };
+      backend.sessions.set("unix-cleanup-reject", session);
+
+      backend.kill("unix-cleanup-reject");
+      backend.emitExitOnce("unix-cleanup-reject", session, -1);
+      await Promise.resolve();
+      await Promise.resolve();
+
+      assertEqual(
+        backend.sessions.has("unix-cleanup-reject"),
+        false,
+        "kill should remove the runtime immediately",
+      );
+      assertEqual(clientEnds, 1, "cleanup rejection should still close SSH once");
+    },
+  );
+
+  await runCase(
+    "SSH shutdown cleanup has a bounded grace period",
+    () => {
+      const backend = new SSHBackend() as any;
+      const session = createSession();
+      const originalSetTimeout = globalThis.setTimeout;
+      const originalClearTimeout = globalThis.clearTimeout;
+      let deadline: (() => void) | undefined;
+      let clientEnds = 0;
+      session.unixShellBootstrapPath = "/tmp/.gyshell-bootstrap-test.sh";
+      session.client = {
+        end: () => (clientEnds += 1),
+        unforwardIn() {},
+      };
+      backend.cleanupUnixShellBootstrap = () => new Promise<void>(() => {});
+      (globalThis as any).setTimeout = (callback: () => void) => {
+        deadline = callback;
+        return { fake: true } as any;
+      };
+      (globalThis as any).clearTimeout = () => {};
+
+      try {
+        backend.sessions.set("unix-cleanup-timeout", session);
+        backend.kill("unix-cleanup-timeout");
+        assertEqual(clientEnds, 0, "cleanup grace should not close SSH early");
+        assertCondition(deadline, "cleanup shutdown should install a deadline");
+        deadline?.();
+        assertEqual(clientEnds, 1, "cleanup deadline should close SSH exactly once");
+      } finally {
+        globalThis.setTimeout = originalSetTimeout;
+        globalThis.clearTimeout = originalClearTimeout;
+      }
     },
   );
 

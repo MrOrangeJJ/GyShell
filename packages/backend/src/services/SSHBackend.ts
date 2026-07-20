@@ -35,6 +35,7 @@ import {
   buildWindowsPowerShellBootstrapLoaderEncodedCommand,
   buildWindowsPowerShellDispatchInput,
   buildWindowsPowerShellEncodedCommand,
+  buildWindowsPowerShellInitializationReadyVariableName,
   buildWindowsPowerShellRequestMarkerPath,
   WINDOWS_POWERSHELL_COMMAND_OUTPUT_FILE_PREFIX,
   escapePowerShellSingleQuotedString,
@@ -54,14 +55,19 @@ import {
   buildCommandProtocolMarkerPrefix,
   buildInitializationReadyMarker,
   buildUnixCommandDispatcherScript,
-  consumeInitializationReadyMarker,
 } from "./terminal/CommandStreamProtocol";
+import { PrivateShellInitializationGate } from "./terminal/PrivateShellInitializationGate";
 
 const SSH_CONNECT_READY_TIMEOUT_MS = 20_000;
 const SSH_KEEPALIVE_INTERVAL_MS = 30_000;
 const SSH_KEEPALIVE_COUNT_MAX = 3;
 const SSH_DIRECT_CONTROL_READY_TIMEOUT_MS = 4_000;
 const WINDOWS_POWERSHELL_BOOTSTRAP_FILE_PREFIX = "gyshell-bootstrap-";
+const UNIX_SHELL_BOOTSTRAP_FILE_PREFIX = ".gyshell-bootstrap-";
+const SSH_TRANSPORT_CLEANUP_GRACE_MS = 1_000;
+
+const quotePosixShellLiteral = (value: string): string =>
+  `'${value.replace(/'/g, `'"'"'`)}'`;
 
 interface SshRouteConnectOptions {
   signal?: AbortSignal;
@@ -91,8 +97,6 @@ interface SSHInstance {
   exitCallbacks: Set<(code: number) => void>;
   requestedCols?: number;
   requestedRows?: number;
-  isInitializing: boolean;
-  buffer: string;
   commandProtocolToken: string;
   cwd?: string;
   homeDir?: string;
@@ -110,11 +114,16 @@ interface SSHInstance {
   windowsCommandRequestPath?: string;
   windowsCommandOutputPath?: string;
   windowsPowerShellBootstrapPath?: string;
+  unixShellBootstrapPath?: string;
+  unixShellBootstrapCleanupPromise?: Promise<void>;
   windowsPromptMarkerState?: WindowsPromptMarkerState;
   forwardServers: net.Server[];
   remoteForwards: Array<{ host: string; port: number }>;
   remoteForwardHandlerInstalled: boolean;
   initializationState: "initializing" | "ready" | "failed";
+  initializationGate: PrivateShellInitializationGate;
+  initializationAbortController: AbortController;
+  transportShutdownStarted?: boolean;
   exitEmitted?: boolean;
   streamDecoder: StringDecoder;
   commandProtocolAvailable?: boolean;
@@ -178,6 +187,9 @@ const normalizeBoundedWindowsCommandOutput = (
 export class SSHBackend implements TerminalBackend {
   private static readonly SHELL_INIT_RETRY_INTERVAL_MS = 8000;
   private static readonly WINDOWS_SHELL_INIT_RETRY_INTERVAL_MS = 20000;
+  private static readonly SHELL_INIT_MAX_ATTEMPTS = 3;
+  private static readonly SHELL_INIT_START_DELAY_MS = 1000;
+  private static readonly SHELL_INIT_INTERRUPT_SETTLE_MS = 500;
   private static readonly WINDOWS_PROMPT_MARKER_TAIL_BYTES = 8192;
   private sessions: Map<string, SSHInstance> = new Map();
   private readonly chunkWriteSessions = new Map<
@@ -953,11 +965,12 @@ export class SSHBackend implements TerminalBackend {
     commandRequestPath?: string;
     commandOutputPath?: string;
     commandProtocolToken?: string;
+    readyMarker?: string;
   }): string {
     return buildWindowsPowerShellEncodedCommand({
-      readyMarker: buildInitializationReadyMarker(
-        options?.commandProtocolToken,
-      ),
+      readyMarker:
+        options?.readyMarker ||
+        buildInitializationReadyMarker(options?.commandProtocolToken),
       commandTrackingMode: options?.commandTrackingMode || "shell-integration",
       promptMarkerPath: options?.promptMarkerPath,
       commandRequestPath: options?.commandRequestPath,
@@ -977,11 +990,15 @@ export class SSHBackend implements TerminalBackend {
       readyMarker: buildInitializationReadyMarker(
         options.commandProtocolToken,
       ),
+      readyMarkerFromRuntimeVariable: true,
       ...options,
     });
   }
 
-  private buildWindowsPowerShellLaunchCommand(instance: SSHInstance): string {
+  private buildWindowsPowerShellLaunchCommand(
+    instance: SSHInstance,
+    readyMarker: string,
+  ): string {
     if (
       instance.commandTrackingMode === "windows-powershell-sidecar" &&
       instance.windowsPowerShellBootstrapPath
@@ -991,6 +1008,13 @@ export class SSHBackend implements TerminalBackend {
           instance,
           instance.windowsPowerShellBootstrapPath,
         ),
+        {
+          readyMarker,
+          readyMarkerVariableName:
+            buildWindowsPowerShellInitializationReadyVariableName(
+              instance.commandProtocolToken,
+            ),
+        },
       );
       return this.buildPowerShellEncodedInvocation(instance, loader, {
         noExit: true,
@@ -1003,6 +1027,7 @@ export class SSHBackend implements TerminalBackend {
       commandRequestPath: instance.windowsCommandRequestPath,
       commandOutputPath: instance.windowsCommandOutputPath,
       commandProtocolToken: instance.commandProtocolToken,
+      readyMarker,
     });
     return this.buildPowerShellEncodedInvocation(instance, encoded, {
       noExit: true,
@@ -2181,6 +2206,300 @@ export class SSHBackend implements TerminalBackend {
     }
   }
 
+  private waitForShellInitializationDelay(
+    delayMs: number,
+    signal: AbortSignal,
+  ): Promise<boolean> {
+    if (signal.aborted) return Promise.resolve(false);
+    return new Promise<boolean>((resolve) => {
+      const finish = (completed: boolean): void => {
+        clearTimeout(timer);
+        signal.removeEventListener("abort", onAbort);
+        resolve(completed);
+      };
+      const timer = setTimeout(() => finish(true), delayMs);
+      const onAbort = (): void => finish(false);
+      signal.addEventListener("abort", onAbort, { once: true });
+    });
+  }
+
+  private waitForShellInitializationAttempt(
+    opened: Promise<boolean>,
+    timeoutMs: number,
+    signal: AbortSignal,
+  ): Promise<boolean> {
+    if (signal.aborted) return Promise.resolve(false);
+    return new Promise<boolean>((resolve) => {
+      let settled = false;
+      const finish = (ready: boolean): void => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        signal.removeEventListener("abort", onAbort);
+        resolve(ready);
+      };
+      const timer = setTimeout(() => finish(false), timeoutMs);
+      const onAbort = (): void => finish(false);
+      signal.addEventListener("abort", onAbort, { once: true });
+      opened.then(
+        (ready) => finish(ready),
+        () => finish(false),
+      );
+    });
+  }
+
+  private writeShellInitializationInput(
+    stream: ssh2.ClientChannel,
+    input: string,
+    timeoutMs: number,
+    signal: AbortSignal,
+  ): Promise<boolean> {
+    if (signal.aborted) return Promise.resolve(false);
+    return new Promise<boolean>((resolve) => {
+      let settled = false;
+      const finish = (written: boolean): void => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        stream.removeListener("close", onClose);
+        signal.removeEventListener("abort", onAbort);
+        resolve(written);
+      };
+      const onClose = (): void => finish(false);
+      const onAbort = (): void => finish(false);
+      const timer = setTimeout(() => finish(false), timeoutMs);
+      stream.once("close", onClose);
+      signal.addEventListener("abort", onAbort, { once: true });
+      try {
+        stream.write(input, (error?: Error | null) => finish(!error));
+      } catch {
+        finish(false);
+      }
+    });
+  }
+
+  private failShellInitialization(
+    ptyId: string,
+    instance: SSHInstance,
+    emit: (data: string) => void,
+    emitExit: (code: number) => void,
+    reason: string,
+  ): void {
+    if (instance.initializationState !== "initializing") return;
+    instance.initializationState = "failed";
+    instance.initializationGate.fail();
+    instance.initializationAbortController.abort();
+    emit(
+      "\x1b[31m✘ Shell initialization failed. Reconnect to retry.\x1b[0m\r\n",
+    );
+    console.error(`[SSH] Initialization failed for ${ptyId}: ${reason}`);
+    emitExit(-1);
+  }
+
+  private async runShellInitializationAttempts(
+    ptyId: string,
+    instance: SSHInstance,
+    stream: ssh2.ClientChannel,
+    emit: (data: string) => void,
+    emitExit: (code: number) => void,
+  ): Promise<void> {
+    const signal = instance.initializationAbortController.signal;
+    const isCurrent = (): boolean =>
+      !signal.aborted &&
+      instance.initializationState === "initializing" &&
+      instance.stream === stream &&
+      this.sessions.get(ptyId) === instance;
+
+    if (
+      !(await this.waitForShellInitializationDelay(
+        SSHBackend.SHELL_INIT_START_DELAY_MS,
+        signal,
+      )) ||
+      !isCurrent()
+    ) {
+      return;
+    }
+
+    for (
+      let attempt = 1;
+      attempt <= SSHBackend.SHELL_INIT_MAX_ATTEMPTS;
+      attempt += 1
+    ) {
+      if (!isCurrent()) return;
+      const readyMarker = buildInitializationReadyMarker(
+        instance.commandProtocolToken,
+        attempt,
+      );
+      const opened = instance.initializationGate.beginAttempt(readyMarker);
+      const attemptTimeoutMs = this.getShellInitRetryIntervalMs(
+        instance.commandShellFamily,
+      );
+
+      console.log(`[SSH] Injection attempt ${attempt}...`);
+      if (instance.commandShellFamily !== "powershell" || attempt > 1) {
+        if (
+          !(await this.writeShellInitializationInput(
+            stream,
+            "\x03\n\n",
+            attemptTimeoutMs,
+            signal,
+          ))
+        ) {
+          if (isCurrent()) {
+            this.failShellInitialization(
+              ptyId,
+              instance,
+              emit,
+              emitExit,
+              "the shell channel closed while preparing an attempt",
+            );
+          }
+          return;
+        }
+      }
+
+      if (
+        !(await this.waitForShellInitializationDelay(
+          SSHBackend.SHELL_INIT_INTERRUPT_SETTLE_MS,
+          signal,
+        )) ||
+        !isCurrent()
+      ) {
+        return;
+      }
+
+      const launchCommand =
+        instance.commandShellFamily === "powershell"
+          ? `${this.buildWindowsPowerShellLaunchCommand(instance, readyMarker)}\r`
+          : this.buildUnixShellLaunchCommand(instance, attempt);
+      if (
+        !(await this.writeShellInitializationInput(
+          stream,
+          launchCommand,
+          attemptTimeoutMs,
+          signal,
+        ))
+      ) {
+        if (isCurrent()) {
+          this.failShellInitialization(
+            ptyId,
+            instance,
+            emit,
+            emitExit,
+            "the shell channel closed while sending an attempt",
+          );
+        }
+        return;
+      }
+
+      const ready = await this.waitForShellInitializationAttempt(
+        opened,
+        attemptTimeoutMs,
+        signal,
+      );
+      if (ready || !isCurrent()) return;
+
+      if (attempt < SSHBackend.SHELL_INIT_MAX_ATTEMPTS) {
+        emit(
+          `\x1b[33m⚠ Initialization timeout, retrying (${attempt}/${SSHBackend.SHELL_INIT_MAX_ATTEMPTS})...\x1b[0m\r\n`,
+        );
+      }
+    }
+
+    this.failShellInitialization(
+      ptyId,
+      instance,
+      emit,
+      emitExit,
+      `no ready marker after ${SSHBackend.SHELL_INIT_MAX_ATTEMPTS} attempts`,
+    );
+  }
+
+  private handleShellStreamData(
+    ptyId: string,
+    instance: SSHInstance,
+    stream: ssh2.ClientChannel,
+    chunk: string,
+    emit: (data: string) => void,
+  ): void {
+    const projected = instance.initializationGate.accept(chunk);
+    if (projected.kind === "suppressed") return;
+    if (projected.kind === "visible") {
+      if (projected.visibleData) emit(projected.visibleData);
+      return;
+    }
+
+    const sawContinuation =
+      /(?:\r?\n)>>\s*\r?\n/.test(projected.suppressedData) ||
+      projected.suppressedData.trimEnd().endsWith("\n>>") ||
+      projected.suppressedData.trimEnd().endsWith("\r\n>>");
+    instance.commandProtocolAvailable =
+      instance.commandShellFamily === "powershell"
+        ? this.hasReliableWindowsCommandProtocol(instance)
+        : projected.suppressedData.includes(
+            "__GYSHELL_COMMAND_PROTOCOL__=verified",
+          );
+    instance.initializationState = "ready";
+
+    // TerminalService synchronizes backend readiness from emitted data, so the
+    // complete ready state must be committed before the first public event.
+    emit("\x1b[2J\x1b[H");
+    const visibleData = projected.visibleData.trimStart();
+    if (visibleData) emit(visibleData);
+    if (instance.commandShellFamily === "unix") {
+      void this.cleanupUnixShellBootstrap(instance).catch(() => {});
+    }
+    if (sawContinuation && instance.commandShellFamily === "powershell") {
+      setTimeout(() => {
+        if (
+          this.sessions.get(ptyId) !== instance ||
+          instance.stream !== stream ||
+          instance.initializationState !== "ready"
+        ) {
+          return;
+        }
+        try {
+          stream.write("\r");
+        } catch {}
+      }, 50);
+    }
+  }
+
+  private shutdownSshTransport(instance: SSHInstance): void {
+    if (instance.transportShutdownStarted) return;
+    instance.transportShutdownStarted = true;
+
+    try {
+      instance.stream?.end();
+    } catch {}
+
+    const closeTransport = (): void => {
+      try {
+        instance.sftp?.end?.();
+      } catch {}
+      try {
+        instance.client.end();
+      } catch {}
+    };
+    if (
+      !instance.unixShellBootstrapPath &&
+      !instance.unixShellBootstrapCleanupPromise
+    ) {
+      closeTransport();
+      return;
+    }
+
+    let finished = false;
+    const finish = (): void => {
+      if (finished) return;
+      finished = true;
+      clearTimeout(timer);
+      closeTransport();
+    };
+    const timer = setTimeout(finish, SSH_TRANSPORT_CLEANUP_GRACE_MS);
+    void this.cleanupUnixShellBootstrap(instance).then(finish, finish);
+  }
+
   private emitExitOnce(
     ptyId: string,
     instance: SSHInstance,
@@ -2190,7 +2509,8 @@ export class SSHBackend implements TerminalBackend {
       return;
     }
     instance.exitEmitted = true;
-    instance.isInitializing = false;
+    instance.initializationGate.fail();
+    instance.initializationAbortController.abort();
     if (instance.initializationState === "initializing") {
       instance.initializationState = "failed";
     }
@@ -2206,12 +2526,7 @@ export class SSHBackend implements TerminalBackend {
         instance.client.unforwardIn(rf.host, rf.port);
       } catch {}
     }
-    try {
-      instance.sftp?.end?.();
-    } catch {}
-    try {
-      instance.client.end();
-    } catch {}
+    this.shutdownSshTransport(instance);
     if (this.sessions.get(ptyId) === instance) {
       this.sessions.delete(ptyId);
     }
@@ -2240,13 +2555,13 @@ export class SSHBackend implements TerminalBackend {
       exitCallbacks: new Set(),
       requestedCols: config.cols,
       requestedRows: config.rows,
-      isInitializing: true,
-      buffer: "",
       commandProtocolToken: randomBytes(16).toString("hex"),
       forwardServers: [],
       remoteForwards: [],
       remoteForwardHandlerInstalled: false,
       initializationState: "initializing",
+      initializationGate: new PrivateShellInitializationGate(),
+      initializationAbortController: new AbortController(),
       systemInfoRetryCount: 0,
       streamDecoder: new StringDecoder('utf8'),
     };
@@ -2321,6 +2636,17 @@ export class SSHBackend implements TerminalBackend {
           );
         }
 
+        if (instance.commandShellFamily === "unix") {
+          try {
+            await this.stageUnixShellBootstrap(instance);
+          } catch (error) {
+            console.warn(
+              "[SSH] Could not stage the Unix shell bootstrap; using the inline compatibility path:",
+              error,
+            );
+          }
+        }
+
         if (instance.commandShellFamily === "powershell") {
           try {
             await this.bootstrapWindowsSession(instance);
@@ -2353,7 +2679,8 @@ export class SSHBackend implements TerminalBackend {
             if (err) {
               console.error(`[SSH] Failed to open shell:`, err);
               instance.initializationState = "failed";
-              instance.isInitializing = false;
+              instance.initializationGate.fail();
+              instance.initializationAbortController.abort();
               emit(`\x1b[31m✘ Failed to open shell: ${err.message}\x1b[0m\r\n`);
               emitExit(-1);
               return;
@@ -2365,127 +2692,40 @@ export class SSHBackend implements TerminalBackend {
               `[SSH] Shell stream opened. Starting robust initialization...`,
             );
 
-            let retryCount = 0;
-            const maxRetries = 3;
-            let isReadySent = false;
-            const initializationReadyMarker = buildInitializationReadyMarker(
-              instance.commandProtocolToken,
-            );
-
-            const attemptInjection = () => {
-              if (!instance.stream || isReadySent || !instance.isInitializing)
-                return;
-
-              console.log(`[SSH] Injection attempt ${retryCount + 1}...`);
-              if (
-                instance.commandShellFamily !== "powershell" ||
-                retryCount > 0
-              ) {
-                instance.stream.write("\x03\n\n");
-              }
-
-              setTimeout(() => {
-                if (!instance.stream || isReadySent || !instance.isInitializing)
-                  return;
-                if (instance.commandShellFamily === "powershell") {
-                  instance.stream.write(
-                    `${this.buildWindowsPowerShellLaunchCommand(instance)}\r`,
-                  );
-                } else {
-                  const script = this.getUnixInjectionScript(
-                    instance.commandProtocolToken,
-                  );
-                  const b64 = Buffer.from(script).toString("base64");
-                  const injection = `  eval "$(printf '%s' '${b64}' | base64 -d 2>/dev/null || printf '%s' '${b64}' | base64 --decode 2>/dev/null)"\n`;
-
-                  const CHUNK_SIZE = 256;
-                  for (let i = 0; i < injection.length; i += CHUNK_SIZE) {
-                    instance.stream.write(injection.slice(i, i + CHUNK_SIZE));
-                  }
-                }
-              }, 500);
+            const handleShellData = (chunk: string): void => {
+              this.handleShellStreamData(
+                config.id,
+                instance,
+                stream,
+                chunk,
+                emit,
+              );
             };
 
-            setTimeout(attemptInjection, 1000);
-
-            const watchdogInterval = setInterval(() => {
-              if (instance.isInitializing) {
-                retryCount++;
-                if (retryCount >= maxRetries) {
-                  instance.initializationState = "failed";
-                  instance.isInitializing = false;
-                  emit(
-                    "\x1b[31m✘ Initialization failed. Entering fallback mode.\x1b[0m\r\n",
-                  );
-                  console.error(
-                    `[SSH] Initialization FAILED after ${maxRetries} attempts for ${config.id}.`,
-                  );
-                  clearInterval(watchdogInterval);
-                  return;
-                }
-                emit(
-                  `\x1b[33m⚠ Initialization timeout, retrying (${retryCount}/${maxRetries})...\x1b[0m\r\n`,
-                );
-                attemptInjection();
-              } else {
-                clearInterval(watchdogInterval);
-              }
-            }, this.getShellInitRetryIntervalMs(instance.commandShellFamily));
-
             stream.on("data", (data: Buffer) => {
-              const chunk = instance.streamDecoder.write(data);
-              if (instance.isInitializing) {
-                instance.buffer += chunk;
-                const postInitializationData = consumeInitializationReadyMarker(
-                  instance.buffer,
-                  initializationReadyMarker,
-                );
-                if (postInitializationData !== undefined) {
-                  emit("\x1b[2J\x1b[H"); // Clear screen
-                  isReadySent = true;
-                  clearInterval(watchdogInterval);
-                  const sawContinuation =
-                    /(?:\r?\n)>>\s*\r?\n/.test(instance.buffer) ||
-                    instance.buffer.trimEnd().endsWith("\n>>") ||
-                    instance.buffer.trimEnd().endsWith("\r\n>>");
-                  instance.initializationState = "ready";
-                  instance.isInitializing = false;
-                  instance.commandProtocolAvailable =
-                    instance.commandShellFamily === "powershell"
-                      ? this.hasReliableWindowsCommandProtocol(instance)
-                      : instance.buffer.includes(
-                          "__GYSHELL_COMMAND_PROTOCOL__=verified",
-                        );
-                  const realContent = postInitializationData.trimStart();
-                  if (realContent) emit(realContent);
-                  instance.buffer = "";
-                  if (
-                    sawContinuation &&
-                    instance.commandShellFamily === "powershell" &&
-                    instance.stream
-                  ) {
-                    setTimeout(() => {
-                      try {
-                        instance.stream?.write("\r");
-                      } catch {}
-                    }, 50);
-                  }
-                }
-              } else {
-                emit(chunk);
-              }
+              handleShellData(instance.streamDecoder.write(data));
             });
 
-            stream.on("close", async (code: number) => {
+            stream.on("close", (code: number) => {
               const remaining = instance.streamDecoder.end();
-              if (remaining) {
-                if (instance.isInitializing) {
-                  instance.buffer += remaining;
-                } else {
-                  emit(remaining);
-                }
-              }
+              if (remaining) handleShellData(remaining);
               emitExit(typeof code === "number" ? code : 0);
+            });
+
+            void this.runShellInitializationAttempts(
+              config.id,
+              instance,
+              stream,
+              emit,
+              emitExit,
+            ).catch((error) => {
+              this.failShellInitialization(
+                config.id,
+                instance,
+                emit,
+                emitExit,
+                error instanceof Error ? error.message : String(error),
+              );
             });
           },
         );
@@ -2493,8 +2733,6 @@ export class SSHBackend implements TerminalBackend {
 
       client.on("error", (err) => {
         console.error(`[SSH] Client error:`, err);
-        instance.initializationState = "failed";
-        instance.isInitializing = false;
         emit(`\x1b[31m✘ SSH Error: ${err.message}\x1b[0m\r\n`);
         emitExit(-1);
       });
@@ -2561,8 +2799,6 @@ export class SSHBackend implements TerminalBackend {
         client.connect(connectConfig);
       } catch (e: any) {
         const errMsg = e instanceof Error ? e.message : String(e);
-        instance.initializationState = "failed";
-        instance.isInitializing = false;
         emit(`\x1b[31m✘ Connection failed: ${errMsg}\x1b[0m\r\n`);
         emitExit(-1);
       }
@@ -2595,6 +2831,11 @@ export class SSHBackend implements TerminalBackend {
   kill(ptyId: string): void {
     const instance = this.sessions.get(ptyId);
     if (instance) {
+      instance.initializationGate.fail();
+      instance.initializationAbortController.abort();
+      if (instance.initializationState === "initializing") {
+        instance.initializationState = "failed";
+      }
       this.clearSystemInfoRetry(instance);
       void this.cleanupWindowsPromptMarker(instance);
       this.closeChunkSessionsForPty(ptyId);
@@ -2608,10 +2849,7 @@ export class SSHBackend implements TerminalBackend {
           instance.client.unforwardIn(rf.host, rf.port);
         } catch {}
       }
-      try {
-        instance.sftp?.end?.();
-      } catch {}
-      instance.client.end();
+      this.shutdownSshTransport(instance);
       this.sessions.delete(ptyId);
     }
   }
@@ -2823,10 +3061,111 @@ export class SSHBackend implements TerminalBackend {
     return sftp;
   }
 
+  private buildUnixShellBootstrapPath(runtimeToken: string): string {
+    return `/tmp/${UNIX_SHELL_BOOTSTRAP_FILE_PREFIX}${runtimeToken}.sh`;
+  }
+
+  private async stageUnixShellBootstrap(instance: SSHInstance): Promise<void> {
+    const bootstrapPath = this.buildUnixShellBootstrapPath(
+      instance.commandProtocolToken,
+    );
+    const script = this.getUnixInjectionScript(instance.commandProtocolToken);
+    const content = Buffer.from(`${script}\n`, "utf8");
+
+    if (instance.sftp) {
+      try {
+        await this.sftpWriteFile(instance.sftp, bootstrapPath, content, {
+          mode: 0o600,
+        });
+        await this.sftpChmod(instance.sftp, bootstrapPath, 0o600);
+        instance.unixShellBootstrapPath = bootstrapPath;
+        return;
+      } catch {
+        try {
+          await this.sftpUnlink(instance.sftp, bootstrapPath);
+        } catch {}
+        // Some SFTP servers restrict /tmp even when an exec channel can use it.
+      }
+    }
+
+    const stagedMarker = `__GYSHELL_BOOTSTRAP_STAGED__:${instance.commandProtocolToken}`;
+    const result = await this.execCollect(
+      instance.client,
+      [
+        "umask 077",
+        `command cat > ${quotePosixShellLiteral(bootstrapPath)}`,
+        `command chmod 600 ${quotePosixShellLiteral(bootstrapPath)}`,
+        `command printf '%s' ${quotePosixShellLiteral(stagedMarker)}`,
+      ].join(" && "),
+      15_000,
+      { stdin: `${script}\n` },
+    );
+    if (!String(result.stdout || "").includes(stagedMarker)) {
+      throw new Error("Remote Unix shell bootstrap could not be staged");
+    }
+    instance.unixShellBootstrapPath = bootstrapPath;
+  }
+
+  private buildUnixShellLaunchCommand(
+    instance: SSHInstance,
+    attempt: number,
+  ): string {
+    const attemptVariable = `__gyshell_${instance.commandProtocolToken}_initialization_attempt`;
+    const assignment = `${attemptVariable}=${attempt};`;
+    if (instance.unixShellBootstrapPath && attempt === 1) {
+      return `  ${assignment} . ${quotePosixShellLiteral(instance.unixShellBootstrapPath)}\n`;
+    }
+
+    const script = this.getUnixInjectionScript(instance.commandProtocolToken);
+    const encodedScript = Buffer.from(script).toString("base64");
+    return `  ${assignment} eval "$(printf '%s' '${encodedScript}' | base64 -d 2>/dev/null || printf '%s' '${encodedScript}' | base64 --decode 2>/dev/null)"\n`;
+  }
+
+  private cleanupUnixShellBootstrap(instance: SSHInstance): Promise<void> {
+    if (instance.unixShellBootstrapCleanupPromise) {
+      return instance.unixShellBootstrapCleanupPromise;
+    }
+    const bootstrapPath = instance.unixShellBootstrapPath;
+    instance.unixShellBootstrapPath = undefined;
+    if (!bootstrapPath) return Promise.resolve();
+
+    const cleanup = (async (): Promise<void> => {
+      if (instance.sftp) {
+        try {
+          await this.sftpUnlink(instance.sftp, bootstrapPath);
+          return;
+        } catch {
+          // Fall through to the exec channel while the SSH client is still live.
+        }
+      }
+      await this.execCollect(
+        instance.client,
+        `command rm -f ${quotePosixShellLiteral(bootstrapPath)}`,
+        3000,
+      );
+    })();
+    instance.unixShellBootstrapCleanupPromise = cleanup;
+    void cleanup.then(
+      () => {
+        if (instance.unixShellBootstrapCleanupPromise === cleanup) {
+          instance.unixShellBootstrapCleanupPromise = undefined;
+        }
+      },
+      () => {
+        if (instance.unixShellBootstrapCleanupPromise === cleanup) {
+          instance.unixShellBootstrapCleanupPromise = undefined;
+        }
+      },
+    );
+    return cleanup;
+  }
+
   private getUnixInjectionScript(runtimeToken: string): string {
-    // Minified script to reduce payload size and potential TTY buffer issues
+    // This script is staged outside the interactive PTY. Only a short source
+    // command is typed into the shell, so line editing never has to echo it.
     const commandMarkerPrefix = buildCommandProtocolMarkerPrefix(runtimeToken);
     const privateIdentifierPrefix = `__gyshell_${runtimeToken}`;
+    const initializationAttemptName = `${privateIdentifierPrefix}_initialization_attempt`;
     const protocolName = `${privateIdentifierPrefix}_command_protocol`;
     const inCommandName = `${privateIdentifierPrefix}_in_command`;
     const commandSequenceName = `${privateIdentifierPrefix}_command_seq`;
@@ -2930,8 +3269,8 @@ elif [ -n "$BASH_VERSION" ]; then
     unset ${cleanPromptCommandsName}
   fi
 fi
-echo "__GYSHELL_COMMAND_PROTOCOL__=\${${protocolName}:-unsupported}"
-echo "${buildInitializationReadyMarker(runtimeToken)}"
+command printf '%s\n' "__GYSHELL_COMMAND_PROTOCOL__=\${${protocolName}:-unsupported}"
+command printf '%s:%s\n' '${buildInitializationReadyMarker(runtimeToken)}' "$${initializationAttemptName}"
 `.trim();
     return script;
   }
@@ -3374,6 +3713,22 @@ echo "${buildInitializationReadyMarker(runtimeToken)}"
     });
   }
 
+  private async sftpChmod(
+    sftp: ssh2.SFTPWrapper,
+    normalizedPath: string,
+    mode: number,
+  ): Promise<void> {
+    await new Promise<void>((resolve, reject) => {
+      sftp.chmod(normalizedPath, mode, (err) => {
+        if (err) {
+          reject(err);
+          return;
+        }
+        resolve();
+      });
+    });
+  }
+
   private async sftpRmdir(
     sftp: ssh2.SFTPWrapper,
     normalizedPath: string,
@@ -3424,15 +3779,21 @@ echo "${buildInitializationReadyMarker(runtimeToken)}"
     sftp: ssh2.SFTPWrapper,
     normalizedPath: string,
     content: Buffer,
+    options?: ssh2.WriteFileOptions,
   ): Promise<void> {
     await new Promise<void>((resolve, reject) => {
-      sftp.writeFile(normalizedPath, content, (err) => {
+      const callback = (err?: Error | null): void => {
         if (err) {
           reject(err);
           return;
         }
         resolve();
-      });
+      };
+      if (options) {
+        sftp.writeFile(normalizedPath, content, options, callback);
+      } else {
+        sftp.writeFile(normalizedPath, content, callback);
+      }
     });
   }
 

@@ -116,6 +116,18 @@ const run = async (): Promise<void> => {
       () => service.getTerminalRuntimeSnapshot(config.id)?.canRunCommand === true,
       `Saved SSH connection ${CONNECTION_NAME} did not become command-ready.`,
     )
+    const startupOutput = service.getBufferDelta(config.id, 0)
+    for (const privateBootstrapFragment of [
+      '__GYSHELL_',
+      '__gyshell_',
+      '__GyShell_Internal',
+      '-EncodedCommand',
+    ]) {
+      assert(
+        !startupOutput.includes(privateBootstrapFragment),
+        `Windows SSH startup exposed private bootstrap data: ${privateBootstrapFragment}`,
+      )
+    }
 
     const unicode = await runTracked(
       service,
