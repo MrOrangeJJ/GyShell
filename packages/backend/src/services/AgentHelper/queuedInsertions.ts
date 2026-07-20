@@ -1,6 +1,44 @@
 import { AGENT_NOTIFICATION_TAG } from './prompts'
+import type { CommandExecutionState } from '@gyshell/shared'
 
 export type QueuedAgentInsertionKind = 'exec_command_nowait_completed' | string
+
+export const EXEC_COMMAND_NOTIFICATION_MAX_UTF8_BYTES = 16 * 1024
+const EXEC_COMMAND_NOTIFICATION_COMMAND_JSON_BYTES = 4 * 1024
+const EXEC_COMMAND_NOTIFICATION_IDENTIFIER_JSON_BYTES = 2 * 1024
+const EXEC_COMMAND_NOTIFICATION_NAME_JSON_BYTES = 1024
+
+const normalizeNotificationScalar = (value: string): string => {
+  const codePoint = value.codePointAt(0)
+  return codePoint !== undefined && codePoint >= 0xd800 && codePoint <= 0xdfff
+    ? '\ufffd'
+    : value
+}
+
+const boundedJsonString = (
+  input: string,
+  maxEncodedBytes: number,
+): { value: string; originalUtf8Bytes: number; truncated: boolean } => {
+  const source = String(input || '')
+  const originalUtf8Bytes = Buffer.byteLength(source, 'utf8')
+  let encodedBytes = 0
+  let value = ''
+  let truncated = false
+  for (const rawScalar of source) {
+    const scalar = normalizeNotificationScalar(rawScalar)
+    const scalarEncodedBytes = Buffer.byteLength(
+      JSON.stringify(scalar).slice(1, -1),
+      'utf8',
+    )
+    if (encodedBytes + scalarEncodedBytes > maxEncodedBytes) {
+      truncated = true
+      break
+    }
+    value += scalar
+    encodedBytes += scalarEncodedBytes
+  }
+  return { value, originalUtf8Bytes, truncated }
+}
 
 export interface QueuedAgentInsertionInput {
   kind: QueuedAgentInsertionKind
@@ -113,37 +151,82 @@ export function buildExecCommandNowaitCompletedInsertion(params: {
   command: string
   exitCode?: number
   runtimeBoundary?: boolean
+  executionState?: CommandExecutionState
+  terminalAvailable?: boolean
 }): QueuedAgentInsertionInput {
-  const terminalRef = params.terminalId || params.terminalName
-  const outcomeUnknown = params.runtimeBoundary === true
-  const instruction = outcomeUnknown
-    ? 'The hidden completion tracker stopped before a definitive outcome was observed. Do not assume success or replay the command automatically. ' +
-      `Inspect the terminal and use read_command_output with tabIdOrName=${JSON.stringify(terminalRef)} and history_command_match_id=${JSON.stringify(params.historyCommandMatchId)} before planning later mutations.`
+  const terminalId = boundedJsonString(
+    params.terminalId,
+    EXEC_COMMAND_NOTIFICATION_IDENTIFIER_JSON_BYTES,
+  )
+  const historyCommandMatchId = boundedJsonString(
+    params.historyCommandMatchId,
+    EXEC_COMMAND_NOTIFICATION_IDENTIFIER_JSON_BYTES,
+  )
+  const terminalName = boundedJsonString(
+    params.terminalName,
+    EXEC_COMMAND_NOTIFICATION_NAME_JSON_BYTES,
+  )
+  const command = boundedJsonString(
+    params.command,
+    EXEC_COMMAND_NOTIFICATION_COMMAND_JSON_BYTES,
+  )
+  const terminalRef = terminalId.value || terminalName.value
+  const outcomeUnknown =
+    params.runtimeBoundary === true ||
+    params.executionState === 'outcome_unknown'
+  const aborted = params.executionState === 'aborted'
+  const readInstruction = params.terminalAvailable === false
+    ? `The terminal tab is closed, but retention-bounded read-only command history remains available in this GyShell process until it is evicted. Use read_command_output with tabIdOrName=${JSON.stringify(terminalId.value)} and history_command_match_id=${JSON.stringify(historyCommandMatchId.value)}; do not use the old terminal name.`
+    : `Use read_command_output with tabIdOrName=${JSON.stringify(terminalRef)} and history_command_match_id=${JSON.stringify(historyCommandMatchId.value)} if you need to inspect the result.`
+  const instruction = aborted
+    ? 'The background exec_command was aborted. It did not produce a trustworthy successful outcome; do not assume success or automatically replay a command with side effects. ' +
+      readInstruction
+    : outcomeUnknown
+    ? 'The command is no longer running, but GyShell has no trustworthy definitive outcome (for example, the runtime ended or the shell could not determine an exact exit code). Do not assume success or replay the command automatically. ' +
+      readInstruction
     : 'The nowait exec_command has completed. Do not infer or summarize command output from this notification. ' +
-      `Use read_command_output with tabIdOrName=${JSON.stringify(terminalRef)} and history_command_match_id=${JSON.stringify(params.historyCommandMatchId)} if you need to inspect the result.`
+      readInstruction
   const payload = {
-    notification_type: outcomeUnknown
-      ? 'exec_command_nowait_outcome_unknown'
-      : 'exec_command_nowait_completed',
-    message: outcomeUnknown
-      ? 'A background exec_command no longer has a definitive tracked outcome.'
-      : 'A background nowait exec_command has completed.',
-    history_command_match_id: params.historyCommandMatchId,
-    terminal_id: params.terminalId,
-    terminal_name: params.terminalName,
+    notification_type: aborted
+      ? 'exec_command_nowait_aborted'
+      : outcomeUnknown
+        ? 'exec_command_nowait_outcome_unknown'
+        : 'exec_command_nowait_completed',
+    message: aborted
+      ? 'A background exec_command was aborted.'
+      : outcomeUnknown
+        ? 'A background exec_command ended without a definitive tracked outcome.'
+        : 'A background nowait exec_command has completed.',
+    history_command_match_id: historyCommandMatchId.value,
+    terminal_id: terminalId.value,
+    terminal_name: terminalName.value,
     tool: 'exec_command',
     execution_mode: 'nowait',
-    ...(typeof params.exitCode === 'number' ? { exit_code: params.exitCode } : {}),
-    command: params.command,
+    terminal_tab_exists: params.terminalAvailable !== false,
+    ...(!outcomeUnknown && !aborted && typeof params.exitCode === 'number'
+      ? { exit_code: params.exitCode }
+      : {}),
+    command_preview: command.value,
+    command_utf8_bytes: command.originalUtf8Bytes,
+    command_truncated: command.truncated,
+    ...(terminalId.truncated || historyCommandMatchId.truncated
+      ? { identifiers_truncated: true }
+      : {}),
+    ...(terminalName.truncated ? { terminal_name_truncated: true } : {}),
     instruction
   }
   const content = `${AGENT_NOTIFICATION_TAG}${JSON.stringify(payload, null, 2)}`
+  if (Buffer.byteLength(content, 'utf8') > EXEC_COMMAND_NOTIFICATION_MAX_UTF8_BYTES) {
+    throw new Error('exec_command completion notification exceeded its hard size limit.')
+  }
   return {
-    kind: outcomeUnknown
-      ? 'exec_command_nowait_outcome_unknown'
-      : 'exec_command_nowait_completed',
+    kind: aborted
+      ? 'exec_command_nowait_aborted'
+      : outcomeUnknown
+        ? 'exec_command_nowait_outcome_unknown'
+        : 'exec_command_nowait_completed',
     content,
-    dedupeKey: `exec_command_nowait_completed:${params.terminalId}:${params.historyCommandMatchId}`
+    dedupeKey: `exec_command_nowait_completed:${terminalId.value}:${historyCommandMatchId.value}`
   }
 }
 
@@ -195,13 +278,30 @@ export function buildFileTransferFinishedInsertion(params: {
 
 export function buildUnfinishedExecCommandContinueInstruction(commands: RunBackgroundExecCommand[]): string {
   const commandLines = commands.map((command, index) => {
-    const terminalRef = command.terminalId || command.terminalName
+    const commandPreview = boundedJsonString(
+      command.command,
+      EXEC_COMMAND_NOTIFICATION_COMMAND_JSON_BYTES,
+    )
+    const terminalId = boundedJsonString(
+      command.terminalId,
+      EXEC_COMMAND_NOTIFICATION_IDENTIFIER_JSON_BYTES,
+    ).value
+    const terminalName = boundedJsonString(
+      command.terminalName,
+      EXEC_COMMAND_NOTIFICATION_NAME_JSON_BYTES,
+    ).value
+    const historyCommandMatchId = boundedJsonString(
+      command.historyCommandMatchId,
+      EXEC_COMMAND_NOTIFICATION_IDENTIFIER_JSON_BYTES,
+    ).value
+    const terminalRef = terminalId || terminalName
     return [
-      `${index + 1}. command=${JSON.stringify(command.command)}`,
-      `   terminalId=${JSON.stringify(command.terminalId)}`,
-      `   terminalName=${JSON.stringify(command.terminalName)}`,
-      `   history_command_match_id=${JSON.stringify(command.historyCommandMatchId)}`,
-      `   suggested read_command_output args: tabIdOrName=${JSON.stringify(terminalRef)}, history_command_match_id=${JSON.stringify(command.historyCommandMatchId)}`
+      `${index + 1}. command_preview=${JSON.stringify(commandPreview.value)}`,
+      `   command_utf8_bytes=${commandPreview.originalUtf8Bytes}, command_truncated=${commandPreview.truncated}`,
+      `   terminalId=${JSON.stringify(terminalId)}`,
+      `   terminalName=${JSON.stringify(terminalName)}`,
+      `   history_command_match_id=${JSON.stringify(historyCommandMatchId)}`,
+      `   suggested read_command_output args: tabIdOrName=${JSON.stringify(terminalRef)}, history_command_match_id=${JSON.stringify(historyCommandMatchId)}`
     ].join('\n')
   })
 

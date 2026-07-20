@@ -223,5 +223,28 @@ export interface MobileTranslations {
     unknownFile: string;
     moreLines: (n: number) => string;
     moreChars: (n: number) => string;
+    commandOutput: {
+      executionRunning: string;
+      executionFinished: string;
+      executionExit: (code: number) => string;
+      executionAborted: string;
+      executionUnknown: string;
+      captureInProgress: string;
+      captureComplete: string;
+      captureIncomplete: string;
+      captureUnknown: string;
+      reasonRetentionLimit: string;
+      reasonTrackingLost: string;
+      reasonRuntimeBoundary: string;
+      reasonTrackingUnavailable: string;
+      reasonProjectionAmbiguous: string;
+      reasonRecordExpired: string;
+      retainedOfObserved: (retained: number, observed: number) => string;
+      terminalControlsObserved: string;
+      presentationNoneYet: string;
+      presentationNone: string;
+      presentationFull: string;
+      presentationExcerpt: string;
+    };
   };
 }

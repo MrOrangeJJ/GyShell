@@ -27,6 +27,11 @@ export interface ToolExecutionContext {
   markWaitInterruptedByQueuedInsertion?: () => void
   registerBackgroundExecCommand?: (command: RunBackgroundExecCommandInput) => void
   completeBackgroundExecCommand?: (command: RunBackgroundExecCommandInput & { exitCode?: number }) => void
+  replaceExecCommandToolResult?: (result: {
+    content: string
+    terminalId: string
+    historyCommandMatchId: string
+  }) => void
   registerBackgroundFileTransfer?: (transfer: RunBackgroundFileTransferInput) => void
   completeBackgroundFileTransfer?: (transfer: RunBackgroundFileTransferInput & { status?: string; error?: string }) => void
   signal?: AbortSignal

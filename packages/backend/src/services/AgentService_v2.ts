@@ -90,10 +90,13 @@ import {
 } from "./AgentHelper/utils/streamed_tool_call_integrity";
 import {
   buildDynamicRequestHistory,
+  expireUnbackedStoredCommandOutputEnvelopes,
   invokeWithRetryAndSanitizedInput,
+  prepareModelInputMessagesForInvocation,
   sanitizeStoredMessagesForChatRuntime,
   stripRawResponseFromStoredMessages,
 } from "./AgentHelper/utils/model_messages";
+import { parseCommandOutputEnvelopeContract } from "./AgentHelper/tools/command_output_contract";
 import { buildDeterministicCompactionDigest } from "./AgentHelper/utils/deterministic_compaction_digest";
 import { createStreamReasoningExtractor } from "./AgentHelper/utils/stream_reasoning_extractor";
 import { resolveRunExperimentalFlags } from "./AgentHelper/utils/experimental_flags";
@@ -356,6 +359,179 @@ export class AgentService_v2 {
   private fallbackCompactionHistoryExportService: PassChatTempExportService | null =
     null;
   private activeAgentRunIdsBySession: Map<string, string> = new Map();
+
+  private getCommandOutputBackingSource = (
+    terminalId: string,
+    historyCommandMatchId: string,
+  ) => {
+    const getSnapshot = (this.terminalService as any).getCommandOutputSnapshot;
+    const snapshot =
+      typeof getSnapshot === "function"
+        ? getSnapshot.call(
+            this.terminalService,
+            terminalId,
+            historyCommandMatchId,
+          )
+        : undefined;
+    return snapshot
+      ? {
+          terminalId,
+          historyCommandMatchId,
+          executionState: snapshot.executionState,
+          ...(snapshot.exitCode !== undefined
+            ? { exitCode: snapshot.exitCode }
+            : {}),
+          output: snapshot.output,
+          capture: snapshot.capture,
+        }
+      : undefined;
+  };
+
+  private getStoredMessageId(message: any): string | undefined {
+    const messageId = message?.data?.additional_kwargs?._gyshellMessageId;
+    return typeof messageId === "string" && messageId.length > 0
+      ? messageId
+      : undefined;
+  }
+
+  private getStoredExecCommandContract(message: any) {
+    if (
+      message?.type !== "tool" ||
+      message?.data?.name !== "exec_command" ||
+      typeof message?.data?.content !== "string"
+    ) {
+      return undefined;
+    }
+    return parseCommandOutputEnvelopeContract(message.data.content);
+  }
+
+  private commandSettlementRank(
+    contract: ReturnType<typeof parseCommandOutputEnvelopeContract>,
+  ): number {
+    if (!contract || contract.executionState === "running") return 0;
+    if (
+      contract.executionState === "outcome_unknown" &&
+      contract.capture.reason === "tracking_lost"
+    ) {
+      return 1;
+    }
+    if (contract.executionState === "outcome_unknown") return 2;
+    return 3;
+  }
+
+  private preferDurableExecCommandSettlements(
+    sessionId: string,
+    incomingMessages: any[],
+  ): void {
+    const loadSession = (this.chatHistoryService as any).loadSession;
+    if (typeof loadSession !== "function") return;
+    const durableSession = loadSession.call(
+      this.chatHistoryService,
+      sessionId,
+    ) as ChatSession | null;
+    if (!durableSession) return;
+
+    const durableByMessageId = new Map<string, any>();
+    for (const [key, message] of durableSession.messages.entries()) {
+      const messageId = this.getStoredMessageId(message) || key;
+      durableByMessageId.set(messageId, message);
+    }
+
+    for (const incoming of incomingMessages) {
+      const messageId = this.getStoredMessageId(incoming);
+      const incomingContract = this.getStoredExecCommandContract(incoming);
+      if (!messageId || !incomingContract) continue;
+      const durable = durableByMessageId.get(messageId);
+      const durableContract = this.getStoredExecCommandContract(durable);
+      if (
+        !durableContract ||
+        durableContract.terminalId !== incomingContract.terminalId ||
+        durableContract.historyCommandMatchId !==
+          incomingContract.historyCommandMatchId ||
+        this.commandSettlementRank(durableContract) <=
+          this.commandSettlementRank(incomingContract)
+      ) {
+        continue;
+      }
+      incoming.data.content = durable.data.content;
+    }
+  }
+
+  private persistSettledExecCommandToolResult(params: {
+    sessionId: string;
+    messageId: string;
+    content: string;
+    terminalId: string;
+    historyCommandMatchId: string;
+  }): boolean {
+    const settledContract = parseCommandOutputEnvelopeContract(params.content);
+    if (
+      !settledContract ||
+      settledContract.executionState === "running" ||
+      settledContract.terminalId !== params.terminalId ||
+      settledContract.historyCommandMatchId !== params.historyCommandMatchId
+    ) {
+      return false;
+    }
+
+    try {
+      const loadSession = (this.chatHistoryService as any).loadSession;
+      const saveSession = (this.chatHistoryService as any).saveSession;
+      if (
+        typeof loadSession !== "function" ||
+        typeof saveSession !== "function"
+      ) {
+        return false;
+      }
+      const session = loadSession.call(
+        this.chatHistoryService,
+        params.sessionId,
+      ) as ChatSession | null;
+      if (!session) return false;
+      const entry = Array.from(session.messages.entries()).find(
+        ([key, message]) =>
+          key === params.messageId ||
+          this.getStoredMessageId(message) === params.messageId,
+      );
+      if (!entry) return false;
+      const [storedKey, storedMessage] = entry;
+      if (this.getStoredMessageId(storedMessage) !== params.messageId) {
+        return false;
+      }
+      const currentContract = this.getStoredExecCommandContract(storedMessage);
+      if (
+        !currentContract ||
+        currentContract.terminalId !== params.terminalId ||
+        currentContract.historyCommandMatchId !==
+          params.historyCommandMatchId
+      ) {
+        return false;
+      }
+      if (storedMessage.data.content === params.content) return true;
+      if (
+        this.commandSettlementRank(currentContract) >=
+        this.commandSettlementRank(settledContract)
+      ) {
+        return false;
+      }
+
+      session.messages.set(storedKey, {
+        ...storedMessage,
+        data: {
+          ...storedMessage.data,
+          content: params.content,
+        },
+      });
+      saveSession.call(this.chatHistoryService, session);
+      return true;
+    } catch (error) {
+      console.warn(
+        `[AgentService_v2] Failed to persist settled exec_command result (sessionId=${params.sessionId}, messageId=${params.messageId}).`,
+        error,
+      );
+      return false;
+    }
+  }
 
   private captureAbortedMessageForActiveRun(
     physicalRunId: string,
@@ -1470,8 +1646,18 @@ export class AgentService_v2 {
             );
             let invokeResponse: any;
             try {
+              const invokeInputMessages =
+                prepareModelInputMessagesForInvocation(
+                  streamInputMessages,
+                  {
+                    modelSupportsImage:
+                      sessionBinding.readFileSupport.image,
+                    getCommandOutputBackingSource:
+                      this.getCommandOutputBackingSource,
+                  },
+                );
               invokeResponse = await modelWithTools.invoke(
-                streamInputMessages,
+                invokeInputMessages,
                 {
                   signal: config?.signal,
                 },
@@ -1539,6 +1725,7 @@ export class AgentService_v2 {
         },
         maxRetries: MODEL_RETRY_MAX,
         delaysMs: MODEL_RETRY_DELAYS_MS,
+        getCommandOutputBackingSource: this.getCommandOutputBackingSource,
       });
 
       // A successful attempt supersedes any interrupted attempt captured under
@@ -2110,6 +2297,10 @@ export class AgentService_v2 {
       }
 
       const toolMessage = this.createToolMessage(toolCall);
+      let latestCommandResultText: string | undefined;
+      let latestCommandResultContract: ReturnType<
+        typeof parseCommandOutputEnvelopeContract
+      >;
       const executionContext = this.createExecutionContext(
         sessionId,
         toolMessage.additional_kwargs._gyshellMessageId as string,
@@ -2145,6 +2336,37 @@ export class AgentService_v2 {
         };
       }
       const bestMatch = resolvedTerminal.terminal;
+      executionContext.replaceExecCommandToolResult = (result) => {
+        const contract = parseCommandOutputEnvelopeContract(
+          result.content,
+        );
+        if (
+          !contract ||
+          result.terminalId !== bestMatch.id ||
+          contract.terminalId !== result.terminalId ||
+          contract.historyCommandMatchId !==
+            result.historyCommandMatchId ||
+          (latestCommandResultContract !== undefined &&
+            (this.commandSettlementRank(latestCommandResultContract) >
+              this.commandSettlementRank(contract) ||
+              (this.commandSettlementRank(latestCommandResultContract) ===
+                this.commandSettlementRank(contract) &&
+                latestCommandResultContract.executionState !== "running")))
+        ) {
+          return;
+        }
+        latestCommandResultText = result.content;
+        latestCommandResultContract = contract;
+        toolMessage.content = result.content;
+        if (contract.executionState !== "running") {
+          this.persistSettledExecCommandToolResult({
+            sessionId,
+            messageId: toolMessage.additional_kwargs
+              ._gyshellMessageId as string,
+            ...result,
+          });
+        }
+      };
       if (!resolvedTerminal.snapshot.canRunCommand) {
         toolMessage.content = formatTerminalUnavailableForTool(
           resolvedTerminal.snapshot,
@@ -2158,15 +2380,14 @@ export class AgentService_v2 {
       }
 
       let resultText = "";
-      if (validated.waitMode === "nowait") {
-        const res = await toolImplementations.runCommandNowait(
-          validated,
-          executionContext,
-        );
-        resultText =
-          res +
-          "\nThis command may hang, so it is run asynchronously. Please use read_terminal_tab to check the result/status!";
-      } else {
+      try {
+        if (validated.waitMode === "nowait") {
+          const res = await toolImplementations.runCommandNowait(
+            validated,
+            executionContext,
+          );
+          resultText = res;
+        } else {
         const recent = this.terminalService.getRecentOutput(bestMatch.id) || "";
 
         let autoSwitchToNowait = false;
@@ -2273,6 +2494,19 @@ export class AgentService_v2 {
           await actionDecisionTask;
         }
 
+        }
+      } catch (error) {
+        if (
+          this.helpers.isAbortError(error) &&
+          latestCommandResultContract &&
+          typeof state.physicalRunId === "string"
+        ) {
+          this.captureAbortedMessageForActiveRun(
+            state.physicalRunId,
+            toolMessage,
+          );
+        }
+        throw error;
       }
 
       const activeTaskId =
@@ -2293,7 +2527,7 @@ export class AgentService_v2 {
         );
       }
 
-      toolMessage.content = resultText;
+      toolMessage.content = latestCommandResultText ?? resultText;
       return {
         messages: [...messageHistory, toolMessage],
         sessionId,
@@ -4031,6 +4265,7 @@ export class AgentService_v2 {
         },
         maxRetries: MODEL_RETRY_MAX,
         delaysMs: MODEL_RETRY_DELAYS_MS,
+        getCommandOutputBackingSource: this.getCommandOutputBackingSource,
       });
     }
 
@@ -4085,6 +4320,7 @@ export class AgentService_v2 {
       },
       maxRetries: MODEL_RETRY_MAX,
       delaysMs: MODEL_RETRY_DELAYS_MS,
+      getCommandOutputBackingSource: this.getCommandOutputBackingSource,
     });
     return result as z.infer<T>;
   }
@@ -4123,6 +4359,7 @@ export class AgentService_v2 {
         },
         maxRetries: MODEL_RETRY_MAX,
         delaysMs: MODEL_RETRY_DELAYS_MS,
+        getCommandOutputBackingSource: this.getCommandOutputBackingSource,
       });
     }
 
@@ -4147,6 +4384,7 @@ export class AgentService_v2 {
         },
         maxRetries: MODEL_RETRY_MAX,
         delaysMs: MODEL_RETRY_DELAYS_MS,
+        getCommandOutputBackingSource: this.getCommandOutputBackingSource,
       });
     }
 
@@ -4194,6 +4432,7 @@ export class AgentService_v2 {
         },
         maxRetries: MODEL_RETRY_MAX,
         delaysMs: MODEL_RETRY_DELAYS_MS,
+        getCommandOutputBackingSource: this.getCommandOutputBackingSource,
       });
     }
 
@@ -4218,6 +4457,7 @@ export class AgentService_v2 {
         },
         maxRetries: MODEL_RETRY_MAX,
         delaysMs: MODEL_RETRY_DELAYS_MS,
+        getCommandOutputBackingSource: this.getCommandOutputBackingSource,
       });
     }
 
@@ -4330,6 +4570,7 @@ export class AgentService_v2 {
       },
       maxRetries: MODEL_RETRY_MAX,
       delaysMs: MODEL_RETRY_DELAYS_MS,
+      getCommandOutputBackingSource: this.getCommandOutputBackingSource,
     });
   }
 
@@ -4383,6 +4624,10 @@ export class AgentService_v2 {
           `[AgentService_v2] Dropped ${sanitizedStoredMessages.removedCount} invalid stored message(s) before restoring session history (sessionId=${sessionId}).`,
         );
       }
+      expireUnbackedStoredCommandOutputEnvelopes(
+        sanitizedStoredMessages.messages as any[],
+        this.getCommandOutputBackingSource,
+      );
       baseMessages = mapStoredMessagesToChatMessages(
         sanitizedStoredMessages.messages as any[],
       );
@@ -4624,6 +4869,15 @@ export class AgentService_v2 {
     // }
 
     let storedMessages = mapChatMessagesToStoredMessages(persisted) as any[];
+    // A background completion can settle after another run has already
+    // restored the earlier running snapshot. Preserve the more advanced
+    // durable lifecycle before refreshing from the current terminal backing,
+    // so an eventual whole-session save cannot move a command backwards.
+    this.preferDurableExecCommandSettlements(session.id, storedMessages);
+    expireUnbackedStoredCommandOutputEnvelopes(
+      storedMessages,
+      this.getCommandOutputBackingSource,
+    );
     const sanitizedStoredMessages =
       sanitizeStoredMessagesForChatRuntime(storedMessages);
     if (sanitizedStoredMessages.removedCount > 0) {
@@ -4835,7 +5089,9 @@ export class AgentService_v2 {
     cutIndex: number,
     sessionId: string,
   ): BaseMessage[] {
-    const keptMessages = entries.slice(0, cutIndex).map(([, msg]) => msg);
+    const keptMessages = entries
+      .slice(0, cutIndex)
+      .map(([, msg]) => JSON.parse(JSON.stringify(msg)));
     const sanitizedKeptStoredMessages = sanitizeStoredMessagesForChatRuntime(
       keptMessages as any[],
     );
@@ -4844,6 +5100,10 @@ export class AgentService_v2 {
         `[AgentService_v2] Dropped ${sanitizedKeptStoredMessages.removedCount} invalid stored message(s) while preparing branch/rollback history (sessionId=${sessionId}).`,
       );
     }
+    expireUnbackedStoredCommandOutputEnvelopes(
+      sanitizedKeptStoredMessages.messages as any[],
+      this.getCommandOutputBackingSource,
+    );
     const chatMessages = mapStoredMessagesToChatMessages(
       sanitizedKeptStoredMessages.messages as any[],
     );
@@ -4887,6 +5147,24 @@ export class AgentService_v2 {
     return 0;
   }
 
+  private branchCutContainsRunningCommand(
+    entries: Array<[string, any]>,
+    cutIndex: number,
+  ): boolean {
+    return entries.slice(0, cutIndex).some(([, message]) => {
+      const content = message?.data?.content;
+      if (typeof content !== "string") return false;
+      const contract = parseCommandOutputEnvelopeContract(content);
+      if (contract?.executionState !== "running") return false;
+      return (
+        this.getCommandOutputBackingSource(
+          contract.terminalId,
+          contract.historyCommandMatchId,
+        )?.executionState === "running"
+      );
+    });
+  }
+
   branchFromMessage(
     sourceSessionId: string,
     messageId: string,
@@ -4914,6 +5192,21 @@ export class AgentService_v2 {
           );
     if (branchCutIndex === null) {
       return { ok: false, reason: "Branch target message not found." };
+    }
+
+    const uiValidation = this.uiHistoryService.validateBranchFromMessage(
+      sourceSessionId,
+      messageId,
+    );
+    if (!uiValidation.ok) {
+      return uiValidation;
+    }
+    if (this.branchCutContainsRunningCommand(entries, branchCutIndex)) {
+      return {
+        ok: false,
+        reason:
+          "Cannot branch through a running command. Wait for it to settle, then try again.",
+      };
     }
 
     const branchTitle = this.buildBranchTitle(

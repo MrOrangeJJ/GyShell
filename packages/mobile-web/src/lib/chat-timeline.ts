@@ -1,3 +1,4 @@
+import { parseCommandOutputContractV1 } from '@gyshell/shared'
 import type { ChatMessage } from '../types'
 import { normalizeDisplayText, trimOuterBlankLines } from '../session-store'
 
@@ -5,6 +6,7 @@ export interface UserTimelineItem {
   kind: 'user'
   id: string
   message: ChatMessage
+  branchBlockedByUnsettledCommand: boolean
 }
 
 export interface AgentTimelineItem {
@@ -53,9 +55,20 @@ function hasMessagePayload(message: ChatMessage): boolean {
   return false
 }
 
+function isUnsettledCommand(message: ChatMessage): boolean {
+  if (message.type !== 'command') return false
+  const commandOutput = parseCommandOutputContractV1(
+    message.metadata?.commandOutput,
+  )
+  return (
+    message.streaming === true || commandOutput?.executionState === 'running'
+  )
+}
+
 export function buildChatTimeline(messages: ChatMessage[]): ChatTimelineItem[] {
   const timeline: ChatTimelineItem[] = []
   let currentAgent: AgentTimelineItem | null = null
+  let hasUnsettledCommandInPrefix = false
 
   for (const message of messages) {
     if (!message || message.type === 'tokens_count') continue
@@ -75,10 +88,13 @@ export function buildChatTimeline(messages: ChatMessage[]): ChatTimelineItem[] {
         kind: 'user',
         id: message.id,
         message,
+        branchBlockedByUnsettledCommand: hasUnsettledCommandInPrefix,
       })
       currentAgent = null
       continue
     }
+
+    hasUnsettledCommandInPrefix ||= isUnsettledCommand(message)
 
     if (!currentAgent) {
       currentAgent = {

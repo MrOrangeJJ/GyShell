@@ -1,5 +1,15 @@
+import {
+  extractCommandOutputDisplayText,
+  parseCommandOutputContractV1,
+} from "@gyshell/shared";
 import type { ChatMessage, UIChatSession } from "../../types/ui-chat";
+import {
+  expireUnbackedCommandOutputContract,
+  rewriteCommandOutputEnvelopeContract,
+} from "../AgentHelper/tools/command_output_contract";
 import type { UISessionSummaryRecord } from "./historyTypes";
+
+const SESSION_CLOSED_COMMAND_NOTE = "[Session closed before command finished]";
 
 const normalizeBoundaryBackendId = (value: unknown): string => {
   return typeof value === "string" && value.trim().length > 0
@@ -43,20 +53,61 @@ export function restoreLegacyAutoTitleIfTruncated(
 
 export function sanitizeUiSession(
   session: UIChatSession,
-  options?: { restoreLegacyAutoTitle?: boolean },
+  options?: {
+    restoreLegacyAutoTitle?: boolean;
+    recoverInterruptedCommands?: boolean;
+  },
 ): UIChatSession {
   const sanitized = cloneUiSession(session);
   sanitized.messages = sanitized.messages.filter(
     (message) => message.type !== "ask",
   );
   sanitized.messages.forEach((message) => {
-    if (message.type !== "command" || !message.streaming) {
-      return;
+    const rawContract = message.metadata?.commandOutput as unknown;
+    const previousContract = parseCommandOutputContractV1(rawContract);
+    if (rawContract !== undefined) {
+      const metadata = message.metadata || (message.metadata = {});
+      if (previousContract) {
+        metadata.commandOutput = previousContract;
+      } else {
+        delete metadata.commandOutput;
+      }
     }
-    message.streaming = false;
-    if (message.metadata && message.metadata.exitCode === undefined) {
-      message.metadata.exitCode = -1;
-      message.metadata.output = `${message.metadata.output || ""}\n[Session closed before command finished]`;
+
+    if (options?.recoverInterruptedCommands !== false) {
+      const lostTypedRunningCommand =
+        previousContract?.executionState === "running";
+      const lostLegacyRunningCommand =
+        message.type === "command" && message.streaming === true;
+      if (!previousContract && !lostLegacyRunningCommand) {
+        return;
+      }
+      const metadata = message.metadata || (message.metadata = {});
+
+      if (previousContract) {
+        const recoveredContract =
+          expireUnbackedCommandOutputContract(previousContract);
+        if (recoveredContract !== previousContract) {
+          metadata.commandOutput = recoveredContract;
+          metadata.output = rewriteCommandOutputEnvelopeContract(
+            metadata.output || "",
+            recoveredContract,
+          );
+        }
+      }
+
+      if (lostTypedRunningCommand || lostLegacyRunningCommand) {
+        message.streaming = false;
+        if (message.type === "command" && metadata.exitCode === undefined) {
+          metadata.exitCode = -1;
+        }
+        if (message.type === "command") {
+          const output = metadata.output || "";
+          if (!output.endsWith(SESSION_CLOSED_COMMAND_NOTE)) {
+            metadata.output = `${output}${output ? "\n" : ""}${SESSION_CLOSED_COMMAND_NOTE}`;
+          }
+        }
+      }
     }
   });
   sanitized.messages = normalizeCompactionBoundaryMarkers(sanitized.messages);
@@ -151,8 +202,16 @@ export function getLastVisiblePreview(messages: ChatMessage[]): string {
             .map((item) => item.fileName || item.attachmentId || "image")
             .join(", ")
         : "";
+    const rawOutput = message.metadata?.output || "";
+    const displayOutput = extractCommandOutputDisplayText(rawOutput);
+    const hasDecodedCommandEnvelope = displayOutput !== rawOutput;
+    const hasCommandOutputContract =
+      parseCommandOutputContractV1(message.metadata?.commandOutput) !==
+      undefined;
     const preview = String(
-      message.content || message.metadata?.output || imagePreview || "",
+      hasCommandOutputContract || hasDecodedCommandEnvelope
+        ? displayOutput || message.content || imagePreview || ""
+        : message.content || displayOutput || imagePreview || "",
     );
     if (preview) {
       return preview;

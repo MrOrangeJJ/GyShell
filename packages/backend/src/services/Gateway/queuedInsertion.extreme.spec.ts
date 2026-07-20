@@ -9,6 +9,7 @@ import {
 import {
   buildExecCommandNowaitCompletedInsertion,
   buildFileTransferFinishedInsertion,
+  EXEC_COMMAND_NOTIFICATION_MAX_UTF8_BYTES,
 } from "../AgentHelper/queuedInsertions";
 import type { StartTaskInput, StartTaskMode } from "./types";
 import type {
@@ -648,6 +649,120 @@ const run = async (): Promise<void> => {
         insertion.kind,
         "exec_command_nowait_outcome_unknown",
         "the queue kind should preserve the unknown-outcome boundary",
+      );
+      assertEqual(
+        Object.prototype.hasOwnProperty.call(payload, "exit_code"),
+        false,
+        "an unknown outcome must not expose a diagnostic sentinel as an authoritative exit code",
+      );
+    },
+  );
+
+  await runCase(
+    "nowait notifications bound adversarial Unicode and JSON expansion",
+    () => {
+      const huge = "<\u0000😀".repeat(30_000);
+      const insertion = buildExecCommandNowaitCompletedInsertion({
+        terminalId: huge,
+        terminalName: huge,
+        historyCommandMatchId: huge,
+        command: huge,
+        exitCode: 0,
+      });
+      const payload = JSON.parse(
+        insertion.content.slice(AGENT_NOTIFICATION_TAG.length),
+      );
+
+      assertEqual(
+        Buffer.byteLength(insertion.content, "utf8") <=
+          EXEC_COMMAND_NOTIFICATION_MAX_UTF8_BYTES,
+        true,
+        "the entire queued notification must remain inside its hard byte budget",
+      );
+      assertEqual(
+        payload.command_truncated,
+        true,
+        "the payload must disclose a shortened command preview",
+      );
+      assertEqual(
+        payload.command_utf8_bytes,
+        Buffer.byteLength(huge, "utf8"),
+        "the original command size must remain machine-readable",
+      );
+      assertEqual(
+        payload.identifiers_truncated,
+        true,
+        "identifier JSON expansion must be bounded and disclosed",
+      );
+      assertEqual(
+        payload.terminal_name_truncated,
+        true,
+        "terminal-name JSON expansion must be bounded and disclosed",
+      );
+    },
+  );
+
+  await runCase(
+    "aborted nowait notifications never masquerade as completion",
+    () => {
+      const insertion = buildExecCommandNowaitCompletedInsertion({
+        terminalId: "terminal-aborted",
+        terminalName: "Aborted",
+        historyCommandMatchId: "history-aborted",
+        command: "dangerous-side-effect",
+        exitCode: 0,
+        executionState: "aborted",
+      });
+      const payload = JSON.parse(
+        insertion.content.slice(AGENT_NOTIFICATION_TAG.length),
+      );
+
+      assertEqual(
+        insertion.kind,
+        "exec_command_nowait_aborted",
+        "the queue kind must retain the aborted state",
+      );
+      assertEqual(
+        payload.notification_type,
+        "exec_command_nowait_aborted",
+        "the Agent-facing payload must explicitly say aborted",
+      );
+      assertEqual(
+        Object.prototype.hasOwnProperty.call(payload, "exit_code"),
+        false,
+        "an aborted lifecycle must not expose any exit code as authoritative",
+      );
+      assertEqual(
+        payload.instruction.includes("do not assume success or automatically replay"),
+        true,
+        "aborted instructions must forbid success inference and unsafe replay",
+      );
+    },
+  );
+
+  await runCase(
+    "indeterminate shell status uses the same unknown nowait notification",
+    () => {
+      const insertion = buildExecCommandNowaitCompletedInsertion({
+        terminalId: "terminal-win",
+        terminalName: "WIN",
+        historyCommandMatchId: "history-ambiguous",
+        command: "cmd /c exit 7; Write-Error ambiguous",
+        executionState: "outcome_unknown",
+      });
+      const payload = JSON.parse(
+        insertion.content.slice(AGENT_NOTIFICATION_TAG.length),
+      );
+
+      assertEqual(
+        payload.notification_type,
+        "exec_command_nowait_outcome_unknown",
+        "PowerShell status ambiguity must not be announced as a completed known outcome",
+      );
+      assertEqual(
+        payload.instruction.includes("Do not assume success"),
+        true,
+        "the queued Agent instruction must preserve safe unknown-outcome behavior",
       );
     },
   );

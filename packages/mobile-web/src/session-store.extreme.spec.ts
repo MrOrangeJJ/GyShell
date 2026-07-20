@@ -5,6 +5,7 @@ import {
   autoTitle,
   createUnloadedRenamedSession,
   createSessionState,
+  normalizeSessionPreview,
   normalizeDisplayText,
   previewFromSession,
   UiUpdateBootstrapBuffer,
@@ -87,6 +88,59 @@ runCase(
     );
   },
 );
+
+runCase("mobile session preview unwraps typed command output", () => {
+  const session = createSessionState("typed-command-preview");
+  const contract = {
+    contractVersion: 1 as const,
+    terminalId: "terminal-1",
+    historyCommandMatchId: "command-1",
+    executionState: "finished" as const,
+    exitCode: 0,
+    capture: {
+      state: "complete" as const,
+      observedUtf8Bytes: 11,
+      retainedUtf8Bytes: 11,
+      availableLineCount: 1,
+      revision: 1,
+      terminalControlsObserved: false,
+    },
+    presentation: {
+      state: "full" as const,
+      returnedUtf8Bytes: 11,
+      hasMoreCapturedOutput: false,
+    },
+  };
+  session.messages.push({
+    id: "typed-command-message",
+    role: "assistant",
+    type: "command",
+    content: "printf preview",
+    timestamp: 1,
+    metadata: {
+      output: [
+        "<gyshell_command_result>",
+        JSON.stringify(contract),
+        "</gyshell_command_result>",
+        "<terminal_content>",
+        "human text",
+        "</terminal_content>",
+      ].join("\n"),
+    },
+  });
+
+  const preview = previewFromSession(session);
+  assertEqual(preview, "human text", "session rows should show terminal text");
+  assertCondition(
+    !preview.includes("gyshell_command_result"),
+    "session rows must decode the envelope even when duplicate UI metadata is absent",
+  );
+  assertEqual(
+    normalizeSessionPreview(session.messages[0]?.metadata?.output || ""),
+    "human text",
+    "unloaded remote summaries should use the same envelope decoding as loaded sessions",
+  );
+});
 
 runCase(
   "mobile supported mention normalization still renders compact display names",
@@ -194,6 +248,175 @@ runCase("mobile SESSION_RENAMED updates the session title", () => {
     session.title,
     "Renamed Chat",
     "mobile clients should preserve a rename through the first prompt",
+  );
+});
+
+runCase("mobile loaded-session updates have one authoritative busy transition", () => {
+  const session = createSessionState("mobile-loaded-busy");
+  applyUiUpdate(session, {
+    type: "ADD_MESSAGE",
+    sessionId: session.id,
+    message: {
+      id: "assistant-activity",
+      role: "assistant",
+      type: "reasoning",
+      content: "working",
+      timestamp: 1,
+      streaming: true,
+    },
+  });
+  assertEqual(
+    session.isBusy,
+    true,
+    "assistant activity should mark a loaded session busy without a controller pre-pass",
+  );
+
+  applyUiUpdate(session, { type: "SESSION_READY", sessionId: session.id });
+  applyUiUpdate(session, {
+    type: "ADD_MESSAGE",
+    sessionId: session.id,
+    message: {
+      id: "token-count",
+      role: "assistant",
+      type: "tokens_count",
+      content: "",
+      timestamp: 2,
+    },
+  });
+  assertEqual(
+    session.isBusy,
+    false,
+    "trailing token accounting must not reopen a ready session",
+  );
+});
+
+runCase("mobile late nowait completion does not reopen a ready session", () => {
+  const session = createSessionState("mobile-nowait-ready");
+  const finishedContract = {
+    contractVersion: 1 as const,
+    terminalId: "terminal-1",
+    historyCommandMatchId: "history-1",
+    executionState: "finished" as const,
+    exitCode: 0,
+    capture: {
+      state: "complete" as const,
+      observedUtf8Bytes: 0,
+      retainedUtf8Bytes: 0,
+      availableLineCount: 0,
+      revision: 1,
+      terminalControlsObserved: false,
+    },
+    presentation: {
+      state: "none" as const,
+      returnedUtf8Bytes: 0,
+      hasMoreCapturedOutput: false,
+    },
+  };
+  const runningContract = {
+    ...finishedContract,
+    executionState: "running" as const,
+    exitCode: null,
+    capture: {
+      ...finishedContract.capture,
+      state: "in_progress" as const,
+    },
+    presentation: {
+      ...finishedContract.presentation,
+      pollCursor: "mobile-running-poll",
+    },
+  };
+  session.messages.push({
+    id: "nowait-command",
+    role: "assistant",
+    type: "command",
+    content: "true",
+    timestamp: 1,
+    streaming: false,
+  });
+  applyUiUpdate(session, {
+    type: "SESSION_READY",
+    sessionId: session.id,
+  });
+  applyUiUpdate(session, {
+    type: "UPDATE_MESSAGE",
+    sessionId: session.id,
+    messageId: "nowait-command",
+    patch: {
+      streaming: false,
+      metadata: { output: "", commandOutput: runningContract },
+    },
+  });
+  assertEqual(
+    session.isBusy,
+    false,
+    "a late running handoff after SESSION_READY is background lifecycle state, not a new agent run",
+  );
+  applyUiUpdate(session, {
+    type: "UPDATE_MESSAGE",
+    sessionId: session.id,
+    messageId: "nowait-command",
+    patch: {
+      streaming: false,
+      metadata: { output: "", commandOutput: finishedContract },
+    },
+  });
+
+  assertEqual(
+    session.isBusy,
+    false,
+    "a settled background command update after SESSION_READY must stay idle",
+  );
+  assertEqual(
+    session.messages[0]?.metadata?.commandOutput?.executionState,
+    "finished",
+    "the late completion must still update the visible command contract",
+  );
+
+  const unloaded = createSessionState("mobile-nowait-unloaded");
+  const unloadedMeta = {
+    id: unloaded.id,
+    title: unloaded.title,
+    updatedAt: 1,
+    messagesCount: 1,
+    loaded: false,
+  };
+  applyUiUpdateToUnloadedSession(
+    unloaded,
+    unloadedMeta,
+    {
+      type: "UPDATE_MESSAGE",
+      sessionId: unloaded.id,
+      messageId: "nowait-command",
+      patch: {
+        streaming: false,
+        metadata: { output: "", commandOutput: runningContract },
+      },
+    },
+    2,
+  );
+  assertEqual(
+    unloaded.isBusy,
+    false,
+    "an unloaded ready session must ignore a late running handoff for admission state",
+  );
+  applyUiUpdateToUnloadedSession(
+    unloaded,
+    unloadedMeta,
+    {
+      type: "UPDATE_MESSAGE",
+      sessionId: unloaded.id,
+      messageId: "nowait-command",
+      patch: {
+        streaming: false,
+        metadata: { output: "", commandOutput: finishedContract },
+      },
+    },
+    3,
+  );
+  assertEqual(
+    unloaded.isBusy,
+    false,
+    "an unloaded ready session must also ignore background completion for busy state",
   );
 });
 

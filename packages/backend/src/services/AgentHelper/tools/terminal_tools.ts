@@ -1,17 +1,65 @@
 import { z } from 'zod'
 import type { ToolExecutionContext } from '../types'
+import type { CommandResult } from '../../../types'
 import { buildExecCommandNowaitCompletedInsertion } from '../queuedInsertions'
 import {
   formatTerminalStatusHeader,
   formatTerminalUnavailableForTool,
   resolveTerminalForTool
 } from './terminal_runtime_guard'
+import {
+  COMMAND_OUTPUT_IDENTIFIER_MAX_UTF8_BYTES,
+  type CommandCaptureMetadata,
+  type CommandExecutionState,
+} from '@gyshell/shared'
+import {
+  DEFAULT_LEGACY_LINE_LIMIT,
+  MAX_LEGACY_LINE_LIMIT,
+  MAX_PAGE_UTF8_BYTES,
+  formatCommandOutputPage,
+  formatInitialCommandOutput,
+  type CommandOutputSource,
+} from './command_output_contract'
 
 // --- Schemas ---
 
+const boundedTerminalReferenceSchema = z
+  .string()
+  .min(1)
+  .max(COMMAND_OUTPUT_IDENTIFIER_MAX_UTF8_BYTES)
+  .refine(
+    (value) =>
+      Buffer.byteLength(value, 'utf8') <=
+      COMMAND_OUTPUT_IDENTIFIER_MAX_UTF8_BYTES,
+    {
+      message: `terminal reference cannot exceed ${COMMAND_OUTPUT_IDENTIFIER_MAX_UTF8_BYTES} UTF-8 bytes.`,
+    }
+  )
+
+const boundedCommandHistoryIdSchema = z
+  .string()
+  .min(1)
+  .max(COMMAND_OUTPUT_IDENTIFIER_MAX_UTF8_BYTES)
+  .refine(
+    (value) =>
+      Buffer.byteLength(value, 'utf8') <=
+      COMMAND_OUTPUT_IDENTIFIER_MAX_UTF8_BYTES,
+    {
+      message: `history_command_match_id cannot exceed ${COMMAND_OUTPUT_IDENTIFIER_MAX_UTF8_BYTES} UTF-8 bytes.`,
+    }
+  )
+
 export const execCommandSchema = z.object({
-  tabIdOrName: z.string().describe('The ID or Name of the terminal tab'),
-  command: z.string().describe('The shell command to execute'),
+  tabIdOrName: boundedTerminalReferenceSchema.describe('The ID or Name of the terminal tab'),
+  command: z
+    .string()
+    .min(1, 'command cannot be empty.')
+    .max(256 * 1024, 'command is too large for one shell submission.')
+    .refine((command) => !/[\r\n\x00]/.test(command), {
+      message:
+        'command must be one physical shell submission and cannot contain CR, LF, or NUL. For a multi-line script, use write_file in the terminal temporary directory, then execute that file with a one-line exec_command.',
+    })
+    .describe('One physical shell command to execute'),
   waitMode: z
     .enum(['wait', 'nowait'])
     .optional()
@@ -20,20 +68,48 @@ export const execCommandSchema = z.object({
 })
 
 export const readTerminalTabSchema = z.object({
-  tabIdOrName: z.string().describe('The ID or Name of the terminal tab'),
+  tabIdOrName: boundedTerminalReferenceSchema.describe('The ID or Name of the terminal tab'),
   lines: z.number().optional().default(100).describe('Number of lines to read')
 })
 
-export const readCommandOutputSchema = z.object({
-  tabIdOrName: z.string().describe('The ID or Name of the terminal tab'),
-  history_command_match_id: z.string().describe('The unique command ID to read output from'),
-  offset: z.number().optional().describe('The line number to start reading from (0-based).'),
-  limit: z.number().optional().describe('The number of lines to read (defaults to 2000).')
-})
+export const readCommandOutputSchema = z
+  .object({
+    tabIdOrName: boundedTerminalReferenceSchema.describe('The ID or Name of the terminal tab'),
+    history_command_match_id: boundedCommandHistoryIdSchema.describe('The unique command ID to read output from'),
+    cursor: z
+      .string()
+      .max(4096)
+      .optional()
+      .describe('Opaque cursor returned by a previous command output result. Pass it back unchanged.'),
+    offset: z
+      .number()
+      .int()
+      .nonnegative()
+      .max(10_000_000)
+      .optional()
+      .describe('Legacy line offset (0-based). Do not combine with cursor.'),
+    limit: z
+      .number()
+      .int()
+      .min(1)
+      .max(MAX_LEGACY_LINE_LIMIT)
+      .optional()
+      .describe(`Legacy line limit (defaults to ${DEFAULT_LEGACY_LINE_LIMIT}).`),
+    maxBytes: z
+      .number()
+      .int()
+      .min(4)
+      .max(MAX_PAGE_UTF8_BYTES)
+      .optional()
+      .describe('Maximum UTF-8 content bytes for this page.'),
+  })
+  .refine((value) => value.cursor === undefined || value.offset === undefined, {
+    message: 'cursor and offset are mutually exclusive.',
+  })
 
 export const writeStdinSchema = z
   .object({
-    tabIdOrName: z.string().describe('The ID or Name of the terminal tab'),
+    tabIdOrName: boundedTerminalReferenceSchema.describe('The ID or Name of the terminal tab'),
     sequence: z
       .array(z.string())
       .optional()
@@ -44,7 +120,7 @@ export const writeStdinSchema = z
   })
 
 export const reconnectTerminalTabSchema = z.object({
-  tabIdOrName: z.string().describe('The ID or Name of the disconnected SSH terminal tab to reconnect')
+  tabIdOrName: boundedTerminalReferenceSchema.describe('The ID or Name of the disconnected SSH terminal tab to reconnect')
 })
 
 // --- Constants ---
@@ -63,15 +139,6 @@ export const C0_CHAR_BY_NAME: Record<(typeof C0_NAMES)[number], string> = {
   CAN: '\x18', EM: '\x19', SUB: '\x1a', ESC: '\x1b', FS: '\x1c', GS: '\x1d', RS: '\x1e', US: '\x1f', DEL: '\x7f'
 }
 
-const COMMAND_OUTPUT_MAX_LINES = 200
-const COMMAND_OUTPUT_HEAD_LINES = 60
-const COMMAND_OUTPUT_TAIL_LINES = 60
-const COMMAND_OUTPUT_MAX_LINE_LENGTH = 2000
-const COMMAND_OUTPUT_MAX_BYTES = 50 * 1024
-
-const COMMAND_READ_DEFAULT_LIMIT = 2000
-const COMMAND_READ_MAX_LINE_LENGTH = 2000
-const COMMAND_READ_MAX_BYTES = 50 * 1024
 const RECONNECT_READY_TIMEOUT_MS = 45 * 1000
 const RECONNECT_READY_POLL_MS = 500
 
@@ -84,15 +151,145 @@ type RunCommandOptions = {
   onRuntimeBoundary?: () => void
 }
 
+const fallbackCaptureMetadata = (
+  output: string,
+  state: CommandCaptureMetadata['state'] = 'unknown'
+): CommandCaptureMetadata => {
+  const bytes = Buffer.byteLength(output, 'utf8')
+  return {
+    state,
+    ...(state === 'unknown' ? { reason: 'tracking_unavailable' as const } : {}),
+    observedUtf8Bytes: bytes,
+    retainedUtf8Bytes: bytes,
+    availableLineCount: output
+      ? output.split('\n').length - (output.endsWith('\n') ? 1 : 0)
+      : 0,
+    revision: 0,
+    terminalControlsObserved: false,
+  }
+}
+
+const formatClosedTerminalCommandHistoryHeader = (
+  terminalId: string
+): string =>
+  [
+    `Terminal: ${terminalId} (closed)`,
+    'terminal_status:',
+    '- runtime_state: closed',
+    '- shell_input_state: unavailable',
+    '- tab_still_exists: false',
+    '- reconnectable: false',
+    '',
+    'The terminal tab is closed. This result comes from bounded, read-only command history retained by the current GyShell process.',
+  ].join('\n')
+
+const formatRunningCommandConflict = (params: {
+  error: string
+  terminalId: string
+  activeTaskId?: string
+}): string => {
+  const boundedError = String(params.error || '').slice(0, 4096)
+  const inspection = params.activeTaskId
+    ? `Use read_command_output with tabIdOrName=${JSON.stringify(params.terminalId)} and history_command_match_id=${JSON.stringify(params.activeTaskId)} to inspect its bounded transcript.`
+    : `Use read_terminal_tab with tabIdOrName=${JSON.stringify(params.terminalId)} to inspect the current rendered screen.`
+  return [
+    `Error: ${boundedError}`,
+    '',
+    'No new command was submitted. GyShell intentionally omitted the terminal screen from this error so untrusted or large display content cannot masquerade as command output.',
+    inspection,
+    'Use write_stdin only if you intend to interact with or interrupt the active command.',
+  ].join('\n')
+}
+
+function resolveCommandOutputSource(params: {
+  context: ToolExecutionContext
+  terminalId: string
+  historyCommandMatchId: string
+  fallbackOutput?: string
+  fallbackExitCode?: number
+  fallbackExecutionState?: CommandExecutionState
+  fallbackCapture?: CommandCaptureMetadata
+}): CommandOutputSource {
+  const getSnapshot = (params.context.terminalService as any)
+    .getCommandOutputSnapshot
+  const snapshot =
+    typeof getSnapshot === 'function'
+      ? getSnapshot.call(
+          params.context.terminalService,
+          params.terminalId,
+          params.historyCommandMatchId
+        )
+      : undefined
+  if (snapshot) {
+    return {
+      terminalId: params.terminalId,
+      historyCommandMatchId: params.historyCommandMatchId,
+      executionState: snapshot.executionState,
+      ...(snapshot.exitCode !== undefined ? { exitCode: snapshot.exitCode } : {}),
+      output: snapshot.output || '',
+      capture: { ...snapshot.capture },
+    }
+  }
+  const output = params.fallbackOutput || ''
+  return {
+    terminalId: params.terminalId,
+    historyCommandMatchId: params.historyCommandMatchId,
+    executionState: params.fallbackExecutionState || 'outcome_unknown',
+    ...(params.fallbackExitCode !== undefined
+      ? { exitCode: params.fallbackExitCode }
+      : {}),
+    output,
+    capture:
+      params.fallbackCapture || fallbackCaptureMetadata(output, 'unknown'),
+  }
+}
+
 function enqueueNowaitCompletionNotification(params: {
   context: ToolExecutionContext
   terminalId: string
   terminalName: string
   command: string
   historyCommandMatchId: string
+  output?: string
   exitCode?: number
+  executionState?: CommandExecutionState
+  capture?: CommandCaptureMetadata
   runtimeBoundary?: boolean
+  terminalStatus?: string
 }): void {
+  const source = resolveCommandOutputSource({
+    context: params.context,
+    terminalId: params.terminalId,
+    historyCommandMatchId: params.historyCommandMatchId,
+    fallbackOutput: params.output,
+    fallbackExitCode: params.exitCode,
+    fallbackExecutionState:
+      params.executionState ||
+      (params.runtimeBoundary ? 'outcome_unknown' : 'finished'),
+    fallbackCapture: params.capture,
+  })
+  const formatted = formatInitialCommandOutput(source, {
+    terminalStatus: params.terminalStatus,
+  })
+  if (formatted.contract.executionState !== 'running') {
+    params.context.replaceExecCommandToolResult?.({
+      content: formatted.text,
+      terminalId: params.terminalId,
+      historyCommandMatchId: params.historyCommandMatchId,
+    })
+  }
+  params.context.sendEvent(params.context.sessionId, {
+    messageId: params.context.messageId,
+    type: 'command_finished',
+    command: params.command,
+    commandId: params.context.messageId,
+    tabName: params.terminalName,
+    exitCode: params.exitCode,
+    outputDelta: formatted.text,
+    commandOutput: formatted.contract,
+    outputMode: 'replace',
+    isNowait: true,
+  } as any)
   params.context.completeBackgroundExecCommand?.({
     terminalId: params.terminalId,
     terminalName: params.terminalName,
@@ -108,7 +305,12 @@ function enqueueNowaitCompletionNotification(params: {
       historyCommandMatchId: params.historyCommandMatchId,
       command: params.command,
       exitCode: params.exitCode,
-      runtimeBoundary: params.runtimeBoundary
+      runtimeBoundary: params.runtimeBoundary,
+      executionState: source.executionState,
+      terminalAvailable:
+        params.context.terminalService.getTerminalRuntimeSnapshot(
+          params.terminalId
+        ) != null,
     })
   )
 }
@@ -118,7 +320,11 @@ export async function runCommand(
   context: ToolExecutionContext,
   options?: RunCommandOptions
 ): Promise<string> {
-  const { tabIdOrName, command } = args
+  const validation = execCommandSchema.safeParse(args)
+  if (!validation.success) {
+    return `Parameter validation error for exec_command: ${validation.error.message}`
+  }
+  const { tabIdOrName, command } = validation.data
   const { terminalService, sessionId, messageId } = context
   
   abortIfNeeded(context.signal)
@@ -168,6 +374,23 @@ export async function runCommand(
   })
 
   let shouldNotifyAsyncCompletion = false
+  let initialResultPublished = false
+  let completionBeforeInitialResult: CommandResult | undefined
+  const publishAsyncCompletion = (finished: CommandResult): void => {
+    enqueueNowaitCompletionNotification({
+      context,
+      terminalId: bestMatch.id,
+      terminalName: bestMatch.title || bestMatch.id,
+      command,
+      historyCommandMatchId: finished.history_command_match_id,
+      output: finished.stdoutDelta,
+      exitCode: finished.exitCode,
+      executionState: finished.executionState,
+      capture: finished.capture,
+      runtimeBoundary: finished.runtimeBoundary,
+      terminalStatus: finished.terminalStatus,
+    })
+  }
   try {
     // Subscribe to skip wait feedback for this message
     let userSkipped = false
@@ -187,75 +410,68 @@ export async function runCommand(
           userSkipped || options?.shouldSkipWait?.() === true
         if (shouldSkip) {
           shouldNotifyAsyncCompletion = true
-          options?.onContinuesInBackground?.()
         }
         return shouldSkip
       },
       onFinished: (finished) => {
         if (!shouldNotifyAsyncCompletion) return
-        enqueueNowaitCompletionNotification({
-          context,
-          terminalId: bestMatch.id,
-          terminalName: bestMatch.title || bestMatch.id,
-          command,
-          historyCommandMatchId: finished.history_command_match_id,
-          exitCode: finished.exitCode,
-          runtimeBoundary: finished.runtimeBoundary
-        })
+        if (!initialResultPublished) {
+          completionBeforeInitialResult = finished
+          return
+        }
+        publishAsyncCompletion(finished)
       }
     })
     const historyCommandMatchId = result.history_command_match_id
-    const truncatedOutput = truncateCommandOutput(result.stdoutDelta || '', historyCommandMatchId, bestMatch.id)
-    
-    let finalResult = ''
-    if (result.exitCode === -3 || result.stdoutDelta === 'USER_SKIPPED_WAIT') {
+    let executionState: CommandExecutionState =
+      result.executionState ||
+      (result.runtimeBoundary ? 'outcome_unknown' : 'finished')
+    let fallbackOutput = result.stdoutDelta || ''
+    let backgroundRequested = false
+    if (result.exitCode === -3) {
       shouldNotifyAsyncCompletion = true
       options?.onContinuesInBackground?.()
-      context.registerBackgroundExecCommand?.({
-        terminalId: bestMatch.id,
-        terminalName: bestMatch.title || bestMatch.id,
-        historyCommandMatchId,
-        command
-      })
-      const autoSwitchReason = options?.getSkipWaitReason?.()?.trim()
-      finalResult = autoSwitchReason
-        ? `This command has been switched to nowait mode because ${autoSwitchReason}. The command is currently running in the background. Please DO NOT wait for it to finish unless specifically asked. You can use read_command_output to check its progress if needed. history_command_match_id=${historyCommandMatchId}, terminalId=${bestMatch.id}`
-        : `The command has been switched to asynchronous mode by user choice. It is currently running in the background. Please DO NOT wait for it to finish unless specifically asked. You can use read_command_output to check its progress if needed. history_command_match_id=${historyCommandMatchId}, terminalId=${bestMatch.id}`
-      
-      // Update the finished event to mark it as isNowait: true so the UI banner switches to Async style
-      context.sendEvent(sessionId, { 
-        messageId,
-        type: 'command_finished', 
-        command, 
-        commandId: messageId,
-        tabName: bestMatch.title || bestMatch.id,
-        exitCode: result.exitCode,
-        outputDelta: finalResult,
-        isNowait: true // Force UI to switch to Async style
-      })
-      return finalResult
+      backgroundRequested = true
+      executionState = 'running'
+      fallbackOutput = ''
     } else if (result.runtimeBoundary) {
       options?.onRuntimeBoundary?.()
-      finalResult = `The command did not reach a definitive tracked completion. It may still be running, or the terminal runtime may have exited; the command outcome is unknown and must not be treated as successful or replayed automatically. The following output was retained (history_command_match_id=${historyCommandMatchId}):
-<terminal_content>
-${truncatedOutput}
-</terminal_content>`
-    } else if (result.exitCode === -1 && result.stdoutDelta?.includes('timed out')) {
+      executionState = 'outcome_unknown'
+    } else if (result.executionState === 'running') {
       shouldNotifyAsyncCompletion = true
       options?.onContinuesInBackground?.()
+      backgroundRequested = true
+      executionState = 'running'
+      fallbackOutput = ''
+    }
+
+    const source = resolveCommandOutputSource({
+      context,
+      terminalId: bestMatch.id,
+      historyCommandMatchId,
+      fallbackOutput,
+      fallbackExitCode: result.exitCode,
+      fallbackExecutionState: executionState,
+      fallbackCapture: result.capture,
+    })
+    if (backgroundRequested && source.executionState === 'running') {
       context.registerBackgroundExecCommand?.({
         terminalId: bestMatch.id,
         terminalName: bestMatch.title || bestMatch.id,
         historyCommandMatchId,
         command
       })
-      finalResult = `The command has been running for over 120s and has been switched to nowait mode (running in the background). You can use read_command_output to check its progress. history_command_match_id=${historyCommandMatchId}, terminalId=${bestMatch.id}`
-    } else {
-      finalResult = `The command has finished executing. The following is the output (history_command_match_id=${historyCommandMatchId}):
-<terminal_content>
-${truncatedOutput}
-</terminal_content>`
     }
+    const formatted = formatInitialCommandOutput(source, {
+      terminalStatus: result.terminalStatus,
+    })
+    const finalResult = formatted.text
+
+    context.replaceExecCommandToolResult?.({
+      content: finalResult,
+      terminalId: bestMatch.id,
+      historyCommandMatchId,
+    })
 
     context.sendEvent(sessionId, {
       messageId,
@@ -264,8 +480,20 @@ ${truncatedOutput}
       commandId: messageId,
       tabName: bestMatch.title || bestMatch.id,
       exitCode: result.exitCode,
-      outputDelta: finalResult
+      outputDelta: finalResult,
+      commandOutput: formatted.contract,
+      outputMode: 'replace',
+      ...(formatted.contract.executionState === 'running'
+        ? { isNowait: true }
+        : {}),
     })
+    initialResultPublished = true
+    if (
+      completionBeforeInitialResult &&
+      formatted.contract.executionState === 'running'
+    ) {
+      publishAsyncCompletion(completionBeforeInitialResult)
+    }
     return finalResult
   } catch (error) {
     if (isAbortError(error)) {
@@ -292,7 +520,44 @@ ${truncatedOutput}
             historyCommandMatchId: continuingCommandId,
             command
           })
-        } else if (task?.status === 'finished') {
+
+          // The foreground ToolMessage is being cancelled, but the physical
+          // command remains live. Publish a durable typed replacement before
+          // rethrowing AbortError so UI history and restart recovery retain
+          // that distinction. Keep initialResultPublished false until after
+          // sendEvent: a re-entrant completion is then queued and cannot race
+          // ahead of this running snapshot.
+          const source = resolveCommandOutputSource({
+            context,
+            terminalId: bestMatch.id,
+            historyCommandMatchId: continuingCommandId,
+            fallbackExecutionState: 'running',
+            fallbackCapture: fallbackCaptureMetadata('', 'in_progress'),
+          })
+          const formatted = formatInitialCommandOutput(source)
+          context.replaceExecCommandToolResult?.({
+            content: formatted.text,
+            terminalId: bestMatch.id,
+            historyCommandMatchId: continuingCommandId,
+          })
+          context.sendEvent(sessionId, {
+            messageId,
+            type: 'command_finished',
+            command,
+            commandId: messageId,
+            tabName: bestMatch.title || bestMatch.id,
+            exitCode: -3,
+            outputDelta: formatted.text,
+            commandOutput: formatted.contract,
+            outputMode: 'replace',
+            isNowait: true,
+          } as any)
+          initialResultPublished = true
+          if (completionBeforeInitialResult) {
+            publishAsyncCompletion(completionBeforeInitialResult)
+            completionBeforeInitialResult = undefined
+          }
+        } else if (task && task.status !== 'running') {
           enqueueNowaitCompletionNotification({
             context,
             terminalId: bestMatch.id,
@@ -300,7 +565,14 @@ ${truncatedOutput}
             command,
             historyCommandMatchId: continuingCommandId,
             exitCode: task.exitCode,
-            runtimeBoundary: task.runtimeBoundary
+            executionState: task.runtimeBoundary
+              ? 'outcome_unknown'
+              : task.status === 'aborted'
+                ? 'aborted'
+                : 'finished',
+            capture: task.capture,
+            runtimeBoundary: task.runtimeBoundary,
+            terminalStatus: task.terminalStatus,
           })
         }
       }
@@ -308,14 +580,15 @@ ${truncatedOutput}
     }
     let errorMessage = error instanceof Error ? error.message : String(error)
 
-    // If it's a "command running" error, append the last terminal output
+    // Keep this diagnostic bounded and structurally separate from output of
+    // the command that is already running.
     if (errorMessage.includes('There is a running exec_command')) {
-      const recentOutput = terminalService.getRecentOutput(bestMatch.id) || '(No recent output available)'
       const activeTaskId = terminalService.getActiveTaskId(bestMatch.id)
-      errorMessage = `Error: ${errorMessage}\n\nThe current visible state of the terminal tab "${bestMatch.title || bestMatch.id}" is:
-<terminal_content>
-${recentOutput}
-</terminal_content>\n\nIf you think you need to exit the current command, use write_stdin. If you want to check its status, use read_command_output.${activeTaskId ? ` history_command_match_id=${activeTaskId}, terminalId=${bestMatch.id}` : ''}`
+      errorMessage = formatRunningCommandConflict({
+        error: errorMessage,
+        terminalId: bestMatch.id,
+        activeTaskId,
+      })
     }
 
     context.sendEvent(sessionId, { 
@@ -332,7 +605,11 @@ ${recentOutput}
 }
 
 export async function runCommandNowait(args: z.infer<typeof execCommandSchema>, context: ToolExecutionContext): Promise<string> {
-  const { tabIdOrName, command } = args
+  const validation = execCommandSchema.safeParse(args)
+  if (!validation.success) {
+    return `Parameter validation error for exec_command: ${validation.error.message}`
+  }
+  const { tabIdOrName, command } = validation.data
   const { terminalService, sessionId, messageId } = context
   
   abortIfNeeded(context.signal)
@@ -382,43 +659,91 @@ export async function runCommandNowait(args: z.infer<typeof execCommandSchema>, 
   })
 
   try {
+    let initialResultPublished = false
+    let completionBeforeInitialResult: CommandResult | undefined
+    const publishAsyncCompletion = (finished: CommandResult): void => {
+      enqueueNowaitCompletionNotification({
+        context,
+        terminalId: bestMatch.id,
+        terminalName: bestMatch.title || bestMatch.id,
+        command,
+        historyCommandMatchId: finished.history_command_match_id,
+        output: finished.stdoutDelta,
+        exitCode: finished.exitCode,
+        executionState: finished.executionState,
+        capture: finished.capture,
+        runtimeBoundary: finished.runtimeBoundary,
+        terminalStatus: finished.terminalStatus,
+      })
+    }
     const historyCommandMatchId = await terminalService.runCommandNoWait(
       bestMatch.id,
       command,
       (finished) => {
-        enqueueNowaitCompletionNotification({
-          context,
-          terminalId: bestMatch.id,
-          terminalName: bestMatch.title || bestMatch.id,
-          command,
-          historyCommandMatchId: finished.history_command_match_id,
-          exitCode: finished.exitCode,
-          runtimeBoundary: finished.runtimeBoundary
-        })
+        if (!initialResultPublished) {
+          completionBeforeInitialResult = finished
+          return
+        }
+        publishAsyncCompletion(finished)
       },
       context.signal
     )
-    context.registerBackgroundExecCommand?.({
+    const source = resolveCommandOutputSource({
+      context,
       terminalId: bestMatch.id,
-      terminalName: bestMatch.title || bestMatch.id,
       historyCommandMatchId,
-      command
+      fallbackExecutionState: 'running',
+      fallbackCapture: fallbackCaptureMetadata('', 'in_progress'),
     })
-    return `Command started in background. Use read_command_output to view output and check status (finished or running). history_command_match_id=${historyCommandMatchId}, terminalId=${bestMatch.id}.`
+    if (source.executionState === 'running') {
+      context.registerBackgroundExecCommand?.({
+        terminalId: bestMatch.id,
+        terminalName: bestMatch.title || bestMatch.id,
+        historyCommandMatchId,
+        command
+      })
+    }
+    const formatted = formatInitialCommandOutput(source)
+    context.replaceExecCommandToolResult?.({
+      content: formatted.text,
+      terminalId: bestMatch.id,
+      historyCommandMatchId,
+    })
+    context.sendEvent(sessionId, {
+      messageId,
+      type: 'command_finished',
+      command,
+      commandId: messageId,
+      tabName: bestMatch.title || bestMatch.id,
+      exitCode: source.exitCode ?? (source.executionState === 'running' ? -3 : undefined),
+      outputDelta: formatted.text,
+      commandOutput: formatted.contract,
+      outputMode: 'replace',
+      isNowait: true,
+    } as any)
+    initialResultPublished = true
+    if (
+      completionBeforeInitialResult &&
+      formatted.contract.executionState === 'running'
+    ) {
+      publishAsyncCompletion(completionBeforeInitialResult)
+    }
+    return formatted.text
   } catch (error) {
     if (isAbortError(error)) {
       throw error
     }
     let errorMessage = error instanceof Error ? error.message : String(error)
 
-    // If it's a "command running" error, append the last terminal output
+    // Keep this diagnostic bounded and structurally separate from output of
+    // the command that is already running.
     if (errorMessage.includes('There is a running exec_command')) {
-      const recentOutput = terminalService.getRecentOutput(bestMatch.id) || '(No recent output available)'
       const activeTaskId = terminalService.getActiveTaskId(bestMatch.id)
-      errorMessage = `Error: ${errorMessage}\n\nThe current visible state of the terminal tab "${bestMatch.title || bestMatch.id}" is:
-<terminal_content>
-${recentOutput}
-</terminal_content>\n\nIf you think you need to exit the current command, use write_stdin. If you want to check its status, use read_command_output.${activeTaskId ? ` history_command_match_id=${activeTaskId}, terminalId=${bestMatch.id}` : ''}`
+      errorMessage = formatRunningCommandConflict({
+        error: errorMessage,
+        terminalId: bestMatch.id,
+        activeTaskId,
+      })
     }
 
     context.sendEvent(sessionId, {
@@ -483,12 +808,39 @@ export async function readCommandOutput(
   args: z.infer<typeof readCommandOutputSchema>,
   context: ToolExecutionContext
 ): Promise<string> {
-  const { tabIdOrName, history_command_match_id, offset = 0, limit = COMMAND_READ_DEFAULT_LIMIT } = args
   const { terminalService, sessionId, messageId, sendEvent } = context
+  const validation = readCommandOutputSchema.safeParse(args)
+  if (!validation.success) {
+    const errorText = `Parameter validation error for read_command_output: ${validation.error.message}`
+    sendEvent(sessionId, {
+      messageId,
+      type: 'tool_call',
+      toolName: 'read_command_output',
+      input: JSON.stringify(args ?? {}),
+      output: errorText,
+    })
+    return errorText
+  }
+  const { tabIdOrName, history_command_match_id, cursor, offset, limit, maxBytes } = validation.data
 
   abortIfNeeded(context.signal)
+  const getSnapshot = (terminalService as any).getCommandOutputSnapshot
+  const getRecordLocation = (terminalService as any).getCommandRecordLocation
+  const exactHistoricalSnapshot =
+    typeof getSnapshot === 'function'
+      ? getSnapshot.call(
+          terminalService,
+          tabIdOrName,
+          history_command_match_id
+        )
+      : undefined
+  const exactHistoricalTasks = terminalService.getCommandTasks(tabIdOrName)
   const terminalResolution = resolveTerminalForTool(context, tabIdOrName)
-  if (!terminalResolution.ok) {
+  if (
+    !terminalResolution.ok &&
+    !exactHistoricalSnapshot &&
+    exactHistoricalTasks.length === 0
+  ) {
     const errorText = terminalResolution.message
     sendEvent(sessionId, {
       messageId,
@@ -499,20 +851,60 @@ export async function readCommandOutput(
     })
     return errorText
   }
-  const bestMatch = terminalResolution.terminal
-
-  const task = terminalService.getCommandTask(bestMatch.id, history_command_match_id)
-  if (!task) {
-    const tasks = terminalService.getCommandTasks(bestMatch.id)
+  const exactLocation = exactHistoricalSnapshot && typeof getRecordLocation === 'function'
+    ? getRecordLocation.call(
+        terminalService,
+        tabIdOrName,
+        history_command_match_id
+      )
+    : undefined
+  const exactBelongsToDetachedHistory = Boolean(
+    exactHistoricalSnapshot &&
+      (exactLocation === 'detached' ||
+        (terminalResolution.ok &&
+          terminalResolution.terminal.id !== tabIdOrName))
+  )
+  const terminalId = exactHistoricalSnapshot
+    ? tabIdOrName
+    : terminalResolution.ok
+      ? terminalResolution.terminal.id
+      : tabIdOrName
+  const resolvedSnapshot =
+    !exactHistoricalSnapshot && typeof getSnapshot === 'function'
+      ? getSnapshot.call(terminalService, terminalId, history_command_match_id)
+      : undefined
+  const resolvedLocation = resolvedSnapshot && typeof getRecordLocation === 'function'
+    ? getRecordLocation.call(
+        terminalService,
+        terminalId,
+        history_command_match_id
+      )
+    : undefined
+  const snapshot = exactHistoricalSnapshot || resolvedSnapshot
+  const recordIsDetached =
+    exactBelongsToDetachedHistory || resolvedLocation === 'detached'
+  const terminalName =
+    terminalResolution.ok && !recordIsDetached
+      ? terminalResolution.terminal.title || terminalResolution.terminal.id
+      : terminalId
+  const task = terminalService.getCommandTask(terminalId, history_command_match_id)
+  if (!task && !snapshot) {
+    const tasks = terminalService.getCommandTasks(terminalId)
     const history = tasks.length
       ? tasks
+          .slice(0, 20)
           .map((t) => {
             const started = new Date(t.startTime).toISOString()
-            return `- id: ${t.id}, status: ${t.status}, command: ${t.command}, started: ${started}`
+            const commandPreview = String(t.command || '').replace(/\s+/g, ' ').slice(0, 160)
+            return `- id: ${t.id}, status: ${t.status}, command: ${commandPreview}, started: ${started}`
           })
           .join('\n')
       : '(No command history for this terminal)'
-    const errorText = `Error: history_command_match_id "${history_command_match_id}" not found in terminal "${bestMatch.title || bestMatch.id}".\n${history}`
+    const errorText = [
+      `Error: command record ${JSON.stringify(history_command_match_id)} was not found for terminal ${JSON.stringify(terminalName)}.`,
+      'The record may never have existed, or its bounded process-local history may have expired. Do not automatically replay a side-effecting command merely to recover output.',
+      history,
+    ].join('\n')
     sendEvent(sessionId, {
       messageId,
       type: 'tool_call',
@@ -523,34 +915,63 @@ export async function readCommandOutput(
     return errorText
   }
 
-  const output = task.output || ''
-  const isRunning = task.status === 'running'
-  const result = formatCommandOutputSlice({
-    output,
-    offset,
-    limit,
-    isRunning
-  })
-
-  const header = [
-    `Command: ${task.command}`,
-    `history_command_match_id: ${task.id}`,
-    `Terminal: ${bestMatch.title || bestMatch.id}`,
-    `Status: ${task.status}`
-  ].join('\n')
-
-  const finalOutput = `${formatTerminalStatusHeader(terminalResolution.snapshot)}
-${header}
-<terminal_content>
-${result}
-</terminal_content>`
+  const source = snapshot
+    ? {
+        terminalId,
+        historyCommandMatchId: snapshot.taskId,
+        executionState: snapshot.executionState,
+        ...(snapshot.exitCode !== undefined ? { exitCode: snapshot.exitCode } : {}),
+        output: snapshot.output || '',
+        capture: { ...snapshot.capture },
+      }
+    : resolveCommandOutputSource({
+        context,
+        terminalId,
+        historyCommandMatchId: history_command_match_id,
+        fallbackOutput: task?.output || '',
+        fallbackExitCode: task?.exitCode,
+        fallbackExecutionState:
+          task?.runtimeBoundary
+            ? 'outcome_unknown'
+            : task?.status === 'finished'
+              ? 'finished'
+              : task?.status === 'aborted'
+                ? 'aborted'
+                : 'running',
+        fallbackCapture: task?.capture,
+      })
+  let formatted: ReturnType<typeof formatCommandOutputPage>
+  try {
+    formatted = formatCommandOutputPage({
+      source,
+      options: { cursor, offset, limit, maxBytes },
+      command: task?.command || snapshot?.command || '',
+      terminalStatus: terminalResolution.ok && !recordIsDetached
+        ? formatTerminalStatusHeader(terminalResolution.snapshot)
+        : formatClosedTerminalCommandHistoryHeader(terminalId),
+    })
+  } catch (error) {
+    const errorText = `Parameter validation error for read_command_output: ${
+      error instanceof Error ? error.message : String(error)
+    }`
+    sendEvent(sessionId, {
+      messageId,
+      type: 'tool_call',
+      toolName: 'read_command_output',
+      input: JSON.stringify(args ?? {}),
+      output: errorText,
+    })
+    return errorText
+  }
+  const finalOutput = formatted.text
 
   sendEvent(sessionId, {
     messageId,
     type: 'tool_call',
     toolName: 'read_command_output',
     input: JSON.stringify(args ?? {}),
-    output: finalOutput
+    output: finalOutput,
+    commandOutput: formatted.contract,
   })
 
   return finalOutput
@@ -829,90 +1250,4 @@ function waitWithSignal(ms: number, signal?: AbortSignal): Promise<void> {
     }
     signal?.addEventListener('abort', onAbort, { once: true })
   })
-}
-
-export function truncateCommandOutput(output: string, historyCommandMatchId: string, terminalId: string): string {
-  const normalized = String(output || '').replace(/\r\n/g, '\n')
-  const lines = normalized.split('\n').map((line) => {
-    if (line.length <= COMMAND_OUTPUT_MAX_LINE_LENGTH) return line
-    return line.slice(0, COMMAND_OUTPUT_MAX_LINE_LENGTH) + '...'
-  })
-  const totalLines = lines.length
-  const totalBytes = Buffer.byteLength(lines.join('\n'), 'utf8')
-
-  if (totalLines <= COMMAND_OUTPUT_MAX_LINES && totalBytes <= COMMAND_OUTPUT_MAX_BYTES) {
-    return normalized.trimEnd()
-  }
-
-  const headCount = Math.min(COMMAND_OUTPUT_HEAD_LINES, totalLines)
-  const tailCount = Math.min(COMMAND_OUTPUT_TAIL_LINES, Math.max(0, totalLines - headCount))
-  const omittedStart = headCount + 1
-  const omittedEnd = totalLines - tailCount
-  const omittedMessage =
-    omittedEnd >= omittedStart
-      ? `... omitted lines ${omittedStart} - ${omittedEnd}. Use read_command_output to view full output, history_command_match_id=${historyCommandMatchId}, terminalId=${terminalId}`
-      : `... output truncated. Use read_command_output to view full output, history_command_match_id=${historyCommandMatchId}, terminalId=${terminalId}`
-
-  const lineLabel = (lineNumber: number) => `${lineNumber.toString().padStart(5, '0')}| `
-  const formatLines = (startIndex: number, segment: string[]) =>
-    segment.map((line, index) => `${lineLabel(startIndex + index)}${line}`)
-
-  const head = formatLines(1, lines.slice(0, headCount))
-  const tailStart = totalLines - tailCount + 1
-  const tail = tailCount > 0 ? formatLines(tailStart, lines.slice(totalLines - tailCount)) : []
-  const omittedLine = `.....| ${omittedMessage}`
-
-  const truncatedLines = [...head, omittedLine, ...tail]
-
-  let result = truncatedLines.join('\n').trimEnd()
-  if (Buffer.byteLength(result, 'utf8') > COMMAND_OUTPUT_MAX_BYTES) {
-    result =
-      result.slice(0, COMMAND_OUTPUT_MAX_BYTES) +
-      `\n.....| ... output truncated. Use read_command_output to view full output, history_command_match_id=${historyCommandMatchId}, terminalId=${terminalId}`
-  }
-  return result
-}
-
-function formatCommandOutputSlice(params: { output: string; offset: number; limit: number; isRunning?: boolean }): string {
-  const { output, offset, limit, isRunning } = params
-  const lines = String(output || '').replace(/\r\n/g, '\n').split('\n')
-  if (lines.length === 1 && lines[0] === '' && !isRunning) {
-    return 'No output captured for this command yet.'
-  }
-
-  const safeOffset = Math.max(0, offset || 0)
-  const safeLimit = Math.max(1, limit || COMMAND_READ_DEFAULT_LIMIT)
-  const raw: string[] = []
-  let bytesCount = 0
-  let truncatedByBytes = false
-
-  for (let i = safeOffset; i < Math.min(lines.length, safeOffset + safeLimit); i++) {
-    const line =
-      lines[i].length > COMMAND_READ_MAX_LINE_LENGTH ? lines[i].slice(0, COMMAND_READ_MAX_LINE_LENGTH) + '...' : lines[i]
-    const size = Buffer.byteLength(line, 'utf8') + (raw.length > 0 ? 1 : 0)
-    if (bytesCount + size > COMMAND_READ_MAX_BYTES) {
-      truncatedByBytes = true
-      break
-    }
-    raw.push(line)
-    bytesCount += size
-  }
-
-  const content = raw.map((line, index) => `${(index + safeOffset + 1).toString().padStart(5, '0')}| ${line}`)
-  let result = content.join('\n')
-
-  const totalLines = lines.length
-  const lastReadLine = safeOffset + raw.length
-  const hasMoreLines = totalLines > lastReadLine
-
-  if (truncatedByBytes) {
-    result += `\n\n(Output truncated at ${COMMAND_READ_MAX_BYTES} bytes. Use 'offset' to read beyond line ${lastReadLine})`
-  } else if (hasMoreLines) {
-    result += `\n\n(Output has more lines. Use 'offset' to read beyond line ${lastReadLine})`
-  } else if (isRunning) {
-    result += `\n\n(Command is still running. Total ${totalLines} lines captured so far. Use read_command_output again later to see more)`
-  } else {
-    result += `\n\n(End of output - total ${totalLines} lines)`
-  }
-  return result
 }

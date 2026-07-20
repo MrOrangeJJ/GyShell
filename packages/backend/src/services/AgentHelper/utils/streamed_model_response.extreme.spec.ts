@@ -6,6 +6,8 @@ import {
   AIMessageChunk,
   ChatMessageChunk,
   HumanMessage,
+  ToolMessage,
+  mapChatMessagesToStoredMessages,
 } from "@langchain/core/messages";
 import { AgentService_v2 } from "../../AgentService_v2";
 import { ChatHistoryService } from "../../ChatHistoryService";
@@ -19,6 +21,10 @@ import {
   isEmptyUnusableModelResponse,
 } from "./streamed_model_response";
 import { captureRawResponseChunk } from "./raw_response";
+import {
+  formatInitialCommandOutput,
+  parseCommandOutputEnvelopeContract,
+} from "../tools/command_output_contract";
 
 const assertEqual = <T>(actual: T, expected: T, message: string): void => {
   if (actual !== expected) {
@@ -316,6 +322,37 @@ class FakeMalformedStreamWithInvokeModel extends FakeStreamingModel {
   }
 }
 
+class FakeStateChangingMalformedStreamModel extends FakeStreamingModel {
+  constructor(
+    private readonly beforeMalformedFinish: (messages: any[]) => void,
+    private readonly invokeResponse: AIMessage,
+  ) {
+    super();
+  }
+
+  bindTools(): {
+    stream: (messages?: any[]) => AsyncGenerator<any>;
+    invoke: (messages?: any[]) => Promise<any>;
+  } {
+    const self = this;
+    return {
+      stream: async function* (messages?: any[]) {
+        const request = Array.isArray(messages) ? messages : [];
+        self.streamCalls += 1;
+        self.requests.push(request);
+        yield new ChatMessageChunk({ content: "", role: "" });
+        self.beforeMalformedFinish(request);
+        yield createMalformedAssistantChunk();
+      },
+      invoke: async (messages?: any[]) => {
+        self.invokeCalls += 1;
+        self.invokeRequests.push(Array.isArray(messages) ? messages : []);
+        return self.invokeResponse;
+      },
+    };
+  }
+}
+
 class FakeEmptyErrorThenTextModel extends FakeStreamingModel {
   bindTools(): {
     stream: (messages?: any[]) => AsyncGenerator<any>;
@@ -504,12 +541,13 @@ class GuardShouldNotRunModel extends FakeStreamingModel {
 const createAgentService = (
   chatHistory: ChatHistoryService,
   uiHistory: UIHistoryService,
+  terminalService?: Record<string, unknown>,
 ): AgentService_v2 =>
   new AgentService_v2(
-    {
+    (terminalService || {
       getAllTerminals: () => [],
       getRecentOutput: () => "",
-    } as any,
+    }) as any,
     {} as any,
     {
       getActiveTools: () => [],
@@ -1166,6 +1204,221 @@ const run = async (): Promise<void> => {
         ),
         false,
         "backend history should not persist the internal malformed response",
+      );
+    },
+  );
+
+  await runCase(
+    "malformed-stream fallback refreshes command backing truth immediately before invoke",
+    async () => {
+      const tempDir = fs.mkdtempSync(
+        path.join(os.tmpdir(), "gyshell-stream-command-refresh-extreme-"),
+      );
+      const store = new HistorySqliteStore({
+        filePath: path.join(tempDir, "history.sqlite3"),
+      });
+      const chatHistory = new ChatHistoryService({ store });
+      const uiHistory = new UIHistoryService({ store });
+      const terminalId = "terminal-stream-refresh";
+      const historyCommandMatchId = "command-stream-refresh";
+      const runningOutput = "partial output";
+      const finalOutput = "final authoritative output";
+      let snapshot: any = {
+        executionState: "running",
+        output: runningOutput,
+        capture: {
+          state: "in_progress",
+          observedUtf8Bytes: Buffer.byteLength(runningOutput, "utf8"),
+          retainedUtf8Bytes: Buffer.byteLength(runningOutput, "utf8"),
+          availableLineCount: 1,
+          revision: 1,
+          terminalControlsObserved: false,
+        },
+      };
+      const terminalService = {
+        getAllTerminals: () => [],
+        getRecentOutput: () => "",
+        getCommandOutputSnapshot: (
+          requestedTerminalId: string,
+          requestedHistoryCommandMatchId: string,
+        ) =>
+          requestedTerminalId === terminalId &&
+          requestedHistoryCommandMatchId === historyCommandMatchId
+            ? snapshot
+            : undefined,
+      };
+      const agent = createAgentService(
+        chatHistory,
+        uiHistory,
+        terminalService,
+      );
+      agent.setEventPublisher(() => {});
+
+      const runningEnvelope = formatInitialCommandOutput({
+        terminalId,
+        historyCommandMatchId,
+        executionState: "running",
+        output: runningOutput,
+        capture: snapshot.capture,
+      }).text;
+      const historyMessages = [
+        new HumanMessage({
+          content: "Run the command.",
+          additional_kwargs: { _gyshellMessageId: "refresh-user" },
+        }),
+        new AIMessage({
+          content: "",
+          tool_calls: [
+            {
+              id: "call-stream-refresh",
+              name: "exec_command",
+              args: { terminalId, command: "synthetic-command" },
+            } as any,
+          ],
+          additional_kwargs: { _gyshellMessageId: "refresh-assistant" },
+        }),
+        new ToolMessage({
+          content: runningEnvelope,
+          tool_call_id: "call-stream-refresh",
+          name: "exec_command",
+          additional_kwargs: { _gyshellMessageId: "refresh-tool" },
+        }),
+      ];
+      const storedHistory = mapChatMessagesToStoredMessages(
+        historyMessages,
+      ) as any[];
+      chatHistory.saveSession({
+        id: "stream-command-refresh-session",
+        title: "Stream command refresh",
+        lastCheckpointOffset: 0,
+        lastProfileMaxTokens: 1000000,
+        messages: new Map([
+          ["refresh-user", storedHistory[0]],
+          ["refresh-assistant", storedHistory[1]],
+          ["refresh-tool", storedHistory[2]],
+        ]),
+      });
+
+      const mainModel = new FakeStateChangingMalformedStreamModel(
+        (streamRequest) => {
+          snapshot = {
+            executionState: "finished",
+            exitCode: 23,
+            output: finalOutput,
+            capture: {
+              state: "complete",
+              observedUtf8Bytes: Buffer.byteLength(finalOutput, "utf8"),
+              retainedUtf8Bytes: Buffer.byteLength(finalOutput, "utf8"),
+              availableLineCount: 1,
+              revision: 2,
+              terminalControlsObserved: false,
+            },
+          };
+          const commandMessage = streamRequest.find(
+            (message) =>
+              message?.getType?.() === "tool" &&
+              message?.name === "exec_command",
+          );
+          commandMessage.additional_kwargs = {
+            ...(commandMessage.additional_kwargs || {}),
+            __raw_response: { providerSecret: "must-be-sanitized-again" },
+          };
+        },
+        createTextAssistantMessage("Refreshed fallback answer."),
+      );
+      const guardModel = new GuardShouldNotRunModel();
+      const sessionId = "stream-command-refresh-session";
+      const profileId = "glm-profile";
+      (agent as any).sessionModelBindings.set(sessionId, {
+        profileId,
+        model: mainModel,
+        actionModel: guardModel,
+        thinkingModel: guardModel,
+        compactionModel: guardModel,
+        actionModelSupportsStructuredOutput: true,
+        actionModelSupportsObjectToolChoice: false,
+        thinkingModelSupportsStructuredOutput: true,
+        thinkingModelSupportsObjectToolChoice: false,
+        compactionModelSupportsStructuredOutput: true,
+        compactionModelSupportsObjectToolChoice: false,
+        readFileSupport: { image: false },
+        toolsForModel: [],
+        globalMaxTokens: 1000000,
+        thinkingMaxTokens: 1000000,
+        compactionMaxTokens: 1000000,
+      });
+
+      await agent.run(
+        {
+          sessionId,
+          lockedProfileId: profileId,
+          metadata: {},
+          lockedExperimentalFlags: {
+            runtimeThinkingCorrectionEnabled: false,
+            taskFinishGuardEnabled: false,
+            firstTurnThinkingModelEnabled: false,
+            execCommandActionModelEnabled: true,
+            writeStdinActionModelEnabled: true,
+          },
+        } as any,
+        "continue",
+        new AbortController().signal,
+      );
+
+      const findCommandMessage = (request: any[]): any =>
+        request.find(
+          (message) =>
+            message?.getType?.() === "tool" &&
+            message?.name === "exec_command",
+        );
+      const streamedCommand = findCommandMessage(mainModel.requests[0]);
+      const invokedCommand = findCommandMessage(mainModel.invokeRequests[0]);
+      const streamedContract = parseCommandOutputEnvelopeContract(
+        String(streamedCommand?.content || ""),
+      );
+      const invokedContract = parseCommandOutputEnvelopeContract(
+        String(invokedCommand?.content || ""),
+      );
+
+      assertEqual(mainModel.streamCalls, 1, "original request should stream once");
+      assertEqual(mainModel.invokeCalls, 1, "fallback should invoke once");
+      assertEqual(
+        streamedContract?.executionState,
+        "running",
+        "stream request should observe the original running snapshot",
+      );
+      assertCondition(
+        typeof streamedContract?.presentation.pollCursor === "string",
+        "running stream request should carry its poll cursor",
+      );
+      assertEqual(
+        invokedContract?.executionState,
+        "finished",
+        "fallback invoke must refresh execution state after the stream",
+      );
+      assertEqual(
+        invokedContract?.exitCode,
+        23,
+        "fallback invoke must refresh the authoritative exit code",
+      );
+      assertEqual(
+        invokedContract?.capture.revision,
+        2,
+        "fallback invoke must refresh capture metadata",
+      );
+      assertEqual(
+        invokedContract?.presentation.pollCursor,
+        undefined,
+        "finished fallback input must not retain a stale running poll cursor",
+      );
+      assertCondition(
+        String(invokedCommand?.content || "").includes(finalOutput),
+        "fallback invoke should receive the final retained output",
+      );
+      assertEqual(
+        invokedCommand?.additional_kwargs?.__raw_response,
+        undefined,
+        "fallback invoke must rerun model-input sanitation",
       );
     },
   );

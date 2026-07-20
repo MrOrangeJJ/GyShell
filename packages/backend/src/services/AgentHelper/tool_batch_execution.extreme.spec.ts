@@ -1,4 +1,7 @@
 import assert from 'node:assert/strict'
+import fs from 'node:fs'
+import os from 'node:os'
+import path from 'node:path'
 import {
   AIMessage,
   HumanMessage,
@@ -7,12 +10,78 @@ import {
   mapStoredMessagesToChatMessages
 } from '@langchain/core/messages'
 import { AgentService_v2 } from '../AgentService_v2'
+import { ChatHistoryService } from '../ChatHistoryService'
+import { HistorySqliteStore } from '../history/HistorySqliteStore'
 import { toolImplementations } from './tools'
+import {
+  formatInitialCommandOutput,
+  parseCommandOutputEnvelopeContract
+} from './tools/command_output_contract'
+import { expireUnbackedStoredCommandOutputEnvelopes } from './utils/model_messages'
+import type { CommandExecutionState } from '@gyshell/shared'
 
 const PNG_1X1 = Buffer.from(
   'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=',
   'base64'
 )
+
+function commandEnvelope(
+  executionState: CommandExecutionState,
+  options: {
+    terminalId?: string
+    historyCommandMatchId?: string
+    output?: string
+    revision?: number
+  } = {}
+): string {
+  const terminalId = options.terminalId || 'local-terminal'
+  const historyCommandMatchId =
+    options.historyCommandMatchId || 'background-task'
+  const output = options.output || ''
+  const outputBytes = Buffer.byteLength(output, 'utf8')
+  return formatInitialCommandOutput({
+    terminalId,
+    historyCommandMatchId,
+    executionState,
+    ...(executionState === 'finished' ? { exitCode: 0 } : {}),
+    output,
+    capture: {
+      state: executionState === 'running' ? 'in_progress' : 'complete',
+      observedUtf8Bytes: outputBytes,
+      retainedUtf8Bytes: outputBytes,
+      availableLineCount: output ? output.split('\n').length : 0,
+      revision: options.revision ?? (executionState === 'running' ? 0 : 1),
+      terminalControlsObserved: false
+    }
+  }).text
+}
+
+function toolHistoryFixture(content: string, messageId = 'exec-message') {
+  const assistant = new AIMessage({
+    content: '',
+    tool_calls: [
+      {
+        id: 'exec-call',
+        name: 'exec_command',
+        args: {
+          tabIdOrName: 'local-terminal',
+          command: 'printf durable',
+          waitMode: 'nowait'
+        }
+      }
+    ]
+  })
+  ;(assistant as any).additional_kwargs = {
+    _gyshellMessageId: 'exec-assistant'
+  }
+  const tool = new ToolMessage({
+    content,
+    tool_call_id: 'exec-call',
+    name: 'exec_command'
+  })
+  ;(tool as any).additional_kwargs = { _gyshellMessageId: messageId }
+  return { assistant, tool }
+}
 
 async function runCase(name: string, fn: () => Promise<void> | void): Promise<void> {
   try {
@@ -80,6 +149,7 @@ function createAgent(input?: {
   saveSession?: (session: any) => void
   onEvent?: (event: any) => void
   terminalRuntime?: any
+  chatHistoryRuntime?: any
 }) {
   const mcpToolNames = new Set(input?.mcpToolNames || [])
   const chatHistoryRuntime = {
@@ -104,7 +174,7 @@ function createAgent(input?: {
     {} as any,
     {} as any,
     { flush() {} } as any,
-    chatHistoryRuntime as any
+    (input?.chatHistoryRuntime || chatHistoryRuntime) as any
   )
   agent.setEventPublisher((_sessionId, event) => input?.onEvent?.(event))
   return agent
@@ -1054,6 +1124,389 @@ await runCase('an MCP tool deactivated after routing receives a structured resul
     retryable: true
   })
 })
+
+await runCase(
+  'exec_command completion that wins the initial-save race cannot be overwritten by its running return value',
+  async () => {
+    const originalRunCommandNowait = toolImplementations.runCommandNowait
+    const running = commandEnvelope('running')
+    const finished = commandEnvelope('finished', {
+      output: 'durable completion\n'
+    })
+    ;(toolImplementations as any).runCommandNowait = async (
+      _args: unknown,
+      context: any
+    ) => {
+      context.replaceExecCommandToolResult?.({
+        content: finished,
+        terminalId: 'local-terminal',
+        historyCommandMatchId: 'background-task'
+      })
+      return running
+    }
+
+    try {
+      const agent = createAgent()
+      const toolCall = {
+        id: 'exec-call',
+        name: 'exec_command',
+        args: {
+          tabIdOrName: 'local-terminal',
+          command: 'printf durable',
+          waitMode: 'nowait'
+        }
+      }
+      const source = new AIMessage({ content: '', tool_calls: [toolCall] })
+      const result = await (agent as any).createCommandToolsNode().invoke({
+        sessionId: 'completion-before-save',
+        messages: [source],
+        pendingToolCalls: [toolCall],
+        execCommandActionModelEnabled: false
+      })
+      const contract = parseCommandOutputEnvelopeContract(
+        String((result.messages[1] as ToolMessage).content)
+      )
+
+      assert.equal(contract?.executionState, 'finished')
+      assert.equal(
+        String((result.messages[1] as ToolMessage).content).includes(
+          'durable completion'
+        ),
+        true
+      )
+    } finally {
+      ;(toolImplementations as any).runCommandNowait = originalRunCommandNowait
+    }
+  }
+)
+
+await runCase(
+  'late exec_command settlement is durable, monotonic across stale saves, and never resurrects deleted history',
+  () => {
+    let durableSession: any = null
+    let saveCount = 0
+    const agent = createAgent({
+      loadSession: (sessionId) =>
+        durableSession?.id === sessionId ? durableSession : null,
+      saveSession: (session) => {
+        durableSession = session
+        saveCount += 1
+      }
+    })
+    const running = commandEnvelope('running')
+    const finished = commandEnvelope('finished', {
+      output: 'persisted final output\n'
+    })
+    const initial = toolHistoryFixture(running)
+    const initialStored = mapChatMessagesToStoredMessages([
+      initial.assistant,
+      initial.tool
+    ]) as any[]
+    durableSession = {
+      id: 'durable-nowait',
+      title: 'Durable nowait',
+      messages: new Map([
+        ['exec-assistant', initialStored[0]],
+        ['exec-message', initialStored[1]]
+      ]),
+      lastCheckpointOffset: 0
+    }
+
+    const patched = (agent as any).persistSettledExecCommandToolResult({
+      sessionId: 'durable-nowait',
+      messageId: 'exec-message',
+      content: finished,
+      terminalId: 'local-terminal',
+      historyCommandMatchId: 'background-task'
+    })
+    assert.equal(patched, true)
+    assert.equal(saveCount, 1)
+    assert.equal(
+      parseCommandOutputEnvelopeContract(
+        durableSession.messages.get('exec-message').data.content
+      )?.executionState,
+      'finished'
+    )
+
+    const stale = toolHistoryFixture(running)
+    const staleSession = {
+      id: 'durable-nowait',
+      title: 'Durable nowait',
+      messages: new Map(),
+      lastCheckpointOffset: 0
+    }
+    ;(agent as any).updateSessionFromMessages(staleSession, [
+      stale.assistant,
+      stale.tool
+    ])
+    ;(agent as any).chatHistoryService.saveSession(staleSession)
+    assert.equal(
+      parseCommandOutputEnvelopeContract(
+        durableSession.messages.get('exec-message').data.content
+      )?.executionState,
+      'finished',
+      'a later whole-session save must not move a settled command back to running'
+    )
+
+    const restartedStoredMessages = [
+      ...durableSession.messages.values()
+    ] as any[]
+    expireUnbackedStoredCommandOutputEnvelopes(
+      restartedStoredMessages,
+      () => undefined
+    )
+    assert.equal(
+      parseCommandOutputEnvelopeContract(
+        restartedStoredMessages[1].data.content
+      )?.executionState,
+      'finished',
+      'a self-contained final result must survive process-local backing loss'
+    )
+
+    const savesBeforeMismatch = saveCount
+    const mismatched = (agent as any).persistSettledExecCommandToolResult({
+      sessionId: 'durable-nowait',
+      messageId: 'exec-message',
+      content: commandEnvelope('finished', {
+        historyCommandMatchId: 'different-task',
+        output: 'wrong command\n'
+      }),
+      terminalId: 'local-terminal',
+      historyCommandMatchId: 'different-task'
+    })
+    assert.equal(mismatched, false)
+    assert.equal(saveCount, savesBeforeMismatch)
+
+    durableSession.messages.delete('exec-message')
+    const savesBeforeDeletion = saveCount
+    const resurrected = (agent as any).persistSettledExecCommandToolResult({
+      sessionId: 'durable-nowait',
+      messageId: 'exec-message',
+      content: finished,
+      terminalId: 'local-terminal',
+      historyCommandMatchId: 'background-task'
+    })
+    assert.equal(resurrected, false)
+    assert.equal(saveCount, savesBeforeDeletion)
+    assert.equal(durableSession.messages.has('exec-message'), false)
+  }
+)
+
+await runCase(
+  'aborted and unknown exec_command terminal states replace durable running snapshots',
+  () => {
+    for (const state of ['aborted', 'outcome_unknown'] as const) {
+      let durableSession: any = null
+      const agent = createAgent({
+        loadSession: () => durableSession,
+        saveSession: (session) => {
+          durableSession = session
+        }
+      })
+      const initial = toolHistoryFixture(commandEnvelope('running'))
+      const stored = mapChatMessagesToStoredMessages([
+        initial.assistant,
+        initial.tool
+      ]) as any[]
+      durableSession = {
+        id: `terminal-state-${state}`,
+        title: state,
+        messages: new Map([
+          ['exec-assistant', stored[0]],
+          ['exec-message', stored[1]]
+        ]),
+        lastCheckpointOffset: 0
+      }
+      const content = commandEnvelope(state, {
+        output: `${state}\n`
+      })
+
+      assert.equal(
+        (agent as any).persistSettledExecCommandToolResult({
+          sessionId: durableSession.id,
+          messageId: 'exec-message',
+          content,
+          terminalId: 'local-terminal',
+          historyCommandMatchId: 'background-task'
+        }),
+        true
+      )
+      assert.equal(
+        parseCommandOutputEnvelopeContract(
+          durableSession.messages.get('exec-message').data.content
+        )?.executionState,
+        state
+      )
+    }
+  }
+)
+
+await runCase(
+  'SQLite restart retains late exec_command settlement after a stale whole-session save',
+  () => {
+    const tempDir = fs.mkdtempSync(
+      path.join(os.tmpdir(), 'gyshell-command-settlement-')
+    )
+    const databasePath = path.join(tempDir, 'history.sqlite')
+    let store: HistorySqliteStore | undefined
+    try {
+      store = new HistorySqliteStore({ filePath: databasePath })
+      const history = new ChatHistoryService({ store })
+      const running = commandEnvelope('running')
+      const finished = commandEnvelope('finished', {
+        output: 'sqlite final output\n'
+      })
+      const initial = toolHistoryFixture(running)
+      const initialStored = mapChatMessagesToStoredMessages([
+        initial.assistant,
+        initial.tool
+      ]) as any[]
+      history.saveSession({
+        id: 'sqlite-nowait',
+        title: 'SQLite nowait',
+        messages: new Map([
+          ['exec-assistant', initialStored[0]],
+          ['exec-message', initialStored[1]]
+        ]),
+        lastCheckpointOffset: 0
+      })
+
+      const agent = createAgent({ chatHistoryRuntime: history })
+      assert.equal(
+        (agent as any).persistSettledExecCommandToolResult({
+          sessionId: 'sqlite-nowait',
+          messageId: 'exec-message',
+          content: finished,
+          terminalId: 'local-terminal',
+          historyCommandMatchId: 'background-task'
+        }),
+        true
+      )
+
+      const stale = toolHistoryFixture(running)
+      const staleSession = {
+        id: 'sqlite-nowait',
+        title: 'SQLite nowait',
+        messages: new Map(),
+        lastCheckpointOffset: 0
+      }
+      ;(agent as any).updateSessionFromMessages(staleSession, [
+        stale.assistant,
+        stale.tool
+      ])
+      history.saveSession(staleSession)
+      store.close()
+      store = undefined
+
+      store = new HistorySqliteStore({ filePath: databasePath })
+      const restarted = new ChatHistoryService({ store }).loadSession(
+        'sqlite-nowait'
+      )
+      assert.ok(restarted)
+      const restartedMessages = [...restarted.messages.values()] as any[]
+      expireUnbackedStoredCommandOutputEnvelopes(
+        restartedMessages,
+        () => undefined
+      )
+      const restartedTool = restartedMessages.find(
+        (message) => message?.data?.name === 'exec_command'
+      )
+      const restartedContract = parseCommandOutputEnvelopeContract(
+        restartedTool?.data?.content
+      )
+      assert.equal(restartedContract?.executionState, 'finished')
+      assert.equal(
+        String(restartedTool?.data?.content).includes('sqlite final output'),
+        true
+      )
+    } finally {
+      store?.close()
+      fs.rmSync(tempDir, { recursive: true, force: true })
+    }
+  }
+)
+
+await runCase(
+  'stop after dispatch preserves the originating ToolMessage for late command settlement',
+  async () => {
+    const originalRunCommand = toolImplementations.runCommand
+    let replaceResult:
+      | ((result: {
+          content: string
+          terminalId: string
+          historyCommandMatchId: string
+        }) => void)
+      | undefined
+    ;(toolImplementations as any).runCommand = async (
+      _args: unknown,
+      context: any
+    ) => {
+      replaceResult = context.replaceExecCommandToolResult
+      replaceResult?.({
+        content: commandEnvelope('running'),
+        terminalId: 'local-terminal',
+        historyCommandMatchId: 'background-task'
+      })
+      const error = new Error('AbortError')
+      error.name = 'AbortError'
+      throw error
+    }
+
+    const agent = createAgent()
+    const physicalRunId = 'stopped-command-run'
+    ;(agent as any).activePhysicalRunIds.add(physicalRunId)
+    try {
+      const toolCall = {
+        id: 'exec-call',
+        name: 'exec_command',
+        args: {
+          tabIdOrName: 'local-terminal',
+          command: 'long-running',
+          waitMode: 'wait'
+        }
+      }
+      const source = new AIMessage({ content: '', tool_calls: [toolCall] })
+      await assert.rejects(
+        () =>
+          (agent as any).createCommandToolsNode().invoke({
+            sessionId: 'stopped-command-session',
+            physicalRunId,
+            messages: [source],
+            pendingToolCalls: [toolCall],
+            execCommandActionModelEnabled: false
+          }),
+        /AbortError/
+      )
+
+      const preserved = (agent as any).abortedMessagesByRunId.get(
+        physicalRunId
+      ) as ToolMessage[] | undefined
+      assert.equal(preserved?.length, 1)
+      assert.equal(
+        parseCommandOutputEnvelopeContract(String(preserved?.[0]?.content))
+          ?.executionState,
+        'running'
+      )
+
+      replaceResult?.({
+        content: commandEnvelope('finished', {
+          output: 'finished after stop\n'
+        }),
+        terminalId: 'local-terminal',
+        historyCommandMatchId: 'background-task'
+      })
+      assert.equal(
+        parseCommandOutputEnvelopeContract(String(preserved?.[0]?.content))
+          ?.executionState,
+        'finished'
+      )
+    } finally {
+      ;(agent as any).activePhysicalRunIds.delete(physicalRunId)
+      ;(agent as any).abortedMessagesByRunId.delete(physicalRunId)
+      ;(toolImplementations as any).runCommand = originalRunCommand
+    }
+  }
+)
 
 await runCase('checkpoint stop preserves image supplements and isolates partial text by run', async () => {
   const saved = new Map<string, any>()

@@ -1,13 +1,19 @@
 import * as ssh2 from "ssh2";
 import * as fs from "fs";
 import * as net from "net";
+import { randomBytes } from "node:crypto";
 import { dirname } from "node:path";
 import { pipeline } from "node:stream/promises";
+import { StringDecoder } from "node:string_decoder";
 import { SocksClient } from "socks";
+import { COMMAND_CAPTURE_MAX_UTF8_BYTES } from "@gyshell/shared";
 import {
   isSshConnectionConfig,
+  type TerminalCommandShellFamily,
   type TerminalCommandTrackingToken,
+  type TerminalCommandTrackingMode,
   type TerminalCommandTrackingUpdate,
+  type TerminalCommandProtocolMetadata,
   type TerminalBackend,
   type TerminalConfig,
   type TerminalExecOptions,
@@ -25,24 +31,37 @@ import {
 } from "./ssh/SftpAdaptiveTransferTuner";
 import { SshDirectFileTransfer } from "./ssh/SshDirectFileTransfer";
 import {
+  buildWindowsPowerShellBootstrapScript,
+  buildWindowsPowerShellBootstrapLoaderEncodedCommand,
+  buildWindowsPowerShellDispatchInput,
   buildWindowsPowerShellEncodedCommand,
+  buildWindowsPowerShellRequestMarkerPath,
   WINDOWS_POWERSHELL_COMMAND_OUTPUT_FILE_PREFIX,
   escapePowerShellSingleQuotedString,
   parseWindowsBuildNumber,
   parseWindowsPromptMarkerLine,
+  parseWindowsPowerShellRequestMarkerFile,
   shouldUseWindowsPowerShellSidecar,
   WINDOWS_POWERSHELL_COMMAND_REQUEST_FILE_PREFIX,
+  WINDOWS_POWERSHELL_SIDECAR_BUILD_THRESHOLD,
   WINDOWS_POWERSHELL_REMOTE_SIDECAR_DIR_NAME,
+  WINDOWS_POWERSHELL_REQUEST_MARKER_MAX_UTF8_BYTES,
   WINDOWS_POWERSHELL_SIDECAR_RETENTION_MS,
   type WindowsCommandTrackingMode,
   type WindowsPromptMarkerState,
 } from "./windowsPowerShellTracking";
+import {
+  buildCommandProtocolMarkerPrefix,
+  buildInitializationReadyMarker,
+  buildUnixCommandDispatcherScript,
+  consumeInitializationReadyMarker,
+} from "./terminal/CommandStreamProtocol";
 
-const GYSHELL_READY_MARKER = "__GYSHELL_READY__";
 const SSH_CONNECT_READY_TIMEOUT_MS = 20_000;
 const SSH_KEEPALIVE_INTERVAL_MS = 30_000;
 const SSH_KEEPALIVE_COUNT_MAX = 3;
 const SSH_DIRECT_CONTROL_READY_TIMEOUT_MS = 4_000;
+const WINDOWS_POWERSHELL_BOOTSTRAP_FILE_PREFIX = "gyshell-bootstrap-";
 
 interface SshRouteConnectOptions {
   signal?: AbortSignal;
@@ -74,10 +93,12 @@ interface SSHInstance {
   requestedRows?: number;
   isInitializing: boolean;
   buffer: string;
-  oscBuffer: string;
+  commandProtocolToken: string;
   cwd?: string;
   homeDir?: string;
   remoteOs?: "unix" | "windows";
+  commandShellFamily?: TerminalCommandShellFamily;
+  powerShellExecutable?: "powershell.exe" | "pwsh";
   observedHostKey?: Buffer;
   systemInfo?: any;
   systemInfoPromise?: Promise<any>;
@@ -88,12 +109,15 @@ interface SSHInstance {
   windowsPromptMarkerPath?: string;
   windowsCommandRequestPath?: string;
   windowsCommandOutputPath?: string;
+  windowsPowerShellBootstrapPath?: string;
   windowsPromptMarkerState?: WindowsPromptMarkerState;
   forwardServers: net.Server[];
   remoteForwards: Array<{ host: string; port: number }>;
   remoteForwardHandlerInstalled: boolean;
   initializationState: "initializing" | "ready" | "failed";
   exitEmitted?: boolean;
+  streamDecoder: StringDecoder;
+  commandProtocolAvailable?: boolean;
 }
 
 interface SftpChunkWriteSession {
@@ -110,6 +134,46 @@ interface WindowsBootstrapInfo {
   TempPath?: string;
   PSVersionMajor?: number;
 }
+
+interface BoundedWindowsCommandOutput {
+  text: string;
+  observedUtf8Bytes: number;
+  truncated: boolean;
+}
+
+const utf8Length = (value: string): number => Buffer.byteLength(value, "utf8");
+
+const takeUtf8Prefix = (value: string, byteLimit: number): string => {
+  if (byteLimit <= 0) return "";
+  let bytes = 0;
+  let result = "";
+  for (const scalar of value) {
+    const scalarBytes = utf8Length(scalar);
+    if (bytes + scalarBytes > byteLimit) break;
+    result += scalar;
+    bytes += scalarBytes;
+  }
+  return result;
+};
+
+const normalizeBoundedWindowsCommandOutput = (
+  decoded: string,
+  observedFileBytes: number,
+): BoundedWindowsCommandOutput => {
+  const text = takeUtf8Prefix(
+    decoded,
+    COMMAND_CAPTURE_MAX_UTF8_BYTES,
+  );
+  const observedUtf8Bytes = Math.max(
+    0,
+    Math.floor(observedFileBytes),
+  );
+  return {
+    text,
+    observedUtf8Bytes,
+    truncated: observedUtf8Bytes > utf8Length(text),
+  };
+};
 
 export class SSHBackend implements TerminalBackend {
   private static readonly SHELL_INIT_RETRY_INTERVAL_MS = 8000;
@@ -128,6 +192,7 @@ export class SSHBackend implements TerminalBackend {
   private readonly directFileTransfer = new SshDirectFileTransfer();
   private static readonly CHUNK_SESSION_IDLE_MS = 8000;
   private static readonly MAX_SFTP_READ_REQUEST_BYTES = 64 * 1024;
+  private static readonly MAX_SFTP_READ_CONCURRENCY = 16;
   private static readonly FAST_TRANSFER_TIMEOUT_MIN_MS = 45_000;
   private static readonly FAST_TRANSFER_TIMEOUT_MAX_MS = 10 * 60 * 1000;
   private static readonly FAST_TRANSFER_TIMEOUT_PER_MB_MS = 12_000;
@@ -442,7 +507,6 @@ export class SSHBackend implements TerminalBackend {
     ) {
       return undefined;
     }
-    const cachedSnapshot = instance.windowsPromptMarkerState || null;
     let snapshot: WindowsPromptMarkerState | null = null;
     try {
       snapshot = await this.refreshWindowsPromptMarkerState(instance, {
@@ -451,14 +515,22 @@ export class SSHBackend implements TerminalBackend {
     } catch {
       snapshot = null;
     }
-    if (!snapshot && !cachedSnapshot) {
+    if (!snapshot) {
       const resetOk = await this.resetWindowsPromptMarker(instance);
+      if (!resetOk) {
+        throw new Error(
+          "Unable to establish a live Windows prompt marker baseline",
+        );
+      }
       return {
         mode: "windows-powershell-sidecar",
+        trackingScopeId: instance.commandProtocolToken,
         baselineSequence: 0,
-        awaitingInitialFreshMarker: !resetOk,
         dispatchMode: instance.windowsCommandRequestPath
           ? "prompt-file"
+          : undefined,
+        dispatchInput: instance.windowsCommandRequestPath
+          ? buildWindowsPowerShellDispatchInput(instance.commandProtocolToken)
           : undefined,
         displayMode: instance.windowsCommandRequestPath
           ? "synthetic-transcript"
@@ -467,16 +539,18 @@ export class SSHBackend implements TerminalBackend {
         commandOutputPath: instance.windowsCommandOutputPath,
       };
     }
-    const resolvedSnapshot = snapshot || cachedSnapshot;
-    if (!resolvedSnapshot) {
-      return undefined;
+    if (!(await this.resetWindowsPromptMarker(instance))) {
+      throw new Error("Unable to reset the live Windows prompt marker journal");
     }
     return {
       mode: "windows-powershell-sidecar",
-      baselineSequence: resolvedSnapshot.sequence,
-      awaitingInitialFreshMarker: !snapshot && !!cachedSnapshot,
+      trackingScopeId: instance.commandProtocolToken,
+      baselineSequence: snapshot.sequence,
       dispatchMode: instance.windowsCommandRequestPath
         ? "prompt-file"
+        : undefined,
+      dispatchInput: instance.windowsCommandRequestPath
+        ? buildWindowsPowerShellDispatchInput(instance.commandProtocolToken)
         : undefined,
       displayMode: instance.windowsCommandRequestPath
         ? "synthetic-transcript"
@@ -484,6 +558,21 @@ export class SSHBackend implements TerminalBackend {
       commandRequestPath: instance.windowsCommandRequestPath,
       commandOutputPath: instance.windowsCommandOutputPath,
     };
+  }
+
+  getCommandTrackingMode(
+    ptyId: string,
+  ): TerminalCommandTrackingMode | undefined {
+    return this.sessions.get(ptyId)?.commandTrackingMode ===
+      "windows-powershell-sidecar"
+      ? "windows-powershell-sidecar"
+      : undefined;
+  }
+
+  getCommandShellFamily(
+    ptyId: string,
+  ): TerminalCommandShellFamily | undefined {
+    return this.sessions.get(ptyId)?.commandShellFamily;
   }
 
   async pollCommandTracking(
@@ -500,24 +589,38 @@ export class SSHBackend implements TerminalBackend {
     ) {
       return undefined;
     }
+    if (
+      token.trackingScopeId &&
+      instance.commandProtocolToken !== token.trackingScopeId
+    ) {
+      return undefined;
+    }
     const snapshot = token.awaitingInitialFreshMarker
       ? await this.refreshWindowsPromptMarkerStateViaExec(instance, {
           allowCachedFallback: false,
+          expectedRequestId: token.expectedRequestId,
         })
-      : await this.refreshWindowsPromptMarkerState(instance);
+      : await this.refreshWindowsPromptMarkerState(instance, {
+          expectedRequestId: token.expectedRequestId,
+        });
     if (!snapshot || snapshot.sequence <= token.baselineSequence) {
+      return undefined;
+    }
+    if (
+      this.sessions.get(ptyId) !== instance ||
+      (token.trackingScopeId &&
+        instance.commandProtocolToken !== token.trackingScopeId)
+    ) {
+      return undefined;
+    }
+    if (
+      token.expectedRequestId &&
+      snapshot.requestId !== token.expectedRequestId
+    ) {
       return undefined;
     }
     const preferExecOutputRead = Boolean(token.awaitingInitialFreshMarker);
     if (token.awaitingInitialFreshMarker) {
-      const dispatchedAtMs = token.dispatchedAtMs || 0;
-      if (
-        snapshot.modifiedAtMs !== undefined &&
-        snapshot.modifiedAtMs <= dispatchedAtMs
-      ) {
-        token.baselineSequence = snapshot.sequence;
-        return undefined;
-      }
       token.awaitingInitialFreshMarker = false;
     }
     const output = await this.readWindowsCommandOutputBestEffort(
@@ -525,13 +628,64 @@ export class SSHBackend implements TerminalBackend {
       token.commandOutputPath || instance.windowsCommandOutputPath,
       { preferExec: preferExecOutputRead },
     );
+    if (
+      this.sessions.get(ptyId) !== instance ||
+      (token.trackingScopeId &&
+        instance.commandProtocolToken !== token.trackingScopeId)
+    ) {
+      return undefined;
+    }
+    if (token.expectCommandOutput && token.commandOutputPath && !output) {
+      throw new Error("Windows sidecar output file is not readable yet");
+    }
+    if (token.expectCommandOutput && output) {
+      if (snapshot.outputRetainedUtf8Bytes === undefined) {
+        throw new Error(
+          "Windows sidecar completion marker has no retained output length",
+        );
+      }
+      if (output.observedUtf8Bytes !== snapshot.outputRetainedUtf8Bytes) {
+        throw new Error(
+          "Windows sidecar output file length does not match its completion marker",
+        );
+      }
+      if (utf8Length(output.text) !== output.observedUtf8Bytes) {
+        throw new Error(
+          "Windows sidecar output file was not read as one complete UTF-8 transcript",
+        );
+      }
+    }
+    if (token.expectedRequestId && instance.windowsPromptMarkerPath) {
+      const completedMarkerPath = buildWindowsPowerShellRequestMarkerPath(
+        instance.windowsPromptMarkerPath,
+        token.expectedRequestId,
+      );
+      try {
+        const sftp = await this.initializeSftp(instance);
+        await this.sftpUnlink(
+          sftp,
+          this.normalizeRemotePath(completedMarkerPath),
+        );
+      } catch {
+        // The runtime-scoped marker is also removed on terminal cleanup and by
+        // stale-sidecar retention. A transient unlink failure cannot revoke a
+        // completion whose marker and output were already fully validated.
+      }
+    }
     return {
       mode: "windows-powershell-sidecar",
       sequence: snapshot.sequence,
       exitCode: snapshot.exitCode,
+      outcomeKnown: snapshot.outcomeKnown,
+      requestId: snapshot.requestId,
       cwd: snapshot.cwd,
       homeDir: snapshot.homeDir,
-      output,
+      output: output?.text,
+      outputObservedUtf8Bytes:
+        snapshot.outputObservedUtf8Bytes ?? output?.observedUtf8Bytes,
+      outputRetainedUtf8Bytes:
+        snapshot.outputRetainedUtf8Bytes ?? output?.observedUtf8Bytes,
+      outputTruncated: snapshot.outputTruncated ?? output?.truncated,
     };
   }
 
@@ -544,11 +698,6 @@ export class SSHBackend implements TerminalBackend {
       return;
     }
     await this.refreshWindowsPromptMarkerState(instance);
-  }
-
-  private stripReadyMarker(chunk: string): string {
-    if (!chunk.includes(GYSHELL_READY_MARKER)) return chunk;
-    return chunk.replace(/__GYSHELL_READY__/g, "");
   }
 
   private clearSystemInfoRetry(instance: SSHInstance): void {
@@ -601,6 +750,8 @@ export class SSHBackend implements TerminalBackend {
     return await new Promise((resolve, reject) => {
       let stdout = "";
       let stderr = "";
+      const stdoutDecoder = new StringDecoder("utf8");
+      const stderrDecoder = new StringDecoder("utf8");
       let settled = false;
 
       const timer = setTimeout(() => {
@@ -617,15 +768,17 @@ export class SSHBackend implements TerminalBackend {
         }
 
         stream.on("data", (d: Buffer) => {
-          stdout += d.toString("utf8");
+          stdout += stdoutDecoder.write(d);
         });
         stream.stderr.on("data", (d: Buffer) => {
-          stderr += d.toString("utf8");
+          stderr += stderrDecoder.write(d);
         });
         stream.on("close", () => {
           if (settled) return;
           settled = true;
           clearTimeout(timer);
+          stdout += stdoutDecoder.end();
+          stderr += stderrDecoder.end();
           resolve({ stdout, stderr });
         });
         if (options?.stdin !== undefined) {
@@ -641,7 +794,77 @@ export class SSHBackend implements TerminalBackend {
     });
   }
 
-  private buildWindowsBootstrapInfoCommand(): string {
+  private async detectCommandShellFamily(
+    instance: SSHInstance,
+  ): Promise<TerminalCommandShellFamily> {
+    const markerSuffix = instance.commandProtocolToken;
+    const powerShellMarker = `__GYSHELL_SHELL_POWERSHELL__${markerSuffix}`;
+    const unixMarker = `__GYSHELL_SHELL_UNIX__${markerSuffix}`;
+
+    try {
+      const result = await this.execCollect(
+        instance.client,
+        `if ($null -ne $PSVersionTable) { [Console]::Out.Write('${powerShellMarker}') }`,
+        6000,
+      );
+      if (String(result.stdout || "").includes(powerShellMarker)) {
+        instance.powerShellExecutable =
+          instance.remoteOs === "windows" ? "powershell.exe" : "pwsh";
+        return "powershell";
+      }
+    } catch {
+      // A POSIX login shell rejects the PowerShell-only probe.
+    }
+
+    try {
+      const result = await this.execCollect(
+        instance.client,
+        `if [ -n "\${BASH_VERSION-}\${ZSH_VERSION-}" ]; then printf '%s' '${unixMarker}'; fi`,
+        6000,
+      );
+      if (String(result.stdout || "").includes(unixMarker)) {
+        return "unix";
+      }
+    } catch {
+      // cmd.exe and PowerShell reject the POSIX-only probe.
+    }
+
+    const fallback = instance.remoteOs === "windows" ? "powershell" : "unix";
+    if (fallback === "powershell") {
+      instance.powerShellExecutable = "powershell.exe";
+    }
+    return fallback;
+  }
+
+  private getPowerShellExecutable(instance: SSHInstance): "powershell.exe" | "pwsh" {
+    return (
+      instance.powerShellExecutable ||
+      (instance.remoteOs === "unix" ? "pwsh" : "powershell.exe")
+    );
+  }
+
+  private normalizePowerShellPath(instance: SSHInstance, filePath: string): string {
+    const normalized = this.normalizeRemotePath(filePath);
+    return instance.remoteOs === "unix"
+      ? normalized
+      : normalized.replace(/\//g, "\\");
+  }
+
+  private buildPowerShellEncodedInvocation(
+    instance: SSHInstance,
+    encoded: string,
+    options?: { noExit?: boolean; bypassExecutionPolicy?: boolean },
+  ): string {
+    const executable = this.getPowerShellExecutable(instance);
+    const lifecycleArg = options?.noExit ? "-NoExit" : "-NonInteractive";
+    const executionPolicy =
+      options?.bypassExecutionPolicy && instance.remoteOs !== "unix"
+        ? " -ExecutionPolicy Bypass"
+        : "";
+    return `${executable} -NoLogo -NoProfile ${lifecycleArg}${executionPolicy} -EncodedCommand ${encoded}`;
+  }
+
+  private buildWindowsBootstrapInfoCommand(instance: SSHInstance): string {
     const script = [
       "$utf8=[System.Text.UTF8Encoding]::new($false)",
       "[Console]::OutputEncoding=$utf8",
@@ -651,15 +874,38 @@ export class SSHBackend implements TerminalBackend {
       "[Console]::OpenStandardOutput().Write($bytes,0,$bytes.Length)",
     ].join(";");
     const encoded = Buffer.from(script, "utf16le").toString("base64");
-    return `powershell.exe -NoLogo -NoProfile -NonInteractive -EncodedCommand ${encoded}`;
+    return this.buildPowerShellEncodedInvocation(instance, encoded);
   }
 
   private shouldUseWindowsPowerShellSidecar(instance: SSHInstance): boolean {
     return shouldUseWindowsPowerShellSidecar({
       buildNumber: instance.windowsBuildNumber,
-      shell: String(instance.systemInfo?.shell || "powershell.exe"),
+      shell: String(
+        instance.systemInfo?.shell || this.getPowerShellExecutable(instance),
+      ),
       trackingChannelAvailable: !instance.sftpInitError,
     });
+  }
+
+  private hasReliableWindowsCommandProtocol(instance: SSHInstance): boolean {
+    if (instance.commandTrackingMode === "windows-powershell-sidecar") {
+      return Boolean(
+        instance.sftp &&
+          !instance.sftpInitError &&
+          instance.windowsPromptMarkerPath &&
+          instance.windowsCommandRequestPath &&
+          instance.windowsCommandOutputPath &&
+          instance.windowsPowerShellBootstrapPath,
+      );
+    }
+    const buildNumber = instance.windowsBuildNumber;
+    if (!buildNumber) {
+      return false;
+    }
+    return (
+      buildNumber >= WINDOWS_POWERSHELL_SIDECAR_BUILD_THRESHOLD &&
+      instance.commandTrackingMode === "shell-integration"
+    );
   }
 
   private buildWindowsPromptMarkerPath(
@@ -683,6 +929,13 @@ export class SSHBackend implements TerminalBackend {
     return `${this.buildWindowsPromptMarkerDirectory(tempPath)}/${WINDOWS_POWERSHELL_COMMAND_OUTPUT_FILE_PREFIX}${ptyId}.txt`;
   }
 
+  private buildWindowsPowerShellBootstrapPath(
+    tempPath: string,
+    runtimeToken: string,
+  ): string {
+    return `${this.buildWindowsPromptMarkerDirectory(tempPath)}/${WINDOWS_POWERSHELL_BOOTSTRAP_FILE_PREFIX}${runtimeToken}.ps1`;
+  }
+
   private buildWindowsPromptMarkerDirectory(tempPath: string): string {
     const normalizedTemp = this.normalizeRemotePath(tempPath).replace(
       /\/+$/,
@@ -696,20 +949,67 @@ export class SSHBackend implements TerminalBackend {
     promptMarkerPath?: string;
     commandRequestPath?: string;
     commandOutputPath?: string;
+    commandProtocolToken?: string;
   }): string {
     return buildWindowsPowerShellEncodedCommand({
-      readyMarker: GYSHELL_READY_MARKER,
+      readyMarker: buildInitializationReadyMarker(
+        options?.commandProtocolToken,
+      ),
       commandTrackingMode: options?.commandTrackingMode || "shell-integration",
       promptMarkerPath: options?.promptMarkerPath,
       commandRequestPath: options?.commandRequestPath,
       commandOutputPath: options?.commandOutputPath,
+      commandProtocolToken: options?.commandProtocolToken,
+    });
+  }
+
+  private buildWindowsPowerShellBootstrapScript(options: {
+    commandTrackingMode: WindowsCommandTrackingMode;
+    promptMarkerPath?: string;
+    commandRequestPath?: string;
+    commandOutputPath?: string;
+    commandProtocolToken: string;
+  }): string {
+    return buildWindowsPowerShellBootstrapScript({
+      readyMarker: buildInitializationReadyMarker(
+        options.commandProtocolToken,
+      ),
+      ...options,
+    });
+  }
+
+  private buildWindowsPowerShellLaunchCommand(instance: SSHInstance): string {
+    if (
+      instance.commandTrackingMode === "windows-powershell-sidecar" &&
+      instance.windowsPowerShellBootstrapPath
+    ) {
+      const loader = buildWindowsPowerShellBootstrapLoaderEncodedCommand(
+        this.normalizePowerShellPath(
+          instance,
+          instance.windowsPowerShellBootstrapPath,
+        ),
+      );
+      return this.buildPowerShellEncodedInvocation(instance, loader, {
+        noExit: true,
+        bypassExecutionPolicy: true,
+      });
+    }
+    const encoded = this.buildWindowsPowerShellEncodedCommand({
+      commandTrackingMode: instance.commandTrackingMode,
+      promptMarkerPath: instance.windowsPromptMarkerPath,
+      commandRequestPath: instance.windowsCommandRequestPath,
+      commandOutputPath: instance.windowsCommandOutputPath,
+      commandProtocolToken: instance.commandProtocolToken,
+    });
+    return this.buildPowerShellEncodedInvocation(instance, encoded, {
+      noExit: true,
     });
   }
 
   private getShellInitRetryIntervalMs(
-    remoteOs: SSHInstance["remoteOs"],
+    shellFamily: TerminalCommandShellFamily | undefined,
   ): number {
-    return remoteOs === "windows"
+    return shellFamily === "powershell"
       ? SSHBackend.WINDOWS_SHELL_INIT_RETRY_INTERVAL_MS
       : SSHBackend.SHELL_INIT_RETRY_INTERVAL_MS;
   }
@@ -718,48 +1018,96 @@ export class SSHBackend implements TerminalBackend {
     try {
       const info = await this.execCollect(
         instance.client,
-        this.buildWindowsBootstrapInfoCommand(),
+        this.buildWindowsBootstrapInfoCommand(instance),
         10000,
       );
       const parsed = JSON.parse(info.stdout || "{}") as WindowsBootstrapInfo;
       const release = String(parsed.Version || "").trim();
       const tempPath = String(parsed.TempPath || "").trim();
-      const nextSystemInfo = {
-        os: "Windows",
-        platform: "win32",
-        release,
-        arch: String(parsed.Arch || "").trim(),
-        hostname: String(parsed.CSName || "").trim(),
-        isRemote: true,
-        shell: "powershell.exe",
-      };
-      instance.systemInfo = nextSystemInfo;
-      instance.windowsBuildNumber = parseWindowsBuildNumber(release);
+      if (instance.remoteOs !== "unix") {
+        instance.systemInfo = {
+          os: "Windows",
+          platform: "win32",
+          release,
+          arch: String(parsed.Arch || "").trim(),
+          hostname: String(parsed.CSName || "").trim(),
+          isRemote: true,
+          shell: this.getPowerShellExecutable(instance),
+        };
+        instance.windowsBuildNumber = parseWindowsBuildNumber(release);
+      }
       instance.commandTrackingMode = this.shouldUseWindowsPowerShellSidecar(
         instance,
       )
         ? "windows-powershell-sidecar"
         : "shell-integration";
       if (instance.commandTrackingMode === "windows-powershell-sidecar") {
-        const fallbackTempPath = tempPath || "C:/Windows/Temp";
+        const fallbackTempPath =
+          tempPath ||
+          (instance.remoteOs === "unix" ? "/tmp" : "C:/Windows/Temp");
         await this.cleanupStaleWindowsPromptMarkers(instance, fallbackTempPath);
+        // The public SSH config id and pty id are intentionally stable across
+        // reconnects. Sidecar paths must not be: a delayed SFTP write from an
+        // abandoned runtime could otherwise overwrite a replacement command.
+        // The command protocol token is random for every spawned SSH runtime.
+        const runtimeSidecarId = instance.commandProtocolToken;
         instance.windowsPromptMarkerPath = this.buildWindowsPromptMarkerPath(
           fallbackTempPath,
-          instance.sshConfig?.id || "ssh",
+          runtimeSidecarId,
         );
         instance.windowsCommandRequestPath =
           this.buildWindowsCommandRequestPath(
             fallbackTempPath,
-            instance.sshConfig?.id || "ssh",
+            runtimeSidecarId,
           );
         instance.windowsCommandOutputPath = this.buildWindowsCommandOutputPath(
           fallbackTempPath,
-          instance.sshConfig?.id || "ssh",
+          runtimeSidecarId,
+        );
+        instance.windowsPowerShellBootstrapPath =
+          this.buildWindowsPowerShellBootstrapPath(
+            fallbackTempPath,
+            runtimeSidecarId,
+          );
+        const bootstrapDirectory = this.normalizePowerShellPath(
+          instance,
+          dirname(instance.windowsPowerShellBootstrapPath),
+        );
+        const createDirectoryScript =
+          `[IO.Directory]::CreateDirectory('${escapePowerShellSingleQuotedString(bootstrapDirectory)}')|Out-Null`;
+        const createDirectoryEncoded = Buffer.from(
+          createDirectoryScript,
+          "utf16le",
+        ).toString("base64");
+        await this.execCollect(
+          instance.client,
+          this.buildPowerShellEncodedInvocation(
+            instance,
+            createDirectoryEncoded,
+          ),
+          6000,
+        );
+        const bootstrapScript = this.buildWindowsPowerShellBootstrapScript({
+          commandTrackingMode: "windows-powershell-sidecar",
+          promptMarkerPath: instance.windowsPromptMarkerPath,
+          commandRequestPath: instance.windowsCommandRequestPath,
+          commandOutputPath: instance.windowsCommandOutputPath,
+          commandProtocolToken: instance.commandProtocolToken,
+        });
+        const sftp = await this.initializeSftp(instance);
+        await this.sftpWriteFile(
+          sftp,
+          this.normalizeRemotePath(instance.windowsPowerShellBootstrapPath),
+          Buffer.concat([
+            Buffer.from([0xef, 0xbb, 0xbf]),
+            Buffer.from(bootstrapScript, "utf8"),
+          ]),
         );
       } else {
         instance.windowsPromptMarkerPath = undefined;
         instance.windowsCommandRequestPath = undefined;
         instance.windowsCommandOutputPath = undefined;
+        instance.windowsPowerShellBootstrapPath = undefined;
       }
       instance.windowsPromptMarkerState = undefined;
     } catch {
@@ -767,6 +1115,7 @@ export class SSHBackend implements TerminalBackend {
       instance.windowsPromptMarkerPath = undefined;
       instance.windowsCommandRequestPath = undefined;
       instance.windowsCommandOutputPath = undefined;
+      instance.windowsPowerShellBootstrapPath = undefined;
     }
   }
 
@@ -774,22 +1123,22 @@ export class SSHBackend implements TerminalBackend {
     instance: SSHInstance,
     tempPath: string,
   ): Promise<void> {
-    const markerDir = this.buildWindowsPromptMarkerDirectory(tempPath).replace(
-      /\//g,
-      "\\",
+    const markerDir = this.normalizePowerShellPath(
+      instance,
+      this.buildWindowsPromptMarkerDirectory(tempPath),
     );
     const cutoffDays = Math.floor(
       WINDOWS_POWERSHELL_SIDECAR_RETENTION_MS / (24 * 60 * 60 * 1000),
     );
     const script = [
       `$__gyshell_marker_dir='${escapePowerShellSingleQuotedString(markerDir)}'`,
-      `if(Test-Path -LiteralPath $__gyshell_marker_dir){Get-ChildItem -LiteralPath $__gyshell_marker_dir -File -ErrorAction SilentlyContinue|Where-Object{($_.Name -like 'gyshell-prompt-*.log' -or $_.Name -like '${WINDOWS_POWERSHELL_COMMAND_REQUEST_FILE_PREFIX}*.b64' -or $_.Name -like '${WINDOWS_POWERSHELL_COMMAND_OUTPUT_FILE_PREFIX}*.txt') -and $_.LastWriteTimeUtc -lt (Get-Date).ToUniversalTime().AddDays(-${cutoffDays})}|Remove-Item -Force -ErrorAction SilentlyContinue}`,
+      `if(Test-Path -LiteralPath $__gyshell_marker_dir){Get-ChildItem -LiteralPath $__gyshell_marker_dir -File -ErrorAction SilentlyContinue|Where-Object{($_.Name -like 'gyshell-prompt-*.log' -or $_.Name -like 'gyshell-prompt-*.log.*' -or $_.Name -like '${WINDOWS_POWERSHELL_COMMAND_REQUEST_FILE_PREFIX}*.b64' -or $_.Name -like '${WINDOWS_POWERSHELL_COMMAND_OUTPUT_FILE_PREFIX}*.txt' -or $_.Name -like '${WINDOWS_POWERSHELL_BOOTSTRAP_FILE_PREFIX}*.ps1') -and $_.LastWriteTimeUtc -lt (Get-Date).ToUniversalTime().AddDays(-${cutoffDays})}|Remove-Item -Force -ErrorAction SilentlyContinue}`,
     ].join(";");
     const encoded = Buffer.from(script, "utf16le").toString("base64");
     try {
       await this.execCollect(
         instance.client,
-        `powershell.exe -NoLogo -NoProfile -NonInteractive -EncodedCommand ${encoded}`,
+        this.buildPowerShellEncodedInvocation(instance, encoded),
         6000,
       );
     } catch {
@@ -803,9 +1152,10 @@ export class SSHBackend implements TerminalBackend {
     if (!instance.windowsPromptMarkerPath) {
       return false;
     }
-    const markerPath = this.normalizeRemotePath(
+    const markerPath = this.normalizePowerShellPath(
+      instance,
       instance.windowsPromptMarkerPath,
-    ).replace(/\//g, "\\");
+    );
     const script = [
       "$__gyshell_utf8=[Text.UTF8Encoding]::new($false)",
       "$OutputEncoding=$__gyshell_utf8",
@@ -817,7 +1167,7 @@ export class SSHBackend implements TerminalBackend {
     try {
       await this.execCollect(
         instance.client,
-        `powershell.exe -NoLogo -NoProfile -NonInteractive -EncodedCommand ${encoded}`,
+        this.buildPowerShellEncodedInvocation(instance, encoded),
         6000,
       );
       instance.windowsPromptMarkerState = undefined;
@@ -829,14 +1179,19 @@ export class SSHBackend implements TerminalBackend {
 
   private async readWindowsPromptMarkerState(
     instance: SSHInstance,
+    expectedRequestId?: string,
   ): Promise<WindowsPromptMarkerState | null> {
     if (!instance.windowsPromptMarkerPath) {
       return null;
     }
     const sftp = await this.initializeSftp(instance);
-    const normalizedPath = this.normalizeRemotePath(
-      instance.windowsPromptMarkerPath,
-    );
+    const markerPath = expectedRequestId
+      ? buildWindowsPowerShellRequestMarkerPath(
+          instance.windowsPromptMarkerPath,
+          expectedRequestId,
+        )
+      : instance.windowsPromptMarkerPath;
+    const normalizedPath = this.normalizeRemotePath(markerPath);
     let stats: ssh2.Stats;
     try {
       stats = await this.sftpStat(sftp, normalizedPath);
@@ -849,14 +1204,23 @@ export class SSHBackend implements TerminalBackend {
 
     const totalSize = Math.max(0, Number(stats.size) || 0);
     if (totalSize <= 0) {
+      if (expectedRequestId) {
+        throw new Error("Windows sidecar request marker is empty.");
+      }
       return null;
     }
 
-    const readSize = Math.min(
-      totalSize,
-      SSHBackend.WINDOWS_PROMPT_MARKER_TAIL_BYTES,
-    );
-    const startOffset = Math.max(0, totalSize - readSize);
+    if (
+      expectedRequestId &&
+      totalSize > WINDOWS_POWERSHELL_REQUEST_MARKER_MAX_UTF8_BYTES
+    ) {
+      throw new Error("Windows sidecar request marker exceeds its protocol limit.");
+    }
+
+    const readSize = expectedRequestId
+      ? totalSize
+      : Math.min(totalSize, SSHBackend.WINDOWS_PROMPT_MARKER_TAIL_BYTES);
+    const startOffset = expectedRequestId ? 0 : Math.max(0, totalSize - readSize);
     const handle = await this.sftpOpen(sftp, normalizedPath, "r");
     try {
       const buffer = Buffer.allocUnsafe(readSize);
@@ -869,16 +1233,38 @@ export class SSHBackend implements TerminalBackend {
         startOffset,
       );
       if (bytesRead <= 0) {
+        if (expectedRequestId) {
+          throw new Error("Windows sidecar request marker could not be read.");
+        }
         return null;
       }
       const text = buffer.subarray(0, bytesRead).toString("utf8");
-      const lines = text.split(/\r?\n/);
-      for (let index = lines.length - 1; index >= 0; index -= 1) {
-        const parsed = parseWindowsPromptMarkerLine(lines[index] || "");
+      const exactRequestMarker = expectedRequestId
+        ? parseWindowsPowerShellRequestMarkerFile(text, expectedRequestId)
+        : undefined;
+      if (expectedRequestId && !exactRequestMarker) {
+        throw new Error("Windows sidecar request marker is malformed.");
+      }
+      const candidates: Array<string | WindowsPromptMarkerState> = exactRequestMarker
+        ? [exactRequestMarker]
+        : text.split(/\r?\n/);
+      for (let index = candidates.length - 1; index >= 0; index -= 1) {
+        const candidate = candidates[index];
+        const parsed = typeof candidate === "string"
+          ? parseWindowsPromptMarkerLine(candidate)
+          : candidate;
         if (parsed) {
+          if (expectedRequestId && parsed.requestId !== expectedRequestId) {
+            continue;
+          }
           return {
             sequence: parsed.sequence,
             exitCode: parsed.exitCode,
+            outcomeKnown: parsed.outcomeKnown,
+            requestId: parsed.requestId,
+            outputObservedUtf8Bytes: parsed.outputObservedUtf8Bytes,
+            outputRetainedUtf8Bytes: parsed.outputRetainedUtf8Bytes,
+            outputTruncated: parsed.outputTruncated,
             cwd: parsed.cwd
               ? this.normalizeDecodedRemotePath(parsed.cwd) || undefined
               : undefined,
@@ -899,39 +1285,68 @@ export class SSHBackend implements TerminalBackend {
 
   private async refreshWindowsPromptMarkerState(
     instance: SSHInstance,
-    options?: { allowCachedFallback?: boolean },
+    options?: {
+      allowCachedFallback?: boolean;
+      expectedRequestId?: string;
+    },
   ): Promise<WindowsPromptMarkerState | null> {
     let next: WindowsPromptMarkerState | null = null;
     try {
-      next = await this.readWindowsPromptMarkerState(instance);
-    } catch (error) {
-      next = await this.readWindowsPromptMarkerStateViaExec(instance).catch(
-        () => {
-          throw error;
-        },
+      next = await this.readWindowsPromptMarkerState(
+        instance,
+        options?.expectedRequestId,
       );
+    } catch (error) {
+      next = await this.readWindowsPromptMarkerStateViaExec(
+        instance,
+        options?.expectedRequestId,
+      ).catch(() => {
+        throw error;
+      });
     }
     return this.applyWindowsPromptMarkerState(instance, next, options);
   }
 
   private async refreshWindowsPromptMarkerStateViaExec(
     instance: SSHInstance,
-    options?: { allowCachedFallback?: boolean },
+    options?: {
+      allowCachedFallback?: boolean;
+      expectedRequestId?: string;
+    },
   ): Promise<WindowsPromptMarkerState | null> {
-    const next = await this.readWindowsPromptMarkerStateViaExec(instance);
+    const next = await this.readWindowsPromptMarkerStateViaExec(
+      instance,
+      options?.expectedRequestId,
+    );
     return this.applyWindowsPromptMarkerState(instance, next, options);
   }
 
   private applyWindowsPromptMarkerState(
     instance: SSHInstance,
     next: WindowsPromptMarkerState | null,
-    options?: { allowCachedFallback?: boolean },
+    options?: {
+      allowCachedFallback?: boolean;
+      expectedRequestId?: string;
+    },
   ): WindowsPromptMarkerState | null {
     if (!next) {
+      if (options?.expectedRequestId) {
+        return null;
+      }
       if (options?.allowCachedFallback === false) {
         return null;
       }
-      return instance.windowsPromptMarkerState || null;
+      const cached = instance.windowsPromptMarkerState;
+      if (
+        options?.expectedRequestId &&
+        cached?.requestId !== options.expectedRequestId
+      ) {
+        return null;
+      }
+      return cached || null;
+    }
+    if (options?.expectedRequestId) {
+      return next;
     }
     instance.windowsPromptMarkerState = next;
     if (next.cwd) {
@@ -945,132 +1360,195 @@ export class SSHBackend implements TerminalBackend {
 
   private async readWindowsPromptMarkerStateViaExec(
     instance: SSHInstance,
+    expectedRequestId?: string,
   ): Promise<WindowsPromptMarkerState | null> {
     if (!instance.windowsPromptMarkerPath) {
       return null;
     }
-    const markerPath = this.normalizeRemotePath(
-      instance.windowsPromptMarkerPath,
-    ).replace(/\//g, "\\");
+    const sourceMarkerPath = expectedRequestId
+      ? buildWindowsPowerShellRequestMarkerPath(
+          instance.windowsPromptMarkerPath,
+          expectedRequestId,
+        )
+      : instance.windowsPromptMarkerPath;
+    const markerPath = this.normalizePowerShellPath(instance, sourceMarkerPath);
+    const readMarkerBody = expectedRequestId
+      ? `$__gyshell_length=(Get-Item -LiteralPath $__gyshell_marker_path).Length;if($__gyshell_length -gt ${WINDOWS_POWERSHELL_REQUEST_MARKER_MAX_UTF8_BYTES}){[Console]::Error.WriteLine('__GYSHELL_REQUEST_MARKER_OVERSIZE__='+$__gyshell_length)}else{$__gyshell_text=[IO.File]::ReadAllText($__gyshell_marker_path,$__gyshell_utf8)}`
+      : "$__gyshell_lines=@(Get-Content -LiteralPath $__gyshell_marker_path -Tail 128 -ErrorAction SilentlyContinue);$__gyshell_text=[string]::Join([Environment]::NewLine,[string[]]$__gyshell_lines)";
     const script = [
       "$__gyshell_utf8=[Text.UTF8Encoding]::new($false)",
       "[Console]::OutputEncoding=$__gyshell_utf8",
       "$OutputEncoding=$__gyshell_utf8",
       `$__gyshell_marker_path='${escapePowerShellSingleQuotedString(markerPath)}'`,
-      "if(Test-Path -LiteralPath $__gyshell_marker_path){$__gyshell_item=Get-Item -LiteralPath $__gyshell_marker_path -ErrorAction SilentlyContinue;$__gyshell_line=Get-Content -LiteralPath $__gyshell_marker_path -Tail 1 -ErrorAction SilentlyContinue;if($null -ne $__gyshell_line){$__gyshell_json=([pscustomobject]@{line=[string]$__gyshell_line;modifiedAtMs=[int64]([DateTimeOffset]$__gyshell_item.LastWriteTimeUtc).ToUnixTimeMilliseconds()}|ConvertTo-Json -Compress);$__gyshell_bytes=$__gyshell_utf8.GetBytes($__gyshell_json);[Console]::OpenStandardOutput().Write($__gyshell_bytes,0,$__gyshell_bytes.Length)}}",
+      `if(Test-Path -LiteralPath $__gyshell_marker_path){${expectedRequestId ? "[Console]::Error.WriteLine('__GYSHELL_REQUEST_MARKER_EXISTS__=1');" : ""}${readMarkerBody};if(-not [string]::IsNullOrEmpty($__gyshell_text)){$__gyshell_bytes=$__gyshell_utf8.GetBytes($__gyshell_text);[Console]::OpenStandardOutput().Write($__gyshell_bytes,0,$__gyshell_bytes.Length)}}`,
     ].join(";");
     const encoded = Buffer.from(script, "utf16le").toString("base64");
     const result = await this.execCollect(
       instance.client,
-      `powershell.exe -NoLogo -NoProfile -NonInteractive -EncodedCommand ${encoded}`,
+      this.buildPowerShellEncodedInvocation(instance, encoded),
       6000,
     );
+    if (
+      expectedRequestId &&
+      /(?:^|\r?\n)__GYSHELL_REQUEST_MARKER_OVERSIZE__=\d+(?:\r?\n|$)/.test(
+        String(result.stderr || ""),
+      )
+    ) {
+      throw new Error("Windows sidecar request marker exceeds its protocol limit.");
+    }
+    const exactMarkerExists =
+      expectedRequestId &&
+      /(?:^|\r?\n)__GYSHELL_REQUEST_MARKER_EXISTS__=1(?:\r?\n|$)/.test(
+        String(result.stderr || ""),
+      );
     const text = String(result.stdout || "").trim();
     if (!text) {
+      if (exactMarkerExists) {
+        throw new Error("Windows sidecar request marker is empty.");
+      }
       return null;
     }
-    try {
-      const parsedJson = JSON.parse(text) as {
-        line?: string;
-        modifiedAtMs?: number;
-      };
-      const parsed = parseWindowsPromptMarkerLine(
-        String(parsedJson.line || ""),
-      );
-      if (!parsed) {
-        return null;
-      }
-      return {
-        sequence: parsed.sequence,
-        exitCode: parsed.exitCode,
-        cwd: parsed.cwd
-          ? this.normalizeDecodedRemotePath(parsed.cwd) || undefined
-          : undefined,
-        homeDir: parsed.homeDir
-          ? this.normalizeDecodedRemotePath(parsed.homeDir) || undefined
-          : undefined,
-        modifiedAtMs: Number.isFinite(Number(parsedJson.modifiedAtMs))
-          ? Number(parsedJson.modifiedAtMs)
-          : undefined,
-      };
-    } catch {
-      const lines = text.split(/\r?\n/);
+    const parseLines = (
+      source: string,
+      modifiedAtMs?: number,
+    ): WindowsPromptMarkerState | null => {
+      const lines = source.split(/\r?\n/);
       for (let index = lines.length - 1; index >= 0; index -= 1) {
         const parsed = parseWindowsPromptMarkerLine(lines[index] || "");
         if (parsed) {
+          if (expectedRequestId && parsed.requestId !== expectedRequestId) {
+            continue;
+          }
           return {
             sequence: parsed.sequence,
             exitCode: parsed.exitCode,
+            outcomeKnown: parsed.outcomeKnown,
+            requestId: parsed.requestId,
+            outputObservedUtf8Bytes: parsed.outputObservedUtf8Bytes,
+            outputRetainedUtf8Bytes: parsed.outputRetainedUtf8Bytes,
+            outputTruncated: parsed.outputTruncated,
             cwd: parsed.cwd
               ? this.normalizeDecodedRemotePath(parsed.cwd) || undefined
               : undefined,
             homeDir: parsed.homeDir
               ? this.normalizeDecodedRemotePath(parsed.homeDir) || undefined
               : undefined,
+            modifiedAtMs,
           };
         }
       }
+      return null;
+    };
+    if (expectedRequestId) {
+      const exact = parseWindowsPowerShellRequestMarkerFile(
+        text,
+        expectedRequestId,
+      );
+      if (!exact) {
+        throw new Error("Windows sidecar request marker is malformed.");
+      }
+      return {
+        ...exact,
+        cwd: exact.cwd
+          ? this.normalizeDecodedRemotePath(exact.cwd) || undefined
+          : undefined,
+        homeDir: exact.homeDir
+          ? this.normalizeDecodedRemotePath(exact.homeDir) || undefined
+          : undefined,
+      };
     }
-    return null;
+    return parseLines(text);
   }
 
   private async readWindowsCommandOutput(
     instance: SSHInstance,
     outputPath: string,
-  ): Promise<string | undefined> {
+  ): Promise<BoundedWindowsCommandOutput | undefined> {
     const sftp = await this.initializeSftp(instance);
     const normalizedPath = this.normalizeRemotePath(outputPath);
+    let handle: Buffer | undefined;
     try {
-      const data = await new Promise<Buffer>((resolve, reject) => {
-        sftp.readFile(normalizedPath, (err, buf) => {
-          if (err || !buf) {
-            reject(
-              err || new Error("Failed to read Windows sidecar output file"),
-            );
-            return;
-          }
-          resolve(buf as Buffer);
-        });
-      });
-      return data.toString("utf8").replace(/^\ufeff/, "");
+      const stats = await this.sftpStat(sftp, normalizedPath);
+      const fileBytes = Math.max(0, Number(stats.size) || 0);
+      // Read a few look-ahead bytes so a scalar crossing the retention limit
+      // can be decoded before the Unicode-safe prefix is selected.
+      const bytesToRead = Math.min(
+        fileBytes,
+        COMMAND_CAPTURE_MAX_UTF8_BYTES + 6,
+      );
+      handle = await this.sftpOpen(sftp, normalizedPath, "r");
+      const buffer = Buffer.allocUnsafe(bytesToRead);
+      const bytesRead = await this.sftpReadRangeConcurrent(
+        sftp,
+        handle,
+        buffer,
+        0,
+        bytesToRead,
+        0,
+      );
+      if (bytesRead !== bytesToRead) {
+        throw new Error("Windows sidecar output file changed during SFTP read");
+      }
+      const decoder = new StringDecoder("utf8");
+      const decoded = decoder.end(buffer.subarray(0, bytesRead));
+      return normalizeBoundedWindowsCommandOutput(decoded, fileBytes);
     } catch (error: any) {
       if (error?.code === 2 || error?.code === "ENOENT") {
         return undefined;
       }
       throw error;
+    } finally {
+      if (handle) {
+        await this.sftpClose(sftp, handle).catch(() => {});
+      }
     }
   }
 
   private async readWindowsCommandOutputViaExec(
     instance: SSHInstance,
     outputPath: string,
-  ): Promise<string | undefined> {
-    const normalizedPath = this.normalizeRemotePath(outputPath).replace(
-      /\//g,
-      "\\",
-    );
+  ): Promise<BoundedWindowsCommandOutput | undefined> {
+    const normalizedPath = this.normalizePowerShellPath(instance, outputPath);
+    const readLimit = COMMAND_CAPTURE_MAX_UTF8_BYTES + 6;
     const script = [
-      "$__gyshell_utf8=[Text.UTF8Encoding]::new($false)",
-      "[Console]::OutputEncoding=$__gyshell_utf8",
-      "$OutputEncoding=$__gyshell_utf8",
       `$__gyshell_output_path='${escapePowerShellSingleQuotedString(normalizedPath)}'`,
-      "if(Test-Path -LiteralPath $__gyshell_output_path){$__gyshell_text=[IO.File]::ReadAllText($__gyshell_output_path,$__gyshell_utf8);$__gyshell_bytes=$__gyshell_utf8.GetBytes($__gyshell_text);[Console]::OpenStandardOutput().Write($__gyshell_bytes,0,$__gyshell_bytes.Length)}",
+      `if(Test-Path -LiteralPath $__gyshell_output_path){$__gyshell_file=[IO.File]::Open($__gyshell_output_path,[IO.FileMode]::Open,[IO.FileAccess]::Read,[IO.FileShare]::ReadWrite);try{$__gyshell_length=$__gyshell_file.Length;[Console]::Error.WriteLine('__GYSHELL_OUTPUT_BYTES__='+$__gyshell_length);$__gyshell_limit=[int][Math]::Min($__gyshell_length,${readLimit});$__gyshell_bytes=New-Object byte[] $__gyshell_limit;$__gyshell_read=0;while($__gyshell_read -lt $__gyshell_limit){$__gyshell_part=$__gyshell_file.Read($__gyshell_bytes,$__gyshell_read,$__gyshell_limit-$__gyshell_read);if($__gyshell_part -le 0){break};$__gyshell_read+=$__gyshell_part};[Console]::OpenStandardOutput().Write($__gyshell_bytes,0,$__gyshell_read);[Console]::Error.WriteLine('__GYSHELL_OUTPUT_READ__='+$__gyshell_read)}finally{$__gyshell_file.Dispose()}}`,
     ].join(";");
     const encoded = Buffer.from(script, "utf16le").toString("base64");
     const result = await this.execCollect(
       instance.client,
-      `powershell.exe -NoLogo -NoProfile -NonInteractive -EncodedCommand ${encoded}`,
+      this.buildPowerShellEncodedInvocation(instance, encoded),
       6000,
     );
-    const stdout = String(result.stdout || "");
-    return stdout ? stdout.replace(/^\ufeff/, "") : undefined;
+    const marker = String(result.stderr || "").match(
+      /(?:^|\r?\n)__GYSHELL_OUTPUT_BYTES__=(\d+)(?:\r?\n|$)/,
+    );
+    const readMarker = String(result.stderr || "").match(
+      /(?:^|\r?\n)__GYSHELL_OUTPUT_READ__=(\d+)(?:\r?\n|$)/,
+    );
+    if (!marker || !readMarker) return undefined;
+    const observedFileBytes = Number.parseInt(marker[1], 10);
+    const actualReadBytes = Number.parseInt(readMarker[1], 10);
+    const expectedReadBytes = Math.min(observedFileBytes, readLimit);
+    if (
+      !Number.isFinite(observedFileBytes) ||
+      !Number.isFinite(actualReadBytes) ||
+      actualReadBytes !== expectedReadBytes ||
+      utf8Length(String(result.stdout || "")) !== actualReadBytes
+    ) {
+      return undefined;
+    }
+    return normalizeBoundedWindowsCommandOutput(
+      String(result.stdout || ""),
+      observedFileBytes,
+    );
   }
 
   private async readWindowsCommandOutputBestEffort(
     instance: SSHInstance,
     outputPath: string | undefined,
     options?: { preferExec?: boolean },
-  ): Promise<string | undefined> {
+  ): Promise<BoundedWindowsCommandOutput | undefined> {
     if (!outputPath) {
       return undefined;
     }
@@ -1098,9 +1576,11 @@ export class SSHBackend implements TerminalBackend {
     const markerPath = instance.windowsPromptMarkerPath;
     const requestPath = instance.windowsCommandRequestPath;
     const outputPath = instance.windowsCommandOutputPath;
+    const bootstrapPath = instance.windowsPowerShellBootstrapPath;
     if (!markerPath) {
       instance.windowsCommandRequestPath = undefined;
       instance.windowsCommandOutputPath = undefined;
+      instance.windowsPowerShellBootstrapPath = undefined;
       return;
     }
     const sftp = instance.sftp;
@@ -1108,11 +1588,33 @@ export class SSHBackend implements TerminalBackend {
       instance.windowsPromptMarkerPath = undefined;
       instance.windowsCommandRequestPath = undefined;
       instance.windowsCommandOutputPath = undefined;
+      instance.windowsPowerShellBootstrapPath = undefined;
       instance.windowsPromptMarkerState = undefined;
       return;
     }
     try {
       await this.sftpUnlink(sftp, this.normalizeRemotePath(markerPath));
+      const normalizedMarkerPath = this.normalizeRemotePath(markerPath);
+      const markerDir = this.normalizeRemotePath(dirname(markerPath));
+      const markerBaseName = normalizedMarkerPath.slice(
+        normalizedMarkerPath.lastIndexOf("/") + 1,
+      );
+      try {
+        const entries = await this.sftpReaddir(sftp, markerDir);
+        for (const entry of entries) {
+          if (
+            entry.filename.startsWith(`${markerBaseName}.`) &&
+            /^[a-f0-9]{32}(?:\.tmp)?$/i.test(
+              entry.filename.slice(markerBaseName.length + 1),
+            )
+          ) {
+            await this.sftpUnlink(
+              sftp,
+              this.joinRemotePath(markerDir, entry.filename),
+            ).catch(() => {});
+          }
+        }
+      } catch {}
       if (requestPath) {
         try {
           await this.sftpUnlink(sftp, this.normalizeRemotePath(requestPath));
@@ -1123,7 +1625,14 @@ export class SSHBackend implements TerminalBackend {
           await this.sftpUnlink(sftp, this.normalizeRemotePath(outputPath));
         } catch {}
       }
-      const markerDir = this.normalizeRemotePath(dirname(markerPath));
+      if (bootstrapPath) {
+        try {
+          await this.sftpUnlink(
+            sftp,
+            this.normalizeRemotePath(bootstrapPath),
+          );
+        } catch {}
+      }
       try {
         await this.sftpRmdir(sftp, markerDir);
       } catch {}
@@ -1141,6 +1650,7 @@ export class SSHBackend implements TerminalBackend {
       instance.windowsPromptMarkerPath = undefined;
       instance.windowsCommandRequestPath = undefined;
       instance.windowsCommandOutputPath = undefined;
+      instance.windowsPowerShellBootstrapPath = undefined;
       instance.windowsPromptMarkerState = undefined;
     }
   }
@@ -1695,7 +2205,9 @@ export class SSHBackend implements TerminalBackend {
     try {
       instance.client.end();
     } catch {}
-    this.sessions.delete(ptyId);
+    if (this.sessions.get(ptyId) === instance) {
+      this.sessions.delete(ptyId);
+    }
     void this.cleanupWindowsPromptMarker(instance).catch(() => {});
     instance.exitCallbacks.forEach((callback) => {
       try {
@@ -1723,12 +2235,13 @@ export class SSHBackend implements TerminalBackend {
       requestedRows: config.rows,
       isInitializing: true,
       buffer: "",
-      oscBuffer: "",
+      commandProtocolToken: randomBytes(16).toString("hex"),
       forwardServers: [],
       remoteForwards: [],
       remoteForwardHandlerInstalled: false,
       initializationState: "initializing",
       systemInfoRetryCount: 0,
+      streamDecoder: new StringDecoder('utf8'),
     };
     this.sessions.set(config.id, instance);
 
@@ -1760,25 +2273,32 @@ export class SSHBackend implements TerminalBackend {
         try {
           emit("\x1b[36m▹ Detecting remote OS...\x1b[0m\r\n");
           console.log(`[SSH] Detecting remote OS...`);
-          const uname = await this.execCollect(client, "uname -s");
-          const u = (uname.stdout || uname.stderr || "").toLowerCase();
-          if (u.includes("linux") || u.includes("darwin")) {
-            instance.remoteOs = "unix";
-          }
+          const ver = await this.execCollect(client, "cmd.exe /c ver");
+          const v = (ver.stdout || ver.stderr || "").toLowerCase();
+          if (v.includes("windows")) instance.remoteOs = "windows";
         } catch {
           // ignore
         }
         if (!instance.remoteOs) {
           try {
-            const ver = await this.execCollect(client, "cmd.exe /c ver");
-            const v = (ver.stdout || ver.stderr || "").toLowerCase();
-            if (v.includes("windows")) instance.remoteOs = "windows";
+            const uname = await this.execCollect(client, "uname -s");
+            const u = (uname.stdout || uname.stderr || "").toLowerCase();
+            if (u.includes("linux") || u.includes("darwin")) {
+              instance.remoteOs = "unix";
+            }
           } catch {
             // ignore
           }
         }
         if (!instance.remoteOs) instance.remoteOs = "unix";
         console.log(`[SSH] Remote OS detected: ${instance.remoteOs}`);
+
+        instance.commandShellFamily = await this.detectCommandShellFamily(
+          instance,
+        );
+        console.log(
+          `[SSH] Command shell family detected: ${instance.commandShellFamily}`,
+        );
 
         try {
           emit("\x1b[36m▹ Initializing SFTP channel...\x1b[0m\r\n");
@@ -1794,7 +2314,7 @@ export class SSHBackend implements TerminalBackend {
           );
         }
 
-        if (instance.remoteOs === "windows") {
+        if (instance.commandShellFamily === "powershell") {
           try {
             await this.bootstrapWindowsSession(instance);
           } catch {
@@ -1841,31 +2361,33 @@ export class SSHBackend implements TerminalBackend {
             let retryCount = 0;
             const maxRetries = 3;
             let isReadySent = false;
+            const initializationReadyMarker = buildInitializationReadyMarker(
+              instance.commandProtocolToken,
+            );
 
             const attemptInjection = () => {
               if (!instance.stream || isReadySent || !instance.isInitializing)
                 return;
 
               console.log(`[SSH] Injection attempt ${retryCount + 1}...`);
-              if (instance.remoteOs !== "windows" || retryCount > 0) {
+              if (
+                instance.commandShellFamily !== "powershell" ||
+                retryCount > 0
+              ) {
                 instance.stream.write("\x03\n\n");
               }
 
               setTimeout(() => {
                 if (!instance.stream || isReadySent || !instance.isInitializing)
                   return;
-                if (instance.remoteOs === "windows") {
-                  const b64 = this.buildWindowsPowerShellEncodedCommand({
-                    commandTrackingMode: instance.commandTrackingMode,
-                    promptMarkerPath: instance.windowsPromptMarkerPath,
-                    commandRequestPath: instance.windowsCommandRequestPath,
-                    commandOutputPath: instance.windowsCommandOutputPath,
-                  });
+                if (instance.commandShellFamily === "powershell") {
                   instance.stream.write(
-                    `powershell.exe -NoLogo -NoProfile -NoExit -EncodedCommand ${b64}\r`,
+                    `${this.buildWindowsPowerShellLaunchCommand(instance)}\r`,
                   );
                 } else {
-                  const script = this.getUnixInjectionScript();
+                  const script = this.getUnixInjectionScript(
+                    instance.commandProtocolToken,
+                  );
                   const b64 = Buffer.from(script).toString("base64");
                   const injection = `  eval "$(printf '%s' '${b64}' | base64 -d 2>/dev/null || printf '%s' '${b64}' | base64 --decode 2>/dev/null)"\n`;
 
@@ -1901,13 +2423,17 @@ export class SSHBackend implements TerminalBackend {
               } else {
                 clearInterval(watchdogInterval);
               }
-            }, this.getShellInitRetryIntervalMs(instance.remoteOs));
+            }, this.getShellInitRetryIntervalMs(instance.commandShellFamily));
 
             stream.on("data", (data: Buffer) => {
-              const chunk = data.toString();
+              const chunk = instance.streamDecoder.write(data);
               if (instance.isInitializing) {
                 instance.buffer += chunk;
-                if (instance.buffer.includes(GYSHELL_READY_MARKER)) {
+                const postInitializationData = consumeInitializationReadyMarker(
+                  instance.buffer,
+                  initializationReadyMarker,
+                );
+                if (postInitializationData !== undefined) {
                   emit("\x1b[2J\x1b[H"); // Clear screen
                   isReadySent = true;
                   clearInterval(watchdogInterval);
@@ -1917,17 +2443,18 @@ export class SSHBackend implements TerminalBackend {
                     instance.buffer.trimEnd().endsWith("\r\n>>");
                   instance.initializationState = "ready";
                   instance.isInitializing = false;
-                  const parts = instance.buffer.split(GYSHELL_READY_MARKER);
-                  if (parts.length > 1) {
-                    const realContent = this.stripReadyMarker(
-                      parts.slice(1).join(GYSHELL_READY_MARKER),
-                    ).trimStart();
-                    if (realContent) emit(realContent);
-                  }
+                  instance.commandProtocolAvailable =
+                    instance.commandShellFamily === "powershell"
+                      ? this.hasReliableWindowsCommandProtocol(instance)
+                      : instance.buffer.includes(
+                          "__GYSHELL_COMMAND_PROTOCOL__=verified",
+                        );
+                  const realContent = postInitializationData.trimStart();
+                  if (realContent) emit(realContent);
                   instance.buffer = "";
                   if (
                     sawContinuation &&
-                    instance.remoteOs === "windows" &&
+                    instance.commandShellFamily === "powershell" &&
                     instance.stream
                   ) {
                     setTimeout(() => {
@@ -1938,15 +2465,19 @@ export class SSHBackend implements TerminalBackend {
                   }
                 }
               } else {
-                const sanitizedChunk = this.stripReadyMarker(chunk);
-                this.consumeOscMarkers(instance, sanitizedChunk);
-                if (sanitizedChunk) {
-                  emit(sanitizedChunk);
-                }
+                emit(chunk);
               }
             });
 
             stream.on("close", async (code: number) => {
+              const remaining = instance.streamDecoder.end();
+              if (remaining) {
+                if (instance.isInitializing) {
+                  instance.buffer += remaining;
+                } else {
+                  emit(remaining);
+                }
+              }
               emitExit(typeof code === "number" ? code : 0);
             });
           },
@@ -2285,38 +2816,115 @@ export class SSHBackend implements TerminalBackend {
     return sftp;
   }
 
-  private getUnixInjectionScript(): string {
+  private getUnixInjectionScript(runtimeToken: string): string {
     // Minified script to reduce payload size and potential TTY buffer issues
+    const commandMarkerPrefix = buildCommandProtocolMarkerPrefix(runtimeToken);
+    const privateIdentifierPrefix = `__gyshell_${runtimeToken}`;
+    const protocolName = `${privateIdentifierPrefix}_command_protocol`;
+    const inCommandName = `${privateIdentifierPrefix}_in_command`;
+    const commandSequenceName = `${privateIdentifierPrefix}_command_seq`;
+    const commandNonceName = `${privateIdentifierPrefix}_command_nonce`;
+    const dispatchActiveName = `${privateIdentifierPrefix}_dispatch_active`;
+    const dispatchCompletionReadyName = `${privateIdentifierPrefix}_dispatch_completion_ready`;
+    const debugPriorName = `${privateIdentifierPrefix}_debug_prior`;
+    const dispatcherName = `${privateIdentifierPrefix}_dispatch`;
+    const completionName = `${dispatcherName}_complete`;
+    const savedPromptEolName = `${privateIdentifierPrefix}_saved_prompt_eol_mark`;
+    const preexecHookName = `${privateIdentifierPrefix}_preexec`;
+    const precmdBeginHookName = `${privateIdentifierPrefix}_precmd_begin`;
+    const precmdHookName = `${privateIdentifierPrefix}_precmd`;
+    const savedExitName = `${privateIdentifierPrefix}_command_exit`;
+    const cleanPromptCommandsName = `${privateIdentifierPrefix}_prompt_commands`;
+    const promptCommandItemName = `${privateIdentifierPrefix}_prompt_command_item`;
     const script = `
 if [ -n "$ZSH_VERSION" ]; then
-  gyshell_preexec() { builtin printf "\\033]1337;gyshell_preexec\\007"; }
-  gyshell_precmd() { local ec=$? cwd_b64 home_b64; cwd_b64=$(printf "%s" "$PWD" | base64 | tr -d "\\n"); home_b64=$(printf "%s" "$HOME" | base64 | tr -d "\\n"); builtin printf "\\033]1337;gyshell_precmd;ec=%s;cwd_b64=%s;home_b64=%s\\007" "$ec" "$cwd_b64" "$home_b64"; }
+  ${protocolName}=verified
+  typeset -gi ${commandSequenceName}=0
+  typeset -g ${commandNonceName}=
+  typeset -gi ${inCommandName}=0
+  typeset -gi ${dispatchActiveName}=0
+  typeset -gi ${dispatchCompletionReadyName}=0
+  typeset -g ${savedPromptEolName}=
+  typeset -gi ${savedExitName}=0
+  ${preexecHookName}() { if [[ "\${1-}" == ${dispatcherName}\\ * ]]; then return 0; fi; (( ${commandSequenceName} += 1 )); ${inCommandName}=1; ${savedPromptEolName}=\${PROMPT_EOL_MARK-}; builtin printf -v ${commandNonceName} "%04x%04x%04x%04x%04x%04x%04x%04x" "$RANDOM" "$RANDOM" "$RANDOM" "$RANDOM" "$RANDOM" "$RANDOM" "$RANDOM" "$RANDOM"; PROMPT_EOL_MARK="$(builtin printf "\\033]1337;${commandMarkerPrefix}preend;seq=%s;nonce=%s\\007" "$${commandSequenceName}" "$${commandNonceName}")$${savedPromptEolName}"; builtin printf "\\033]1337;${commandMarkerPrefix}preexec;seq=%s;nonce=%s\\007" "$${commandSequenceName}" "$${commandNonceName}"; }
+  ${precmdBeginHookName}() { local prior=$?; if [ "\${${dispatchCompletionReadyName}-0}" != 1 ]; then ${savedExitName}=$prior; fi; builtin printf "\\033]1337;${commandMarkerPrefix}preend;seq=%s;nonce=%s\\007" "$${commandSequenceName}" "$${commandNonceName}"; }
+  ${precmdHookName}() { local ec=$${savedExitName} cwd_b64 home_b64; cwd_b64=$(printf "%s" "$PWD" | base64 | tr -d "\\n"); home_b64=$(printf "%s" "$HOME" | base64 | tr -d "\\n"); builtin printf "\\033]1337;${commandMarkerPrefix}precmd;seq=%s;nonce=%s;ec=%s;cwd_b64=%s;home_b64=%s\\007" "$${commandSequenceName}" "$${commandNonceName}" "$ec" "$cwd_b64" "$home_b64"; PROMPT_EOL_MARK=$${savedPromptEolName}; ${dispatchCompletionReadyName}=0; ${inCommandName}=0; ${dispatchActiveName}=0; return "$ec"; }
+  ${buildUnixCommandDispatcherScript(runtimeToken)}
   autoload -Uz add-zsh-hook 2>/dev/null || true
-  add-zsh-hook preexec gyshell_preexec
-  add-zsh-hook precmd gyshell_precmd
+  add-zsh-hook preexec ${preexecHookName}
+  precmd_functions=(${precmdBeginHookName} \${precmd_functions:#${precmdBeginHookName}})
+  precmd_functions=(\${precmd_functions:#${precmdHookName}} ${precmdHookName})
 elif [ -n "$BASH_VERSION" ]; then
-  __gyshell_in_command=0
-  __gyshell_preexec() {
-    case "$BASH_COMMAND" in
-      __gyshell_precmd*|__gyshell_preexec* ) return ;;
-    esac
-    if [ "$__gyshell_in_command" = "0" ]; then
-      __gyshell_in_command=1
-      builtin printf "\\033]1337;gyshell_preexec\\007"
+  ${protocolName}=verified
+  ${inCommandName}=0
+  ${commandSequenceName}=0
+  ${commandNonceName}=
+  ${savedExitName}=0
+  ${dispatchActiveName}=0
+  ${dispatchCompletionReadyName}=0
+  ${preexecHookName}() {
+    local ${debugPriorName}=$?
+    if shopt -q extdebug; then builtin trap - DEBUG; return 0; fi
+    if [ "\${${dispatchActiveName}-0}" = 1 ]; then
+      return 0
     fi
+    case "$BASH_COMMAND" in
+      ${dispatcherName}*|${completionName}*|${precmdBeginHookName}*|${precmdHookName}*|${preexecHookName}* ) return "$${debugPriorName}" ;;
+    esac
+    case "\${FUNCNAME[1]-}" in ${dispatcherName}|${completionName}) return "$${debugPriorName}" ;; esac
+    if [ "$${inCommandName}" = "0" ]; then
+      ${inCommandName}=1
+      ${commandSequenceName}=$(($${commandSequenceName} + 1))
+      printf -v ${commandNonceName} "%04x%04x%04x%04x%04x%04x%04x%04x" "$RANDOM" "$RANDOM" "$RANDOM" "$RANDOM" "$RANDOM" "$RANDOM" "$RANDOM" "$RANDOM"
+      builtin printf "\\033]1337;${commandMarkerPrefix}preexec;seq=%s;nonce=%s\\007" "$${commandSequenceName}" "$${commandNonceName}"
+    fi
+    return "$${debugPriorName}"
   }
-  trap '__gyshell_preexec' DEBUG
-  __gyshell_precmd() {
-    local ec=$?
+  ${buildUnixCommandDispatcherScript(runtimeToken)}
+  if ! shopt -q extdebug; then trap '${preexecHookName}' DEBUG; fi
+  ${precmdBeginHookName}() {
+    local ${debugPriorName}=$?
+    if [ "\${${dispatchCompletionReadyName}-0}" != 1 ]; then ${savedExitName}="$${debugPriorName}"; fi
+    ${inCommandName}=1
+    builtin printf "\\033]1337;${commandMarkerPrefix}preend;seq=%s;nonce=%s\\007" "$${commandSequenceName}" "$${commandNonceName}"
+  }
+  ${precmdHookName}() {
+    local ec="$${savedExitName}"
     local cwd_b64 home_b64
-    __gyshell_in_command=0
     cwd_b64=$(printf "%s" "$PWD" | base64 | tr -d "\\n")
     home_b64=$(printf "%s" "$HOME" | base64 | tr -d "\\n")
-    builtin printf "\\033]1337;gyshell_precmd;ec=%s;cwd_b64=%s;home_b64=%s\\007" "$ec" "$cwd_b64" "$home_b64"
+    builtin printf "\\033]1337;${commandMarkerPrefix}precmd;seq=%s;nonce=%s;ec=%s;cwd_b64=%s;home_b64=%s\\007" "$${commandSequenceName}" "$${commandNonceName}" "$ec" "$cwd_b64" "$home_b64"
+    ${dispatchCompletionReadyName}=0
+    ${inCommandName}=0
+    ${dispatchActiveName}=0
+    return "$ec"
   }
-  PROMPT_COMMAND="__gyshell_precmd\${PROMPT_COMMAND:+; \$PROMPT_COMMAND}"
+  if [[ "$(declare -p PROMPT_COMMAND 2>/dev/null)" == "declare -a"* ]]; then
+    ${cleanPromptCommandsName}=()
+    for ${promptCommandItemName} in "\${PROMPT_COMMAND[@]}"; do
+      case "$${promptCommandItemName}" in
+        ${precmdBeginHookName}|${precmdHookName}) ;;
+        *) ${cleanPromptCommandsName}+=("$${promptCommandItemName}") ;;
+      esac
+    done
+    PROMPT_COMMAND=(${precmdBeginHookName} "\${${cleanPromptCommandsName}[@]}" ${precmdHookName})
+    unset ${cleanPromptCommandsName} ${promptCommandItemName}
+  else
+    ${cleanPromptCommandsName}="\${PROMPT_COMMAND-}"
+    while [[ "$${cleanPromptCommandsName}" == "${precmdBeginHookName}; "* ]]; do
+      ${cleanPromptCommandsName}="\${${cleanPromptCommandsName}#${precmdBeginHookName}; }"
+    done
+    while [[ "$${cleanPromptCommandsName}" == *"; ${precmdHookName}" ]]; do
+      ${cleanPromptCommandsName}="\${${cleanPromptCommandsName}%; ${precmdHookName}}"
+    done
+    [ "$${cleanPromptCommandsName}" = "${precmdBeginHookName}" ] && ${cleanPromptCommandsName}=
+    [ "$${cleanPromptCommandsName}" = "${precmdHookName}" ] && ${cleanPromptCommandsName}=
+    PROMPT_COMMAND="${precmdBeginHookName}\${${cleanPromptCommandsName}:+; $${cleanPromptCommandsName}}; ${precmdHookName}"
+    unset ${cleanPromptCommandsName}
+  fi
 fi
-echo "__GYSHELL_READY__"
+echo "__GYSHELL_COMMAND_PROTOCOL__=\${${protocolName}:-unsupported}"
+echo "${buildInitializationReadyMarker(runtimeToken)}"
 `.trim();
     return script;
   }
@@ -2336,6 +2944,31 @@ echo "__GYSHELL_READY__"
     } catch {
       return instance.homeDir;
     }
+  }
+
+  applyCommandProtocolMetadata(
+    ptyId: string,
+    metadata: TerminalCommandProtocolMetadata,
+  ): void {
+    const instance = this.sessions.get(ptyId);
+    if (!instance) return;
+    if (metadata.cwd !== undefined) {
+      const normalized = this.normalizeDecodedRemotePath(metadata.cwd);
+      if (normalized) instance.cwd = normalized;
+    }
+    if (metadata.homeDir !== undefined) {
+      const normalized = this.normalizeDecodedRemotePath(metadata.homeDir);
+      if (normalized) instance.homeDir = normalized;
+    }
+  }
+
+  getCommandProtocolAvailability(ptyId: string): boolean | undefined {
+    return this.sessions.get(ptyId)?.commandProtocolAvailable;
+  }
+
+  getCommandProtocolToken(ptyId: string): string | undefined {
+    const instance = this.sessions.get(ptyId);
+    return instance?.remoteOs ? instance.commandProtocolToken : undefined;
   }
 
   private async getSftp(ptyId: string): Promise<ssh2.SFTPWrapper> {
@@ -2548,6 +3181,106 @@ echo "__GYSHELL_READY__"
         resolve(bytesRead);
       });
     });
+  }
+
+  /**
+   * Reads one bounded file prefix through a small pipeline of disjoint SFTP
+   * requests. A sequential 16 MiB read can otherwise cost hundreds of SSH
+   * round trips and outlive exec_command's wait window even on a healthy
+   * host. The returned length is always the contiguous prefix actually read;
+   * later ranges are never exposed across an unexpected short read.
+   */
+  private async sftpReadRangeConcurrent(
+    sftp: ssh2.SFTPWrapper,
+    handle: Buffer,
+    buffer: Buffer,
+    bufferOffset: number,
+    length: number,
+    position: number,
+  ): Promise<number> {
+    const safeBufferOffset = Math.max(
+      0,
+      Math.min(buffer.length, Math.floor(bufferOffset)),
+    );
+    const safePosition = Math.max(0, Math.floor(position));
+    const safeLength = Math.max(
+      0,
+      Math.min(Math.floor(length), buffer.length - safeBufferOffset),
+    );
+    if (safeLength <= 0) {
+      return 0;
+    }
+
+    const requestBytes = SSHBackend.MAX_SFTP_READ_REQUEST_BYTES;
+    const rangeCount = Math.ceil(safeLength / requestBytes);
+    const rangeLengths = Array.from({ length: rangeCount }, (_, index) =>
+      Math.min(requestBytes, safeLength - index * requestBytes),
+    );
+    const actualLengths = new Array<number>(rangeCount).fill(0);
+    let nextRangeIndex = 0;
+    let stopRequested = false;
+
+    const worker = async (): Promise<void> => {
+      while (!stopRequested) {
+        const rangeIndex = nextRangeIndex;
+        nextRangeIndex += 1;
+        if (rangeIndex >= rangeCount) {
+          return;
+        }
+
+        const relativeOffset = rangeIndex * requestBytes;
+        const rangeLength = rangeLengths[rangeIndex];
+        let rangeRead = 0;
+        try {
+          while (rangeRead < rangeLength) {
+            const partRead = await this.sftpReadDirect(
+              sftp,
+              handle,
+              buffer,
+              safeBufferOffset + relativeOffset + rangeRead,
+              rangeLength - rangeRead,
+              safePosition + relativeOffset + rangeRead,
+            );
+            if (partRead <= 0) {
+              break;
+            }
+            rangeRead += partRead;
+          }
+        } catch (error) {
+          stopRequested = true;
+          throw error;
+        }
+        actualLengths[rangeIndex] = rangeRead;
+        if (rangeRead < rangeLength) {
+          stopRequested = true;
+          return;
+        }
+      }
+    };
+
+    const concurrency = Math.min(
+      rangeCount,
+      SSHBackend.MAX_SFTP_READ_CONCURRENCY,
+    );
+    const settlements = await Promise.allSettled(
+      Array.from({ length: concurrency }, () => worker()),
+    );
+    const rejection = settlements.find(
+      (settlement): settlement is PromiseRejectedResult =>
+        settlement.status === "rejected",
+    );
+    if (rejection) {
+      throw rejection.reason;
+    }
+
+    let contiguousBytes = 0;
+    for (let index = 0; index < rangeCount; index += 1) {
+      contiguousBytes += actualLengths[index];
+      if (actualLengths[index] < rangeLengths[index]) {
+        break;
+      }
+    }
+    return contiguousBytes;
   }
 
   private async sftpStat(
@@ -3418,44 +4151,6 @@ echo "__GYSHELL_READY__"
     const normalizedPath = this.normalizeRemotePath(filePath);
     await this.closeChunkSessionsForPath(ptyId, normalizedPath);
     await this.sftpWriteFile(sftp, normalizedPath, content);
-  }
-
-  private consumeOscMarkers(instance: SSHInstance, chunk: string): void {
-    instance.oscBuffer += chunk;
-    const prefix = "\x1b]1337;gyshell_precmd";
-    const suffix = "\x07";
-
-    while (true) {
-      const start = instance.oscBuffer.indexOf(prefix);
-      if (start === -1) break;
-      const end = instance.oscBuffer.indexOf(suffix, start);
-      if (end === -1) break;
-
-      const marker = instance.oscBuffer.slice(start, end);
-      const cwdMatch = marker.match(/cwd_b64=([^;]+)/);
-      if (cwdMatch && cwdMatch[1]) {
-        try {
-          const decoded = Buffer.from(cwdMatch[1], "base64").toString("utf8");
-          const normalized = this.normalizeDecodedRemotePath(decoded);
-          if (normalized) instance.cwd = normalized;
-        } catch {}
-      }
-
-      const homeMatch = marker.match(/home_b64=([^;]+)/);
-      if (homeMatch && homeMatch[1]) {
-        try {
-          const decoded = Buffer.from(homeMatch[1], "base64").toString("utf8");
-          const normalized = this.normalizeDecodedRemotePath(decoded);
-          if (normalized) instance.homeDir = normalized;
-        } catch {}
-      }
-
-      instance.oscBuffer = instance.oscBuffer.slice(end + suffix.length);
-    }
-
-    if (instance.oscBuffer.length > 8192) {
-      instance.oscBuffer = instance.oscBuffer.slice(-4096);
-    }
   }
 
   private normalizeDecodedRemotePath(decodedPath: string): string | null {

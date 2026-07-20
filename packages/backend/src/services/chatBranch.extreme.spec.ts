@@ -4,6 +4,7 @@ import path from "node:path";
 import {
   AIMessage,
   HumanMessage,
+  ToolMessage,
   mapChatMessagesToStoredMessages,
 } from "@langchain/core/messages";
 import { AgentService_v2 } from "./AgentService_v2";
@@ -18,6 +19,10 @@ import {
 } from "./AgentHelper/prompts";
 import { TokenManager } from "./AgentHelper/TokenManager";
 import type { ChatSession } from "../types";
+import {
+  formatInitialCommandOutput,
+  parseCommandOutputEnvelopeContract,
+} from "./AgentHelper/tools/command_output_contract";
 
 const assertEqual = <T>(actual: T, expected: T, message: string): void => {
   if (actual !== expected) {
@@ -45,12 +50,32 @@ const createMessageId = (id: string): Record<string, unknown> => ({
   _gyshellMessageId: id,
 });
 
+const createRunningCommandOutput = () =>
+  formatInitialCommandOutput({
+    terminalId: "terminal-running",
+    historyCommandMatchId: "history-running",
+    executionState: "running",
+    output: "started\n",
+    capture: {
+      state: "in_progress",
+      observedUtf8Bytes: 8,
+      retainedUtf8Bytes: 8,
+      availableLineCount: 1,
+      revision: 1,
+      terminalControlsObserved: false,
+    },
+  });
+
 const createAgent = (
   uiHistory: UIHistoryService,
   chatHistory: ChatHistoryService,
+  getCommandOutputSnapshot: (
+    terminalId: string,
+    historyCommandMatchId: string,
+  ) => any = () => undefined,
 ): AgentService_v2 =>
   new AgentService_v2(
-    {} as any,
+    { getCommandOutputSnapshot } as any,
     {} as any,
     { getActiveTools: () => [] } as any,
     { getEnabledSkills: async () => [] } as any,
@@ -132,7 +157,13 @@ const run = async (): Promise<void> => {
   const store = new HistorySqliteStore({ filePath: sqlitePath });
   const chatHistory = new ChatHistoryService({ store });
   const uiHistory = new UIHistoryService({ store });
-  const agent = createAgent(uiHistory, chatHistory);
+  const terminalSnapshots = new Map<string, any>();
+  const agent = createAgent(
+    uiHistory,
+    chatHistory,
+    (terminalId, historyCommandMatchId) =>
+      terminalSnapshots.get(`${terminalId}\u0000${historyCommandMatchId}`),
+  );
   const fallbackExportDir = path.join(tempDir, "fallback-compaction-history");
   (agent as any).fallbackCompactionHistoryExportService =
     new PassChatTempExportService({
@@ -224,6 +255,391 @@ const run = async (): Promise<void> => {
           branchUi[0]?.backendMessageId,
           sourceUiBefore[0]?.backendMessageId,
           "branch UI messages should preserve backend message ids",
+        );
+      },
+    );
+
+    await runCase(
+      "branch rejects a UI cut that would clone a running command",
+      () => {
+        const sourceSessionId = "source-running-ui-command";
+        const source: ChatSession = {
+          id: sourceSessionId,
+          title: "Running UI command",
+          lastCheckpointOffset: 0,
+          messages: new Map(),
+        };
+        const stored = mapChatMessagesToStoredMessages([
+          new HumanMessage({
+            content: "start work",
+            additional_kwargs: createMessageId("running-ui-user"),
+          }),
+          new AIMessage({
+            content: "background work started",
+            additional_kwargs: createMessageId("running-ui-target"),
+          }),
+        ]) as any[];
+        source.messages.set("running-ui-user", stored[0] as any);
+        source.messages.set("running-ui-target", stored[1] as any);
+        chatHistory.saveSession(source);
+
+        const running = createRunningCommandOutput();
+        uiHistory.recordEvent(sourceSessionId, {
+          type: "user_input",
+          content: "start work",
+          messageId: "running-ui-user",
+        } as any);
+        uiHistory.recordEvent(sourceSessionId, {
+          type: "command_started",
+          command: "long-running",
+          commandId: "running-ui-command",
+          messageId: "running-ui-command",
+          tabName: "Terminal",
+          isNowait: true,
+        } as any);
+        uiHistory.recordEvent(sourceSessionId, {
+          type: "command_finished",
+          command: "long-running",
+          commandId: "running-ui-command",
+          messageId: "running-ui-command",
+          outputDelta: running.text,
+          outputMode: "replace",
+          commandOutput: running.contract,
+          isNowait: true,
+        } as any);
+        uiHistory.recordEvent(sourceSessionId, {
+          type: "say",
+          content: "background work started",
+          messageId: "running-ui-target",
+        } as any);
+        uiHistory.recordEvent(sourceSessionId, { type: "done" } as any);
+
+        const result = agent.branchFromMessage(
+          sourceSessionId,
+          "running-ui-target",
+          "branch-running-ui-command",
+        );
+        assertEqual(result.ok, false, "a live UI contract must block branching");
+        assertCondition(
+          result.reason?.includes("running command"),
+          "the rejection should explain which lifecycle must settle",
+        );
+        assertEqual(
+          chatHistory.loadSession("branch-running-ui-command"),
+          null,
+          "a rejected live branch must not create agent history",
+        );
+        assertEqual(
+          uiHistory.getSession("branch-running-ui-command"),
+          null,
+          "a rejected live branch must not create UI history",
+        );
+      },
+    );
+
+    await runCase(
+      "branch rejects a model-history running contract missing from UI metadata",
+      () => {
+        const sourceSessionId = "source-running-model-command";
+        const running = createRunningCommandOutput();
+        terminalSnapshots.set("terminal-running\u0000history-running", {
+          executionState: "running",
+          output: "started\n",
+          capture: running.contract.capture,
+        });
+        const source: ChatSession = {
+          id: sourceSessionId,
+          title: "Running model command",
+          lastCheckpointOffset: 0,
+          messages: new Map(),
+        };
+        const messages = mapChatMessagesToStoredMessages([
+          new HumanMessage({
+            content: "start work",
+            additional_kwargs: createMessageId("running-model-user"),
+          }),
+          new AIMessage({
+            content: "",
+            tool_calls: [
+              {
+                id: "running-model-call",
+                name: "exec_command",
+                args: { command: "long-running" },
+                type: "tool_call",
+              },
+            ] as any,
+            additional_kwargs: createMessageId("running-model-assistant-call"),
+          }),
+          new ToolMessage({
+            content: running.text,
+            name: "exec_command",
+            tool_call_id: "running-model-call",
+            additional_kwargs: createMessageId("running-model-tool"),
+          } as any),
+          new AIMessage({
+            content: "background work started",
+            additional_kwargs: createMessageId("running-model-target"),
+          }),
+        ]) as any[];
+        [
+          "running-model-user",
+          "running-model-assistant-call",
+          "running-model-tool",
+          "running-model-target",
+        ].forEach((id, index) => source.messages.set(id, messages[index] as any));
+        chatHistory.saveSession(source);
+
+        uiHistory.recordEvent(sourceSessionId, {
+          type: "user_input",
+          content: "start work",
+          messageId: "running-model-user",
+        } as any);
+        uiHistory.recordEvent(sourceSessionId, {
+          type: "say",
+          content: "background work started",
+          messageId: "running-model-target",
+        } as any);
+        uiHistory.recordEvent(sourceSessionId, { type: "done" } as any);
+
+        const result = agent.branchFromMessage(
+          sourceSessionId,
+          "running-model-target",
+          "branch-running-model-command",
+        );
+        assertEqual(
+          result.ok,
+          false,
+          "model history must independently block cloning a live command",
+        );
+        assertCondition(
+          result.reason?.includes("running command"),
+          "model-history rejection should explain that the command must settle",
+        );
+        assertEqual(
+          chatHistory.loadSession("branch-running-model-command"),
+          null,
+          "model-history rejection must happen before branch persistence",
+        );
+        terminalSnapshots.delete("terminal-running\u0000history-running");
+      },
+    );
+
+    await runCase(
+      "branch reconciles a stale running model contract that already finished",
+      () => {
+        const sourceSessionId = "source-settled-model-command";
+        const staleRunning = createRunningCommandOutput();
+        const source: ChatSession = {
+          id: sourceSessionId,
+          title: "Settled model command",
+          lastCheckpointOffset: 0,
+          messages: new Map(),
+        };
+        const messages = mapChatMessagesToStoredMessages([
+          new HumanMessage({
+            content: "start work",
+            additional_kwargs: createMessageId("settled-model-user"),
+          }),
+          new AIMessage({
+            content: "",
+            tool_calls: [
+              {
+                id: "settled-model-call",
+                name: "exec_command",
+                args: { command: "long-running" },
+                type: "tool_call",
+              },
+            ] as any,
+            additional_kwargs: createMessageId("settled-model-assistant-call"),
+          }),
+          new ToolMessage({
+            content: staleRunning.text,
+            name: "exec_command",
+            tool_call_id: "settled-model-call",
+            additional_kwargs: createMessageId("settled-model-tool"),
+          } as any),
+          new AIMessage({
+            content: "background work finished",
+            additional_kwargs: createMessageId("settled-model-target"),
+          }),
+        ]) as any[];
+        [
+          "settled-model-user",
+          "settled-model-assistant-call",
+          "settled-model-tool",
+          "settled-model-target",
+        ].forEach((id, index) => source.messages.set(id, messages[index] as any));
+        chatHistory.saveSession(source);
+
+        uiHistory.recordEvent(sourceSessionId, {
+          type: "user_input",
+          content: "start work",
+          messageId: "settled-model-user",
+        } as any);
+        uiHistory.recordEvent(sourceSessionId, {
+          type: "say",
+          content: "background work finished",
+          messageId: "settled-model-target",
+        } as any);
+        uiHistory.recordEvent(sourceSessionId, { type: "done" } as any);
+        terminalSnapshots.set("terminal-running\u0000history-running", {
+          executionState: "finished",
+          exitCode: 0,
+          output: "started\nfinished\n",
+          capture: {
+            state: "complete",
+            observedUtf8Bytes: 17,
+            retainedUtf8Bytes: 17,
+            availableLineCount: 2,
+            revision: 2,
+            terminalControlsObserved: false,
+          },
+        });
+
+        const result = agent.branchFromMessage(
+          sourceSessionId,
+          "settled-model-target",
+          "branch-settled-model-command",
+        );
+        assertEqual(
+          result.ok,
+          true,
+          "a physically settled command must not remain branch-blocking because model history is stale",
+        );
+        const branch = chatHistory.loadSession("branch-settled-model-command");
+        const branchTool = [...(branch?.messages.values() || [])].find(
+          (message: any) => message?.data?.name === "exec_command",
+        ) as any;
+        assertEqual(
+          parseCommandOutputEnvelopeContract(branchTool?.data?.content || "")
+            ?.executionState,
+          "finished",
+          "the branch must persist reconciled command truth instead of cloning stale running state",
+        );
+        terminalSnapshots.delete("terminal-running\u0000history-running");
+      },
+    );
+
+    await runCase(
+      "settled command can branch past an earlier running poll snapshot",
+      () => {
+        const sourceSessionId = "source-settled-command-with-running-poll";
+        const source: ChatSession = {
+          id: sourceSessionId,
+          title: "Settled command with poll",
+          lastCheckpointOffset: 0,
+          messages: new Map(),
+        };
+        const messages = mapChatMessagesToStoredMessages([
+          new HumanMessage({
+            content: "start background work",
+            additional_kwargs: createMessageId("poll-branch-user"),
+          }),
+          new AIMessage({
+            content: "background work finished",
+            additional_kwargs: createMessageId("poll-branch-target"),
+          }),
+        ]) as any[];
+        source.messages.set("poll-branch-user", messages[0] as any);
+        source.messages.set("poll-branch-target", messages[1] as any);
+        chatHistory.saveSession(source);
+
+        const running = createRunningCommandOutput();
+        const finished = formatInitialCommandOutput({
+          terminalId: running.contract.terminalId,
+          historyCommandMatchId:
+            running.contract.historyCommandMatchId,
+          executionState: "finished",
+          exitCode: 0,
+          output: "started\nfinished\n",
+          capture: {
+            state: "complete",
+            observedUtf8Bytes: 17,
+            retainedUtf8Bytes: 17,
+            availableLineCount: 2,
+            revision: 2,
+            terminalControlsObserved: false,
+          },
+        });
+        uiHistory.recordEvent(sourceSessionId, {
+          type: "user_input",
+          content: "start background work",
+          messageId: "poll-branch-user",
+        } as any);
+        uiHistory.recordEvent(sourceSessionId, {
+          type: "command_started",
+          command: "long-running",
+          commandId: "poll-branch-command-id",
+          messageId: "poll-branch-command-message",
+          commandOutput: running.contract,
+          isNowait: true,
+        } as any);
+        uiHistory.recordEvent(sourceSessionId, {
+          type: "command_finished",
+          commandId: "poll-branch-command-id",
+          messageId: "poll-branch-command-message",
+          outputDelta: running.text,
+          outputMode: "replace",
+          commandOutput: running.contract,
+          isNowait: true,
+        } as any);
+        uiHistory.recordEvent(sourceSessionId, {
+          type: "tool_call",
+          toolName: "read_command_output",
+          input: JSON.stringify({
+            tabIdOrName: running.contract.terminalId,
+            history_command_match_id:
+              running.contract.historyCommandMatchId,
+          }),
+          output: running.text,
+          commandOutput: running.contract,
+          messageId: "poll-branch-read-snapshot",
+        } as any);
+        uiHistory.recordEvent(sourceSessionId, {
+          type: "command_finished",
+          commandId: "poll-branch-command-id",
+          messageId: "poll-branch-command-message",
+          outputDelta: finished.text,
+          outputMode: "replace",
+          commandOutput: finished.contract,
+          isNowait: true,
+        } as any);
+        uiHistory.recordEvent(sourceSessionId, {
+          type: "say",
+          content: "background work finished",
+          messageId: "poll-branch-target",
+        } as any);
+        uiHistory.recordEvent(sourceSessionId, { type: "done" } as any);
+
+        const uiMessages = uiHistory.getMessages(sourceSessionId);
+        const commandRow = uiMessages.find(
+          (message) => message.type === "command",
+        );
+        const pollRow = uiMessages.find(
+          (message) =>
+            message.type === "tool_call" &&
+            message.metadata?.toolName === "read_command_output",
+        );
+        assertEqual(
+          commandRow?.metadata?.commandOutput?.executionState,
+          "finished",
+          "the live command row should receive its completion update",
+        );
+        assertEqual(
+          pollRow?.metadata?.commandOutput?.executionState,
+          "running",
+          "a historical poll must remain an accurate point-in-time snapshot",
+        );
+
+        const result = agent.branchFromMessage(
+          sourceSessionId,
+          "poll-branch-target",
+          "branch-after-running-poll-snapshot",
+        );
+        assertEqual(
+          result.ok,
+          true,
+          "a settled command must not be blocked by an earlier poll snapshot",
         );
       },
     );

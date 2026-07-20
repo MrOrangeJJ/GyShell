@@ -15,9 +15,13 @@ import {
   FastForward,
 } from 'lucide-react'
 import type { ChatMessage } from '../../stores/ChatStore'
+import { extractCommandOutputDisplayText } from '@gyshell/shared'
 import {
   buildSeamlessStepPresentation,
+  getCommandOutputUiPresentation,
   getSeamlessGroupTone,
+  isSeamlessGroupRunning,
+  sliceFromStartAtUnicodeBoundary,
   type SeamlessStepDetail,
   type SeamlessStepPresentation,
 } from './seamlessToolPresentation'
@@ -109,8 +113,16 @@ export const CommandBanner = observer(({
   isSkipping?: boolean
   onSkippingChange?: (nextValue: boolean) => void
 }) => {
-  const isDone = msg.metadata?.exitCode !== undefined
-  const isError = msg.metadata?.exitCode !== 0 && isDone
+  const commandOutputPresentation = getCommandOutputUiPresentation(msg)
+  const displayOutput = extractCommandOutputDisplayText(
+    msg.metadata?.output || '',
+  )
+  const isDone =
+    commandOutputPresentation?.isDone ?? msg.metadata?.exitCode !== undefined
+  const isError =
+    commandOutputPresentation?.tone === 'error' ||
+    (!commandOutputPresentation && msg.metadata?.exitCode !== 0 && isDone)
+  const isWarning = commandOutputPresentation?.tone === 'warning'
   const isNowait = msg.metadata?.isNowait || false
   const [expanded, setExpanded] = useControllableBoolean(
     expandedProp,
@@ -146,7 +158,7 @@ export const CommandBanner = observer(({
   return (
     <div
       ref={ref}
-      className={`message-banner command ${isNowait ? 'nowait' : ''} ${isError ? 'error' : ''} ${isSelected ? 'is-scroll-active' : ''}`}
+      className={`message-banner command ${isNowait ? 'nowait' : ''} ${isError ? 'error' : ''} ${isWarning ? 'warning' : ''} ${isSelected ? 'is-scroll-active' : ''}`}
       onClick={() => setSelected(true)}
     >
       <div
@@ -158,7 +170,13 @@ export const CommandBanner = observer(({
       >
         <div className="banner-icon">
           {isDone ? (
-            isError ? <AlertCircle size={14} /> : <CheckCircle2 size={14} />
+            isError ? (
+              <AlertCircle size={14} />
+            ) : isWarning ? (
+              <AlertTriangle size={14} />
+            ) : (
+              <CheckCircle2 size={14} />
+            )
           ) : (
             <Loader2 size={14} className={isNowait ? '' : 'spin'} />
           )}
@@ -166,6 +184,27 @@ export const CommandBanner = observer(({
         <div className="banner-title">
           <span className="banner-type">{isNowait ? 'RUN ASYNC' : 'RUN'}</span>
           <span className="banner-target">{msg.metadata?.tabName ? `on ${msg.metadata.tabName}` : ''}</span>
+          {commandOutputPresentation ? (
+            <span
+              className="command-output-status-chips"
+              aria-label={commandOutputPresentation.meta}
+            >
+              <span
+                className={`command-output-status-chip execution ${commandOutputPresentation.executionTone}`}
+              >
+                {commandOutputPresentation.executionLabel}
+              </span>
+              <span
+                className={`command-output-status-chip capture ${commandOutputPresentation.captureTone}`}
+                title={commandOutputPresentation.captureLabel}
+              >
+                {commandOutputPresentation.captureLabel}
+              </span>
+              <span className="command-output-status-chip presentation">
+                {commandOutputPresentation.presentationLabel}
+              </span>
+            </span>
+          ) : null}
         </div>
         <div className="banner-actions">
           {!isDone && !isNowait && (
@@ -187,7 +226,9 @@ export const CommandBanner = observer(({
       {expanded && (
         <div className="banner-content">
           <div className="cmd-line">$ {msg.content}</div>
-          {!isNowait && msg.metadata?.output && <pre className="cmd-output">{msg.metadata.output}</pre>}
+          {displayOutput ? (
+            <pre className="cmd-output">{displayOutput}</pre>
+          ) : null}
         </div>
       )}
     </div>
@@ -209,6 +250,10 @@ export const ToolCallBanner = observer(({
     onExpandedChange,
   )
   const toolName = msg.metadata?.toolName || 'Tool Call'
+  const commandOutputPresentation = getCommandOutputUiPresentation(msg)
+  const displayOutput = extractCommandOutputDisplayText(
+    msg.metadata?.output || '',
+  )
   const { ref, isSelected, setSelected } = useBannerSelection<HTMLDivElement>()
   return (
     <div
@@ -229,6 +274,27 @@ export const ToolCallBanner = observer(({
         <div className="banner-title">
           <span className="banner-type">Tool Call</span>
           <span className="banner-target">{toolName}</span>
+          {commandOutputPresentation ? (
+            <span
+              className="command-output-status-chips"
+              aria-label={commandOutputPresentation.meta}
+            >
+              <span
+                className={`command-output-status-chip execution ${commandOutputPresentation.executionTone}`}
+              >
+                {commandOutputPresentation.executionLabel}
+              </span>
+              <span
+                className={`command-output-status-chip capture ${commandOutputPresentation.captureTone}`}
+                title={commandOutputPresentation.captureLabel}
+              >
+                {commandOutputPresentation.captureLabel}
+              </span>
+              <span className="command-output-status-chip presentation">
+                {commandOutputPresentation.presentationLabel}
+              </span>
+            </span>
+          ) : null}
         </div>
         <div className="banner-chevron">
           {expanded ? <ChevronDown size={14} /> : <ChevronRight size={14} />}
@@ -237,7 +303,7 @@ export const ToolCallBanner = observer(({
       {expanded && (
         <div className="banner-content">
           <div className="cmd-line">$ {msg.content}</div>
-          {msg.metadata?.output && <pre className="cmd-output">{msg.metadata.output}</pre>}
+          {displayOutput ? <pre className="cmd-output">{displayOutput}</pre> : null}
         </div>
       )}
     </div>
@@ -611,9 +677,10 @@ const getSeamlessStateMark = (
 }
 
 const getCompactDetailPreview = (content: string): string => {
-  const compact = content.slice(0, 320).replace(/\s+/g, ' ').trim()
+  const preview = sliceFromStartAtUnicodeBoundary(content, 320)
+  const compact = preview.replace(/\s+/g, ' ').trim()
   if (compact.length <= 88) return compact
-  return `${compact.slice(0, 87).trimEnd()}…`
+  return `${sliceFromStartAtUnicodeBoundary(compact, 87).trimEnd()}…`
 }
 
 type ExpandedKeySetter = (
@@ -727,6 +794,9 @@ const getSeamlessStepState = (
   message: ChatMessage,
   presentation: SeamlessStepPresentation,
 ): string | undefined => {
+  if (message.metadata?.commandOutput) {
+    return undefined
+  }
   if (message.streaming) return 'running'
   if (presentation.tone === 'error' && !presentation.meta) return 'error'
   if (presentation.tone === 'warning') return 'warning'
@@ -753,6 +823,7 @@ const SeamlessStepRow = ({
   const hasDetails = presentation.details.length > 0
   const detailsId = React.useId()
   const state = getSeamlessStepState(message, presentation)
+  const stepInfo = [presentation.meta, state].filter(Boolean).join(' · ')
 
   return (
     <div className="stg-step">
@@ -769,9 +840,9 @@ const SeamlessStepRow = ({
           {isLast ? '└' : '├'}
         </span>
         <span className="stg-step-text">{presentation.summary}</span>
-        {presentation.meta || state ? (
-          <span className="stg-step-info">
-            {[presentation.meta, state].filter(Boolean).join(' · ')}
+        {stepInfo ? (
+          <span className="stg-step-info" title={stepInfo}>
+            {stepInfo}
           </span>
         ) : null}
         {hasDetails ? (
@@ -826,7 +897,7 @@ export const SeamlessToolGroupBanner = observer(
       onExpandedDetailIdsChange,
     )
 
-    const isStreaming = messages.some((m) => !!m.streaming)
+    const isStreaming = isSeamlessGroupRunning(messages)
     const stepCount = messages.length
     const presentations = messages.map(buildSeamlessStepPresentation)
     const lastStep = presentations[presentations.length - 1]

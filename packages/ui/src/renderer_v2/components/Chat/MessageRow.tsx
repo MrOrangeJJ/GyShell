@@ -18,6 +18,7 @@ import {
   SeamlessToolGroupBanner,
 } from "./ChatBanner";
 import type { ChatBannerUiState } from "./chatBannerUiState";
+import { isSeamlessGroupRunning } from "./seamlessToolPresentation";
 
 interface MessageRowProps {
   store: AppStore;
@@ -112,8 +113,16 @@ export const MessageRow: React.FC<MessageRowProps> = observer(
       normalizedAssistantGroupMessageIds.length > 0
         ? `assistant-group:${normalizedAssistantGroupMessageIds.join(":")}`
         : "";
+    const assistantGroupIsRunning = isSeamlessGroupRunning(
+      normalizedAssistantGroupMessageIds.flatMap((id) => {
+        const message = session?.messagesById.get(id);
+        return message ? [message] : [];
+      }),
+    );
     const shouldShowGroupCopy =
-      showAssistantGroupCopy && normalizedAssistantGroupMessageIds.length > 0;
+      showAssistantGroupCopy &&
+      normalizedAssistantGroupMessageIds.length > 0 &&
+      !assistantGroupIsRunning;
 
     const copyConnectedAssistantRun = React.useCallback(async () => {
       if (!shouldShowGroupCopy) return;

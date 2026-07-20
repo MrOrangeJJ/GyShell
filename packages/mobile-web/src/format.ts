@@ -1,6 +1,140 @@
 import type { ChatMessage } from "./types";
 import { normalizeDisplayText, trimOuterBlankLines } from "./session-store";
 import type { MobileTranslations } from "./i18n/types";
+import {
+  extractCommandOutputDisplayText,
+  parseCommandOutputContractV1,
+  type CommandCaptureReason,
+} from "@gyshell/shared";
+
+export interface CommandOutputDisplayStatus {
+  execution: string;
+  capture: string;
+  presentation: string;
+  tone: "neutral" | "warning" | "error";
+  executionTone: "neutral" | "warning" | "error";
+  captureTone: "neutral" | "warning";
+}
+
+export function commandOutputDisplayStatus(
+  message: ChatMessage,
+  t: MobileTranslations["format"],
+): CommandOutputDisplayStatus | null {
+  const contract = parseCommandOutputContractV1(
+    message.metadata?.commandOutput,
+  );
+  if (!contract) return null;
+
+  const execution = (() => {
+    switch (contract.executionState) {
+      case "running":
+        return t.commandOutput.executionRunning;
+      case "finished":
+        return typeof contract.exitCode === "number"
+          ? t.commandOutput.executionExit(contract.exitCode)
+          : t.commandOutput.executionFinished;
+      case "aborted":
+        return t.commandOutput.executionAborted;
+      case "outcome_unknown":
+        return t.commandOutput.executionUnknown;
+    }
+  })();
+  const captureBase = (() => {
+    switch (contract.capture.state) {
+      case "in_progress":
+        return t.commandOutput.captureInProgress;
+      case "complete":
+        return t.commandOutput.captureComplete;
+      case "incomplete":
+        return t.commandOutput.captureIncomplete;
+      case "unknown":
+        return t.commandOutput.captureUnknown;
+    }
+  })();
+  const captureDetails: string[] = [];
+  if (contract.capture.reason) {
+    captureDetails.push(
+      commandCaptureReasonLabel(contract.capture.reason, t.commandOutput),
+    );
+  }
+  if (
+    contract.capture.observedUtf8Bytes !== contract.capture.retainedUtf8Bytes
+  ) {
+    captureDetails.push(
+      t.commandOutput.retainedOfObserved(
+        contract.capture.retainedUtf8Bytes,
+        contract.capture.observedUtf8Bytes,
+      ),
+    );
+  }
+  if (contract.capture.terminalControlsObserved) {
+    captureDetails.push(t.commandOutput.terminalControlsObserved);
+  }
+  const capture = `${captureBase}${
+    captureDetails.length > 0 ? ` (${captureDetails.join("; ")})` : ""
+  }`;
+  const presentation = (() => {
+    switch (contract.presentation.state) {
+      case "none":
+        return contract.executionState === "running"
+          ? t.commandOutput.presentationNoneYet
+          : t.commandOutput.presentationNone;
+      case "full":
+        return t.commandOutput.presentationFull;
+      case "excerpt":
+        return t.commandOutput.presentationExcerpt;
+    }
+  })();
+  const hasFailedExit =
+    contract.executionState === "finished" &&
+    typeof contract.exitCode === "number" &&
+    contract.exitCode !== 0;
+  const hasUncertainState =
+    contract.executionState === "aborted" ||
+    contract.executionState === "outcome_unknown" ||
+    contract.capture.state === "incomplete" ||
+    contract.capture.state === "unknown";
+  const executionTone = hasFailedExit
+    ? "error"
+    : contract.executionState === "aborted" ||
+        contract.executionState === "outcome_unknown"
+      ? "warning"
+      : "neutral";
+  const captureTone =
+    contract.capture.state === "incomplete" ||
+    contract.capture.state === "unknown"
+      ? "warning"
+      : "neutral";
+
+  return {
+    execution,
+    capture,
+    presentation,
+    tone: hasFailedExit ? "error" : hasUncertainState ? "warning" : "neutral",
+    executionTone,
+    captureTone,
+  };
+}
+
+const commandCaptureReasonLabel = (
+  reason: CommandCaptureReason,
+  t: MobileTranslations["format"]["commandOutput"],
+): string => {
+  switch (reason) {
+    case "retention_limit":
+      return t.reasonRetentionLimit;
+    case "tracking_lost":
+      return t.reasonTrackingLost;
+    case "runtime_boundary":
+      return t.reasonRuntimeBoundary;
+    case "tracking_unavailable":
+      return t.reasonTrackingUnavailable;
+    case "projection_ambiguous":
+      return t.reasonProjectionAmbiguous;
+    case "record_expired":
+      return t.reasonRecordExpired;
+  }
+};
 
 export function formatClock(timestamp: number): string {
   if (!timestamp) return "--:--";
@@ -60,7 +194,9 @@ export function messageDetail(
 ): string {
   if (message.type === "command") {
     const output = trimOuterBlankLines(
-      normalizeDisplayText(message.metadata?.output || ""),
+      normalizeDisplayText(
+        extractCommandOutputDisplayText(message.metadata?.output || ""),
+      ),
     );
     const command = trimOuterBlankLines(
       normalizeDisplayText(message.content || message.metadata?.command || ""),
@@ -88,7 +224,9 @@ export function messageDetail(
     );
   }
 
-  const base = message.metadata?.output || message.content || "";
+  const rawOutput = message.metadata?.output || "";
+  const displayOutput = extractCommandOutputDisplayText(rawOutput);
+  const base = displayOutput || message.content || "";
   return trimOuterBlankLines(normalizeDisplayText(base));
 }
 

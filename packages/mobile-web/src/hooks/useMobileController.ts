@@ -35,6 +35,7 @@ import {
   cloneSession,
   createUnloadedRenamedSession,
   createSessionState,
+  normalizeSessionPreview,
   previewFromSession,
   reorderSessionIds,
   shouldReplayUiUpdateAfterSnapshot,
@@ -551,15 +552,6 @@ export function useMobileController(): {
       const wasBusy = nextSession.isBusy;
 
       if (
-        update.type === "ADD_MESSAGE" ||
-        update.type === "APPEND_CONTENT" ||
-        update.type === "APPEND_OUTPUT" ||
-        update.type === "UPDATE_MESSAGE"
-      ) {
-        nextSession.isBusy = true;
-      }
-
-      if (
         update.type === "ADD_MESSAGE" &&
         update.message.role === "user" &&
         !wasBusy &&
@@ -811,7 +803,7 @@ export function useMobileController(): {
             : summary.messagesCount,
           lastMessagePreview: loaded
             ? previewFromSession(session)
-            : summary.lastMessagePreview,
+            : normalizeSessionPreview(summary.lastMessagePreview || ""),
           loaded,
           uiRevision: snapshot?.uiRevision ?? summary.uiRevision,
         };

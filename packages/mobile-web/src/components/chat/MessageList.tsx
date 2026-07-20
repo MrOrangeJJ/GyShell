@@ -10,6 +10,7 @@ import { normalizeDisplayText, trimOuterBlankLines } from "../../session-store";
 import type { ChatMessage } from "../../types";
 import { MarkdownContent } from "../common/MarkdownContent";
 import { MentionContent } from "../common/MentionContent";
+import { CommandOutputStatus } from "./CommandOutputStatus";
 
 export interface MessageListProps {
   items: ChatTimelineItem[];
@@ -174,6 +175,9 @@ const AgentTurnBubble = React.memo(function AgentTurnBubble({
                 </span>
               ) : null}
             </div>
+            {message.metadata?.commandOutput ? (
+              <CommandOutputStatus message={message} />
+            ) : null}
             {eventPreview ? (
               <pre
                 className={`agent-event-body ${isToolLike ? "tool-fixed" : ""}${isCompaction ? " compaction" : ""}`}
@@ -286,7 +290,9 @@ const MessageListInner: React.FC<MessageListProps> = ({
                 onRollback={onRollback}
                 onBranch={onBranch}
                 rollbackDisabled={rollbackDisabled}
-                branchDisabled={branchDisabled}
+                branchDisabled={
+                  branchDisabled || item.branchBlockedByUnsettledCommand
+                }
               />
             );
           }

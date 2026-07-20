@@ -1,3 +1,5 @@
+import type { CommandOutputContractV1 } from '@gyshell/shared'
+
 export type MessageType =
   | 'text'
   | 'command'
@@ -43,6 +45,7 @@ export interface ChatMessage {
     action?: 'created' | 'edited' | 'error'
     collapsed?: boolean
     isNowait?: boolean
+    commandOutput?: CommandOutputContractV1
     toolName?: string
     subToolTitle?: string
     subToolHint?: string

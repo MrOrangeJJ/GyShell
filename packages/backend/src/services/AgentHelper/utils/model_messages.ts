@@ -1,6 +1,15 @@
 import { mapChatMessagesToStoredMessages, mapStoredMessagesToChatMessages } from '@langchain/core/messages'
 import type { BaseMessage } from '@langchain/core/messages'
 import { TokenManager } from '../TokenManager'
+import {
+  expireUnbackedCommandOutputEnvelope,
+  formatInitialCommandOutput,
+  formatPrunedCommandOutputForModelContext,
+  parseCommandOutputEnvelopeContract,
+  parsePrunedCommandOutputMaterialization,
+  rewriteCommandOutputEnvelopeContract,
+  type CommandOutputSource,
+} from '../tools/command_output_contract'
 import { cloneMessageWithPatch } from './message_clone'
 
 type RetryCapableHelpers = {
@@ -11,6 +20,11 @@ type RetryCapableHelpers = {
     signal?: AbortSignal
   ) => Promise<T>
 }
+
+type CommandOutputBackingSourceResolver = (
+  terminalId: string,
+  historyCommandMatchId: string,
+) => CommandOutputSource | undefined
 
 export function stripRawResponseForModelInput(messages: BaseMessage[]): BaseMessage[] {
   const stored = mapChatMessagesToStoredMessages(messages)
@@ -50,6 +64,138 @@ export function sanitizeStoredMessagesForChatRuntime(storedMessages: any[]): {
     : { messages: storedMessages, removedCount: 0 }
 }
 
+export function expireUnbackedStoredCommandOutputEnvelopes(
+  storedMessages: any[],
+  getBackingSource: (
+    terminalId: string,
+    historyCommandMatchId: string,
+  ) => CommandOutputSource | undefined,
+): boolean {
+  let mutated = false
+  for (const storedMessage of storedMessages) {
+    if (
+      storedMessage?.type !== 'tool' ||
+      !['exec_command', 'read_command_output'].includes(
+        String(storedMessage?.data?.name || '')
+      )
+    ) {
+      continue
+    }
+    const content = storedMessage?.data?.content
+    if (typeof content !== 'string') continue
+    const contract = parseCommandOutputEnvelopeContract(content)
+    if (!contract) continue
+    const source = getBackingSource(
+      contract.terminalId,
+      contract.historyCommandMatchId,
+    )
+    let reconciled = content
+    if (!source) {
+      reconciled = expireUnbackedCommandOutputEnvelope(content)
+    } else {
+      const executionState = source.executionState
+      const exitCode =
+        executionState === 'finished' ? source.exitCode ?? null : null
+      const capture = {
+        state: source.capture.state,
+        ...(source.capture.reason !== undefined
+          ? { reason: source.capture.reason }
+          : {}),
+        observedUtf8Bytes: source.capture.observedUtf8Bytes,
+        retainedUtf8Bytes: source.capture.retainedUtf8Bytes,
+        availableLineCount: source.capture.availableLineCount,
+        revision: source.capture.revision,
+        terminalControlsObserved: source.capture.terminalControlsObserved,
+      }
+      const executionChanged =
+        contract.executionState !== executionState ||
+        contract.exitCode !== exitCode
+      const captureChanged =
+        JSON.stringify(contract.capture) !== JSON.stringify(capture)
+      const recordExpired = capture.reason === 'record_expired'
+      const isExecCommand = storedMessage.data.name === 'exec_command'
+      const mustRematerialize =
+        !recordExpired &&
+        isExecCommand &&
+        (executionChanged || captureChanged)
+
+      if (mustRematerialize) {
+        try {
+          const refreshed = formatInitialCommandOutput(source).text
+          const prunedMaterialization =
+            parsePrunedCommandOutputMaterialization(content)
+          reconciled = prunedMaterialization
+            ? formatPrunedCommandOutputForModelContext(
+                refreshed,
+                prunedMaterialization.originalApproximateTokens,
+              ) || expireUnbackedCommandOutputEnvelope(content)
+            : refreshed
+        } catch {
+          reconciled = expireUnbackedCommandOutputEnvelope(content)
+        }
+      } else if (captureChanged || executionChanged || recordExpired) {
+        const presentation = (() => {
+          const {
+            nextCursor: _nextCursor,
+            pollCursor: _pollCursor,
+            ...cursorlessPresentation
+          } = contract.presentation
+          if (recordExpired) {
+            return {
+              ...cursorlessPresentation,
+              hasMoreCapturedOutput: false,
+            }
+          }
+          if (
+            storedMessage.data.name !== 'read_command_output' ||
+            contract.presentation.pollCursor === undefined
+          ) {
+            return contract.presentation
+          }
+
+          const retainedOutputGrew =
+            capture.retainedUtf8Bytes >
+            contract.capture.retainedUtf8Bytes
+          if (retainedOutputGrew) {
+            // A poll cursor denotes the exact captured tail that this
+            // historical page reached. Once more retained bytes exist, the
+            // same authenticated position becomes the page's next cursor;
+            // rematerializing from byte zero would erase paging progress.
+            return {
+              ...cursorlessPresentation,
+              state: 'excerpt' as const,
+              hasMoreCapturedOutput: true,
+              nextCursor: contract.presentation.pollCursor,
+            }
+          }
+          if (executionState !== 'running') {
+            // The page reached the final retained tail. Polling is no longer
+            // meaningful, but the already-presented page remains historical
+            // evidence and must stay byte-for-byte stable.
+            return {
+              ...cursorlessPresentation,
+              hasMoreCapturedOutput: false,
+            }
+          }
+          return contract.presentation
+        })()
+        reconciled = rewriteCommandOutputEnvelopeContract(content, {
+          ...contract,
+          executionState,
+          exitCode,
+          capture,
+          presentation,
+        })
+      }
+    }
+    if (reconciled !== content) {
+      storedMessage.data.content = reconciled
+      mutated = true
+    }
+  }
+  return mutated
+}
+
 export function stripRawResponseFromStoredMessages(storedMessages: any[]): boolean {
   let mutated = false
   for (const msg of storedMessages) {
@@ -71,21 +217,56 @@ export async function invokeWithRetryAndSanitizedInput<T>(opts: {
   onRetry?: (attempt: number) => void
   maxRetries: number
   delaysMs: number[]
+  getCommandOutputBackingSource?: CommandOutputBackingSourceResolver
 }): Promise<T> {
   return await opts.helpers.invokeWithRetry(
     async (attempt) => {
       if (attempt > 0) {
         opts.onRetry?.(attempt)
       }
-      const sanitizedMessages = sanitizeModelInputMessages(
-        stripRawResponseForModelInput(opts.messages),
-        { modelSupportsImage: opts.modelSupportsImage }
+      const sanitizedMessages = prepareModelInputMessagesForInvocation(
+        opts.messages,
+        {
+          modelSupportsImage: opts.modelSupportsImage,
+          getCommandOutputBackingSource:
+            opts.getCommandOutputBackingSource,
+        }
       )
       return await opts.operation(sanitizedMessages)
     },
     opts.maxRetries,
     opts.delaysMs,
     opts.signal
+  )
+}
+
+/**
+ * Builds the final immutable request view immediately before one model call.
+ * It is intentionally reusable by secondary calls made inside a streaming
+ * attempt so those calls cannot inherit stale command lifecycle metadata.
+ */
+export function prepareModelInputMessagesForInvocation(
+  messages: BaseMessage[],
+  options?: {
+    modelSupportsImage?: boolean
+    getCommandOutputBackingSource?: CommandOutputBackingSourceResolver
+  }
+): BaseMessage[] {
+  let currentMessages = messages
+  if (options?.getCommandOutputBackingSource) {
+    const stored = mapChatMessagesToStoredMessages(currentMessages) as any[]
+    if (
+      expireUnbackedStoredCommandOutputEnvelopes(
+        stored,
+        options.getCommandOutputBackingSource,
+      )
+    ) {
+      currentMessages = mapStoredMessagesToChatMessages(stored)
+    }
+  }
+  return sanitizeModelInputMessages(
+    stripRawResponseForModelInput(currentMessages),
+    { modelSupportsImage: options?.modelSupportsImage }
   )
 }
 
@@ -126,6 +307,22 @@ function applyPruneMaterialization(messages: BaseMessage[]): BaseMessage[] {
       return message
     }
     changed = true
+    if (
+      message.getType() === 'tool' &&
+      ['exec_command', 'read_command_output'].includes(
+        String((message as { name?: unknown }).name || '')
+      ) &&
+      typeof message.content === 'string'
+    ) {
+      const estimate = TokenManager.estimate(message.content)
+      const commandMaterialization =
+        formatPrunedCommandOutputForModelContext(message.content, estimate)
+      if (commandMaterialization) {
+        return cloneMessageWithPatch(message, {
+          content: commandMaterialization,
+        })
+      }
+    }
     return cloneMessageWithPatch(message, {
       content: buildPrunedPlaceholder(message.content)
     })

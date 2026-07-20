@@ -5,6 +5,7 @@ import path from 'path'
 import os from 'os'
 import type {
   TerminalBackend,
+  TerminalCommandShellFamily,
   TerminalCommandTrackingToken,
   TerminalCommandTrackingUpdate,
   TerminalExecOptions,
@@ -30,43 +31,35 @@ import { escapeShellPathList } from './ShellUtility'
 import { TerminalStateStore, type PersistedTerminalRecord } from './terminal/TerminalStateStore'
 import { v4 as uuidv4 } from 'uuid'
 import {
+  isValidTerminalRuntimeId,
   resolveTerminalConnectionCapabilities,
 } from './terminal/terminalConnectionSupport'
-import { escapePowerShellSingleQuotedString } from './windowsPowerShellTracking'
+import {
+  buildUnixDispatchedCommand,
+  CommandStreamProtocol,
+  type GyShellBoundaryMarker,
+} from './terminal/CommandStreamProtocol'
+import { CommandTranscriptCapture } from './terminal/CommandTranscriptCapture'
+import { buildWindowsPowerShellDispatchRequest } from './windowsPowerShellTracking'
 
 const MAX_BUFFER_SIZE = 200000 // 200KB
 const SCROLLBACK_SIZE = 5000 // Keep up to 5000 lines in virtual terminal
 const PERSIST_FLUSH_DELAY_MS = 120
-// We do NOT print any wrapper/marker commands in the terminal.
-// Instead, we rely on shell integration hooks (installed at shell startup by NodePtyBackend)
-// that emit invisible OSC markers on command boundaries.
-const OSC_PRECMD_PREFIX = '\x1b]1337;gyshell_precmd'
-const OSC_SUFFIX = '\x07'
-const GYSHELL_READY_MARKER = '__GYSHELL_READY__'
-const WINDOWS_TASK_FINISH_PREFIX = '__GYSHELL_TASK_FINISH__::'
-const CONTROL_PREFIXES = [OSC_PRECMD_PREFIX, WINDOWS_TASK_FINISH_PREFIX] as const
+// Shell hooks provide normal interactive boundaries. Agent commands use a
+// top-level eval bookended by runtime-private helpers, which preserves native
+// interactive semantics while restoring the hidden ready hook after a command
+// legitimately changes its own prompt hooks.
 const ANSI_CSI_SEQUENCE_PATTERN = /\x1b\[[0-9;?]*[ -/]*[@-~]/g
 const ANSI_OSC_SEQUENCE_PATTERN = /\x1b\][^\x07]*(?:\x07|\x1b\\)/g
 const OTHER_CONTROL_CHAR_PATTERN = /[\u0000-\u0008\u000b-\u001a\u001c-\u001f\u007f]/g
-const WINDOWS_PROMPT_ONLY_PATTERN = /^(?:PS [A-Za-z]:\\.*?>|[A-Za-z]:\\.*?>)\s*$/
-const WINDOWS_PROMPT_PREFIX_PATTERN = /^(?:PS [A-Za-z]:\\.*?>|[A-Za-z]:\\.*?>)\s*/
-const WINDOWS_NATIVE_PIPELINE_PATTERN = /\|/
-const WINDOWS_POWERSHELL_SPECIAL_PATTERN = /[\$;{}()`]/
-const WINDOWS_POWERSHELL_CMDLET_PATTERN = /\b[A-Za-z]+-[A-Za-z]+\b/
-const COMMAND_TRACKING_FAILURE_MESSAGE =
-  '[GyShell] Hidden command-tracking channel failed; the command may still be running in the terminal.'
+const WINDOWS_PROMPT_ONLY_PATTERN = /^(?:PS (?:[A-Za-z]:\\|\/).*?>|[A-Za-z]:\\.*?>)\s*$/
+const WINDOWS_PROMPT_PREFIX_PATTERN = /^(?:PS (?:[A-Za-z]:\\|\/).*?>|[A-Za-z]:\\.*?>)\s*/
 
 function stripGyShellOscMarkers(s: string): string {
-  return s.replace(/\x1b]1337;gyshell_(?:preexec|precmd)[^\x07]*\x07/g, '')
-}
-
-function stripGyShellTextMarkers(s: string): string {
-  return s.replace(/__GYSHELL_TASK_FINISH__::[^\r\n]*(?:\r?\n|\r)?/g, '')
-}
-
-function stripInternalControlMarkers(s: string): string {
-  if (!s.includes(GYSHELL_READY_MARKER)) return s
-  return s.replace(/__GYSHELL_READY__/g, '')
+  return s.replace(
+    /\x1b]1337;gyshell_(?:[0-9a-f]{32}_)?(?:preexec|preend|precmd)[^\x07]*\x07/g,
+    ''
+  )
 }
 
 function stripTerminalControlSequences(s: string): string {
@@ -82,6 +75,7 @@ interface RingBuffer {
 }
 
 export type TerminalRuntimeState = NonNullable<TerminalTab['runtimeState']>
+export type TerminalShellInputState = 'idle' | 'busy' | 'unknown'
 
 export interface TerminalRuntimeSnapshot {
   id: string
@@ -94,6 +88,19 @@ export interface TerminalRuntimeSnapshot {
   canRunCommand: boolean
   canWrite: boolean
   canUseFilesystem: boolean
+  shellInputState?: TerminalShellInputState
+  commandProtocolAvailable?: boolean
+}
+
+export interface CommandOutputSnapshot {
+  taskId: string
+  command: string
+  status: CommandTask['status']
+  executionState: NonNullable<CommandResult['executionState']>
+  exitCode?: number
+  runtimeBoundary: boolean
+  output: string
+  capture: NonNullable<CommandResult['capture']>
 }
 
 export interface TerminalRenderMetadata {
@@ -104,6 +111,8 @@ export interface TerminalRenderMetadata {
 type RawEventPublisher = (channel: string, data: unknown) => void
 type TerminalClosedListener = (terminalId: string) => void
 type PendingTaskFinish = {
+  taskId: string
+  runtimeGeneration: number | undefined
   requiredWriteSeq: number
   exitCode?: number
 }
@@ -135,6 +144,22 @@ interface CommandStartReservation {
   command: string
   waitForRelease: Promise<void>
   releaseWaiters: () => void
+  startedTaskId?: string
+}
+
+interface WindowsPromptInitialization {
+  ptyId: string
+  runtimeGeneration: number | undefined
+  cancelled: boolean
+  promise: Promise<TerminalCommandTrackingToken | undefined>
+}
+
+interface WindowsManualPromptWatcher {
+  ptyId: string
+  runtimeGeneration: number | undefined
+  expectedInputRevision: number
+  ownedInputReservation: symbol
+  cancelled: boolean
 }
 
 interface PromptFileIoLease {
@@ -211,6 +236,9 @@ const cloneTerminalConfig = (config: TerminalConfig): TerminalConfig =>
   JSON.parse(JSON.stringify(config)) as TerminalConfig
 
 const normalizeTerminalConfigForRuntime = (config: TerminalConfig): TerminalConfig => {
+  if (!isValidTerminalRuntimeId(config.id)) {
+    throw new Error('Terminal id is empty, contains control characters, or exceeds the safe output-contract limit.')
+  }
   const normalized = cloneTerminalConfig(config)
   normalized.id = config.id
   normalized.title = config.title
@@ -266,20 +294,50 @@ export class TerminalService {
   private headlessPtys: Map<string, TerminalType> = new Map()
   private selectionByTerminal: Map<string, string> = new Map()
   private tasksByTerminal: Map<string, Record<string, CommandTask>> = new Map()
+  private detachedTasksByTerminal: Map<string, Record<string, CommandTask>> = new Map()
   private activeTaskByTerminal: Map<string, string> = new Map()
   private commandStartReservationByTerminal: Map<string, CommandStartReservation> = new Map()
   private deferredWritesDuringCommandStartByTerminal: Map<string, string[]> = new Map()
+  private deferredWritesUntilTaskFinishByTaskId: Map<string, string[]> = new Map()
   private promptFileIoTailByTerminal: Map<string, Promise<void>> = new Map()
+  private internalRawDisplaySuppressionByTerminal: Map<string, symbol> = new Map()
   private promptFileIoReleaseByCommandStartToken: Map<symbol, () => void> = new Map()
   private terminalInputSequenceTailByTerminal: Map<string, Promise<void>> = new Map()
-  private oscParseBufByTerminal: Map<string, string> = new Map()
+  private commandStreamProtocolByTerminal: Map<string, CommandStreamProtocol> = new Map()
+  private commandProtocolTokenByTerminal: Map<string, string | undefined> = new Map()
+  private captureByTaskId: Map<string, CommandTranscriptCapture> = new Map()
+  /**
+   * Bytes observed after dispatch but before a trustworthy capture boundary.
+   * Unix discards this echo-prefixed staging capture once preexec is verified;
+   * Windows promotes it as best-effort output when no sidecar capture exists.
+   */
+  private unverifiedCaptureByTaskId: Map<string, CommandTranscriptCapture> = new Map()
+  private shellInputStateByTerminal: Map<string, TerminalShellInputState> = new Map()
+  private lastShellSequenceByTerminal: Map<string, number> = new Map()
+  private activeShellBoundaryByTerminal: Map<
+    string,
+    { sequence?: number; nonce?: string; legacy: boolean }
+  > = new Map()
   private headlessWriteSeqByTerminal: Map<string, number> = new Map()
   private headlessFlushedSeqByTerminal: Map<string, number> = new Map()
   private pendingTaskFinishByTerminal: Map<string, PendingTaskFinish> = new Map()
   private backendRuntimeGenerationByTerminal: Map<string, number> = new Map()
   private nextBackendRuntimeGeneration = 0
-  private startMarkerByTaskId: Map<string, any> = new Map()
   private commandTrackingWatcherByTaskId: Map<string, { cancelled: boolean }> = new Map()
+  private windowsPromptInitializationByTerminal: Map<
+    string,
+    WindowsPromptInitialization
+  > = new Map()
+  private windowsPromptBaselineByTerminal: Map<
+    string,
+    TerminalCommandTrackingToken
+  > = new Map()
+  private windowsManualPromptWatcherByTerminal: Map<
+    string,
+    WindowsManualPromptWatcher
+  > = new Map()
+  private terminalInputRevisionByTerminal: Map<string, number> = new Map()
+  private pendingInputReservationsByTerminal: Map<string, Set<symbol>> = new Map()
   private onTaskFinishedCallbacks: Map<string, (result: CommandResult) => void> = new Map()
   private primaryLocalTerminalId: string | null = null
   private rawEventPublisher: RawEventPublisher | null = null
@@ -288,7 +346,14 @@ export class TerminalService {
   private commandTrackingPollIntervalMs = 250
   private commandTrackingMaxConsecutiveErrors = 8
   private commandTrackingPromptSyncPollIntervalMs = 50
+  private commandTrackingPromptSyncTimeoutMs = 2000
+  private commandTrackingIoTimeoutMs = 5000
+  private promptFileProbeTimeoutMs = 5000
   private syntheticCommandQuietWindowMs = 1000
+  private syntheticCommandMaxSyncWaitMs = 2000
+  private commandCaptureRetentionBudgetBytes = 64 * 1024 * 1024
+  private commandCaptureRetentionMaxRecords = 200
+  private commandHistoryTombstoneMaxRecords = 200
   private readonly terminalIdsBeingKilled = new Set<string>()
   private readonly terminalClosedListeners = new Set<TerminalClosedListener>()
 
@@ -414,6 +479,61 @@ export class TerminalService {
       throw new Error(`No backend found for connection type: ${type}`)
     }
     return backend
+  }
+
+  private backendUsesPowerShellSidecar(
+    terminal: TerminalTab | undefined
+  ): boolean {
+    if (!terminal) return false
+    return (
+      this.getBackend(terminal.type).getCommandTrackingMode?.(
+        terminal.ptyId
+      ) === 'windows-powershell-sidecar'
+    )
+  }
+
+  private getCommandShellFamily(
+    terminal: TerminalTab | undefined
+  ): TerminalCommandShellFamily | undefined {
+    if (!terminal) return undefined
+    const declaredFamily = this.getBackend(
+      terminal.type
+    ).getCommandShellFamily?.(terminal.ptyId)
+    if (declaredFamily) return declaredFamily
+    if (this.backendUsesPowerShellSidecar(terminal)) return 'powershell'
+    if (terminal.remoteOs === 'windows') return 'powershell'
+    if (terminal.remoteOs === 'unix') return 'unix'
+    return undefined
+  }
+
+  /**
+   * Command lifecycle behavior follows the interactive shell protocol, not
+   * the filesystem host. PowerShell Core on macOS/Linux keeps Unix path
+   * semantics while using the same prompt-file sidecar as Windows.
+   */
+  private usesPowerShellCommandLifecycle(
+    terminal: TerminalTab | undefined
+  ): boolean {
+    return this.getCommandShellFamily(terminal) === 'powershell'
+  }
+
+  private runtimeNeedsInitializationSilence(
+    config: TerminalConfig,
+    ptyId: string
+  ): boolean {
+    if (config.type === 'ssh') return true
+    if (config.type !== 'local') return false
+    const backend = this.getBackend(config.type)
+    const declaredFamily = backend.getCommandShellFamily?.(ptyId)
+    if (declaredFamily) return declaredFamily === 'powershell'
+    if (
+      backend.getCommandTrackingMode?.(ptyId) ===
+      'windows-powershell-sidecar'
+    ) return true
+    if (typeof backend.getCommandShellFamily === 'function') return false
+    return (
+      os.platform() === 'win32'
+    )
   }
 
   private getFileSystemBackend(
@@ -550,11 +670,26 @@ export class TerminalService {
     return { config, ptyId }
   }
 
+  private clearWindowsPromptRuntimeState(terminalId: string): void {
+    const initialization = this.windowsPromptInitializationByTerminal.get(terminalId)
+    if (initialization) initialization.cancelled = true
+    this.windowsPromptInitializationByTerminal.delete(terminalId)
+    const manualWatcher = this.windowsManualPromptWatcherByTerminal.get(terminalId)
+    if (manualWatcher) manualWatcher.cancelled = true
+    this.windowsManualPromptWatcherByTerminal.delete(terminalId)
+    this.windowsPromptBaselineByTerminal.delete(terminalId)
+    this.terminalInputRevisionByTerminal.delete(terminalId)
+    // A stale sequence owns its captured Set. Replacing the map entry means
+    // its eventual finally block cannot delete reservations for this runtime.
+    this.pendingInputReservationsByTerminal.delete(terminalId)
+  }
+
   private registerBackendRuntimeHandlers(
     terminalId: string,
     terminalType: ConnectionType,
     ptyId: string
   ): void {
+    this.clearWindowsPromptRuntimeState(terminalId)
     this.nextBackendRuntimeGeneration += 1
     const runtimeGeneration = this.nextBackendRuntimeGeneration
     this.backendRuntimeGenerationByTerminal.set(
@@ -562,6 +697,7 @@ export class TerminalService {
       runtimeGeneration
     )
     const backend = this.getBackend(terminalType)
+    this.synchronizeCommandStreamProtocol(terminalId, backend, ptyId)
     let runtimeExited = false
     const isCurrentRuntime = (): boolean => {
       const terminal = this.terminals.get(terminalId)
@@ -574,13 +710,41 @@ export class TerminalService {
     }
     backend.onData(ptyId, (data: string) => {
       if (!isCurrentRuntime()) return
-      this.handleData(terminalId, data)
+      this.synchronizeCommandStreamProtocol(terminalId, backend, ptyId)
+      this.handleData(terminalId, data, isCurrentRuntime)
     })
     backend.onExit(ptyId, (code: number) => {
       if (!isCurrentRuntime()) return
       runtimeExited = true
       this.handleExit(terminalId, code)
     })
+  }
+
+  private synchronizeCommandStreamProtocol(
+    terminalId: string,
+    backend: TerminalBackend,
+    ptyId: string
+  ): void {
+    const runtimeToken = backend.getCommandProtocolToken?.(ptyId)
+    const hasCurrentToken = this.commandProtocolTokenByTerminal.has(terminalId)
+    const currentToken = this.commandProtocolTokenByTerminal.get(terminalId)
+    if (
+      hasCurrentToken &&
+      currentToken === runtimeToken &&
+      this.commandStreamProtocolByTerminal.has(terminalId)
+    ) {
+      return
+    }
+
+    // SSH learns the remote OS after registration. Its Unix token becomes
+    // visible before the injected hook can emit protocol data, so replacing
+    // the empty/legacy parser here keeps Windows on the legacy namespace while
+    // binding Unix parsing to the runtime-private namespace.
+    this.commandProtocolTokenByTerminal.set(terminalId, runtimeToken)
+    this.commandStreamProtocolByTerminal.set(
+      terminalId,
+      new CommandStreamProtocol(runtimeToken)
+    )
   }
 
   async restorePersistedTerminals(): Promise<RestoreTerminalResult> {
@@ -694,6 +858,8 @@ export class TerminalService {
     }
     config = runtime.config
 
+    const needsInitializationSilence =
+      this.runtimeNeedsInitializationSilence(config, runtime.ptyId)
     const tab: TerminalTab = {
       id: config.id,
       ptyId: runtime.ptyId,
@@ -702,8 +868,8 @@ export class TerminalService {
       rows: config.rows,
       type: config.type,
       capabilities: resolveTerminalConnectionCapabilities(config),
-      isInitializing: config.type === 'ssh' || (config.type === 'local' && os.platform() === 'win32'), // Enable silence mode for SSH and local Windows
-      runtimeState: config.type === 'ssh' || (config.type === 'local' && os.platform() === 'win32') ? 'initializing' : 'ready'
+      isInitializing: needsInitializationSilence,
+      runtimeState: needsInitializationSilence ? 'initializing' : 'ready'
     }
 
     // Initialize Headless Terminal for AI context
@@ -850,8 +1016,11 @@ export class TerminalService {
       rows: tab.rows
     } as TerminalConfig)
 
-    tab.isInitializing = os.platform() === 'win32'
-    tab.runtimeState = tab.isInitializing ? 'initializing' : 'ready'
+    // The old PTY has exited and no replacement exists yet. Keep every local
+    // shell non-writable until spawn returns and the tab is bound to that exact
+    // runtime; otherwise a synchronous caller can dispatch into the dead PTY.
+    tab.isInitializing = true
+    tab.runtimeState = 'initializing'
     tab.lastExitCode = undefined
     tab.capabilities = resolveTerminalConnectionCapabilities(restartConfig)
     this.terminalConfigs.set(terminalId, restartConfig)
@@ -866,7 +1035,10 @@ export class TerminalService {
       tab.rows = nextConfig.rows
       tab.type = nextConfig.type
       tab.capabilities = resolveTerminalConnectionCapabilities(nextConfig)
-      tab.isInitializing = nextConfig.type === 'local' && os.platform() === 'win32'
+      tab.isInitializing = this.runtimeNeedsInitializationSilence(
+        nextConfig,
+        runtime.ptyId
+      )
       tab.runtimeState = tab.isInitializing ? 'initializing' : 'ready'
       tab.lastExitCode = undefined
       this.terminalConfigs.set(terminalId, nextConfig)
@@ -889,8 +1061,11 @@ export class TerminalService {
     }
   }
 
-  private handleData(terminalId: string, data: string): void {
-    const sanitizedData = stripInternalControlMarkers(data)
+  private handleData(
+    terminalId: string,
+    data: string,
+    isCurrentRuntime: () => boolean
+  ): void {
     const tab = this.terminals.get(terminalId)
     if (tab) {
       let shouldPublishTabsChanged = false
@@ -926,13 +1101,20 @@ export class TerminalService {
       }
     }
 
-    const suppressRawDisplay = this.shouldSuppressRawTaskDisplay(terminalId)
+    const syntheticRawTaskActive = this.shouldSuppressRawTaskDisplay(terminalId)
+    const internalRawDisplaySuppressed =
+      this.internalRawDisplaySuppressionByTerminal.has(terminalId)
+    const suppressRawDisplay =
+      syntheticRawTaskActive || internalRawDisplaySuppressed
     const headless = this.headlessPtys.get(terminalId)
     let writeSeq = 0
-    if (!suppressRawDisplay && headless && sanitizedData) {
+    if (!suppressRawDisplay && headless && data) {
       writeSeq = (this.headlessWriteSeqByTerminal.get(terminalId) || 0) + 1
       this.headlessWriteSeqByTerminal.set(terminalId, writeSeq)
-      headless.write(sanitizedData, () => {
+      headless.write(data, () => {
+        if (!isCurrentRuntime()) {
+          return
+        }
         const flushed = Math.max(this.headlessFlushedSeqByTerminal.get(terminalId) || 0, writeSeq)
         this.headlessFlushedSeqByTerminal.set(terminalId, flushed)
         this.tryFlushPendingTaskFinish(terminalId)
@@ -940,8 +1122,28 @@ export class TerminalService {
     }
 
     // Process OSC markers and strip markers from visual output
-    const cleanedData = this.processIncomingData(terminalId, sanitizedData, writeSeq)
-    if (!suppressRawDisplay && cleanedData) {
+    const cleanedData = this.processIncomingData(terminalId, data, writeSeq)
+    const displayRequestBoundSyntheticRaw =
+      syntheticRawTaskActive && !internalRawDisplaySuppressed
+    if (displayRequestBoundSyntheticRaw && headless && cleanedData) {
+      writeSeq = (this.headlessWriteSeqByTerminal.get(terminalId) || 0) + 1
+      this.headlessWriteSeqByTerminal.set(terminalId, writeSeq)
+      headless.write(cleanedData, () => {
+        if (!isCurrentRuntime()) {
+          return
+        }
+        const flushed = Math.max(
+          this.headlessFlushedSeqByTerminal.get(terminalId) || 0,
+          writeSeq
+        )
+        this.headlessFlushedSeqByTerminal.set(terminalId, flushed)
+        this.tryFlushPendingTaskFinish(terminalId)
+      })
+    }
+    if (
+      (!suppressRawDisplay || displayRequestBoundSyntheticRaw) &&
+      cleanedData
+    ) {
       const buffer = this.buffers.get(terminalId)
       let currentOffset = 0
       if (buffer) {
@@ -961,6 +1163,19 @@ export class TerminalService {
         offset: currentOffset,
         ...this.getRenderMetadata(terminalId)
       })
+    }
+    const currentTerminal = this.terminals.get(terminalId)
+    if (
+      currentTerminal !== undefined &&
+      this.usesPowerShellCommandLifecycle(currentTerminal) &&
+      currentTerminal.runtimeState === 'ready' &&
+      !this.activeTaskByTerminal.has(terminalId) &&
+      !this.commandStartReservationByTerminal.has(terminalId) &&
+      this.shellInputStateByTerminal.get(terminalId) !== 'idle'
+    ) {
+      // The in-band PowerShell fallback settles through its OSC marker. A
+      // sidecar runtime returns a verified out-of-band baseline here.
+      void this.ensureWindowsPromptBaseline(terminalId)
     }
   }
 
@@ -983,9 +1198,20 @@ export class TerminalService {
 
     const headless = this.headlessPtys.get(terminalId)
     if (headless) {
+      const terminalAtWrite = this.terminals.get(terminalId)
+      const runtimeGeneration =
+        this.backendRuntimeGenerationByTerminal.get(terminalId)
       const writeSeq = (this.headlessWriteSeqByTerminal.get(terminalId) || 0) + 1
       this.headlessWriteSeqByTerminal.set(terminalId, writeSeq)
       headless.write(data, () => {
+        if (
+          this.terminals.get(terminalId) !== terminalAtWrite ||
+          terminalAtWrite?.runtimeState !== 'ready' ||
+          this.backendRuntimeGenerationByTerminal.get(terminalId) !==
+            runtimeGeneration
+        ) {
+          return
+        }
         const flushed = Math.max(this.headlessFlushedSeqByTerminal.get(terminalId) || 0, writeSeq)
         this.headlessFlushedSeqByTerminal.set(terminalId, flushed)
       })
@@ -1044,10 +1270,12 @@ export class TerminalService {
     }
     const cwd = this.getCwd(terminalId)
     if (cwd) {
-      return `PS ${cwd.replace(/\//g, '\\')}> `
+      const promptCwd =
+        terminal.remoteOs === 'windows' ? cwd.replace(/\//g, '\\') : cwd
+      return `PS ${promptCwd}> `
     }
 
-    return terminal.remoteOs === 'windows' ? 'PS> ' : ''
+    return this.usesPowerShellCommandLifecycle(terminal) ? 'PS> ' : ''
   }
 
   private hasVisibleWindowsPromptLine(terminalId: string): boolean {
@@ -1073,6 +1301,7 @@ export class TerminalService {
     terminalId: string,
     taskId: string
   ): Promise<void> {
+    const deadline = Date.now() + this.syntheticCommandMaxSyncWaitMs
     while (true) {
       const activeTaskId = this.activeTaskByTerminal.get(terminalId)
       const task = this.getTaskMap(terminalId)[taskId]
@@ -1084,123 +1313,416 @@ export class TerminalService {
       if (Date.now() - lastOutputAtMs >= this.syntheticCommandQuietWindowMs) {
         return
       }
+      if (Date.now() >= deadline) {
+        // Protocol completion and the sidecar file are authoritative. Visual
+        // output from an unrelated background writer must not keep the agent
+        // command gate occupied forever.
+        return
+      }
 
       await new Promise((resolve) => setTimeout(resolve, 25))
     }
   }
 
   private processIncomingData(terminalId: string, rawChunk: string, writeSeq: number): string {
-    let buf = this.oscParseBufByTerminal.get(terminalId) || ''
-    buf += rawChunk
-
     let cleanedData = ''
-
-    while (buf.length > 0) {
-      const precmdIdx = buf.indexOf(OSC_PRECMD_PREFIX)
-      const windowsTaskIdx = this.findWindowsTaskMarkerIndex(buf)
-      const nextControlIdx = this.findNextControlIndex(precmdIdx, windowsTaskIdx)
-
-      if (nextControlIdx === -1) {
-        const suffixLength = this.getTrailingControlPrefixLength(buf)
-        const flushable = suffixLength > 0 ? buf.slice(0, -suffixLength) : buf
-        const cleaned = stripGyShellOscMarkers(flushable)
-        cleanedData += cleaned
-        this.appendActiveTaskOutput(terminalId, cleaned)
-        buf = suffixLength > 0 ? buf.slice(-suffixLength) : ''
-        break
-      }
-
-      const before = buf.slice(0, nextControlIdx)
-      const cleanedBefore = stripGyShellOscMarkers(before)
-      cleanedData += cleanedBefore
-      this.appendActiveTaskOutput(terminalId, cleanedBefore)
-
-      if (nextControlIdx === precmdIdx) {
-        const suffixIdx = buf.indexOf(OSC_SUFFIX, precmdIdx)
-        if (suffixIdx === -1) {
-          // Wait for the rest of the marker in the next chunk.
-          buf = buf.slice(precmdIdx)
-          break
-        }
-
-        const markerContent = buf.slice(precmdIdx, suffixIdx)
-        const ecMatch = markerContent.match(/ec=(-?\d+)/)
-        const exitCode = ecMatch ? parseInt(ecMatch[1], 10) : undefined
-
-        this.scheduleTaskFinishAfterHeadlessFlush(terminalId, exitCode, writeSeq)
-
-        buf = buf.slice(suffixIdx + OSC_SUFFIX.length)
-        continue
-      }
-
-      const lineBreakMatch = buf.slice(windowsTaskIdx).match(/\r\n|\n|\r/)
-      if (!lineBreakMatch || lineBreakMatch.index === undefined) {
-        buf = buf.slice(windowsTaskIdx)
-        break
-      }
-
-      const markerEnd = windowsTaskIdx + lineBreakMatch.index
-      const markerContent = buf.slice(windowsTaskIdx, markerEnd)
-      const marker = this.parseWindowsTaskFinishMarker(markerContent)
-      const activeTaskId = this.activeTaskByTerminal.get(terminalId)
-      if (
-        marker &&
-        activeTaskId &&
-        (!marker.taskId || marker.taskId === activeTaskId)
-      ) {
-        this.scheduleTaskFinishAfterHeadlessFlush(terminalId, marker.exitCode, writeSeq)
-      }
-
-      buf = buf.slice(markerEnd + lineBreakMatch[0].length)
+    let protocol = this.commandStreamProtocolByTerminal.get(terminalId)
+    if (!protocol) {
+      protocol = new CommandStreamProtocol(
+        this.commandProtocolTokenByTerminal.get(terminalId)
+      )
+      this.commandStreamProtocolByTerminal.set(terminalId, protocol)
     }
 
-    this.oscParseBufByTerminal.set(terminalId, buf)
+    for (const event of protocol.feed(rawChunk)) {
+      if (event.type === 'text') {
+        const syntheticTask = this.getActiveTask(terminalId)
+        const displayRequestBoundRaw =
+          syntheticTask?.displayMode === 'synthetic-transcript' &&
+          syntheticTask.captureBoundaryState === 'capturing'
+        const cleanedText = this.processTextControlMarkers(
+          terminalId,
+          event.text,
+          writeSeq
+        )
+        if (
+          syntheticTask?.displayMode !== 'synthetic-transcript' ||
+          displayRequestBoundRaw
+        ) {
+          cleanedData += cleanedText
+        }
+        if (displayRequestBoundRaw && cleanedText) {
+          syntheticTask.syntheticRawDisplayObserved = true
+          syntheticTask.syntheticRawDisplayEndsWithLineBreak =
+            /[\r\n]$/.test(cleanedText)
+        }
+      } else if (event.type === 'marker') {
+        this.handleShellBoundaryMarker(terminalId, event.marker, writeSeq)
+      } else {
+        const task = this.getActiveTask(terminalId)
+        if (task?.captureBoundaryState === 'capturing') {
+          this.getTaskCapture(task.id)?.markUnknown('tracking_lost')
+          this.syncTaskCaptureMetadata(task)
+        }
+        this.shellInputStateByTerminal.set(terminalId, 'unknown')
+      }
+    }
     return cleanedData
   }
 
-  private findNextControlIndex(...indices: number[]): number {
-    return indices
-      .filter((index) => index >= 0)
-      .reduce((smallest, index) => (smallest === -1 || index < smallest ? index : smallest), -1)
+  private processTextControlMarkers(
+    terminalId: string,
+    chunk: string,
+    _writeSeq: number
+  ): string {
+    // Windows completion is authenticated either by a runtime-token OSC
+    // marker or by its out-of-band sidecar. Fixed printable marker text is
+    // ordinary command output and must never change task or shell state.
+    this.appendActiveTaskOutput(terminalId, chunk)
+    return chunk
   }
 
-  private findWindowsTaskMarkerIndex(value: string): number {
-    return value.indexOf(WINDOWS_TASK_FINISH_PREFIX)
-  }
-
-  private getTrailingControlPrefixLength(value: string): number {
-    const upperBound = Math.min(
-      value.length,
-      Math.max(...CONTROL_PREFIXES.map((prefix) => prefix.length - 1))
-    )
-
-    for (let length = upperBound; length > 0; length -= 1) {
-      if (CONTROL_PREFIXES.some((prefix) => value.endsWith(prefix.slice(0, length)))) {
-        return length
+  private decodeCommandProtocolPath(value: string | undefined): string | undefined {
+    if (!value || value.length > 16 * 1024) return undefined
+    if (!/^[A-Za-z0-9+/]+={0,2}$/.test(value) || value.length % 4 === 1) {
+      return undefined
+    }
+    const unpadded = value.replace(/=+$/, '')
+    try {
+      const bytes = Buffer.from(value, 'base64')
+      if (bytes.toString('base64').replace(/=+$/, '') !== unpadded) {
+        return undefined
       }
+      const decoded = bytes.toString('utf8')
+      if (!Buffer.from(decoded, 'utf8').equals(bytes)) {
+        return undefined
+      }
+      return decoded
+    } catch {
+      return undefined
     }
-
-    return 0
   }
 
-  private parseWindowsTaskFinishMarker(
-    markerContent: string
-  ): { taskId?: string; exitCode?: number } | null {
-    const normalizedMarkerContent = markerContent
-      .replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, '')
-      .trim()
-    const match = normalizedMarkerContent.match(/^__GYSHELL_TASK_FINISH__::(?:(.+?);)?ec=(-?\d+)$/)
-    if (!match) {
-      return null
+  private applyVerifiedShellMetadata(
+    terminalId: string,
+    marker: GyShellBoundaryMarker
+  ): void {
+    const terminal = this.terminals.get(terminalId)
+    if (!terminal) return
+    const cwd = this.decodeCommandProtocolPath(marker.cwdBase64)
+    const homeDir = this.decodeCommandProtocolPath(marker.homeBase64)
+    if (cwd === undefined && homeDir === undefined) return
+    this.getBackend(terminal.type).applyCommandProtocolMetadata?.(
+      terminal.ptyId,
+      {
+        ...(cwd !== undefined ? { cwd } : {}),
+        ...(homeDir !== undefined ? { homeDir } : {}),
+      }
+    )
+  }
+
+  private handleShellBoundaryMarker(
+    terminalId: string,
+    marker: GyShellBoundaryMarker,
+    writeSeq: number
+  ): void {
+    const terminal = this.terminals.get(terminalId)
+    const task = this.getActiveTask(terminalId)
+    const boundaryMatches = (
+      boundary: { sequence?: number; nonce?: string },
+      candidate: GyShellBoundaryMarker
+    ): boolean =>
+      (boundary.sequence === undefined || candidate.sequence === boundary.sequence) &&
+      (boundary.nonce === undefined || candidate.nonce === boundary.nonce)
+
+    if (marker.kind === 'preexec') {
+      if (this.usesPowerShellCommandLifecycle(terminal)) {
+        const expectedRequestId = task?.completionTracking?.expectedRequestId
+        const expectedSequence =
+          task?.completionTracking?.baselineSequence !== undefined
+            ? task.completionTracking.baselineSequence + 1
+            : undefined
+        if (
+          task?.status === 'running' &&
+          task.displayMode === 'synthetic-transcript' &&
+          task.captureBoundaryState === 'awaiting-start' &&
+          !marker.legacy &&
+          expectedRequestId !== undefined &&
+          marker.nonce === expectedRequestId &&
+          (expectedSequence === undefined || marker.sequence === expectedSequence)
+        ) {
+          // The dispatcher echo is outside this request-bound pair. Replace
+          // its staging transcript so even prompt/command-looking direct
+          // console output inside the pair remains literal task evidence.
+          this.unverifiedCaptureByTaskId.set(
+            task.id,
+            new CommandTranscriptCapture()
+          )
+          task.activeShellSequence = marker.sequence
+          task.activeShellNonce = marker.nonce
+          task.captureBoundaryState = 'capturing'
+          this.syncTaskCaptureMetadata(task)
+        }
+        return
+      }
+      // Once a start boundary is open, further preexec-looking output belongs
+      // to the running command and cannot replace the trusted pair.
+      if (this.activeShellBoundaryByTerminal.has(terminalId)) {
+        return
+      }
+      const previous = this.lastShellSequenceByTerminal.get(terminalId)
+      if (
+        previous !== undefined &&
+        marker.sequence !== undefined &&
+        marker.sequence !== previous + 1
+      ) {
+        this.shellInputStateByTerminal.set(terminalId, 'unknown')
+        if (task?.status === 'running') {
+          this.getTaskCapture(task.id)?.markUnknown('tracking_lost')
+          this.syncTaskCaptureMetadata(task)
+        }
+        return
+      }
+      const boundary = {
+        ...(marker.sequence !== undefined ? { sequence: marker.sequence } : {}),
+        ...(marker.nonce ? { nonce: marker.nonce } : {}),
+        legacy: marker.legacy,
+      }
+      this.activeShellBoundaryByTerminal.set(terminalId, boundary)
+      this.shellInputStateByTerminal.set(terminalId, 'busy')
+
+      if (!task || task.status !== 'running' || task.captureBoundaryState !== 'awaiting-start') {
+        return
+      }
+      if (
+        task.expectedShellSequence !== undefined &&
+        marker.sequence !== undefined &&
+        marker.sequence !== task.expectedShellSequence
+      ) {
+        return
+      }
+      if (!marker.legacy && marker.sequence !== undefined && marker.nonce) {
+        task.activeShellSequence = marker.sequence
+        task.activeShellNonce = marker.nonce
+      } else {
+        task.activeShellSequence = marker.sequence
+      }
+      // Everything before the verified preexec marker is terminal echo or
+      // shell-owned rendering, not command output.
+      this.unverifiedCaptureByTaskId.delete(task.id)
+      task.captureBoundaryState = 'capturing'
+      this.syncTaskCaptureMetadata(task)
+      return
     }
 
-    return {
-      taskId: match[1] || undefined,
-      exitCode: match[2] !== undefined ? parseInt(match[2], 10) : undefined
+    if (marker.kind === 'preend') {
+      if (
+        task?.displayMode === 'synthetic-transcript'
+      ) {
+        if (
+          task.status === 'running' &&
+          task.captureBoundaryState === 'capturing' &&
+          !marker.legacy &&
+          marker.sequence === task.activeShellSequence &&
+          marker.nonce === task.activeShellNonce &&
+          marker.nonce === task.completionTracking?.expectedRequestId
+        ) {
+          this.unverifiedCaptureByTaskId.get(task.id)?.seal()
+          task.captureBoundaryState = 'sealed'
+          this.syncTaskCaptureMetadata(task)
+        }
+        return
+      }
+      const boundary = this.activeShellBoundaryByTerminal.get(terminalId)
+      if (!boundary) {
+        const previous = this.lastShellSequenceByTerminal.get(terminalId)
+        const backend = terminal ? this.getBackend(terminal.type) : undefined
+        const commandProtocolAvailable = terminal
+          ? backend?.getCommandProtocolAvailability?.(terminal.ptyId)
+          : undefined
+        if (
+          task?.status === 'running' &&
+          task.captureBoundaryState === 'awaiting-start' &&
+          commandProtocolAvailable === true &&
+          this.commandProtocolTokenByTerminal.get(terminalId) !== undefined &&
+          previous !== undefined &&
+          marker.sequence === previous
+        ) {
+          // Bash can reject syntax before DEBUG/preexec runs. Its private
+          // prompt-begin hook still closes the staging transcript here so
+          // existing PROMPT_COMMAND output cannot masquerade as diagnostics.
+          this.unverifiedCaptureByTaskId.get(task.id)?.seal()
+        }
+        return
+      }
+      if (!boundaryMatches(boundary, marker)) {
+        return
+      }
+      if (!task || task.status !== 'running' || task.captureBoundaryState !== 'capturing') {
+        return
+      }
+      const sequenceMatches =
+        task.activeShellSequence === undefined ||
+        marker.sequence === task.activeShellSequence
+      const nonceMatches =
+        task.activeShellNonce === undefined || marker.nonce === task.activeShellNonce
+      if (sequenceMatches && nonceMatches) {
+        // zsh renders PROMPT_EOL_MARK before its precmd hooks. Closing only the
+        // capture gate here keeps that shell-owned rendering out of the
+        // transcript; the matching precmd still supplies the authoritative
+        // exit status and completes the task.
+        task.captureBoundaryState = 'awaiting-end'
+      }
+      return
     }
+
+    if (this.usesPowerShellCommandLifecycle(terminal)) {
+      const previous = this.lastShellSequenceByTerminal.get(terminalId)
+      if (task?.status === 'running' && task.captureBoundaryState === 'unverified') {
+        if (
+          task.expectedShellSequence !== undefined &&
+          marker.sequence !== undefined &&
+          marker.sequence !== task.expectedShellSequence
+        ) {
+          return
+        }
+        if (marker.sequence !== undefined) {
+          this.lastShellSequenceByTerminal.set(terminalId, marker.sequence)
+        }
+        // Stop the best-effort transcript at the runtime-namespaced end
+        // marker. Prompt rendering may follow in the same PTY chunk and is
+        // shell-owned rather than command output.
+        task.captureBoundaryState = 'sealed'
+        this.shellInputStateByTerminal.set(terminalId, 'idle')
+        this.applyVerifiedShellMetadata(terminalId, marker)
+        this.scheduleTaskFinishAfterHeadlessFlush(terminalId, marker.exitCode, writeSeq)
+        return
+      }
+      if (
+        !task &&
+        (marker.sequence === undefined ||
+          previous === undefined ||
+          marker.sequence === previous ||
+          marker.sequence === previous + 1)
+      ) {
+        const trackedState = this.shellInputStateByTerminal.get(terminalId)
+        const advancesPrompt =
+          previous !== undefined &&
+          marker.sequence !== undefined &&
+          marker.sequence === previous + 1
+        if (marker.sequence !== undefined) {
+          this.lastShellSequenceByTerminal.set(terminalId, marker.sequence)
+        }
+        // A first or duplicate prompt marker can have been generated before
+        // already-delivered input was consumed. Only an advancing marker may
+        // clear an explicitly busy/unknown Windows gate.
+        if (
+          trackedState === undefined ||
+          trackedState === 'idle' ||
+          advancesPrompt
+        ) {
+          this.shellInputStateByTerminal.set(terminalId, 'idle')
+        }
+        this.applyVerifiedShellMetadata(terminalId, marker)
+      }
+      return
+    }
+
+    const boundary = this.activeShellBoundaryByTerminal.get(terminalId)
+    if (!boundary) {
+      const previous = this.lastShellSequenceByTerminal.get(terminalId)
+      // Initial prompt and blank-line prompts have no paired preexec. They may
+      // confirm idle state, but they must never advance the sequence.
+      if (
+        !task &&
+        (marker.sequence === undefined ||
+          previous === undefined ||
+          marker.sequence === previous)
+      ) {
+        if (previous === undefined && marker.sequence !== undefined) {
+          this.lastShellSequenceByTerminal.set(terminalId, marker.sequence)
+        }
+        this.shellInputStateByTerminal.set(terminalId, 'idle')
+        this.applyVerifiedShellMetadata(terminalId, marker)
+        return
+      }
+
+      const backend = terminal ? this.getBackend(terminal.type) : undefined
+      const commandProtocolAvailable = terminal
+        ? backend?.getCommandProtocolAvailability?.(terminal.ptyId)
+        : undefined
+      if (
+        task?.status === 'running' &&
+        task.captureBoundaryState === 'awaiting-start' &&
+        commandProtocolAvailable === true &&
+        this.commandProtocolTokenByTerminal.get(terminalId) !== undefined &&
+        previous !== undefined &&
+        marker.sequence === previous
+      ) {
+        // Bash syntax errors can return directly to PROMPT_COMMAND without a
+        // DEBUG/preexec hook. The per-runtime namespace makes accidental
+        // marker collisions unlikely; this same-sequence prompt confirms the
+        // outcome, but without a start boundary capture remains unverified.
+        this.shellInputStateByTerminal.set(terminalId, 'idle')
+        this.applyVerifiedShellMetadata(terminalId, marker)
+        this.promoteUnverifiedUnixCapture(terminalId, terminal, task)
+        this.getTaskCapture(task.id)?.markUnknown('tracking_unavailable')
+        this.syncTaskCaptureMetadata(task)
+        this.scheduleTaskFinishAfterHeadlessFlush(terminalId, marker.exitCode, writeSeq)
+      }
+      return
+    }
+    if (!boundaryMatches(boundary, marker)) {
+      return
+    }
+
+    this.activeShellBoundaryByTerminal.delete(terminalId)
+    if (marker.sequence !== undefined) {
+      this.lastShellSequenceByTerminal.set(terminalId, marker.sequence)
+    }
+    this.shellInputStateByTerminal.set(terminalId, 'idle')
+    this.applyVerifiedShellMetadata(terminalId, marker)
+
+    if (
+      !task ||
+      task.status !== 'running' ||
+      (task.captureBoundaryState !== 'capturing' &&
+        task.captureBoundaryState !== 'awaiting-end')
+    ) {
+      return
+    }
+    const sequenceMatches =
+      task.activeShellSequence === undefined ||
+      marker.sequence === task.activeShellSequence
+    const nonceMatches =
+      task.activeShellNonce === undefined ||
+      marker.nonce === task.activeShellNonce
+    if (!sequenceMatches || !nonceMatches) {
+      return
+    }
+
+    task.captureBoundaryState = 'sealed'
+    const capture = this.getTaskCapture(task.id)
+    if (boundary.legacy || marker.legacy) {
+      capture?.markUnknown('tracking_unavailable')
+    }
+    capture?.seal()
+    this.syncTaskCaptureMetadata(task)
+    this.scheduleTaskFinishAfterHeadlessFlush(terminalId, marker.exitCode, writeSeq)
   }
 
   private scheduleTaskFinishAfterHeadlessFlush(terminalId: string, exitCode: number | undefined, writeSeq: number): void {
+    if (
+      !this.usesPowerShellCommandLifecycle(
+        this.terminals.get(terminalId)
+      )
+    ) {
+      // Canonical Unix output is already sealed by the protocol parser. Human
+      // screen rendering is independent and must not delay or weaken the
+      // command outcome.
+      this.finishActiveTask(terminalId, exitCode)
+      return
+    }
     const headless = this.headlessPtys.get(terminalId)
     if (!headless || writeSeq <= 0) {
       this.finishActiveTask(terminalId, exitCode)
@@ -1213,7 +1735,14 @@ export class TerminalService {
       return
     }
 
+    const taskId = this.activeTaskByTerminal.get(terminalId)
+    if (!taskId) {
+      return
+    }
     this.pendingTaskFinishByTerminal.set(terminalId, {
+      taskId,
+      runtimeGeneration:
+        this.backendRuntimeGenerationByTerminal.get(terminalId),
       requiredWriteSeq: writeSeq,
       exitCode
     })
@@ -1222,22 +1751,36 @@ export class TerminalService {
   private tryFlushPendingTaskFinish(terminalId: string): void {
     const pending = this.pendingTaskFinishByTerminal.get(terminalId)
     if (!pending) return
+    if (
+      this.activeTaskByTerminal.get(terminalId) !== pending.taskId ||
+      this.backendRuntimeGenerationByTerminal.get(terminalId) !==
+        pending.runtimeGeneration
+    ) {
+      this.pendingTaskFinishByTerminal.delete(terminalId)
+      return
+    }
     const flushedSeq = this.headlessFlushedSeqByTerminal.get(terminalId) || 0
     if (flushedSeq < pending.requiredWriteSeq) return
     this.pendingTaskFinishByTerminal.delete(terminalId)
     this.finishActiveTask(terminalId, pending.exitCode)
   }
 
-  private disposeTaskStartMarker(taskId: string): void {
-    const marker = this.startMarkerByTaskId.get(taskId)
-    this.startMarkerByTaskId.delete(taskId)
-    if (marker && typeof marker.dispose === 'function') {
-      try {
-        marker.dispose()
-      } catch {
-        // Marker disposal is best-effort and must not hide the command outcome.
+  private flushCommandProtocolOnRuntimeExit(terminalId: string): void {
+    const protocol = this.commandStreamProtocolByTerminal.get(terminalId)
+    if (protocol) {
+      for (const event of protocol.end()) {
+        if (event.type === 'text') {
+          this.processTextControlMarkers(terminalId, event.text, 0)
+        } else if (event.type === 'malformed-marker') {
+          const task = this.getActiveTask(terminalId)
+          if (task) {
+            this.getTaskCapture(task.id)?.markUnknown('tracking_lost')
+            this.syncTaskCaptureMetadata(task)
+          }
+        }
       }
     }
+
   }
 
   private handleExit(terminalId: string, code: number): void {
@@ -1246,6 +1789,7 @@ export class TerminalService {
     // check will prevent any late dispatch.
     this.cancelCommandStartReservation(terminalId)
     const tab = this.terminals.get(terminalId)
+    this.flushCommandProtocolOnRuntimeExit(terminalId)
     
     // Mark active task as aborted if terminal exits unexpectedly. A nowait
     // caller relies on its completion callback to retire the background
@@ -1258,25 +1802,31 @@ export class TerminalService {
       this.onTaskFinishedCallbacks.delete(activeTaskId)
       let exitResult: CommandResult | null = null
       if (task && (task.status === 'running' || task.status === 'timeout')) {
-        const retainedOutput = this.resolveFinalTaskOutput(terminalId, task, tab)
-        task.output = retainedOutput || 'Terminal exited before command completion.'
+        this.finalizeTaskCapture(terminalId, task, tab, {
+          runtimeBoundary: true,
+        })
+        task.output = this.getTaskCapture(task.id)?.getText() ?? ''
         task.status = 'aborted'
         task.endTime = Date.now()
         task.exitCode = typeof code === 'number' ? code : -1
         task.runtimeBoundary = true
+        task.terminalStatus = 'Terminal exited before command completion.'
         task.endOffset = task.startOffset + task.output.length
         if (!task.suppressFinishCallback) {
           exitResult = {
             stdoutDelta: task.output,
             exitCode: task.exitCode,
             history_command_match_id: activeTaskId,
+            executionState: 'outcome_unknown',
+            ...(task.capture ? { capture: { ...task.capture } } : {}),
+            terminalStatus: task.terminalStatus,
             runtimeBoundary: true
           }
         }
       }
       this.stopCommandTrackingWatcher(activeTaskId)
       this.activeTaskByTerminal.delete(terminalId)
-      this.disposeTaskStartMarker(activeTaskId)
+      this.deferredWritesUntilTaskFinishByTaskId.delete(activeTaskId)
       if (callback && exitResult) {
         try {
           callback(exitResult)
@@ -1288,12 +1838,24 @@ export class TerminalService {
           )
         }
       }
+      if (task && task.status !== 'running') {
+        this.compactFinalizedTask(task)
+      }
+      this.enforceCommandCaptureRetention()
     }
     this.terminalInputSequenceTailByTerminal.delete(terminalId)
+    this.internalRawDisplaySuppressionByTerminal.delete(terminalId)
+    this.clearWindowsPromptRuntimeState(terminalId)
     this.pendingTaskFinishByTerminal.delete(terminalId)
+    this.unverifiedCaptureByTaskId.delete(activeTaskId || '')
     this.pendingResizeByTerminal.delete(terminalId)
     this.headlessWriteSeqByTerminal.delete(terminalId)
     this.headlessFlushedSeqByTerminal.delete(terminalId)
+    this.commandStreamProtocolByTerminal.delete(terminalId)
+    this.commandProtocolTokenByTerminal.delete(terminalId)
+    this.shellInputStateByTerminal.delete(terminalId)
+    this.lastShellSequenceByTerminal.delete(terminalId)
+    this.activeShellBoundaryByTerminal.delete(terminalId)
 
     // UI lifecycle is user-driven. Do not auto-remove tab metadata on backend exit.
     // We only update runtime state and keep captured output until user closes the tab.
@@ -1326,9 +1888,6 @@ export class TerminalService {
   }
 
   private canWriteToTerminal(terminal: TerminalTab): boolean {
-    if (terminal.type === 'local') {
-      return terminal.runtimeState !== 'exited'
-    }
     return terminal.runtimeState === 'ready'
   }
 
@@ -1351,14 +1910,22 @@ export class TerminalService {
       rejectOnRuntimeChange?: boolean
     }
   ): Promise<void> | undefined {
-    if (!this.promptFileIoTailByTerminal.has(terminalId)) {
-      return undefined
-    }
-
     const runtimePtyId = terminal.ptyId
     const runtimeGeneration =
       this.backendRuntimeGenerationByTerminal.get(terminalId)
-    const promptFileIo = this.reservePromptFileIo(terminalId)
+    const promptFileIoKey = this.getPromptFileIoKey(
+      terminalId,
+      runtimeGeneration
+    )
+    if (!this.promptFileIoTailByTerminal.has(promptFileIoKey)) {
+      return undefined
+    }
+
+    const promptFileIo = this.reservePromptFileIo(
+      terminalId,
+      undefined,
+      runtimeGeneration
+    )
     return (async () => {
       try {
         await waitForPromiseOrAbort(promptFileIo.waitForTurn, options?.signal)
@@ -1379,7 +1946,7 @@ export class TerminalService {
           return
         }
         const backend = this.getBackend(currentTerminal.type)
-        backend.write(runtimePtyId, data)
+        this.deliverTerminalInput(terminalId, backend, runtimePtyId, data)
       } finally {
         promptFileIo.release()
       }
@@ -1396,6 +1963,23 @@ export class TerminalService {
     }
     const terminal = this.terminals.get(terminalId)
     if (terminal && this.canWriteToTerminal(terminal)) {
+      const requiresOrderedWindowsPromptTracking =
+        this.usesPowerShellCommandLifecycle(terminal) &&
+        this.getBackend(terminal.type).getCommandProtocolAvailability?.(
+          terminal.ptyId
+        ) === true &&
+        !this.activeTaskByTerminal.has(terminalId) &&
+        (/[\r\n\x03\x04\x1a]/.test(data) ||
+          this.terminalInputSequenceTailByTerminal.has(terminalId))
+      if (requiresOrderedWindowsPromptTracking) {
+        void this.writeInputSequence(terminalId, [data]).catch((error) => {
+          console.warn(
+            `[TerminalService] Failed to write tracked Windows input for ${terminalId}.`,
+            error
+          )
+        })
+        return
+      }
       const queuedWrite = this.queueWriteAfterPromptFileIo(
         terminalId,
         terminal,
@@ -1411,7 +1995,39 @@ export class TerminalService {
         return
       }
       const backend = this.getBackend(terminal.type)
-      backend.write(terminal.ptyId, data)
+      this.deliverTerminalInput(terminalId, backend, terminal.ptyId, data)
+    }
+  }
+
+  private deliverTerminalInput(
+    terminalId: string,
+    backend: TerminalBackend,
+    ptyId: string,
+    data: string
+  ): void {
+    if (!data) {
+      backend.write(ptyId, data)
+      return
+    }
+    const hadPreviousState = this.shellInputStateByTerminal.has(terminalId)
+    const previousState = this.shellInputStateByTerminal.get(terminalId)
+    // Treat the state transition and backend write as one transaction. Marking
+    // first prevents a synchronously delivered prompt marker from being
+    // overwritten; a rejected write restores the exact previous gate state.
+    this.shellInputStateByTerminal.set(terminalId, 'busy')
+    try {
+      backend.write(ptyId, data)
+      this.terminalInputRevisionByTerminal.set(
+        terminalId,
+        (this.terminalInputRevisionByTerminal.get(terminalId) || 0) + 1
+      )
+    } catch (error) {
+      if (hadPreviousState && previousState) {
+        this.shellInputStateByTerminal.set(terminalId, previousState)
+      } else {
+        this.shellInputStateByTerminal.delete(terminalId)
+      }
+      throw error
     }
   }
 
@@ -1432,9 +2048,16 @@ export class TerminalService {
     if (!terminal || !this.canWriteToTerminal(terminal)) {
       throw new Error(`Terminal ${terminalId} is not available for input.`)
     }
+    const inputReservation = Symbol(terminalId)
+    const inputReservations =
+      this.pendingInputReservationsByTerminal.get(terminalId) || new Set<symbol>()
+    inputReservations.add(inputReservation)
+    this.pendingInputReservationsByTerminal.set(terminalId, inputReservations)
     const runtimePtyId = terminal.ptyId
     const runtimeGeneration =
       this.backendRuntimeGenerationByTerminal.get(terminalId)
+    const startupReservation =
+      this.commandStartReservationByTerminal.get(terminalId)
 
     const predecessor =
       this.terminalInputSequenceTailByTerminal.get(terminalId) ??
@@ -1448,6 +2071,72 @@ export class TerminalService {
 
     try {
       await waitForPromiseOrAbort(predecessor, options?.signal)
+      let lastNonemptyIndex = -1
+      let lastPromptProducingIndex = -1
+      for (let index = 0; index < sequence.length; index += 1) {
+        if (sequence[index].length > 0) lastNonemptyIndex = index
+        if (/[\r\n\x03\x04\x1a]/.test(sequence[index])) {
+          lastPromptProducingIndex = index
+        }
+      }
+
+      if (startupReservation) {
+        await waitForPromiseOrAbort(
+          startupReservation.waitForRelease,
+          options?.signal
+        )
+        const startedTaskId = startupReservation.startedTaskId
+        if (startedTaskId) {
+          while (this.activeTaskByTerminal.get(terminalId) === startedTaskId) {
+            throwIfTerminalOperationAborted(options?.signal)
+            if (
+              !this.isCurrentTerminalRuntime(
+                terminalId,
+                runtimePtyId,
+                runtimeGeneration
+              )
+            ) {
+              throw new Error(
+                `Terminal ${terminalId} changed while input was deferred behind command startup.`
+              )
+            }
+            await waitForTerminalDelay(10, options?.signal)
+          }
+          const startedTask = this.tasksByTerminal.get(terminalId)?.[startedTaskId]
+          if (
+            !startedTask ||
+            startedTask.status !== 'finished' ||
+            startedTask.runtimeBoundary === true
+          ) {
+            throw new Error(
+              `Input deferred behind command ${startedTaskId} was not sent because its terminal outcome is unknown.`
+            )
+          }
+        }
+      }
+
+      if (
+        !this.isCurrentTerminalRuntime(
+          terminalId,
+          runtimePtyId,
+          runtimeGeneration
+        )
+      ) {
+        throw new Error(
+          `Terminal ${terminalId} changed while the input sequence was waiting to start.`
+        )
+      }
+      const shouldTrackManualWindowsPrompt =
+        this.usesPowerShellCommandLifecycle(terminal) &&
+        !this.activeTaskByTerminal.has(terminalId) &&
+        lastPromptProducingIndex !== -1 &&
+        lastPromptProducingIndex === lastNonemptyIndex
+      const manualTrackingToken = shouldTrackManualWindowsPrompt
+        ? await this.ensureWindowsPromptBaseline(terminalId, {
+            forceRetry: true,
+          })
+        : undefined
+      throwIfTerminalOperationAborted(options?.signal)
       const requestedIntervalMs = options?.intervalMs ?? 0
       const intervalMs =
         Number.isFinite(requestedIntervalMs) && requestedIntervalMs > 0
@@ -1491,7 +2180,12 @@ export class TerminalService {
             await queuedWrite
           } else {
             const backend = this.getBackend(currentTerminal.type)
-            backend.write(runtimePtyId, sequence[index])
+            this.deliverTerminalInput(
+              terminalId,
+              backend,
+              runtimePtyId,
+              sequence[index]
+            )
           }
           break
         }
@@ -1499,7 +2193,34 @@ export class TerminalService {
           await waitForTerminalDelay(intervalMs, options?.signal)
         }
       }
+      if (
+        manualTrackingToken &&
+        shouldTrackManualWindowsPrompt &&
+        this.isCurrentTerminalRuntime(
+          terminalId,
+          runtimePtyId,
+          runtimeGeneration
+        )
+      ) {
+        this.startWindowsManualPromptWatcher(
+          terminal,
+          {
+            ...manualTrackingToken,
+            dispatchedAtMs: Date.now(),
+          },
+          this.terminalInputRevisionByTerminal.get(terminalId) || 0,
+          inputReservation
+        )
+      }
     } finally {
+      inputReservations.delete(inputReservation)
+      if (
+        this.pendingInputReservationsByTerminal.get(terminalId) ===
+          inputReservations &&
+        inputReservations.size === 0
+      ) {
+        this.pendingInputReservationsByTerminal.delete(terminalId)
+      }
       releaseTurn()
       void queuedTail.then(() => {
         if (
@@ -1586,45 +2307,68 @@ export class TerminalService {
         this.headlessPtys.delete(terminalId)
       }
 
-      // Thoroughly cleanup all memory state for this terminal
+      // Thoroughly clean up live runtime and UI state for this terminal.
       this.terminals.delete(terminalId)
       this.buffers.delete(terminalId)
       this.selectionByTerminal.delete(terminalId)
-      this.oscParseBufByTerminal.delete(terminalId)
+      this.commandStreamProtocolByTerminal.delete(terminalId)
+      this.internalRawDisplaySuppressionByTerminal.delete(terminalId)
+      this.commandProtocolTokenByTerminal.delete(terminalId)
+      this.shellInputStateByTerminal.delete(terminalId)
+      this.lastShellSequenceByTerminal.delete(terminalId)
+      this.activeShellBoundaryByTerminal.delete(terminalId)
       this.backendRuntimeGenerationByTerminal.delete(terminalId)
+      this.clearWindowsPromptRuntimeState(terminalId)
       if (activeTaskId) {
         if (activeTask && activeTask.status !== 'finished') {
-          const terminalClosedMessage = 'Terminal tab was closed.'
-          const retainedOutput = (activeTask.output || '').trimEnd()
-          activeTask.output =
-            !retainedOutput ||
-            retainedOutput === 'Terminal exited before command completion.'
-              ? terminalClosedMessage
-              : retainedOutput.includes(terminalClosedMessage)
-                ? retainedOutput
-                : `${retainedOutput}\n\n${terminalClosedMessage}`
+          this.finalizeTaskCapture(terminalId, activeTask, terminal, {
+            runtimeBoundary: true,
+          })
+          activeTask.output = this.getTaskCapture(activeTask.id)?.getText() ?? ''
           activeTask.status = 'aborted'
           activeTask.endTime = Date.now()
           activeTask.exitCode = -2
           activeTask.runtimeBoundary = true
+          activeTask.terminalStatus = 'Terminal tab was closed before command completion.'
           activeTask.endOffset =
             activeTask.startOffset + (activeTask.output?.length || 0)
         }
         this.stopCommandTrackingWatcher(activeTaskId)
-        this.disposeTaskStartMarker(activeTaskId)
       }
       this.activeTaskByTerminal.delete(terminalId)
       this.cancelCommandStartReservation(terminalId)
       this.terminalInputSequenceTailByTerminal.delete(terminalId)
       const activeTaskCloseResult: CommandResult | undefined = activeTaskId
         ? {
-            stdoutDelta: activeTask?.output || 'Terminal tab was closed.',
+            stdoutDelta: activeTask?.output || '',
             exitCode: -2,
             history_command_match_id: activeTaskId,
+            executionState: 'outcome_unknown',
+            ...(activeTask?.capture ? { capture: { ...activeTask.capture } } : {}),
+            ...(activeTask?.terminalStatus
+              ? { terminalStatus: activeTask.terminalStatus }
+              : {}),
             runtimeBoundary: true
           }
         : undefined
+      // Command history outlives the visual tab for the rest of this process,
+      // but it must not become the execution namespace of a later tab that
+      // reuses the same public id. Move it into a read-only detached store.
+      // The aggregate capture budget below still evicts old bytes into
+      // explicit record_expired tombstones.
+      const closedTasks = this.tasksByTerminal.get(terminalId) || {}
+      const closedTaskIds = Object.keys(closedTasks)
+      if (closedTaskIds.length > 0) {
+        this.detachedTasksByTerminal.set(terminalId, {
+          ...(this.detachedTasksByTerminal.get(terminalId) || {}),
+          ...closedTasks,
+        })
+      }
       this.tasksByTerminal.delete(terminalId)
+      for (const taskId of closedTaskIds) {
+        this.unverifiedCaptureByTaskId.delete(taskId)
+        this.deferredWritesUntilTaskFinishByTaskId.delete(taskId)
+      }
       this.headlessWriteSeqByTerminal.delete(terminalId)
       this.headlessFlushedSeqByTerminal.delete(terminalId)
       this.pendingTaskFinishByTerminal.delete(terminalId)
@@ -1648,6 +2392,10 @@ export class TerminalService {
           )
         }
       }
+      for (const task of Object.values(closedTasks)) {
+        this.compactFinalizedTask(task)
+      }
+      this.enforceCommandCaptureRetention()
     }
     this.publishTerminalTabsChanged()
     this.schedulePersistTerminalState()
@@ -2067,7 +2815,7 @@ export class TerminalService {
       if (!buffer) return ''
       const allLines = buffer.content.split('\n')
       const start = Math.max(0, allLines.length - finalLines)
-      return stripGyShellTextMarkers(allLines.slice(start).join('\n'))
+      return allLines.slice(start).join('\n')
     }
     
     // Use xterm headless buffer for clean, rendered text
@@ -2083,7 +2831,7 @@ export class TerminalService {
       }
     }
     
-    return stripGyShellTextMarkers(result.join('\n'))
+    return result.join('\n')
   }
 
   getTerminalById(terminalId: string): TerminalTab | undefined {
@@ -2108,6 +2856,22 @@ export class TerminalService {
     const runtimeState: TerminalRuntimeSnapshot['runtimeState'] =
       terminal.runtimeState ?? (terminal.isInitializing ? 'initializing' : 'unknown')
     const isReady = runtimeState === 'ready'
+    const trackedShellInputState = this.shellInputStateByTerminal.get(terminalId)
+    const shellInputState = trackedShellInputState || 'unknown'
+    const shellProtocolObserved = this.lastShellSequenceByTerminal.has(terminalId)
+    const backend = this.backends.get(terminal.type)
+    const commandProtocolAvailable =
+      backend?.getCommandProtocolAvailability?.(terminal.ptyId)
+    const shellAcceptsCommand = this.shellAcceptsAgentCommand({
+      terminal,
+      commandProtocolAvailable,
+      shellProtocolObserved,
+      trackedShellInputState,
+    })
+    const hasActiveOrStartingCommand =
+      this.activeTaskByTerminal.has(terminalId) ||
+      this.commandStartReservationByTerminal.has(terminalId) ||
+      (this.pendingInputReservationsByTerminal.get(terminalId)?.size || 0) > 0
 
     return {
       id: terminal.id,
@@ -2117,10 +2881,36 @@ export class TerminalService {
       isInitializing: terminal.isInitializing === true,
       lastExitCode: terminal.lastExitCode,
       reconnectable: this.isTerminalReconnectable(terminalId),
-      canRunCommand: isReady,
+      canRunCommand: isReady && shellAcceptsCommand && !hasActiveOrStartingCommand,
       canWrite: this.canWriteToTerminal(terminal),
-      canUseFilesystem: this.canUseFilesystemForTerminal(terminal)
+      canUseFilesystem: this.canUseFilesystemForTerminal(terminal),
+      shellInputState,
+      commandProtocolAvailable,
     }
+  }
+
+  private shellAcceptsAgentCommand(params: {
+    terminal: TerminalTab
+    commandProtocolAvailable: boolean | undefined
+    shellProtocolObserved: boolean
+    trackedShellInputState: TerminalShellInputState | undefined
+  }): boolean {
+    if (params.commandProtocolAvailable === false) {
+      return false
+    }
+    if (params.trackedShellInputState !== undefined) {
+      return params.trackedShellInputState === 'idle'
+    }
+    if (params.commandProtocolAvailable === true) {
+      // A backend claiming a reliable protocol must prove its first prompt.
+      // Unix and the Windows fallback do so in-band; Windows sidecars set
+      // the tracked state to idle only after their marker file is verified.
+      return false
+    }
+    // Legacy/unknown runtimes remain compatible only while untouched. Once a
+    // byte has been delivered, the tracked state above must return to idle via
+    // a verified prompt before an agent command can be appended safely.
+    return !params.shellProtocolObserved
   }
 
   /**
@@ -2221,18 +3011,78 @@ export class TerminalService {
   }
 
   getCommandTask(terminalId: string, commandId: string): CommandTask | undefined {
-    const tab = this.terminals.get(terminalId)
-    if (!tab || tab.isInitializing) return undefined
-    const taskMap = this.tasksByTerminal.get(terminalId)
-    return taskMap ? taskMap[commandId] : undefined
+    const task =
+      this.tasksByTerminal.get(terminalId)?.[commandId] ||
+      this.detachedTasksByTerminal.get(terminalId)?.[commandId]
+    if (!task) return undefined
+    const snapshot = this.getCommandOutputSnapshot(terminalId, commandId)
+    return snapshot
+      ? { ...task, output: snapshot.output, capture: snapshot.capture }
+      : { ...task }
+  }
+
+  getCommandRecordLocation(
+    terminalId: string,
+    commandId: string
+  ): 'active' | 'detached' | undefined {
+    if (this.tasksByTerminal.get(terminalId)?.[commandId]) {
+      return 'active'
+    }
+    if (this.detachedTasksByTerminal.get(terminalId)?.[commandId]) {
+      return 'detached'
+    }
+    return undefined
+  }
+
+  getCommandOutputSnapshot(
+    terminalId: string,
+    commandId: string
+  ): CommandOutputSnapshot | undefined {
+    const task =
+      this.tasksByTerminal.get(terminalId)?.[commandId] ||
+      this.detachedTasksByTerminal.get(terminalId)?.[commandId]
+    if (!task) return undefined
+    const capture = this.captureByTaskId.get(commandId)
+    const output = capture?.getText() ?? task.output ?? ''
+    const captureMetadata = capture?.getMetadata() ?? task.capture ?? {
+      state: 'unknown' as const,
+      reason: 'tracking_unavailable' as const,
+      observedUtf8Bytes: Buffer.byteLength(output, 'utf8'),
+      retainedUtf8Bytes: Buffer.byteLength(output, 'utf8'),
+      availableLineCount: output
+        ? output.split('\n').length - (output.endsWith('\n') ? 1 : 0)
+        : 0,
+      revision: 0,
+      terminalControlsObserved: false,
+    }
+    const executionState: CommandOutputSnapshot['executionState'] =
+      task.runtimeBoundary || task.outcomeUnknown
+      ? 'outcome_unknown'
+      : task.status === 'finished'
+        ? 'finished'
+        : task.status === 'aborted'
+          ? 'aborted'
+          : 'running'
+    return {
+      taskId: task.id,
+      command: task.command,
+      status: task.status,
+      executionState,
+      ...(task.exitCode !== undefined ? { exitCode: task.exitCode } : {}),
+      runtimeBoundary: task.runtimeBoundary === true,
+      output,
+      capture: { ...captureMetadata },
+    }
   }
 
   getCommandTasks(terminalId: string): CommandTask[] {
-    const tab = this.terminals.get(terminalId)
-    if (!tab || tab.isInitializing) return []
-    const taskMap = this.tasksByTerminal.get(terminalId)
-    if (!taskMap) return []
-    return Object.values(taskMap).sort((a, b) => b.startTime - a.startTime)
+    const activeTasks = Object.values(this.tasksByTerminal.get(terminalId) || {})
+    const detachedTasks = Object.values(
+      this.detachedTasksByTerminal.get(terminalId) || {}
+    )
+    return [...activeTasks, ...detachedTasks].sort(
+      (a, b) => b.startTime - a.startTime
+    )
   }
 
   setSelection(terminalId: string, selectionText: string): void {
@@ -2281,21 +3131,299 @@ export class TerminalService {
     return taskId
   }
 
-  private buildDispatchedCommand(_terminal: TerminalTab, command: string, _taskId: string): string {
-    return command
+  private buildDispatchedCommand(
+    terminal: TerminalTab,
+    command: string,
+    taskId: string
+  ): string {
+    if (
+      this.getCommandShellFamily(terminal) !== 'unix'
+    ) return command
+    const runtimeToken = this.commandProtocolTokenByTerminal.get(terminal.id)
+    const previousSequence = this.lastShellSequenceByTerminal.get(terminal.id)
+    if (!runtimeToken || previousSequence === undefined) return command
+
+    const expectedSequence = previousSequence + 1
+    const fallbackNonce = taskId.replace(/-/g, '')
+    return buildUnixDispatchedCommand(
+      runtimeToken,
+      expectedSequence,
+      fallbackNonce,
+      command
+    )
   }
 
   private async prepareCommandTracking(
-    terminal: TerminalTab
+    terminal: TerminalTab,
+    options?: { failClosed?: boolean }
   ): Promise<TerminalCommandTrackingToken | undefined> {
     const backend = this.getBackend(terminal.type)
     if (typeof backend.prepareCommandTracking !== 'function') {
       return undefined
     }
     try {
-      return await backend.prepareCommandTracking(terminal.ptyId)
-    } catch {
+      return await this.awaitCommandTrackingIo(
+        backend.prepareCommandTracking(terminal.ptyId),
+        'command tracking preparation'
+      )
+    } catch (error) {
+      if (options?.failClosed) {
+        const detail = error instanceof Error ? error.message : String(error)
+        throw new Error(
+          `Unable to establish reliable command tracking for terminal ${terminal.title || terminal.id}: ${detail}`
+        )
+      }
       return undefined
+    }
+  }
+
+  private async awaitCommandTrackingIo<T>(
+    operation: Promise<T>,
+    description: string,
+    timeoutMs = this.commandTrackingIoTimeoutMs
+  ): Promise<T> {
+    let timeout: ReturnType<typeof setTimeout> | undefined
+    const boundedTimeoutMs = Math.max(1, Math.floor(timeoutMs))
+    try {
+      return await Promise.race([
+        operation,
+        new Promise<T>((_resolve, reject) => {
+          timeout = setTimeout(() => {
+            reject(
+              new Error(
+                `${description} timed out after ${boundedTimeoutMs}ms.`
+              )
+            )
+          }, boundedTimeoutMs)
+        }),
+      ])
+    } finally {
+      if (timeout) {
+        clearTimeout(timeout)
+      }
+    }
+  }
+
+  private isCurrentTerminalRuntime(
+    terminalId: string,
+    ptyId: string,
+    runtimeGeneration: number | undefined
+  ): boolean {
+    const terminal = this.terminals.get(terminalId)
+    return (
+      terminal?.ptyId === ptyId &&
+      terminal.runtimeState === 'ready' &&
+      this.backendRuntimeGenerationByTerminal.get(terminalId) ===
+        runtimeGeneration
+    )
+  }
+
+  private isCommandTrackingIoTimeout(error: unknown): boolean {
+    return (
+      error instanceof Error &&
+      / timed out after \d+ms\.$/.test(error.message)
+    )
+  }
+
+  private quarantineTerminalRuntime(
+    terminalId: string,
+    ptyId: string,
+    runtimeGeneration: number | undefined
+  ): boolean {
+    if (
+      !this.isCurrentTerminalRuntime(
+        terminalId,
+        ptyId,
+        runtimeGeneration
+      )
+    ) {
+      return false
+    }
+    const terminal = this.terminals.get(terminalId)
+    if (!terminal) return false
+
+    this.deferredWritesDuringCommandStartByTerminal.delete(terminalId)
+    terminal.isInitializing = false
+    terminal.runtimeState = 'exited'
+    terminal.lastExitCode = -1
+    this.terminalIdsBeingKilled.add(terminalId)
+    try {
+      this.getBackend(terminal.type).kill(terminal.ptyId)
+    } catch {
+      // The runtime remains non-writable even if termination cannot be
+      // confirmed. A reconnect receives a new generation and private paths.
+    } finally {
+      this.terminalIdsBeingKilled.delete(terminalId)
+    }
+    this.publishTerminalTabsChanged()
+    this.schedulePersistTerminalState()
+    return true
+  }
+
+  private advanceWindowsPromptBaseline(
+    token: TerminalCommandTrackingToken,
+    sequence: number
+  ): TerminalCommandTrackingToken {
+    return {
+      ...token,
+      baselineSequence: sequence,
+      awaitingInitialFreshMarker: false,
+      dispatchedAtMs: undefined,
+    }
+  }
+
+  private ensureWindowsPromptBaseline(
+    terminalId: string,
+    options?: { forceRetry?: boolean }
+  ): Promise<TerminalCommandTrackingToken | undefined> {
+    const terminal = this.terminals.get(terminalId)
+    if (
+      !this.usesPowerShellCommandLifecycle(terminal) ||
+      terminal?.runtimeState !== 'ready'
+    ) {
+      return Promise.resolve(undefined)
+    }
+    const cached = this.windowsPromptBaselineByTerminal.get(terminalId)
+    if (cached && !options?.forceRetry) {
+      return Promise.resolve({ ...cached })
+    }
+    const runtimePtyId = terminal.ptyId
+    const runtimeGeneration =
+      this.backendRuntimeGenerationByTerminal.get(terminalId)
+    const existing = this.windowsPromptInitializationByTerminal.get(terminalId)
+    if (
+      existing &&
+      !existing.cancelled &&
+      existing.ptyId === runtimePtyId &&
+      existing.runtimeGeneration === runtimeGeneration
+    ) {
+      return existing.promise
+    }
+
+    const inputRevisionAtStart =
+      this.terminalInputRevisionByTerminal.get(terminalId) || 0
+    const initialization: WindowsPromptInitialization = {
+      ptyId: runtimePtyId,
+      runtimeGeneration,
+      cancelled: false,
+      promise: Promise.resolve(undefined),
+    }
+    const isCurrent = (): boolean =>
+      !initialization.cancelled &&
+      this.windowsPromptInitializationByTerminal.get(terminalId) ===
+        initialization &&
+      this.isCurrentTerminalRuntime(
+        terminalId,
+        runtimePtyId,
+        runtimeGeneration
+      )
+    initialization.promise = (async () => {
+      const token = await this.prepareCommandTracking(terminal)
+      if (!token || !isCurrent()) {
+        return undefined
+      }
+
+      let verified = { ...token }
+      if (
+        verified.baselineSequence <= 0 ||
+        verified.awaitingInitialFreshMarker === true
+      ) {
+        const backend = this.getBackend(terminal.type)
+        if (typeof backend.pollCommandTracking !== 'function') {
+          return undefined
+        }
+        let consecutiveUnavailablePolls = 0
+        while (isCurrent()) {
+          try {
+            const update = await this.awaitCommandTrackingIo(
+              backend.pollCommandTracking(runtimePtyId, verified),
+              'Windows prompt baseline poll'
+            )
+            if (!isCurrent()) {
+              return undefined
+            }
+            if (update) {
+              verified = this.advanceWindowsPromptBaseline(
+                verified,
+                update.sequence
+              )
+              this.applyCommandTrackingMetadata(terminalId, update)
+              break
+            }
+            consecutiveUnavailablePolls += 1
+          } catch {
+            if (!isCurrent()) {
+              return undefined
+            }
+            consecutiveUnavailablePolls += 1
+          }
+          if (
+            consecutiveUnavailablePolls >=
+            this.commandTrackingMaxConsecutiveErrors
+          ) {
+            if (isCurrent()) {
+              this.shellInputStateByTerminal.set(terminalId, 'unknown')
+            }
+            // Preserve the zero baseline for a recovery Enter/Ctrl-C. The
+            // caller may send that input and attach a manual watcher, but this
+            // unverified token is deliberately not cached as an idle prompt.
+            return { ...verified }
+          }
+          await new Promise((resolve) =>
+            setTimeout(resolve, this.commandTrackingPollIntervalMs)
+          )
+        }
+      }
+      if (!isCurrent()) {
+        return undefined
+      }
+
+      this.windowsPromptBaselineByTerminal.set(terminalId, { ...verified })
+      const inputRevisionUnchanged =
+        (this.terminalInputRevisionByTerminal.get(terminalId) || 0) ===
+        inputRevisionAtStart
+      const trackedState = this.shellInputStateByTerminal.get(terminalId)
+      const hasPendingInput =
+        (this.pendingInputReservationsByTerminal.get(terminalId)?.size || 0) > 0
+      if (
+        inputRevisionUnchanged &&
+        !hasPendingInput &&
+        !this.activeTaskByTerminal.has(terminalId) &&
+        !this.commandStartReservationByTerminal.has(terminalId) &&
+        (trackedState === undefined || trackedState === 'idle')
+      ) {
+        this.shellInputStateByTerminal.set(terminalId, 'idle')
+      }
+      return { ...verified }
+    })().finally(() => {
+      if (
+        this.windowsPromptInitializationByTerminal.get(terminalId) ===
+        initialization
+      ) {
+        this.windowsPromptInitializationByTerminal.delete(terminalId)
+      }
+    })
+    this.windowsPromptInitializationByTerminal.set(terminalId, initialization)
+    return initialization.promise
+  }
+
+  private applyCommandTrackingMetadata(
+    terminalId: string,
+    update: TerminalCommandTrackingUpdate
+  ): void {
+    const terminal = this.terminals.get(terminalId)
+    if (!terminal) {
+      return
+    }
+    if (update.cwd || update.homeDir) {
+      this.getBackend(terminal.type).applyCommandProtocolMetadata?.(
+        terminal.ptyId,
+        {
+          ...(update.cwd !== undefined ? { cwd: update.cwd } : {}),
+          ...(update.homeDir !== undefined ? { homeDir: update.homeDir } : {}),
+        }
+      )
+      this.hydrateTerminalRuntimeMetadata(terminalId)
     }
   }
 
@@ -2309,13 +3437,60 @@ export class TerminalService {
     const activeTask = this.getActiveTask(terminalId)
     if (activeTask && update.output !== undefined) {
       activeTask.capturedOutput = update.output
+      activeTask.capturedOutputObservedUtf8Bytes = update.outputObservedUtf8Bytes
+      activeTask.capturedOutputTruncated = update.outputTruncated === true
     }
-    const terminal = this.terminals.get(terminalId)
-    if (!terminal) {
+    if (activeTask?.completionTracking) {
+      this.windowsPromptBaselineByTerminal.set(
+        terminalId,
+        this.advanceWindowsPromptBaseline(
+          activeTask.completionTracking,
+          update.sequence
+        )
+      )
+    }
+    this.shellInputStateByTerminal.set(terminalId, 'idle')
+    this.applyCommandTrackingMetadata(terminalId, update)
+  }
+
+  private assertSidecarTaskOutputIsConsistent(
+    task: CommandTask,
+    update: TerminalCommandTrackingUpdate
+  ): void {
+    if (task.displayMode !== 'synthetic-transcript') {
       return
     }
-    if (update.cwd || update.homeDir) {
-      this.hydrateTerminalRuntimeMetadata(terminalId)
+    if (
+      task.completionTracking?.expectedRequestId &&
+      update.requestId !== task.completionTracking.expectedRequestId
+    ) {
+      throw new Error('Windows sidecar completion does not match its task request identity.')
+    }
+    if (update.output === undefined) {
+      throw new Error('Windows sidecar completion arrived without its task output file.')
+    }
+    if (update.outputRetainedUtf8Bytes === undefined) {
+      throw new Error('Windows sidecar completion arrived without its retained output length.')
+    }
+    if (
+      update.outputRetainedUtf8Bytes !== undefined &&
+      Buffer.byteLength(update.output, 'utf8') !==
+        update.outputRetainedUtf8Bytes
+    ) {
+      throw new Error('Windows sidecar output length does not match its completion marker.')
+    }
+    if (
+      update.outputObservedUtf8Bytes !== undefined &&
+      update.outputRetainedUtf8Bytes > update.outputObservedUtf8Bytes
+    ) {
+      throw new Error('Windows sidecar retained output exceeds its observed output length.')
+    }
+    if (
+      update.outputTruncated !== true &&
+      update.outputObservedUtf8Bytes !== undefined &&
+      update.outputRetainedUtf8Bytes !== update.outputObservedUtf8Bytes
+    ) {
+      throw new Error('Windows sidecar reported silent output loss.')
     }
   }
 
@@ -2328,6 +3503,118 @@ export class TerminalService {
       watcher.cancelled = true
       this.commandTrackingWatcherByTaskId.delete(taskId)
     }
+  }
+
+  private startWindowsManualPromptWatcher(
+    terminal: TerminalTab,
+    token: TerminalCommandTrackingToken,
+    expectedInputRevision: number,
+    ownedInputReservation: symbol
+  ): void {
+    const backend = this.getBackend(terminal.type)
+    if (typeof backend.pollCommandTracking !== 'function') {
+      return
+    }
+    const terminalId = terminal.id
+    const previous = this.windowsManualPromptWatcherByTerminal.get(terminalId)
+    if (previous) previous.cancelled = true
+    const runtimePtyId = terminal.ptyId
+    const runtimeGeneration =
+      this.backendRuntimeGenerationByTerminal.get(terminalId)
+    const watcher: WindowsManualPromptWatcher = {
+      ptyId: runtimePtyId,
+      runtimeGeneration,
+      expectedInputRevision,
+      ownedInputReservation,
+      cancelled: false,
+    }
+    this.windowsManualPromptWatcherByTerminal.set(terminalId, watcher)
+    const isCurrent = (): boolean =>
+      !watcher.cancelled &&
+      this.windowsManualPromptWatcherByTerminal.get(terminalId) === watcher &&
+      this.isCurrentTerminalRuntime(
+        terminalId,
+        runtimePtyId,
+        runtimeGeneration
+      )
+
+    void (async () => {
+      let consecutiveUnavailablePolls = 0
+      try {
+        while (isCurrent()) {
+          try {
+            const update = await this.awaitCommandTrackingIo(
+              backend.pollCommandTracking!(runtimePtyId, token),
+              'Windows manual prompt poll'
+            )
+            if (!isCurrent()) {
+              return
+            }
+            if (update) {
+              const advanced = this.advanceWindowsPromptBaseline(
+                token,
+                update.sequence
+              )
+              this.windowsPromptBaselineByTerminal.set(terminalId, advanced)
+              this.applyCommandTrackingMetadata(terminalId, update)
+
+              // The update can race the async input sequence's finally block.
+              // Wait for this watcher's own reservation to retire, but never
+              // ignore a newer sequence or command reservation.
+              while (
+                isCurrent() &&
+                this.pendingInputReservationsByTerminal
+                  .get(terminalId)
+                  ?.has(ownedInputReservation)
+              ) {
+                await new Promise((resolve) => setTimeout(resolve, 0))
+              }
+              const reservations =
+                this.pendingInputReservationsByTerminal.get(terminalId)
+              if (
+                isCurrent() &&
+                (this.terminalInputRevisionByTerminal.get(terminalId) || 0) ===
+                  expectedInputRevision &&
+                (!reservations || reservations.size === 0) &&
+                !this.activeTaskByTerminal.has(terminalId) &&
+                !this.commandStartReservationByTerminal.has(terminalId)
+              ) {
+                this.shellInputStateByTerminal.set(terminalId, 'idle')
+              }
+              return
+            }
+            consecutiveUnavailablePolls += 1
+          } catch {
+            if (!isCurrent()) {
+              return
+            }
+            consecutiveUnavailablePolls += 1
+          }
+          if (
+            consecutiveUnavailablePolls >=
+            this.commandTrackingMaxConsecutiveErrors
+          ) {
+            if (
+              isCurrent() &&
+              (this.terminalInputRevisionByTerminal.get(terminalId) || 0) ===
+                expectedInputRevision
+            ) {
+              this.shellInputStateByTerminal.set(terminalId, 'unknown')
+            }
+            return
+          }
+          await new Promise((resolve) =>
+            setTimeout(resolve, this.commandTrackingPollIntervalMs)
+          )
+        }
+      } finally {
+        if (
+          this.windowsManualPromptWatcherByTerminal.get(terminalId) === watcher
+        ) {
+          this.windowsManualPromptWatcherByTerminal.delete(terminalId)
+        }
+      }
+    })()
   }
 
   private isWindowsPromptRendered(terminalId: string, cwd?: string): boolean {
@@ -2370,11 +3657,15 @@ export class TerminalService {
     taskId: string,
     cwd?: string
   ): Promise<void> {
+    const deadline = Date.now() + this.commandTrackingPromptSyncTimeoutMs
     while (true) {
       if (this.activeTaskByTerminal.get(terminalId) !== taskId) {
         return
       }
       if (this.isWindowsPromptRendered(terminalId, cwd)) {
+        return
+      }
+      if (Date.now() >= deadline) {
         return
       }
       await new Promise((resolve) =>
@@ -2395,37 +3686,71 @@ export class TerminalService {
     this.stopCommandTrackingWatcher(taskId)
     const watcher = { cancelled: false }
     this.commandTrackingWatcherByTaskId.set(taskId, watcher)
+    const terminalId = terminal.id
+    const runtimePtyId = terminal.ptyId
+    const runtimeGeneration =
+      this.backendRuntimeGenerationByTerminal.get(terminalId)
+    const isCurrentTask = (): boolean => {
+      const task = this.tasksByTerminal.get(terminalId)?.[taskId]
+      return (
+        !watcher.cancelled &&
+        this.commandTrackingWatcherByTaskId.get(taskId) === watcher &&
+        this.isCurrentTerminalRuntime(
+          terminalId,
+          runtimePtyId,
+          runtimeGeneration
+        ) &&
+        this.activeTaskByTerminal.get(terminalId) === taskId &&
+        task?.status === 'running'
+      )
+    }
 
     const poll = async (): Promise<void> => {
       let consecutivePollErrors = 0
       try {
-        while (!watcher.cancelled) {
-          const activeTaskId = this.activeTaskByTerminal.get(terminal.id)
-          const task = this.getTaskMap(terminal.id)[taskId]
-          if (!task || task.status !== 'running' || activeTaskId !== taskId) {
+        while (isCurrentTask()) {
+          const task = this.tasksByTerminal.get(terminalId)?.[taskId]
+          if (!task) {
             return
           }
 
           try {
-            const update = await backend.pollCommandTracking!(terminal.ptyId, token)
-            consecutivePollErrors = 0
-            if (update) {
-              this.applyCommandTrackingUpdate(terminal.id, update)
-              if (task.displayMode === 'synthetic-transcript') {
-                await this.maybeCaptureWindowsSyntheticFallbackOutput(terminal, task, update)
-              }
-              if (task.displayMode === 'synthetic-transcript') {
-                await this.waitForSyntheticTaskOutputQuiescence(terminal.id, taskId)
-              } else {
-                await this.waitForWindowsPromptSync(terminal.id, taskId, update.cwd)
-              }
-              this.finishActiveTask(terminal.id, update.exitCode)
+            const update = await this.awaitCommandTrackingIo(
+              backend.pollCommandTracking!(runtimePtyId, token),
+              'Windows command completion poll'
+            )
+            if (!isCurrentTask()) {
               return
             }
+            if (update) {
+              this.assertSidecarTaskOutputIsConsistent(task, update)
+              consecutivePollErrors = 0
+              this.applyCommandTrackingUpdate(terminalId, update)
+              if (task.displayMode === 'synthetic-transcript') {
+                if (task.captureBoundaryState !== 'sealed') {
+                  await this.waitForSyntheticTaskOutputQuiescence(terminalId, taskId)
+                }
+              } else {
+                await this.waitForWindowsPromptSync(terminalId, taskId, update.cwd)
+              }
+              if (!isCurrentTask()) {
+                return
+              }
+              this.finishActiveTask(
+                terminalId,
+                update.exitCode,
+                update.outcomeKnown === false || update.exitCode === undefined
+              )
+              return
+            }
+            consecutivePollErrors = 0
           } catch {
+            if (!isCurrentTask()) {
+              return
+            }
             consecutivePollErrors += 1
             if (consecutivePollErrors >= this.commandTrackingMaxConsecutiveErrors) {
-              this.failActiveTaskDueToTrackingLoss(terminal.id)
+              this.failActiveTaskDueToTrackingLoss(terminalId)
               return
             }
           }
@@ -2433,7 +3758,9 @@ export class TerminalService {
           await new Promise((resolve) => setTimeout(resolve, this.commandTrackingPollIntervalMs))
         }
       } finally {
-        this.commandTrackingWatcherByTaskId.delete(taskId)
+        if (this.commandTrackingWatcherByTaskId.get(taskId) === watcher) {
+          this.commandTrackingWatcherByTaskId.delete(taskId)
+        }
       }
     }
 
@@ -2488,13 +3815,22 @@ export class TerminalService {
         task.suppressFinishCallback = false
       }
     }
+    const currentTaskOutput = (): string =>
+      this.getTaskCapture(taskId)?.getText() ?? task.output ?? ''
 
     while (true) {
       if (task.status === 'finished') {
+        const outcomeUnknown =
+          task.runtimeBoundary === true || task.outcomeUnknown === true
         return {
-          stdoutDelta: task.output || '',
-          exitCode: task.exitCode ?? -1,
+          stdoutDelta: currentTaskOutput(),
+          ...(!task.outcomeUnknown
+            ? { exitCode: task.exitCode ?? -1 }
+            : {}),
           history_command_match_id: taskId,
+          executionState: outcomeUnknown ? 'outcome_unknown' : 'finished',
+          ...(task.capture ? { capture: { ...task.capture } } : {}),
+          ...(task.terminalStatus ? { terminalStatus: task.terminalStatus } : {}),
           ...(task.runtimeBoundary ? { runtimeBoundary: true } : {})
         }
       }
@@ -2519,14 +3855,23 @@ export class TerminalService {
             this.activeTaskByTerminal.get(terminalId) === taskId
           throw abortError
         }
-        return { stdoutDelta: 'Command aborted by user.', exitCode: -2, history_command_match_id: taskId }
+        return {
+          stdoutDelta: currentTaskOutput(),
+          exitCode: -2,
+          history_command_match_id: taskId,
+          executionState: 'aborted',
+          ...(task.capture ? { capture: { ...task.capture } } : {}),
+        }
       }
 
       if (task.status === 'aborted') {
         return {
-          stdoutDelta: task.output || 'Command aborted because the terminal session ended.',
+          stdoutDelta: currentTaskOutput(),
           exitCode: task.exitCode ?? (task.runtimeBoundary ? -1 : -2),
           history_command_match_id: taskId,
+          executionState: task.runtimeBoundary ? 'outcome_unknown' : 'aborted',
+          ...(task.capture ? { capture: { ...task.capture } } : {}),
+          ...(task.terminalStatus ? { terminalStatus: task.terminalStatus } : {}),
           ...(task.runtimeBoundary ? { runtimeBoundary: true } : {})
         }
       }
@@ -2534,18 +3879,22 @@ export class TerminalService {
       if (opts?.shouldSkip?.()) {
         clearSuppressionIfStillRunning()
         return {
-          stdoutDelta: 'USER_SKIPPED_WAIT',
+          stdoutDelta: currentTaskOutput(),
           exitCode: -3,
-          history_command_match_id: taskId
+          history_command_match_id: taskId,
+          executionState: 'running',
+          ...(task.capture ? { capture: { ...task.capture } } : {}),
         }
       }
 
       if (Date.now() - startTime > timeoutMs) {
         clearSuppressionIfStillRunning()
         return {
-          stdoutDelta: 'Command timed out (120s). The process is still running in the background.',
+          stdoutDelta: currentTaskOutput(),
           exitCode: -1,
-          history_command_match_id: taskId
+          history_command_match_id: taskId,
+          executionState: 'running',
+          ...(task.capture ? { capture: { ...task.capture } } : {}),
         }
       }
 
@@ -2568,10 +3917,34 @@ export class TerminalService {
     if (terminal.runtimeState !== 'ready') {
       throw new Error(`Terminal ${terminal.title || terminal.id} is not ready (state=${terminal.runtimeState || 'unknown'}).`)
     }
+    const backend = this.getBackend(terminal.type)
+    const commandProtocolAvailable =
+      backend.getCommandProtocolAvailability?.(terminal.ptyId)
+    if (commandProtocolAvailable === false) {
+      throw new Error(
+        `Terminal ${terminal.title || terminal.id} shell does not expose a reliable exec_command boundary protocol.`
+      )
+    }
+    if (!this.shellAcceptsAgentCommand({
+      terminal,
+      commandProtocolAvailable,
+      shellProtocolObserved: this.lastShellSequenceByTerminal.has(terminalId),
+      trackedShellInputState: this.shellInputStateByTerminal.get(terminalId),
+    })) {
+      throw new Error(
+        `Terminal ${terminal.title || terminal.id} shell is not at an idle prompt.`
+      )
+    }
+    if ((this.pendingInputReservationsByTerminal.get(terminalId)?.size || 0) > 0) {
+      throw new Error(
+        `Terminal ${terminal.title || terminal.id} has a pending input sequence.`
+      )
+    }
 
     const reservationToken = this.reserveCommandStart(terminalId, command)
+    let startedTaskId: string | undefined
     try {
-      return await this.executeReservedCommand(
+      startedTaskId = await this.executeReservedCommand(
         terminal,
         command,
         type,
@@ -2579,27 +3952,38 @@ export class TerminalService {
         signal,
         reservationToken
       )
+      return startedTaskId
     } finally {
       const releasePromptFileIo =
         this.promptFileIoReleaseByCommandStartToken.get(reservationToken)
       this.promptFileIoReleaseByCommandStartToken.delete(reservationToken)
       releasePromptFileIo?.()
-      this.releaseCommandStart(terminalId, reservationToken)
+      this.releaseCommandStart(
+        terminalId,
+        reservationToken,
+        startedTaskId
+      )
     }
   }
 
   private reservePromptFileIo(
     terminalId: string,
-    reservationToken?: symbol
+    reservationToken?: symbol,
+    runtimeGeneration =
+      this.backendRuntimeGenerationByTerminal.get(terminalId)
   ): PromptFileIoLease {
+    const promptFileIoKey = this.getPromptFileIoKey(
+      terminalId,
+      runtimeGeneration
+    )
     const predecessor =
-      this.promptFileIoTailByTerminal.get(terminalId) ?? Promise.resolve()
+      this.promptFileIoTailByTerminal.get(promptFileIoKey) ?? Promise.resolve()
     let releaseTurn: () => void = () => {}
     const turn = new Promise<void>((resolve) => {
       releaseTurn = resolve
     })
     const queuedTail = predecessor.then(() => turn)
-    this.promptFileIoTailByTerminal.set(terminalId, queuedTail)
+    this.promptFileIoTailByTerminal.set(promptFileIoKey, queuedTail)
 
     let released = false
     const release = (): void => {
@@ -2607,8 +3991,10 @@ export class TerminalService {
       released = true
       releaseTurn()
       void queuedTail.then(() => {
-        if (this.promptFileIoTailByTerminal.get(terminalId) === queuedTail) {
-          this.promptFileIoTailByTerminal.delete(terminalId)
+        if (
+          this.promptFileIoTailByTerminal.get(promptFileIoKey) === queuedTail
+        ) {
+          this.promptFileIoTailByTerminal.delete(promptFileIoKey)
         }
       })
     }
@@ -2619,6 +4005,14 @@ export class TerminalService {
       )
     }
     return { waitForTurn: predecessor, release }
+  }
+
+  private getPromptFileIoKey(
+    terminalId: string,
+    runtimeGeneration =
+      this.backendRuntimeGenerationByTerminal.get(terminalId)
+  ): string {
+    return `${terminalId}:${runtimeGeneration ?? 'unbound'}`
   }
 
   private reserveCommandStart(terminalId: string, command: string): symbol {
@@ -2654,10 +4048,20 @@ export class TerminalService {
       this.commandStartReservationByTerminal.get(terminalId)
     this.commandStartReservationByTerminal.delete(terminalId)
     this.deferredWritesDuringCommandStartByTerminal.delete(terminalId)
+    if (reservation) {
+      const releasePromptFileIo =
+        this.promptFileIoReleaseByCommandStartToken.get(reservation.token)
+      this.promptFileIoReleaseByCommandStartToken.delete(reservation.token)
+      releasePromptFileIo?.()
+    }
     reservation?.releaseWaiters()
   }
 
-  private releaseCommandStart(terminalId: string, token: symbol): void {
+  private releaseCommandStart(
+    terminalId: string,
+    token: symbol,
+    startedTaskId?: string
+  ): void {
     const reservation =
       this.commandStartReservationByTerminal.get(terminalId)
     if (reservation?.token !== token) return
@@ -2667,24 +4071,188 @@ export class TerminalService {
       this.deferredWritesDuringCommandStartByTerminal.get(terminalId) || []
     this.deferredWritesDuringCommandStartByTerminal.delete(terminalId)
     try {
-      const terminal = this.terminals.get(terminalId)
-      if (terminal && this.canWriteToTerminal(terminal)) {
-        for (const data of deferred) {
-          try {
-            this.write(terminalId, data)
-          } catch (error) {
-            // The command is already dispatched and tracked. A failed manual
-            // input replay must not replace its task id with an exception.
-            console.warn(
-              `[TerminalService] Failed to replay input deferred during command startup for ${terminalId}.`,
-              error
-            )
-          }
-        }
+      reservation.startedTaskId = startedTaskId
+      const startedTask = startedTaskId
+        ? this.tasksByTerminal.get(terminalId)?.[startedTaskId]
+        : undefined
+      if (
+        deferred.length > 0 &&
+        startedTask?.status === 'running' &&
+        startedTask.displayMode === 'synthetic-transcript'
+      ) {
+        // A sidecar marker and output file describe one hidden request. Input
+        // buffered behind startup must not generate another prompt marker
+        // before that exact request has been correlated and finalized.
+        this.deferredWritesUntilTaskFinishByTaskId.set(
+          startedTask.id,
+          deferred
+        )
+      } else {
+        this.replayDeferredTerminalWrites(terminalId, deferred)
       }
     } finally {
       reservation.releaseWaiters()
     }
+  }
+
+  private replayDeferredTerminalWrites(
+    terminalId: string,
+    deferred: readonly string[]
+  ): void {
+    const terminal = this.terminals.get(terminalId)
+    if (!terminal || !this.canWriteToTerminal(terminal)) {
+      return
+    }
+    for (const data of deferred) {
+      try {
+        this.write(terminalId, data)
+      } catch (error) {
+        console.warn(
+          `[TerminalService] Failed to replay input deferred during command startup for ${terminalId}.`,
+          error
+        )
+      }
+    }
+  }
+
+  private async waitForPromptFileProbe(options: {
+    terminalId: string
+    runtimePtyId: string
+    backend: TerminalBackend & TerminalFileSystemBackend
+    token: TerminalCommandTrackingToken
+    requestPath: string
+    expectedOutput: string
+    runtimeIsCurrent: () => boolean
+    signal?: AbortSignal
+  }): Promise<TerminalCommandTrackingUpdate> {
+    const {
+      terminalId,
+      runtimePtyId,
+      backend,
+      token,
+      requestPath,
+      expectedOutput,
+      runtimeIsCurrent,
+      signal,
+    } = options
+    if (typeof backend.pollCommandTracking !== 'function') {
+      throw new Error('The Windows prompt-file protocol has no completion poller.')
+    }
+
+    const deadline = Date.now() + this.promptFileProbeTimeoutMs
+    let lastFailure = 'the prompt hook did not acknowledge the probe'
+    while (runtimeIsCurrent()) {
+      throwIfTerminalOperationAborted(signal)
+      try {
+        const remainingMs = Math.max(1, deadline - Date.now())
+        const update = await this.awaitCommandTrackingIo(
+          backend.pollCommandTracking(runtimePtyId, token),
+          'Windows prompt-file probe poll',
+          Math.min(this.commandTrackingIoTimeoutMs, remainingMs)
+        )
+        throwIfTerminalOperationAborted(signal)
+        if (!runtimeIsCurrent()) {
+          break
+        }
+        if (update) {
+          const requestContents = await this.awaitCommandTrackingIo(
+            backend.readFile(runtimePtyId, requestPath),
+            'Windows prompt-file probe request read',
+            Math.min(this.commandTrackingIoTimeoutMs, remainingMs)
+          )
+          throwIfTerminalOperationAborted(signal)
+          if (!runtimeIsCurrent()) {
+            break
+          }
+          const outputWithoutOneTrailingNewline = update.output?.endsWith('\r\n')
+            ? update.output.slice(0, -2)
+            : update.output?.endsWith('\n')
+              ? update.output.slice(0, -1)
+              : update.output
+          if (
+            requestContents.length === 0 &&
+            update.exitCode === 0 &&
+            update.requestId === token.expectedRequestId &&
+            update.outputTruncated !== true &&
+            outputWithoutOneTrailingNewline === expectedOutput
+          ) {
+            return update
+          }
+          lastFailure =
+            requestContents.length === 0
+              ? 'the prompt hook returned an invalid probe acknowledgement'
+              : 'the prompt hook did not consume the probe request file'
+        }
+      } catch (error) {
+        if (signal?.aborted) {
+          throwIfTerminalOperationAborted(signal)
+        }
+        if (!runtimeIsCurrent()) {
+          break
+        }
+        lastFailure = error instanceof Error ? error.message : String(error)
+      }
+
+      if (Date.now() >= deadline) {
+        throw new Error(
+          `Unable to verify the Windows prompt-file command hook for terminal ${terminalId}: ${lastFailure}.`
+        )
+      }
+      await waitForTerminalDelay(this.commandTrackingPollIntervalMs, signal)
+    }
+
+    throw new Error(
+      `Terminal ${terminalId} changed while the Windows prompt-file command hook was being verified.`
+    )
+  }
+
+  private async waitForPromptFileRequestConsumption(options: {
+    terminalId: string
+    runtimePtyId: string
+    backend: TerminalBackend & TerminalFileSystemBackend
+    requestPath: string
+    runtimeIsCurrent: () => boolean
+  }): Promise<void> {
+    const {
+      terminalId,
+      runtimePtyId,
+      backend,
+      requestPath,
+      runtimeIsCurrent,
+    } = options
+    const deadline = Date.now() + this.promptFileProbeTimeoutMs
+    let lastFailure = 'the request file still contains the user command'
+    while (runtimeIsCurrent()) {
+      try {
+        const remainingMs = Math.max(1, deadline - Date.now())
+        const requestContents = await this.awaitCommandTrackingIo(
+          backend.readFile(runtimePtyId, requestPath),
+          'Windows prompt-file request consumption read',
+          Math.min(this.commandTrackingIoTimeoutMs, remainingMs)
+        )
+        if (!runtimeIsCurrent()) {
+          break
+        }
+        if (requestContents.length === 0) {
+          return
+        }
+        lastFailure = 'the request file still contains the user command'
+      } catch (error) {
+        if (!runtimeIsCurrent()) {
+          break
+        }
+        lastFailure = error instanceof Error ? error.message : String(error)
+      }
+      if (Date.now() >= deadline) {
+        throw new Error(
+          `The Windows prompt-file hook did not consume the command for terminal ${terminalId}: ${lastFailure}.`
+        )
+      }
+      await waitForTerminalDelay(this.commandTrackingPollIntervalMs)
+    }
+    throw new Error(
+      `Terminal ${terminalId} changed before its Windows prompt-file command request was consumed.`
+    )
   }
 
   private async executeReservedCommand(
@@ -2711,15 +4279,51 @@ export class TerminalService {
     // Preparation can mutate shared prompt-marker state and is not
     // cancellable. Keep the start reservation until it settles, then honor
     // stop before any dispatch.
-    const completionTracking = await this.prepareCommandTracking(terminal)
+    let completionTracking: TerminalCommandTrackingToken | undefined
+    try {
+      completionTracking = await this.prepareCommandTracking(terminal, {
+        failClosed: true,
+      })
+    } catch (error) {
+      if (this.isCommandTrackingIoTimeout(error)) {
+        this.quarantineTerminalRuntime(
+          terminalId,
+          runtimePtyId,
+          runtimeGeneration
+        )
+      }
+      throw error
+    }
     throwIfTerminalOperationAborted(signal)
     const wireCommand = this.buildDispatchedCommand(terminal, command, taskId)
 
     const backend = this.getBackend(terminal.type)
-    const eol = terminal.remoteOs === 'windows' ? '\r' : '\n'
+    const eol = this.usesPowerShellCommandLifecycle(terminal) ? '\r' : '\n'
     let usedPromptFileDispatch = false
     let promptRequestPending = false
     let promptRequestCleanup: (() => Promise<boolean>) | undefined
+    const shellInputStateBeforePromptDispatch =
+      this.shellInputStateByTerminal.get(terminalId)
+    let promptProbeVerified = false
+    const restoreShellStateAfterPromptDispatchFailure = (): void => {
+      if (!runtimeIsCurrent()) {
+        return
+      }
+      if (shellInputStateBeforePromptDispatch === undefined) {
+        this.shellInputStateByTerminal.delete(terminalId)
+      } else {
+        this.shellInputStateByTerminal.set(
+          terminalId,
+          shellInputStateBeforePromptDispatch
+        )
+      }
+    }
+    const quarantineCurrentPromptFileRuntime = (): boolean =>
+      this.quarantineTerminalRuntime(
+        terminalId,
+        runtimePtyId,
+        runtimeGeneration
+      )
     const clearPendingPromptRequest = async (): Promise<boolean> => {
       if (!promptRequestPending || !promptRequestCleanup) {
         return true
@@ -2730,23 +4334,37 @@ export class TerminalService {
       promptRequestPending = false
       return cleared
     }
-    const usesPromptFileDispatch = Boolean(
-      completionTracking?.dispatchMode === 'prompt-file' &&
-      completionTracking.commandRequestPath &&
-      isTerminalFileSystemBackend(backend)
+    const requestsPromptFileDispatch =
+      completionTracking?.dispatchMode === 'prompt-file'
+    if (
+      requestsPromptFileDispatch &&
+      (!completionTracking?.commandRequestPath ||
+        !completionTracking?.commandOutputPath ||
+        !completionTracking?.dispatchInput ||
+        !isTerminalFileSystemBackend(backend))
+    ) {
+      throw new Error(
+        'The Windows prompt-file command protocol is missing a runtime-bound request, output, or dispatch channel.'
+      )
+    }
+    const usesPromptFileDispatch = Boolean(requestsPromptFileDispatch)
+    const promptFileIoKey = this.getPromptFileIoKey(
+      terminalId,
+      runtimeGeneration
     )
     if (
       usesPromptFileDispatch ||
-      this.promptFileIoTailByTerminal.has(terminalId)
+      this.promptFileIoTailByTerminal.has(promptFileIoKey)
     ) {
       const promptFileIo = this.reservePromptFileIo(
         terminalId,
-        reservationToken
+        reservationToken,
+        runtimeGeneration
       )
-      // Request-file writes are not cancellable and SSH reconnects may reuse
-      // both the pty id and request path. Keep later generations behind this
-      // fence until the previous write/cleanup has fully settled.
-      await promptFileIo.waitForTurn
+      // Serialize request-file access only within one runtime. Every backend
+      // runtime owns unique sidecar paths, so a permanently stalled old write
+      // cannot freeze or later overwrite a replacement runtime.
+      await waitForPromiseOrAbort(promptFileIo.waitForTurn, signal)
       throwIfTerminalOperationAborted(signal)
       if (!runtimeIsCurrent()) {
         throw new Error(
@@ -2761,66 +4379,176 @@ export class TerminalService {
     ) {
       promptRequestCleanup = async (): Promise<boolean> => {
         try {
-          await backend.writeFile(
-            runtimePtyId,
-            completionTracking.commandRequestPath!,
-            ''
+          await this.awaitCommandTrackingIo(
+            backend.writeFile(
+              runtimePtyId,
+              completionTracking.commandRequestPath!,
+              ''
+            ),
+            'Windows prompt-file request cleanup'
           )
           return true
         } catch (cleanupError) {
-          // A stale request file is unsafe. Quarantine the tab before trying
-          // to close its runtime so even a throwing/no-op kill cannot release
-          // deferred or future input into the abandoned prompt hook.
-          const currentTerminal = this.terminals.get(terminalId)
-          if (currentTerminal) {
-            this.deferredWritesDuringCommandStartByTerminal.delete(terminalId)
-            currentTerminal.isInitializing = false
-            currentTerminal.runtimeState = 'exited'
-            currentTerminal.lastExitCode = -1
-            this.terminalIdsBeingKilled.add(terminalId)
-            try {
-              this.getBackend(currentTerminal.type).kill(currentTerminal.ptyId)
-            } catch {
-              // The quarantined runtime remains non-writable even when the
-              // backend cannot confirm termination.
-            } finally {
-              this.terminalIdsBeingKilled.delete(terminalId)
-            }
-            this.publishTerminalTabsChanged()
-            this.schedulePersistTerminalState()
-          }
+          // Every runtime owns a unique sidecar path. Cleanup failure is fatal
+          // only while this exact runtime is still current; a late failure
+          // from an abandoned runtime cannot make its replacement unsafe.
+          const quarantined = quarantineCurrentPromptFileRuntime()
           console.warn(
-            `[TerminalService] Failed to clear a pending prompt-file command for ${terminalId}; quarantined the current terminal runtime.`,
+            quarantined
+              ? `[TerminalService] Failed to clear a pending prompt-file command for ${terminalId}; quarantined the current terminal runtime.`
+              : `[TerminalService] Failed to clear an abandoned runtime's prompt-file command for ${terminalId}; its runtime-scoped path cannot affect the replacement.`,
             cleanupError
           )
           return false
         }
       }
-      const requestPayload = Buffer.from(command, 'utf8').toString('base64')
+
+      // A runtime-private top-level dispatcher consumes the request file. It
+      // can still be damaged by a previous stateful command, while the
+      // filesystem capability remains available. Prove the full dispatch and
+      // prompt-publication path before the real user command is ever stored.
+      completionTracking.expectCommandOutput = true
+      const probeRequestId = uuidv4().replace(/-/g, '')
+      completionTracking.expectedRequestId = probeRequestId
+      const probeOutput = `__GYSHELL_PROMPT_FILE_PROBE_${probeRequestId}`
+      // A previous stateful command may have defined a function or alias named
+      // Write-Output. A string expression exercises capture without invoking
+      // any user-overridable command name.
+      const probeCommand = `'${probeOutput}'`
+      const probePayload = buildWindowsPowerShellDispatchRequest({
+        requestId: probeRequestId,
+        kind: 'probe',
+        command: probeCommand,
+      })
+      promptRequestPending = true
+      try {
+        await this.awaitCommandTrackingIo(
+          backend.writeFile(
+            runtimePtyId,
+            completionTracking.commandRequestPath,
+            probePayload
+          ),
+          'Windows prompt-file probe request write'
+        )
+      } catch (writeError) {
+        await clearPendingPromptRequest()
+        if (this.isCommandTrackingIoTimeout(writeError)) {
+          quarantineCurrentPromptFileRuntime()
+        }
+        restoreShellStateAfterPromptDispatchFailure()
+        throw writeError
+      }
+      if (!runtimeIsCurrent()) {
+        await clearPendingPromptRequest()
+        throw new Error(
+          `Terminal ${terminalId} changed before the prompt-file liveness probe could be triggered.`
+        )
+      }
+      if (signal?.aborted) {
+        await clearPendingPromptRequest()
+        restoreShellStateAfterPromptDispatchFailure()
+        throwIfTerminalOperationAborted(signal)
+      }
+
+      let probeUpdate: TerminalCommandTrackingUpdate
+      const probeDisplaySuppressionLease = Symbol(terminalId)
+      this.internalRawDisplaySuppressionByTerminal.set(
+        terminalId,
+        probeDisplaySuppressionLease
+      )
+      try {
+        this.shellInputStateByTerminal.set(terminalId, 'busy')
+        try {
+          backend.write(
+            runtimePtyId,
+            `${completionTracking.dispatchInput}${eol}`
+          )
+        } catch (writeError) {
+          await clearPendingPromptRequest()
+          restoreShellStateAfterPromptDispatchFailure()
+          throw writeError
+        }
+
+        try {
+          probeUpdate = await this.waitForPromptFileProbe({
+            terminalId,
+            runtimePtyId,
+            backend,
+            token: completionTracking,
+            requestPath: completionTracking.commandRequestPath,
+            expectedOutput: probeOutput,
+            runtimeIsCurrent,
+            signal,
+          })
+        } catch (probeError) {
+          await clearPendingPromptRequest()
+          if (runtimeIsCurrent()) {
+            // The probe may have reached the shell without a trustworthy
+            // acknowledgement. Do not reopen the command gate on an assumption.
+            this.shellInputStateByTerminal.set(terminalId, 'unknown')
+          }
+          throw probeError
+        }
+      } finally {
+        if (
+          this.internalRawDisplaySuppressionByTerminal.get(terminalId) ===
+          probeDisplaySuppressionLease
+        ) {
+          this.internalRawDisplaySuppressionByTerminal.delete(terminalId)
+        }
+      }
+      promptRequestPending = false
+      const advancedTracking = this.advanceWindowsPromptBaseline(
+        completionTracking,
+        probeUpdate.sequence
+      )
+      Object.assign(completionTracking, advancedTracking)
+      this.windowsPromptBaselineByTerminal.set(terminalId, {
+        ...advancedTracking,
+      })
+      this.applyCommandTrackingMetadata(terminalId, probeUpdate)
+      promptProbeVerified = true
+
+      const commandRequestId = taskId.replace(/-/g, '')
+      completionTracking.expectedRequestId = commandRequestId
+      const requestPayload = buildWindowsPowerShellDispatchRequest({
+        requestId: commandRequestId,
+        kind: 'command',
+        command,
+      })
       let promptWriteSucceeded = false
       promptRequestPending = true
       try {
         // The backend file write is not cancellable. Await it while retaining
         // the per-terminal start reservation; otherwise a late write can leave
         // a command that the next PowerShell prompt executes unexpectedly.
-        await backend.writeFile(
-          runtimePtyId,
-          completionTracking.commandRequestPath,
-          requestPayload
+        await this.awaitCommandTrackingIo(
+          backend.writeFile(
+            runtimePtyId,
+            completionTracking.commandRequestPath,
+            requestPayload
+          ),
+          'Windows prompt-file user request write'
         )
         promptWriteSucceeded = true
       } catch (writeError) {
-        const cleared = await clearPendingPromptRequest()
+        await clearPendingPromptRequest()
+        if (this.isCommandTrackingIoTimeout(writeError)) {
+          quarantineCurrentPromptFileRuntime()
+        }
+        restoreShellStateAfterPromptDispatchFailure()
         if (signal?.aborted) {
           throwIfTerminalOperationAborted(signal)
         }
-        if (!cleared) {
-          throw writeError
-        }
-        usedPromptFileDispatch = false
+        // A raw-input fallback cannot use the sidecar output file safely: it
+        // belongs to the most recent hidden request and may still contain a
+        // previous command's transcript. Abort before any shell input is
+        // delivered, even when cleanup succeeded.
+        throw writeError
       }
       if (signal?.aborted) {
         await clearPendingPromptRequest()
+        restoreShellStateAfterPromptDispatchFailure()
         throwIfTerminalOperationAborted(signal)
       }
       usedPromptFileDispatch = promptWriteSucceeded
@@ -2834,7 +4562,14 @@ export class TerminalService {
       )
     }
 
-    const headless = this.headlessPtys.get(terminalId)
+    const usesPowerShellLifecycle =
+      this.usesPowerShellCommandLifecycle(terminal)
+    const usesSyntheticTranscript =
+      usedPromptFileDispatch &&
+      completionTracking?.displayMode === 'synthetic-transcript'
+    const capture = new CommandTranscriptCapture()
+    const unverifiedCapture = new CommandTranscriptCapture()
+    const lastShellSequence = this.lastShellSequenceByTerminal.get(terminalId)
     const task: CommandTask = {
       id: taskId,
       command,
@@ -2845,46 +4580,97 @@ export class TerminalService {
       startOffset,
       startTime: Date.now(),
       output: '',
-      // Scheme 1: Record start line in headless buffer
-      startAbsLine: headless
-        ? headless.buffer.active.baseY + headless.buffer.active.cursorY
-        : undefined
+      capture: capture.getMetadata(),
+      captureBoundaryState: usesSyntheticTranscript
+        ? 'awaiting-start'
+        : usesPowerShellLifecycle
+          ? 'unverified'
+          : 'awaiting-start',
+      ...(usesSyntheticTranscript
+        ? { displayMode: 'synthetic-transcript' as const }
+        : {}),
+      ...(lastShellSequence !== undefined
+        ? { expectedShellSequence: lastShellSequence + 1 }
+        : {})
     }
     const taskMap = this.getTaskMap(terminalId)
     taskMap[taskId] = task
-    if (headless && typeof (headless as any).registerMarker === 'function') {
-      const marker = (headless as any).registerMarker(0)
-      if (marker) this.startMarkerByTaskId.set(taskId, marker)
-    }
+    this.captureByTaskId.set(taskId, capture)
+    this.unverifiedCaptureByTaskId.set(taskId, unverifiedCapture)
     this.activeTaskByTerminal.set(terminalId, taskId)
     if (onFinished) this.onTaskFinishedCallbacks.set(taskId, onFinished)
-
-    try {
-      backend.write(
-        runtimePtyId,
-        usedPromptFileDispatch ? eol : `${wireCommand}${eol}`
-      )
-    } catch (error) {
-      delete taskMap[taskId]
-      if (this.activeTaskByTerminal.get(terminalId) === taskId) {
-        this.activeTaskByTerminal.delete(terminalId)
-      }
-      this.onTaskFinishedCallbacks.delete(taskId)
-      this.disposeTaskStartMarker(taskId)
-      await clearPendingPromptRequest()
-      throw error
-    }
-    promptRequestPending = false
-
-    if (usedPromptFileDispatch && completionTracking?.displayMode === 'synthetic-transcript') {
-      task.displayMode = 'synthetic-transcript'
+    if (task.displayMode === 'synthetic-transcript') {
       this.appendSyntheticDisplayData(
         terminalId,
         this.buildSyntheticTaskPrelude(terminalId, terminal, command)
       )
     }
+
+    try {
+      const dispatchedInput = usedPromptFileDispatch
+        ? `${completionTracking!.dispatchInput}${eol}`
+        : `${wireCommand}${eol}`
+      const previousShellInputState = promptProbeVerified
+        ? shellInputStateBeforePromptDispatch
+        : this.shellInputStateByTerminal.get(terminalId)
+      this.shellInputStateByTerminal.set(terminalId, 'busy')
+      if (completionTracking) {
+        completionTracking.dispatchedAtMs = Date.now()
+      }
+      try {
+        backend.write(runtimePtyId, dispatchedInput)
+      } catch (error) {
+        if (previousShellInputState) {
+          this.shellInputStateByTerminal.set(terminalId, previousShellInputState)
+        } else {
+          this.shellInputStateByTerminal.delete(terminalId)
+        }
+        throw error
+      }
+    } catch (error) {
+      delete taskMap[taskId]
+      this.captureByTaskId.delete(taskId)
+      this.unverifiedCaptureByTaskId.delete(taskId)
+      if (this.activeTaskByTerminal.get(terminalId) === taskId) {
+        this.activeTaskByTerminal.delete(terminalId)
+      }
+      this.onTaskFinishedCallbacks.delete(taskId)
+      await clearPendingPromptRequest()
+      throw error
+    }
+
+    if (
+      usedPromptFileDispatch &&
+      completionTracking?.commandRequestPath &&
+      isTerminalFileSystemBackend(backend)
+    ) {
+      try {
+        await this.waitForPromptFileRequestConsumption({
+          terminalId,
+          runtimePtyId,
+          backend,
+          requestPath: completionTracking.commandRequestPath,
+          runtimeIsCurrent,
+        })
+        promptRequestPending = false
+      } catch (consumptionError) {
+        await clearPendingPromptRequest()
+        task.terminalStatus =
+          consumptionError instanceof Error
+            ? consumptionError.message
+            : String(consumptionError)
+        if (
+          this.activeTaskByTerminal.get(terminalId) === taskId &&
+          task.status === 'running'
+        ) {
+          this.failActiveTaskDueToTrackingLoss(terminalId)
+        }
+        return taskId
+      }
+    } else {
+      promptRequestPending = false
+    }
     if (completionTracking) {
-      completionTracking.dispatchedAtMs = Date.now()
       this.startCommandTrackingWatcher(terminal, taskId, completionTracking)
     }
     return taskId
@@ -2908,36 +4694,82 @@ export class TerminalService {
     if (!taskId) return
     const task = this.getTaskMap(terminalId)[taskId]
     if (!task || task.status !== 'running') return
-    task.output = (task.output || '') + chunk
+    const terminal = this.terminals.get(terminalId)
+    if (this.usesPowerShellCommandLifecycle(terminal)) {
+      if (task.captureBoundaryState === 'sealed') {
+        return
+      }
+      if (
+        task.displayMode === 'synthetic-transcript' &&
+        task.captureBoundaryState !== 'capturing'
+      ) {
+        return
+      }
+      task.lastOutputAtMs = Date.now()
+      this.unverifiedCaptureByTaskId.get(task.id)?.append(chunk)
+      return
+    }
     task.lastOutputAtMs = Date.now()
+    if (task.captureBoundaryState !== 'capturing') {
+      if (task.captureBoundaryState === 'awaiting-start') {
+        this.unverifiedCaptureByTaskId.get(task.id)?.append(chunk)
+      }
+      return
+    }
+    this.getTaskCapture(task.id)?.append(chunk)
+    this.syncTaskCaptureMetadata(task)
   }
 
-  private resolveFinalTaskOutput(terminalId: string, task: CommandTask, terminal?: TerminalTab): string {
-    const rawRenderedOutput = this.getRenderedTaskOutput(terminalId, task)
-    const renderedOutput =
-      rawRenderedOutput !== undefined
-        ? this.normalizeFinishedTaskOutput(terminalId, terminal, task, rawRenderedOutput)
-        : undefined
-    const streamedOutput = this.normalizeFinishedTaskOutput(terminalId, terminal, task, task.output || '')
-    if (task.displayMode === 'synthetic-transcript') {
-      const hasCapturedOutput = task.capturedOutput !== undefined
-      const syntheticSource = hasCapturedOutput ? task.capturedOutput || '' : task.output || ''
-      const normalizedSyntheticOutput = this.normalizeSyntheticWindowsTaskOutput(syntheticSource, task, {
-        source: hasCapturedOutput ? 'captured' : 'raw'
-      })
-      if (hasCapturedOutput) {
-        return normalizedSyntheticOutput
-      }
-      return normalizedSyntheticOutput || renderedOutput || ''
+  private getTaskCapture(taskId: string): CommandTranscriptCapture | undefined {
+    return this.captureByTaskId.get(taskId)
+  }
+
+  private promoteUnverifiedUnixCapture(
+    terminalId: string,
+    terminal: TerminalTab | undefined,
+    task: CommandTask
+  ): void {
+    if (this.usesPowerShellCommandLifecycle(terminal)) {
+      return
     }
-    if (terminal?.remoteOs === 'windows') {
-      return this.selectWindowsTaskOutput(renderedOutput, streamedOutput, task)
+    const pendingCapture = this.unverifiedCaptureByTaskId.get(task.id)
+    if (!pendingCapture) {
+      return
     }
-    if (renderedOutput !== undefined) {
-      const renderedHasContent = renderedOutput.trim().length > 0
-      return renderedHasContent || !streamedOutput ? renderedOutput : streamedOutput
+    this.unverifiedCaptureByTaskId.delete(task.id)
+    pendingCapture.seal()
+    const pendingMetadata = pendingCapture.getMetadata()
+    const capture = this.getTaskCapture(task.id)
+    if (!capture) {
+      return
     }
-    return streamedOutput
+
+    capture.append(
+      this.normalizeFinishedTaskOutput(
+        terminalId,
+        terminal,
+        task,
+        pendingCapture.getText()
+      )
+    )
+    if (pendingMetadata.state === 'incomplete') {
+      capture.markIncomplete(
+        pendingMetadata.reason || 'retention_limit',
+        pendingMetadata.observedUtf8Bytes
+      )
+    }
+    if (pendingMetadata.terminalControlsObserved) {
+      capture.markTerminalControlsObserved()
+    }
+    this.syncTaskCaptureMetadata(task)
+  }
+
+  private syncTaskCaptureMetadata(task: CommandTask): void {
+    const capture = this.getTaskCapture(task.id)
+    if (!capture) {
+      return
+    }
+    task.capture = capture.getMetadata()
   }
 
   private finalizeActiveTask(
@@ -2946,6 +4778,8 @@ export class TerminalService {
       exitCode?: number
       outputOverride?: string
       runtimeBoundary?: boolean
+      outcomeUnknown?: boolean
+      captureUnknownReason?: 'tracking_lost'
     }
   ): void {
     const taskId = this.activeTaskByTerminal.get(terminalId)
@@ -2953,23 +4787,59 @@ export class TerminalService {
     const task = this.getTaskMap(terminalId)[taskId]
     if (!task || (task.status !== 'running' && task.status !== 'timeout')) return
     const terminal = this.terminals.get(terminalId)
-    task.output = options?.outputOverride ?? this.resolveFinalTaskOutput(terminalId, task, terminal)
+    this.finalizeTaskCapture(terminalId, task, terminal, {
+      runtimeBoundary: options?.runtimeBoundary === true,
+      outputOverride: options?.outputOverride,
+      captureUnknownReason: options?.captureUnknownReason,
+    })
+    task.output = this.getTaskCapture(task.id)?.getText() ?? ''
+    const syntheticCompletionOutput = task.syntheticRawDisplayObserved
+      ? task.syntheticSidecarDisplayOutput || ''
+      : task.output
+    const rawToSidecarSeparator =
+      task.syntheticRawDisplayObserved &&
+      syntheticCompletionOutput.length > 0 &&
+      !task.syntheticRawDisplayEndsWithLineBreak
+        ? '\r\n'
+        : ''
     const syntheticDisplay =
       terminal && task.displayMode === 'synthetic-transcript'
-        ? this.buildSyntheticTaskCompletionDisplay(terminalId, terminal, task.output)
+        ? rawToSidecarSeparator + this.buildSyntheticTaskCompletionDisplay(
+            terminalId,
+            terminal,
+            syntheticCompletionOutput
+          )
         : undefined
 
     task.status = 'finished'
     task.endTime = Date.now()
     task.exitCode = options?.exitCode
     task.runtimeBoundary = options?.runtimeBoundary === true
+    task.outcomeUnknown = options?.outcomeUnknown === true
+    if (task.outcomeUnknown && !task.terminalStatus) {
+      task.terminalStatus =
+        'The shell completed the command but did not provide a trustworthy exact exit code.'
+    }
     task.endOffset = task.startOffset + task.output.length
 
     this.stopCommandTrackingWatcher(taskId)
+    this.unverifiedCaptureByTaskId.delete(taskId)
     this.activeTaskByTerminal.delete(terminalId)
     this.pendingTaskFinishByTerminal.delete(terminalId)
+    const deferredWrites =
+      this.deferredWritesUntilTaskFinishByTaskId.get(taskId) || []
+    this.deferredWritesUntilTaskFinishByTaskId.delete(taskId)
     if (syntheticDisplay) {
       this.appendSyntheticDisplayData(terminalId, syntheticDisplay)
+    }
+
+    // Input that arrived while this hidden request was starting belongs to
+    // the shell immediately after this task, not to work a completion
+    // callback may synchronously enqueue. Replay it while the terminal is
+    // task-free but before invoking external code so the shell-input gate is
+    // already busy when a callback attempts to start another command.
+    if (!task.runtimeBoundary) {
+      this.replayDeferredTerminalWrites(terminalId, deferredWrites)
     }
 
     const callback = this.onTaskFinishedCallbacks.get(taskId)
@@ -2977,17 +4847,199 @@ export class TerminalService {
       this.onTaskFinishedCallbacks.delete(taskId)
     }
     if (callback && !task.suppressFinishCallback) {
+      const outcomeUnknown =
+        task.runtimeBoundary === true || task.outcomeUnknown === true
       callback({
         stdoutDelta: task.output,
-        exitCode: options?.exitCode,
+        ...(!task.outcomeUnknown && options?.exitCode !== undefined
+          ? { exitCode: options.exitCode }
+          : {}),
         history_command_match_id: taskId,
+        executionState: outcomeUnknown ? 'outcome_unknown' : 'finished',
+        ...(task.capture ? { capture: { ...task.capture } } : {}),
+        ...(task.terminalStatus ? { terminalStatus: task.terminalStatus } : {}),
         ...(task.runtimeBoundary ? { runtimeBoundary: true } : {})
       })
     }
+    this.compactFinalizedTask(task)
+    this.enforceCommandCaptureRetention()
   }
 
-  private finishActiveTask(terminalId: string, exitCode?: number): void {
-    this.finalizeActiveTask(terminalId, { exitCode })
+  private finalizeTaskCapture(
+    terminalId: string,
+    task: CommandTask,
+    terminal: TerminalTab | undefined,
+    options: {
+      runtimeBoundary: boolean
+      outputOverride?: string
+      captureUnknownReason?: 'tracking_lost'
+    }
+  ): void {
+    const capture = this.getTaskCapture(task.id)
+    if (!capture) {
+      return
+    }
+    this.promoteUnverifiedUnixCapture(terminalId, terminal, task)
+    const current = capture.getMetadata()
+    if (
+      this.usesPowerShellCommandLifecycle(terminal) &&
+      this.unverifiedCaptureByTaskId.has(task.id)
+    ) {
+      const pendingCapture = this.unverifiedCaptureByTaskId.get(task.id)
+      this.unverifiedCaptureByTaskId.delete(task.id)
+      const hasSidecarOutput = task.capturedOutput !== undefined
+      const hasRequestBoundSidecar =
+        hasSidecarOutput && task.displayMode === 'synthetic-transcript'
+      const rawBoundaryVerified =
+        hasRequestBoundSidecar && task.captureBoundaryState === 'sealed'
+      if (hasRequestBoundSidecar && !rawBoundaryVerified) {
+        pendingCapture?.seal()
+      }
+      const pendingMetadata = pendingCapture?.getMetadata()
+      const pendingText = pendingCapture?.getText() || ''
+
+      if (hasRequestBoundSidecar) {
+        capture.append(
+          this.normalizeSyntheticWindowsTaskOutput(
+            task.capturedOutput || '',
+            task,
+            { source: 'captured' }
+          )
+        )
+        task.syntheticSidecarDisplayOutput = capture.getText()
+        // The request-bound OSC pair excludes dispatcher echo and prompt
+        // rendering without content heuristics. Raw bytes inside it can come
+        // from Console/Host/TUI paths that bypass PowerShell streams. Preserve
+        // their projected text, but never claim process attribution or an
+        // ordering relative to the sidecar stream.
+        if (rawBoundaryVerified || task.captureBoundaryState === 'capturing') {
+          capture.append(pendingText)
+        }
+      } else {
+        capture.append(
+          this.normalizeFinishedTaskOutput(
+            terminalId,
+            terminal,
+            task,
+            pendingText
+          )
+        )
+      }
+
+      const capturedOutputBytes = hasSidecarOutput
+        ? Buffer.byteLength(task.capturedOutput || '', 'utf8')
+        : undefined
+      const sidecarObservedLoss =
+        capturedOutputBytes !== undefined &&
+        task.capturedOutputObservedUtf8Bytes !== undefined &&
+        capturedOutputBytes < task.capturedOutputObservedUtf8Bytes
+      const sidecarObservedLossBytes =
+        capturedOutputBytes !== undefined &&
+        task.capturedOutputObservedUtf8Bytes !== undefined
+          ? Math.max(
+              0,
+              task.capturedOutputObservedUtf8Bytes - capturedOutputBytes
+            )
+          : 0
+      const pendingObservedLossBytes = pendingMetadata
+        ? Math.max(
+            0,
+            pendingMetadata.observedUtf8Bytes -
+              pendingMetadata.retainedUtf8Bytes
+          )
+        : 0
+      // The merged capture has already counted every retained projected byte.
+      // Add each source's discarded delta; taking max(sourceObserved) loses
+      // information whenever sidecar and request-bound raw capture both hit
+      // their independent retention limits.
+      const combinedObservedUtf8Bytes =
+        capture.getMetadata().observedUtf8Bytes +
+        sidecarObservedLossBytes +
+        pendingObservedLossBytes
+      if (task.capturedOutputTruncated || sidecarObservedLoss) {
+        if (capture.getMetadata().state === 'unknown') {
+          capture.markUnknown(
+            capture.getMetadata().reason || 'tracking_lost',
+            combinedObservedUtf8Bytes
+          )
+        } else {
+          capture.markIncomplete(
+            'retention_limit',
+            combinedObservedUtf8Bytes
+          )
+        }
+      }
+      if (pendingMetadata?.state === 'incomplete') {
+        if (capture.getMetadata().state === 'unknown') {
+          capture.markUnknown(
+            capture.getMetadata().reason || 'tracking_lost',
+            combinedObservedUtf8Bytes
+          )
+        } else {
+          capture.markIncomplete(
+            pendingMetadata.reason || 'retention_limit',
+            combinedObservedUtf8Bytes
+          )
+        }
+      }
+      if (pendingMetadata?.terminalControlsObserved) {
+        capture.markTerminalControlsObserved()
+      }
+      if (
+        hasRequestBoundSidecar &&
+        rawBoundaryVerified &&
+        (pendingText.length > 0 || pendingMetadata?.terminalControlsObserved) &&
+        capture.getMetadata().state !== 'complete' &&
+        capture.getMetadata().state !== 'unknown'
+      ) {
+        capture.markUnknown('projection_ambiguous')
+      }
+      if (
+        hasRequestBoundSidecar &&
+        !rawBoundaryVerified &&
+        capture.getMetadata().state !== 'complete' &&
+        capture.getMetadata().state !== 'unknown'
+      ) {
+        capture.markUnknown('tracking_lost')
+      }
+      if (
+        !hasSidecarOutput &&
+        !options.captureUnknownReason &&
+        !options.runtimeBoundary &&
+        capture.getMetadata().state === 'in_progress'
+      ) {
+        // The modern PowerShell prompt hook provides an end marker but no
+        // task-bound start marker. Its best-effort transcript is useful, but
+        // claiming completeness would overstate what the protocol proves.
+        capture.markUnknown('tracking_unavailable')
+      }
+    } else if (options.outputOverride && current.retainedUtf8Bytes === 0) {
+      capture.append(options.outputOverride)
+    }
+
+    const afterAppend = capture.getMetadata()
+    if (options.captureUnknownReason) {
+      capture.markUnknown(options.captureUnknownReason)
+    } else if (options.runtimeBoundary) {
+      capture.markUnknown('runtime_boundary')
+    } else if (
+      !this.usesPowerShellCommandLifecycle(terminal) &&
+      task.captureBoundaryState !== 'sealed' &&
+      afterAppend.state === 'in_progress'
+    ) {
+      capture.markUnknown('tracking_lost')
+    } else {
+      capture.seal()
+    }
+    this.syncTaskCaptureMetadata(task)
+  }
+
+  private finishActiveTask(
+    terminalId: string,
+    exitCode?: number,
+    outcomeUnknown = exitCode === undefined
+  ): void {
+    this.finalizeActiveTask(terminalId, { exitCode, outcomeUnknown })
   }
 
   private failActiveTaskDueToTrackingLoss(terminalId: string): void {
@@ -2999,57 +5051,173 @@ export class TerminalService {
     if (!task || task.status !== 'running') {
       return
     }
-    const terminal = this.terminals.get(terminalId)
-    const currentOutput = this.resolveFinalTaskOutput(terminalId, task, terminal)
-    const outputOverride = currentOutput
-      ? `${currentOutput}\n\n${COMMAND_TRACKING_FAILURE_MESSAGE}`
-      : COMMAND_TRACKING_FAILURE_MESSAGE
+    this.shellInputStateByTerminal.set(terminalId, 'unknown')
     this.finalizeActiveTask(terminalId, {
       exitCode: -1,
-      outputOverride,
-      runtimeBoundary: true
+      runtimeBoundary: true,
+      captureUnknownReason: 'tracking_lost',
     })
-  }
-
-  private getRenderedTaskOutput(terminalId: string, task: CommandTask): string | undefined {
-    const headless = this.headlessPtys.get(terminalId)
-    if (!headless) return undefined
-    const buffer = headless.buffer.active
-    if (!buffer) return undefined
-
-    const marker = this.startMarkerByTaskId.get(task.id)
-    const markerLine = marker && typeof marker.line === 'number' ? marker.line : undefined
-    this.disposeTaskStartMarker(task.id)
-
-    const startAbsLineFromMarker = markerLine !== undefined && markerLine >= 0 ? markerLine : undefined
-    const startAbsLine = startAbsLineFromMarker !== undefined ? startAbsLineFromMarker : task.startAbsLine
-    if (startAbsLine === undefined) return undefined
-
-    const endAbsLine = buffer.baseY + buffer.cursorY
-    const start = Math.max(0, startAbsLine)
-    if (endAbsLine < start) return ''
-
-    const lines: string[] = []
-    for (let i = start; i <= endAbsLine; i++) {
-      const line = buffer.getLine(i)
-      if (line) {
-        lines.push(line.translateToString(true))
-      }
-    }
-    return lines.join('\n').trimEnd()
   }
 
   private markTaskAborted(terminalId: string, taskId: string): void {
     const task = this.getTaskMap(terminalId)[taskId]
     if (!task || task.status !== 'running') return
+    const terminal = this.terminals.get(terminalId)
+    this.finalizeTaskCapture(terminalId, task, terminal, {
+      runtimeBoundary: false,
+      captureUnknownReason: 'tracking_lost',
+    })
+    task.output = this.getTaskCapture(task.id)?.getText() ?? ''
     task.status = 'aborted'
     task.endTime = Date.now()
     task.exitCode = -2
     task.endOffset = task.startOffset + (task.output?.length || 0)
     this.stopCommandTrackingWatcher(taskId)
+    this.unverifiedCaptureByTaskId.delete(taskId)
     this.activeTaskByTerminal.delete(terminalId)
+    this.pendingTaskFinishByTerminal.delete(terminalId)
+    this.deferredWritesUntilTaskFinishByTaskId.delete(taskId)
     this.onTaskFinishedCallbacks.delete(taskId)
-    this.disposeTaskStartMarker(taskId)
+    this.compactFinalizedTask(task)
+    this.enforceCommandCaptureRetention()
+  }
+
+  private compactFinalizedTask(task: CommandTask): void {
+    if (task.status === 'running') return
+    task.command = this.takeTaskCommandPreview(task.command, 4096)
+    delete task.output
+    delete task.wireCommand
+    delete task.completionTracking
+    delete task.capturedOutput
+    delete task.capturedOutputObservedUtf8Bytes
+    delete task.capturedOutputTruncated
+    delete task.syntheticSidecarDisplayOutput
+    delete task.syntheticRawDisplayObserved
+    delete task.syntheticRawDisplayEndsWithLineBreak
+  }
+
+  private takeTaskCommandPreview(command: string, maxUtf8Bytes: number): string {
+    const source = String(command || '')
+    if (Buffer.byteLength(source, 'utf8') <= maxUtf8Bytes) return source
+    const suffix = '… [command preview truncated]'
+    const contentBudget = Math.max(
+      0,
+      maxUtf8Bytes - Buffer.byteLength(suffix, 'utf8')
+    )
+    let preview = ''
+    let retainedBytes = 0
+    for (const scalar of source) {
+      const scalarBytes = Buffer.byteLength(scalar, 'utf8')
+      if (retainedBytes + scalarBytes > contentBudget) break
+      preview += scalar
+      retainedBytes += scalarBytes
+    }
+    return `${preview}${suffix}`
+  }
+
+  /**
+   * Bounds aggregate in-memory transcripts without turning eviction into
+   * silent data loss. Active and newest captures are never evicted; older
+   * records remain as explicit tombstones for read_command_output.
+   */
+  private enforceCommandCaptureRetention(): void {
+    const candidates: Array<{
+      task: CommandTask
+      capture: CommandTranscriptCapture
+      retainedBytes: number
+    }> = []
+    let retainedBytes = 0
+
+    const taskStores = [
+      ...this.tasksByTerminal.entries(),
+      ...this.detachedTasksByTerminal.entries(),
+    ] as Array<[string, Record<string, CommandTask>]>
+    for (const [terminalId, tasks] of taskStores) {
+      const activeTaskId = this.activeTaskByTerminal.get(terminalId)
+      for (const task of Object.values(tasks)) {
+        if (task.id === activeTaskId || task.status === 'running') {
+          continue
+        }
+        const capture = this.captureByTaskId.get(task.id)
+        if (!capture) {
+          continue
+        }
+        const bytes = capture.getMetadata().retainedUtf8Bytes
+        retainedBytes += bytes
+        candidates.push({ task, capture, retainedBytes: bytes })
+      }
+    }
+
+    candidates.sort(
+      (left, right) =>
+        (left.task.endTime || left.task.startTime) -
+        (right.task.endTime || right.task.startTime)
+    )
+    while (
+      candidates.length > 1 &&
+      (retainedBytes > this.commandCaptureRetentionBudgetBytes ||
+        candidates.length > this.commandCaptureRetentionMaxRecords)
+    ) {
+      const expired = candidates.shift()
+      if (!expired) {
+        break
+      }
+      const metadata = expired.capture.getMetadata()
+      retainedBytes -= expired.retainedBytes
+      this.captureByTaskId.delete(expired.task.id)
+      this.unverifiedCaptureByTaskId.delete(expired.task.id)
+      this.compactFinalizedTask(expired.task)
+      expired.task.command = this.takeTaskCommandPreview(
+        expired.task.command,
+        1024
+      )
+      expired.task.capture = {
+        state: 'unknown',
+        reason: 'record_expired',
+        observedUtf8Bytes: metadata.observedUtf8Bytes,
+        retainedUtf8Bytes: 0,
+        availableLineCount: 0,
+        revision: metadata.revision + 1,
+        terminalControlsObserved: metadata.terminalControlsObserved,
+      }
+    }
+
+    const tombstones: Array<{
+      terminalId: string
+      task: CommandTask
+      tasks: Record<string, CommandTask>
+      detached: boolean
+    }> = []
+    for (const [terminalId, tasks] of taskStores) {
+      const detached = this.detachedTasksByTerminal.get(terminalId) === tasks
+      for (const task of Object.values(tasks)) {
+        if (
+          task.status !== 'running' &&
+          !this.captureByTaskId.has(task.id)
+        ) {
+          tombstones.push({ terminalId, task, tasks, detached })
+        }
+      }
+    }
+    tombstones.sort(
+      (left, right) =>
+        (left.task.endTime || left.task.startTime) -
+        (right.task.endTime || right.task.startTime)
+    )
+    while (tombstones.length > this.commandHistoryTombstoneMaxRecords) {
+      const expired = tombstones.shift()
+      if (!expired) break
+      delete expired.tasks[expired.task.id]
+      this.unverifiedCaptureByTaskId.delete(expired.task.id)
+      this.deferredWritesUntilTaskFinishByTaskId.delete(expired.task.id)
+      if (
+        expired.detached &&
+        Object.keys(expired.tasks).length === 0 &&
+        this.detachedTasksByTerminal.get(expired.terminalId) === expired.tasks
+      ) {
+        this.detachedTasksByTerminal.delete(expired.terminalId)
+      }
+    }
   }
 
   private stripEchoedCommand(output: string, command: string): string {
@@ -3075,11 +5243,11 @@ export class TerminalService {
     output: string
   ): string {
     const stripped = this.stripEchoedCommands(
-      stripGyShellTextMarkers(stripGyShellOscMarkers(output)),
+      stripGyShellOscMarkers(output),
       task.command,
       task.wireCommand
     )
-    if (terminal?.remoteOs === 'windows') {
+    if (this.usesPowerShellCommandLifecycle(terminal)) {
       return this.normalizeWindowsTaskOutput(terminalId, stripped, task)
     }
     return stripped.trimEnd()
@@ -3095,14 +5263,10 @@ export class TerminalService {
     }
 
     if (options?.source === 'captured') {
+      // Sidecar output is the authoritative command transcript. Feed it
+      // unchanged into CommandTranscriptCapture so whitespace, blank lines,
+      // carriage returns, and control-sequence metadata share one projector.
       return output
-        .replace(/\r\n/g, '\n')
-        .replace(/\r/g, '\n')
-        .split('\n')
-        .map((line) => stripTerminalControlSequences(line).replace(/[ \t]+$/g, ''))
-        .join('\n')
-        .replace(/^\n+/g, '')
-        .replace(/\n+$/g, '')
     }
 
     const logicalLineOutput = output.replace(/\x1b\[(\d+);(\d+)H/g, (_match, _row, col) =>
@@ -3154,72 +5318,6 @@ export class TerminalService {
     }
 
     return cleanedLines.join('\n')
-  }
-
-  private shouldUseWindowsNativeFallbackCapture(task: CommandTask): boolean {
-    const command = String(task.command || '').trim()
-    if (!command) {
-      return false
-    }
-    if (!WINDOWS_NATIVE_PIPELINE_PATTERN.test(command)) {
-      return false
-    }
-    if (WINDOWS_POWERSHELL_SPECIAL_PATTERN.test(command)) {
-      return false
-    }
-    return !WINDOWS_POWERSHELL_CMDLET_PATTERN.test(command)
-  }
-
-  private async maybeCaptureWindowsSyntheticFallbackOutput(
-    terminal: TerminalTab,
-    task: CommandTask,
-    update: TerminalCommandTrackingUpdate
-  ): Promise<void> {
-    const currentOutput = task.capturedOutput
-    if (!this.shouldUseWindowsNativeFallbackCapture(task)) {
-      return
-    }
-    if (typeof currentOutput === 'string' && currentOutput.trim().length > 0) {
-      return
-    }
-    const backend = this.getBackend(terminal.type)
-    if (typeof backend.execOnSession !== 'function') {
-      return
-    }
-
-    const commandB64 = Buffer.from(task.command, 'utf8').toString('base64')
-    const fallbackScript = [
-      '$__gyshell_utf8=[Text.UTF8Encoding]::new($false)',
-      '[Console]::OutputEncoding=$__gyshell_utf8',
-      '$OutputEncoding=$__gyshell_utf8',
-      `$__gyshell_cmd_b64='${commandB64}'`,
-      '$__gyshell_cmd=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($__gyshell_cmd_b64))',
-      '$ProgressPreference=\'SilentlyContinue\'',
-      update.cwd
-        ? `$__gyshell_cwd='${escapePowerShellSingleQuotedString(update.cwd.replace(/\//g, '\\'))}'`
-        : '',
-      update.cwd ? 'Set-Location -LiteralPath $__gyshell_cwd' : '',
-      '. ([scriptblock]::Create($__gyshell_cmd))'
-    ]
-      .filter(Boolean)
-      .join(';')
-    const encodedScript = Buffer.from(fallbackScript, 'utf16le').toString('base64')
-    const fallbackCommand =
-      `powershell.exe -NoLogo -NoProfile -NonInteractive -EncodedCommand ${encodedScript}`
-
-    try {
-      const fallbackResult = await backend.execOnSession(
-        terminal.ptyId,
-        fallbackCommand,
-        30000
-      )
-      const stdout = String(fallbackResult?.stdout || '')
-      if (stdout.trim().length > 0) {
-        task.capturedOutput = stdout
-      }
-    } catch {
-      // Keep the primary captured output path result when the hidden fallback fails.
-    }
   }
 
   private stripSyntheticCommandEchoPrefix(
@@ -3345,8 +5443,6 @@ export class TerminalService {
 
   private isWindowsSshNoiseLine(line: string, task: CommandTask): boolean {
     if (!line) return false
-    if (line.startsWith(WINDOWS_TASK_FINISH_PREFIX)) return true
-    if (line.includes('__GYSHELL_READY__')) return true
     if (task.command && this.isEchoedCommandLine(line, task.command)) return true
     if (task.wireCommand && this.isEchoedCommandLine(line, task.wireCommand)) return true
     return false
@@ -3368,56 +5464,6 @@ export class TerminalService {
 
   private normalizeCommandEchoComparison(value: string): string {
     return value.replace(/\s+/g, ' ').trim()
-  }
-
-  private selectWindowsTaskOutput(
-    renderedOutput: string | undefined,
-    streamedOutput: string,
-    task: CommandTask
-  ): string {
-    if (renderedOutput && WINDOWS_PROMPT_ONLY_PATTERN.test(renderedOutput.trim())) {
-      return streamedOutput || ''
-    }
-
-    const renderedSignal = this.measureTaskOutputSignal(renderedOutput)
-    const streamedSignal = this.measureTaskOutputSignal(streamedOutput)
-
-    if (renderedSignal > 0 && this.looksLikeWindowsCommandEchoPollution(streamedOutput, task)) {
-      return renderedOutput || ''
-    }
-    if (streamedSignal > renderedSignal) {
-      return streamedOutput
-    }
-    if (renderedSignal > 0) {
-      return renderedOutput || ''
-    }
-    return streamedOutput || renderedOutput || ''
-  }
-
-  private measureTaskOutputSignal(output: string | undefined): number {
-    if (!output) return 0
-    return output.replace(/\s+/g, '').length
-  }
-
-  private looksLikeWindowsCommandEchoPollution(output: string, task: CommandTask): boolean {
-    const command = this.normalizeCommandEchoComparison(task.command || task.wireCommand || '')
-    const normalizedOutput = this.normalizeCommandEchoComparison(output)
-    if (!command || !normalizedOutput) {
-      return false
-    }
-    if (
-      normalizedOutput.includes(command) &&
-      normalizedOutput !== command
-    ) {
-      return true
-    }
-
-    const commandWords = command.split(/\s+/).filter(Boolean)
-    const echoPrefix = commandWords.slice(0, 2).join(' ')
-    if (!echoPrefix) {
-      return false
-    }
-    return normalizedOutput.split(echoPrefix).length - 1 >= 2
   }
 
   private sendToRenderer(channel: string, data: unknown): void {

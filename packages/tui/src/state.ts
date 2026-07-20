@@ -1,4 +1,8 @@
 import type { ChatMessage, UIUpdateAction } from "./protocol";
+import {
+  extractCommandOutputDisplayText,
+  parseCommandOutputContractV1,
+} from "@gyshell/shared";
 
 export interface SessionState {
   id: string;
@@ -8,6 +12,10 @@ export interface SessionState {
   isBusy: boolean;
   lockedProfileId: string | null;
 }
+
+const isCommandOutputLifecycleUpdate = (update: UIUpdateAction): boolean =>
+  update.type === "UPDATE_MESSAGE" &&
+  update.patch.metadata?.commandOutput !== undefined;
 
 export function createSessionState(
   id: string,
@@ -106,8 +114,12 @@ export function applyUiUpdateToUnloadedSession(
     case "INSERT_MESSAGE":
     case "APPEND_CONTENT":
     case "APPEND_OUTPUT":
-    case "UPDATE_MESSAGE":
       session.isBusy = true;
+      break;
+    case "UPDATE_MESSAGE":
+      if (!isCommandOutputLifecycleUpdate(update)) {
+        session.isBusy = true;
+      }
       break;
     case "DONE":
       session.isThinking = false;
@@ -228,7 +240,9 @@ export function applyUiUpdate(
       const msg = session.messages.find((item) => item.id === update.messageId);
       if (msg) {
         Object.assign(msg, update.patch);
-        session.isBusy = true;
+        if (!isCommandOutputLifecycleUpdate(update)) {
+          session.isBusy = true;
+        }
       }
       break;
     }
@@ -384,14 +398,22 @@ export function compactMessageSummary(
 
   if (message.type === "command") {
     const command = message.content || message.metadata?.command || "";
-    const output = normalizeCompactText(message.metadata?.output ?? "");
+    const output = normalizeCompactText(getTuiDisplayOutput(message.metadata));
+    const commandOutputStatus = getTuiCommandOutputStatus(message);
+    const statusSuffix = commandOutputStatus
+      ? ` [${formatTuiCommandOutputStatus(commandOutputStatus)}]`
+      : "";
     const suffix = showDetails && output ? ` | ${short(output, 140)}` : "";
-    return `$ ${short(command, 80)}${suffix}`;
+    return `$ ${short(command, 80)}${statusSuffix}${suffix}`;
   }
 
   if (message.type === "tool_call") {
     const name = message.metadata?.toolName ?? "tool";
-    return `${name}: ${short(message.content, showDetails ? 180 : 80)}`;
+    const commandOutputStatus = getTuiCommandOutputStatus(message);
+    const statusSuffix = commandOutputStatus
+      ? ` [${formatTuiCommandOutputStatus(commandOutputStatus)}]`
+      : "";
+    return `${name}${statusSuffix}: ${short(message.content, showDetails ? 180 : 80)}`;
   }
 
   if (message.type === "file_edit") {
@@ -426,6 +448,133 @@ export function compactMessageSummary(
   if (message.type === "error") return `error: ${short(message.content, 120)}`;
 
   return short(message.content, 120);
+}
+
+export function getTuiDisplayOutput(
+  metadata: ChatMessage["metadata"] | undefined,
+): string {
+  return getTuiHumanDisplayText(metadata?.output ?? "");
+}
+
+export function getTuiHumanDisplayText(value: string): string {
+  return extractCommandOutputDisplayText(String(value || ""));
+}
+
+const extractLegacyTerminalContent = (value: string): string | undefined => {
+  const match = String(value || "").match(
+    /<terminal_content>\s*([\s\S]*?)\s*<\/terminal_content>/i,
+  );
+  return match ? String(match[1] || "").trim() : undefined;
+};
+
+export function summarizeTuiTerminalOutput(raw: string): string {
+  const normalized = String(raw || "");
+  const decoded = extractCommandOutputDisplayText(normalized);
+  const content =
+    decoded !== normalized
+      ? decoded
+      : extractLegacyTerminalContent(normalized) ?? normalized;
+  const firstLine = content
+    .split("\n")
+    .map((line) => line.trim())
+    .find((line) => !!line && !line.startsWith("="));
+  return firstLine || "";
+}
+
+export interface TuiCommandOutputStatus {
+  parts: [execution: string, capture: string, presentation: string];
+  tone: "neutral" | "warning" | "error";
+}
+
+export function formatTuiCommandOutputStatus(
+  status: TuiCommandOutputStatus,
+): string {
+  const severity =
+    status.tone === "neutral"
+      ? ""
+      : `${status.tone === "warning" ? "WARN" : "ERROR"} | `;
+  return `${severity}${status.parts.join(" | ")}`;
+}
+
+export function getTuiCommandOutputStatus(
+  message: ChatMessage,
+): TuiCommandOutputStatus | null {
+  return getTuiCommandOutputStatusFromMetadata(message.metadata);
+}
+
+export function getTuiCommandOutputStatusFromMetadata(
+  metadata: ChatMessage["metadata"] | undefined,
+): TuiCommandOutputStatus | null {
+  const contract = parseCommandOutputContractV1(metadata?.commandOutput);
+  if (!contract) return null;
+
+  const execution = (() => {
+    switch (contract.executionState) {
+      case "running":
+        return "execution=running";
+      case "finished":
+        return typeof contract.exitCode === "number"
+          ? `execution=exit:${contract.exitCode}`
+          : "execution=finished";
+      case "aborted":
+        return "execution=aborted";
+      case "outcome_unknown":
+        return "execution=outcome-unknown";
+    }
+  })();
+  const captureState = (() => {
+    switch (contract.capture.state) {
+      case "in_progress":
+        return "in-progress";
+      case "complete":
+        return "complete";
+      case "incomplete":
+        return "incomplete";
+      case "unknown":
+        return "unknown";
+    }
+  })();
+  const captureDetails: string[] = [];
+  if (contract.capture.reason) {
+    captureDetails.push(`reason=${contract.capture.reason}`);
+  }
+  if (
+    contract.capture.observedUtf8Bytes !== contract.capture.retainedUtf8Bytes
+  ) {
+    captureDetails.push(
+      `retained=${contract.capture.retainedUtf8Bytes}/${contract.capture.observedUtf8Bytes}B`,
+    );
+  }
+  if (contract.capture.terminalControlsObserved) {
+    captureDetails.push("terminal-controls=observed");
+  }
+  const capture = `capture=${captureState}${
+    captureDetails.length > 0 ? `(${captureDetails.join(",")})` : ""
+  }`;
+  const presentation = (() => {
+    switch (contract.presentation.state) {
+      case "none":
+        return "presentation=none";
+      case "full":
+        return "presentation=all-captured";
+      case "excerpt":
+        return "presentation=excerpt";
+    }
+  })();
+  const hasFailedExit =
+    contract.executionState === "finished" &&
+    typeof contract.exitCode === "number" &&
+    contract.exitCode !== 0;
+  const hasUncertainState =
+    contract.executionState === "aborted" ||
+    contract.executionState === "outcome_unknown" ||
+    contract.capture.state === "incomplete" ||
+    contract.capture.state === "unknown";
+
+  return {
+    parts: [execution, capture, presentation],
+    tone: hasFailedExit ? "error" : hasUncertainState ? "warning" : "neutral",
+  };
 }
 
 function normalizeCompactText(input: string): string {

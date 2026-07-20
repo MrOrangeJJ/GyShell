@@ -9,6 +9,7 @@ import {
 import { v4 as uuidv4 } from "uuid";
 import { ChatQueueStore, type QueueItem } from "./ChatQueueStore";
 import type { InputImageAttachment, UserInputPayload } from "../lib/userInput";
+import type { CommandOutputContractV1 } from "@gyshell/shared";
 
 const buildAutoSessionTitle = (content: string): string => {
   const normalized = String(content || "")
@@ -47,6 +48,7 @@ export interface ChatMessage {
     action?: "created" | "edited" | "error";
     collapsed?: boolean;
     isNowait?: boolean;
+    commandOutput?: CommandOutputContractV1;
     toolName?: string;
     subToolTitle?: string;
     subToolHint?: string;

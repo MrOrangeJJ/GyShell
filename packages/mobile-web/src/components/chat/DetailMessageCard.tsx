@@ -14,6 +14,7 @@ import {
 import type { ChatMessage } from "../../types";
 import { MarkdownContent } from "../common/MarkdownContent";
 import { MentionContent } from "../common/MentionContent";
+import { CommandOutputStatus } from "./CommandOutputStatus";
 
 interface DetailMessageCardProps {
   message: ChatMessage;
@@ -128,6 +129,10 @@ export const DetailMessageCard: React.FC<DetailMessageCardProps> = ({
         </div>
         <span>{formatClock(message.timestamp)}</span>
       </header>
+
+      {message.metadata?.commandOutput ? (
+        <CommandOutputStatus message={message} />
+      ) : null}
 
       {detailToRender ? (
         <pre

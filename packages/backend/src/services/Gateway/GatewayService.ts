@@ -163,8 +163,12 @@ export class GatewayService extends EventEmitter implements IGatewayRuntime {
   private setupInternalSubscriptions() {
     // UIHistoryService subscribes to all agent events for persistence
     this.subscribe("agent:event", (event) => {
+      const sessionId = String(event.sessionId || "").trim();
+      if (!sessionId || this.deletedSessionIds.has(sessionId)) {
+        return;
+      }
       const actions = this.uiHistoryService.recordEvent(
-        event.sessionId!,
+        sessionId,
         event.payload,
       );
 
@@ -172,6 +176,30 @@ export class GatewayService extends EventEmitter implements IGatewayRuntime {
       actions.forEach((action) => this.sendUIUpdate(action));
       // 2. Send raw Agent Event (for auxiliary components like Banners, status lights, etc.)
       this.transportHub.emitEvent(event);
+      const commandOutput = event.payload.commandOutput;
+      if (
+        event.payload.type === "command_finished" &&
+        event.payload.isNowait === true &&
+        commandOutput !== undefined
+      ) {
+        // Every typed background transition is its own durability boundary.
+        // In particular, a manual stop clears the foreground run before the
+        // exec_command AbortError handler can publish its still-running
+        // replacement. Relying on dispatchTask's finally-flush would then
+        // leave that late running snapshot dirty only in memory. Persist both
+        // the running handoff and the eventual settled replacement so a
+        // restart can conservatively recover either state.
+        try {
+          this.uiHistoryService.flush(sessionId, {
+            preserveLiveTransientState: true,
+          });
+        } catch (error) {
+          console.error(
+            `[GatewayService] Failed to persist background command transition for ${sessionId}:`,
+            error,
+          );
+        }
+      }
     });
   }
 

@@ -1,7 +1,10 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import type { TerminalConfig } from '../../types'
-import { normalizePersistedTerminalConfig } from './terminalConnectionSupport'
+import {
+  isValidTerminalRuntimeId,
+  normalizePersistedTerminalConfig,
+} from './terminalConnectionSupport'
 
 export interface PersistedTerminalRecord {
   id: string
@@ -24,7 +27,7 @@ const normalizeRecord = (raw: unknown): PersistedTerminalRecord | null => {
   const config = normalizePersistedTerminalConfig(raw.config)
   if (!config) return null
   const id = typeof raw.id === 'string' ? raw.id.trim() : config.id
-  if (!id) return null
+  if (!isValidTerminalRuntimeId(id)) return null
   return {
     id,
     config: {

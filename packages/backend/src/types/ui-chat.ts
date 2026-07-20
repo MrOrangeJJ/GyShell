@@ -1,3 +1,4 @@
+import type { CommandOutputContractV1 } from '@gyshell/shared'
 import type { InputImageAttachment } from './index'
 
 export type MessageType =
@@ -30,6 +31,7 @@ export interface ChatMessage {
     action?: 'created' | 'edited' | 'error'
     collapsed?: boolean
     isNowait?: boolean
+    commandOutput?: CommandOutputContractV1
     toolName?: string
     subToolTitle?: string
     subToolHint?: string

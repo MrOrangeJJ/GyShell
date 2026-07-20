@@ -1,4 +1,5 @@
 import type { ChatMessage, UIUpdateAction } from "./types";
+import { extractCommandOutputDisplayText } from "@gyshell/shared";
 
 export interface SessionState {
   id: string;
@@ -18,6 +19,10 @@ export interface SessionMeta {
   loaded: boolean;
   uiRevision?: number;
 }
+
+const isCommandOutputLifecycleUpdate = (update: UIUpdateAction): boolean =>
+  update.type === "UPDATE_MESSAGE" &&
+  update.patch.metadata?.commandOutput !== undefined;
 
 export function shouldReplayUiUpdateAfterSnapshot(
   update: UIUpdateAction,
@@ -199,8 +204,12 @@ export function applyUiUpdateToUnloadedSession(
     case "INSERT_MESSAGE":
     case "APPEND_CONTENT":
     case "APPEND_OUTPUT":
-    case "UPDATE_MESSAGE":
       session.isBusy = true;
+      break;
+    case "UPDATE_MESSAGE":
+      if (!isCommandOutputLifecycleUpdate(update)) {
+        session.isBusy = true;
+      }
       break;
     case "DONE":
       session.isThinking = false;
@@ -247,9 +256,12 @@ export function applyUiUpdate(
       );
       session.messages.push(message);
 
+      if (message.type !== "tokens_count") {
+        session.isBusy = true;
+      }
+
       if (message.role === "user") {
         session.isThinking = true;
-        session.isBusy = true;
         const firstUser =
           session.messages.filter((item) => item.role === "user").length === 1;
         const currentTitle = String(session.title || "").trim();
@@ -318,7 +330,9 @@ export function applyUiUpdate(
       );
       if (message) {
         Object.assign(message, update.patch);
-        session.isBusy = true;
+        if (!isCommandOutputLifecycleUpdate(update)) {
+          session.isBusy = true;
+        }
       }
       break;
     }
@@ -503,7 +517,10 @@ export function isEmptyMessageContent(message: ChatMessage): boolean {
     return false;
   }
   const content = normalizeDisplayText(message.content || "");
-  const output = normalizeDisplayText(message.metadata?.output || "");
+  const rawOutput = message.metadata?.output || "";
+  const output = normalizeDisplayText(
+    extractCommandOutputDisplayText(rawOutput),
+  );
   return content.trim().length === 0 && output.trim().length === 0;
 }
 
@@ -519,10 +536,12 @@ export function previewFromSession(session: SessionState): string {
 
   if (!latest) return "";
 
+  const rawOutput = latest.metadata?.output || "";
+  const displayOutput = extractCommandOutputDisplayText(rawOutput);
   const base =
     latest.type === "command"
-      ? latest.metadata?.output || latest.content
-      : latest.metadata?.output ||
+      ? displayOutput || latest.content
+      : displayOutput ||
         latest.content ||
         (Array.isArray(latest.metadata?.inputImages) &&
         latest.metadata.inputImages.length > 0
@@ -531,7 +550,14 @@ export function previewFromSession(session: SessionState): string {
               .join(", ")
           : "");
 
-  return normalizeDisplayText(base).replace(/\s+/g, " ").trim().slice(0, 140);
+  return normalizeSessionPreview(base);
+}
+
+export function normalizeSessionPreview(input: string): string {
+  return normalizeDisplayText(extractCommandOutputDisplayText(input))
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 140);
 }
 
 export function reorderSessionIds(

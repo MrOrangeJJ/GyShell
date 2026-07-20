@@ -87,6 +87,10 @@ export function formatTerminalStatusHeader(snapshot: TerminalRuntimeSnapshot): s
     `Terminal: ${snapshot.title || snapshot.id} (id=${snapshot.id}, type=${snapshot.type})`,
     'terminal_status:',
     `- runtime_state: ${snapshot.runtimeState}`,
+    `- shell_input_state: ${snapshot.shellInputState || 'unknown'}`,
+    ...(snapshot.commandProtocolAvailable !== undefined
+      ? [`- command_protocol_available: ${snapshot.commandProtocolAvailable}`]
+      : []),
     `- tab_still_exists: true`,
     `- reconnectable: ${snapshot.reconnectable}`,
     ...(typeof snapshot.lastExitCode === 'number'
@@ -110,18 +114,30 @@ export function formatTerminalUnavailableForTool(
       ? 'disconnected'
       : snapshot.runtimeState === 'initializing'
         ? 'initializing'
-        : 'not ready'
+        : snapshot.shellInputState === 'busy'
+          ? 'connected, but its shell is busy and not at a prompt'
+          : snapshot.commandProtocolAvailable === false
+            ? 'connected, but its shell has no reliable exec_command boundary protocol'
+          : 'not ready'
   const lines = [
     `Error: Terminal tab "${snapshot.title || snapshot.id}" (id=${snapshot.id}, type=${snapshot.type}) is ${stateLabel}.`,
     'terminal_status:',
     `- runtime_state: ${snapshot.runtimeState}`,
+    `- shell_input_state: ${snapshot.shellInputState || 'unknown'}`,
+    ...(snapshot.commandProtocolAvailable !== undefined
+      ? [`- command_protocol_available: ${snapshot.commandProtocolAvailable}`]
+      : []),
     `- tab_still_exists: true`,
     `- reconnectable: ${snapshot.reconnectable}`,
     ...(typeof snapshot.lastExitCode === 'number'
       ? [`- last_exit_code: ${snapshot.lastExitCode}`]
       : []),
     '',
-    `Cannot ${operation} until the terminal is connected and ready.`
+    snapshot.commandProtocolAvailable === false
+      ? `Cannot ${operation} because this shell cannot provide reliable command start/end boundaries. Use write_stdin for manual interaction or open a bash, zsh, or PowerShell terminal.`
+      : `Cannot ${operation} until the terminal is connected and ready${
+          snapshot.shellInputState === 'busy' ? ' at an idle shell prompt' : ''
+        }.`
   ]
 
   if (snapshot.runtimeState === 'exited') {

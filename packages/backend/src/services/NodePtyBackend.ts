@@ -9,13 +9,19 @@ import {
 import * as os from 'os'
 import * as fs from 'fs'
 import * as path from 'path'
+import { randomBytes } from 'node:crypto'
 import { pipeline } from 'node:stream/promises'
 import { execFile, spawn } from 'child_process'
 import { promisify } from 'util'
+import { StringDecoder } from 'node:string_decoder'
+import { COMMAND_CAPTURE_MAX_UTF8_BYTES } from '@gyshell/shared'
 import {
   isLocalConnectionConfig,
+  type TerminalCommandShellFamily,
   type TerminalCommandTrackingToken,
+  type TerminalCommandTrackingMode,
   type TerminalCommandTrackingUpdate,
+  type TerminalCommandProtocolMetadata,
   type TerminalBackend,
   type TerminalConfig,
   type TerminalExecOptions,
@@ -23,29 +29,45 @@ import {
   type FileStatInfo,
 } from '../types'
 import {
+  buildWindowsPowerShellBootstrapLoaderEncodedCommand,
+  buildWindowsPowerShellBootstrapScript,
+  buildWindowsPowerShellDispatchInput,
+  buildWindowsPowerShellRequestMarkerPath,
   buildWindowsPowerShellEncodedCommand,
   parseWindowsBuildNumber,
   parseWindowsPromptMarkerLine,
+  parseWindowsPowerShellRequestMarkerFile,
   shouldUseWindowsPowerShellSidecar,
   WINDOWS_POWERSHELL_COMMAND_OUTPUT_FILE_PREFIX,
   WINDOWS_POWERSHELL_COMMAND_REQUEST_FILE_PREFIX,
   WINDOWS_POWERSHELL_LOCAL_SIDECAR_DIR_PREFIX,
+  WINDOWS_POWERSHELL_REQUEST_MARKER_MAX_UTF8_BYTES,
   WINDOWS_POWERSHELL_SIDECAR_RETENTION_MS,
   type WindowsCommandTrackingMode,
   type WindowsPromptMarkerState,
 } from './windowsPowerShellTracking'
+import {
+  buildCommandProtocolMarkerPrefix,
+  buildInitializationReadyMarker,
+  buildUnixCommandDispatcherScript,
+  consumeInitializationReadyMarker,
+} from './terminal/CommandStreamProtocol'
 
 const execFileAsync = promisify(execFile)
-
-const GYSHELL_READY_MARKER = '__GYSHELL_READY__'
 
 interface PtyInstance {
   pty: pty.IPty
   dataCallbacks: Set<(data: string) => void>
   exitCallbacks: Set<(code: number) => void>
-  oscBuffer: string
+  pendingData: string
   isInitializing?: boolean
   buffer?: string
+}
+
+interface BoundedCommandOutput {
+  text: string
+  observedUtf8Bytes: number
+  truncated: boolean
 }
 
 export class NodePtyBackend implements TerminalBackend {
@@ -57,6 +79,9 @@ export class NodePtyBackend implements TerminalBackend {
   private promptMarkerPathByPtyId: Map<string, string> = new Map()
   private commandRequestPathByPtyId: Map<string, string> = new Map()
   private commandOutputPathByPtyId: Map<string, string> = new Map()
+  private commandProtocolAvailabilityByPtyId: Map<string, boolean> = new Map()
+  private commandProtocolTokenByPtyId: Map<string, string> = new Map()
+  private commandShellFamilyByPtyId: Map<string, TerminalCommandShellFamily> = new Map()
   private promptMarkerStateByPtyId: Map<string, WindowsPromptMarkerState> = new Map()
   private hasScannedWindowsSidecarTempDirs = false
 
@@ -166,38 +191,55 @@ export class NodePtyBackend implements TerminalBackend {
   }
 
   async prepareCommandTracking(ptyId: string): Promise<TerminalCommandTrackingToken | undefined> {
-    if (this.commandTrackingModeByPtyId.get(ptyId) !== 'windows-powershell-sidecar') {
+    const runtimeInstance = this.ptys.get(ptyId)
+    const commandTrackingMode = this.commandTrackingModeByPtyId.get(ptyId)
+    if (commandTrackingMode !== 'windows-powershell-sidecar') {
       return undefined
     }
-    const cachedSnapshot = this.promptMarkerStateByPtyId.get(ptyId) || null
+    const markerPath = this.promptMarkerPathByPtyId.get(ptyId)
+    const commandRequestPath = this.commandRequestPathByPtyId.get(ptyId)
+    const commandOutputPath = this.commandOutputPathByPtyId.get(ptyId)
+    const commandProtocolToken = this.commandProtocolTokenByPtyId.get(ptyId)
+    if (!markerPath) {
+      throw new Error('Windows prompt marker path is unavailable for this runtime.')
+    }
+    const runtimeIsCurrent = (): boolean =>
+      this.ptys.get(ptyId) === runtimeInstance &&
+      this.commandTrackingModeByPtyId.get(ptyId) === commandTrackingMode &&
+      this.promptMarkerPathByPtyId.get(ptyId) === markerPath &&
+      this.commandRequestPathByPtyId.get(ptyId) === commandRequestPath &&
+      this.commandOutputPathByPtyId.get(ptyId) === commandOutputPath &&
+      this.commandProtocolTokenByPtyId.get(ptyId) === commandProtocolToken
+    const buildToken = (baselineSequence: number): TerminalCommandTrackingToken => ({
+      mode: 'windows-powershell-sidecar',
+      trackingScopeId: commandProtocolToken,
+      baselineSequence,
+      dispatchMode: commandRequestPath ? 'prompt-file' : undefined,
+      dispatchInput: commandRequestPath
+        ? buildWindowsPowerShellDispatchInput(commandProtocolToken)
+        : undefined,
+      displayMode: commandRequestPath ? 'synthetic-transcript' : undefined,
+      commandRequestPath,
+      commandOutputPath,
+    })
     const snapshot = await this.refreshPromptMarkerState(ptyId, {
       allowCachedFallback: false,
+      baseMarkerPath: markerPath,
     })
-    if (!snapshot && !cachedSnapshot) {
-      const resetOk = await this.resetPromptMarkerFile(ptyId)
-      return {
-        mode: 'windows-powershell-sidecar',
-        baselineSequence: 0,
-        awaitingInitialFreshMarker: !resetOk,
-        dispatchMode: this.commandRequestPathByPtyId.get(ptyId) ? 'prompt-file' : undefined,
-        displayMode: this.commandRequestPathByPtyId.get(ptyId) ? 'synthetic-transcript' : undefined,
-        commandRequestPath: this.commandRequestPathByPtyId.get(ptyId),
-        commandOutputPath: this.commandOutputPathByPtyId.get(ptyId),
+    if (!runtimeIsCurrent()) {
+      throw new Error('Windows prompt marker runtime changed during preparation.')
+    }
+    if (!snapshot) {
+      const resetOk = await this.resetPromptMarkerFile(ptyId, markerPath)
+      if (!resetOk || !runtimeIsCurrent()) {
+        throw new Error('Unable to establish a live Windows prompt marker baseline.')
       }
+      return buildToken(0)
     }
-    const resolvedSnapshot = snapshot || cachedSnapshot
-    if (!resolvedSnapshot) {
-      return undefined
+    if (!(await this.resetPromptMarkerFile(ptyId, markerPath)) || !runtimeIsCurrent()) {
+      throw new Error('Unable to reset the live Windows prompt marker journal.')
     }
-    return {
-      mode: 'windows-powershell-sidecar',
-      baselineSequence: resolvedSnapshot.sequence,
-      awaitingInitialFreshMarker: !snapshot && !!cachedSnapshot,
-      dispatchMode: this.commandRequestPathByPtyId.get(ptyId) ? 'prompt-file' : undefined,
-      displayMode: this.commandRequestPathByPtyId.get(ptyId) ? 'synthetic-transcript' : undefined,
-      commandRequestPath: this.commandRequestPathByPtyId.get(ptyId),
-      commandOutputPath: this.commandOutputPathByPtyId.get(ptyId),
-    }
+    return buildToken(snapshot.sequence)
   }
 
   async pollCommandTracking(
@@ -210,28 +252,83 @@ export class NodePtyBackend implements TerminalBackend {
     if (this.commandTrackingModeByPtyId.get(ptyId) !== 'windows-powershell-sidecar') {
       return undefined
     }
+    if (
+      token.trackingScopeId &&
+      this.commandProtocolTokenByPtyId.get(ptyId) !== token.trackingScopeId
+    ) {
+      return undefined
+    }
     const snapshot = await this.refreshPromptMarkerState(ptyId, {
       allowCachedFallback: !token.awaitingInitialFreshMarker,
+      expectedRequestId: token.expectedRequestId,
     })
     if (!snapshot || snapshot.sequence <= token.baselineSequence) {
       return undefined
     }
+    if (
+      token.trackingScopeId &&
+      this.commandProtocolTokenByPtyId.get(ptyId) !== token.trackingScopeId
+    ) {
+      return undefined
+    }
+    if (
+      token.expectedRequestId &&
+      snapshot.requestId !== token.expectedRequestId
+    ) {
+      return undefined
+    }
     if (token.awaitingInitialFreshMarker) {
-      const dispatchedAtMs = token.dispatchedAtMs || 0
-      if (snapshot.modifiedAtMs !== undefined && snapshot.modifiedAtMs <= dispatchedAtMs) {
-        token.baselineSequence = snapshot.sequence
-        return undefined
-      }
       token.awaitingInitialFreshMarker = false
     }
-    const output = await this.readCommandOutputFile(token.commandOutputPath || this.commandOutputPathByPtyId.get(ptyId))
+    const output = await this.readCommandOutputFile(
+      token.commandOutputPath || this.commandOutputPathByPtyId.get(ptyId)
+    )
+    if (
+      token.trackingScopeId &&
+      this.commandProtocolTokenByPtyId.get(ptyId) !== token.trackingScopeId
+    ) {
+      return undefined
+    }
+    if (token.expectCommandOutput && token.commandOutputPath && !output) {
+      throw new Error('Windows sidecar output file is not readable yet.')
+    }
+    if (token.expectCommandOutput && output) {
+      if (snapshot.outputRetainedUtf8Bytes === undefined) {
+        throw new Error('Windows sidecar completion marker has no retained output length.')
+      }
+      if (output.observedUtf8Bytes !== snapshot.outputRetainedUtf8Bytes) {
+        throw new Error('Windows sidecar output file length does not match its completion marker.')
+      }
+      if (Buffer.byteLength(output.text, 'utf8') !== output.observedUtf8Bytes) {
+        throw new Error('Windows sidecar output file was not read as one complete UTF-8 transcript.')
+      }
+    }
+    if (token.expectedRequestId) {
+      const baseMarkerPath = this.promptMarkerPathByPtyId.get(ptyId)
+      if (baseMarkerPath) {
+        const completedMarkerPath = buildWindowsPowerShellRequestMarkerPath(
+          baseMarkerPath,
+          token.expectedRequestId
+        )
+        await fs.promises.unlink(completedMarkerPath).catch(() => {
+          // Runtime cleanup and stale-sidecar retention remain the fallback.
+        })
+      }
+    }
     return {
       mode: 'windows-powershell-sidecar',
       sequence: snapshot.sequence,
       exitCode: snapshot.exitCode,
+      outcomeKnown: snapshot.outcomeKnown,
+      requestId: snapshot.requestId,
       cwd: snapshot.cwd,
       homeDir: snapshot.homeDir,
-      output,
+      output: output?.text,
+      outputObservedUtf8Bytes:
+        snapshot.outputObservedUtf8Bytes ?? output?.observedUtf8Bytes,
+      outputRetainedUtf8Bytes:
+        snapshot.outputRetainedUtf8Bytes ?? output?.observedUtf8Bytes,
+      outputTruncated: snapshot.outputTruncated ?? output?.truncated,
     }
   }
 
@@ -242,16 +339,14 @@ export class NodePtyBackend implements TerminalBackend {
     await this.refreshPromptMarkerState(ptyId)
   }
 
-  private stripReadyMarker(chunk: string): string {
-    if (!chunk.includes(GYSHELL_READY_MARKER)) return chunk
-    return chunk.replace(/__GYSHELL_READY__/g, '')
-  }
-
   private cleanupTempArtifacts(ptyId: string): void {
     this.commandTrackingModeByPtyId.delete(ptyId)
     this.promptMarkerPathByPtyId.delete(ptyId)
     this.commandRequestPathByPtyId.delete(ptyId)
     this.commandOutputPathByPtyId.delete(ptyId)
+    this.commandProtocolAvailabilityByPtyId.delete(ptyId)
+    this.commandProtocolTokenByPtyId.delete(ptyId)
+    this.commandShellFamilyByPtyId.delete(ptyId)
     this.promptMarkerStateByPtyId.delete(ptyId)
     const tmp = this.tmpPathsByPtyId.get(ptyId)
     if (!tmp) {
@@ -296,74 +391,197 @@ export class NodePtyBackend implements TerminalBackend {
 
   private async refreshPromptMarkerState(
     ptyId: string,
-    options?: { allowCachedFallback?: boolean }
+    options?: {
+      allowCachedFallback?: boolean
+      expectedRequestId?: string
+      baseMarkerPath?: string
+    }
   ): Promise<WindowsPromptMarkerState | null> {
-    const markerPath = this.promptMarkerPathByPtyId.get(ptyId)
-    if (!markerPath) {
+    const baseMarkerPath =
+      options?.baseMarkerPath ?? this.promptMarkerPathByPtyId.get(ptyId)
+    if (!baseMarkerPath) {
       return this.promptMarkerStateByPtyId.get(ptyId) || null
     }
+    if (
+      options?.baseMarkerPath &&
+      this.promptMarkerPathByPtyId.get(ptyId) !== options.baseMarkerPath
+    ) {
+      return null
+    }
+    const markerPath = options?.expectedRequestId
+      ? buildWindowsPowerShellRequestMarkerPath(
+          baseMarkerPath,
+          options.expectedRequestId
+        )
+      : baseMarkerPath
     try {
       const stats = await fs.promises.stat(markerPath)
+      if (
+        options?.expectedRequestId &&
+        stats.size > WINDOWS_POWERSHELL_REQUEST_MARKER_MAX_UTF8_BYTES
+      ) {
+        throw new Error('Windows sidecar request marker exceeds its protocol limit.')
+      }
       const raw = await fs.promises.readFile(markerPath, 'utf8')
-      const lines = raw.split(/\r?\n/)
-      for (let index = lines.length - 1; index >= 0; index -= 1) {
-        const parsed = parseWindowsPromptMarkerLine(lines[index] || '')
+      if (this.promptMarkerPathByPtyId.get(ptyId) !== baseMarkerPath) {
+        return null
+      }
+      const exactRequestMarker = options?.expectedRequestId
+        ? parseWindowsPowerShellRequestMarkerFile(
+            raw,
+            options.expectedRequestId
+          )
+        : undefined
+      if (options?.expectedRequestId && !exactRequestMarker) {
+        throw new Error('Windows sidecar request marker is malformed.')
+      }
+      const lines = exactRequestMarker ? [] : raw.split(/\r?\n/)
+      const candidates = exactRequestMarker ? [exactRequestMarker] : lines
+      for (let index = candidates.length - 1; index >= 0; index -= 1) {
+        const candidate = candidates[index]
+        const parsed = typeof candidate === 'string'
+          ? parseWindowsPromptMarkerLine(candidate)
+          : candidate
         if (!parsed) {
+          continue
+        }
+        if (
+          options?.expectedRequestId &&
+          parsed.requestId !== options.expectedRequestId
+        ) {
           continue
         }
         const next: WindowsPromptMarkerState = {
           sequence: parsed.sequence,
           exitCode: parsed.exitCode,
+          outcomeKnown: parsed.outcomeKnown,
+          requestId: parsed.requestId,
+          outputObservedUtf8Bytes: parsed.outputObservedUtf8Bytes,
+          outputRetainedUtf8Bytes: parsed.outputRetainedUtf8Bytes,
+          outputTruncated: parsed.outputTruncated,
           cwd: parsed.cwd ? this.normalizeDecodedLocalPath(parsed.cwd) || undefined : undefined,
           homeDir: parsed.homeDir ? this.normalizeDecodedLocalPath(parsed.homeDir) || undefined : undefined,
           modifiedAtMs: Number.isFinite(stats.mtimeMs) ? stats.mtimeMs : undefined,
         }
-        this.promptMarkerStateByPtyId.set(ptyId, next)
-        if (next.cwd) {
-          this.cwdByPtyId.set(ptyId, next.cwd)
-        }
-        if (next.homeDir) {
-          this.homeDirByPtyId.set(ptyId, next.homeDir)
+        if (!options?.expectedRequestId) {
+          this.promptMarkerStateByPtyId.set(ptyId, next)
+          if (next.cwd) {
+            this.cwdByPtyId.set(ptyId, next.cwd)
+          }
+          if (next.homeDir) {
+            this.homeDirByPtyId.set(ptyId, next.homeDir)
+          }
         }
         return next
       }
     } catch (error: any) {
-      if (!(error?.code === 'ENOENT')) {
+      if (error?.code !== 'ENOENT' && options?.expectedRequestId) {
+        throw error
+      }
+      if (error?.code !== 'ENOENT') {
         // ignore transient best-effort read failures
       }
+    }
+    if (options?.expectedRequestId) {
+      // The immutable request marker is the completion commit record. Never
+      // substitute a mutable journal cache when that exact file is absent.
+      return null
     }
     if (options?.allowCachedFallback === false) {
       return null
     }
-    return this.promptMarkerStateByPtyId.get(ptyId) || null
+    const cached = this.promptMarkerStateByPtyId.get(ptyId)
+    return cached || null
   }
 
-  private async resetPromptMarkerFile(ptyId: string): Promise<boolean> {
-    const markerPath = this.promptMarkerPathByPtyId.get(ptyId)
+  private async resetPromptMarkerFile(
+    ptyId: string,
+    expectedMarkerPath?: string
+  ): Promise<boolean> {
+    const markerPath =
+      expectedMarkerPath ?? this.promptMarkerPathByPtyId.get(ptyId)
     if (!markerPath) {
+      return false
+    }
+    if (
+      expectedMarkerPath &&
+      this.promptMarkerPathByPtyId.get(ptyId) !== expectedMarkerPath
+    ) {
       return false
     }
     try {
       await fs.promises.mkdir(path.dirname(markerPath), { recursive: true })
       await fs.promises.writeFile(markerPath, '', 'utf8')
+      if (this.promptMarkerPathByPtyId.get(ptyId) !== markerPath) {
+        return false
+      }
+      this.promptMarkerStateByPtyId.delete(ptyId)
       return true
     } catch {
       return false
     }
   }
 
-  private async readCommandOutputFile(filePath?: string): Promise<string | undefined> {
+  private async readCommandOutputFile(
+    filePath?: string
+  ): Promise<BoundedCommandOutput | undefined> {
     if (!filePath) {
       return undefined
     }
+    let handle: fs.promises.FileHandle | undefined
     try {
-      const text = await fs.promises.readFile(filePath, 'utf8')
-      return text.replace(/^\ufeff/, '')
+      const stats = await fs.promises.stat(filePath)
+      const fileBytes = Math.max(0, Number(stats.size) || 0)
+      const bytesToRead = Math.min(
+        fileBytes,
+        COMMAND_CAPTURE_MAX_UTF8_BYTES + 6
+      )
+      handle = await fs.promises.open(filePath, 'r')
+      const buffer = Buffer.allocUnsafe(bytesToRead)
+      let bytesRead = 0
+      while (bytesRead < bytesToRead) {
+        const partRead = (
+          await handle.read(
+            buffer,
+            bytesRead,
+            bytesToRead - bytesRead,
+            bytesRead
+          )
+        ).bytesRead
+        if (partRead <= 0) {
+          break
+        }
+        bytesRead += partRead
+      }
+      if (bytesRead !== bytesToRead) {
+        return undefined
+      }
+      const bytes = buffer.subarray(0, bytesRead)
+      const decoder = new StringDecoder('utf8')
+      const decoded = decoder.end(bytes)
+      let retainedBytes = 0
+      let text = ''
+      for (const scalar of decoded) {
+        const scalarBytes = Buffer.byteLength(scalar, 'utf8')
+        if (retainedBytes + scalarBytes > COMMAND_CAPTURE_MAX_UTF8_BYTES) {
+          break
+        }
+        text += scalar
+        retainedBytes += scalarBytes
+      }
+      const observedUtf8Bytes = fileBytes
+      return {
+        text,
+        observedUtf8Bytes,
+        truncated: observedUtf8Bytes > retainedBytes,
+      }
     } catch (error: any) {
       if (error?.code === 'ENOENT') {
         return undefined
       }
       return undefined
+    } finally {
+      await handle?.close().catch(() => {})
     }
   }
 
@@ -408,6 +626,7 @@ export class NodePtyBackend implements TerminalBackend {
     const localConfig = config
 
     const shell = this.pickShell(localConfig.shell)
+    const commandShellFamily = this.resolveCommandShellFamily(shell)
     const cwdCandidate = localConfig.cwd || os.homedir()
     const cwd = fs.existsSync(cwdCandidate) ? cwdCandidate : os.homedir()
     const env = this.getSafeEnv()
@@ -419,6 +638,11 @@ export class NodePtyBackend implements TerminalBackend {
       LANG: 'en_US.UTF-8',
     }
 
+    const commandProtocolToken = this.shellSupportsCommandProtocol(shell)
+      ? randomBytes(16).toString('hex')
+      : undefined
+    const initializationReadyMarker = buildInitializationReadyMarker(commandProtocolToken)
+
     const {
       args,
       envOverrides,
@@ -427,7 +651,7 @@ export class NodePtyBackend implements TerminalBackend {
       promptMarkerPath,
       commandRequestPath,
       commandOutputPath,
-    } = this.buildShellIntegration(shell)
+    } = this.buildShellIntegration(shell, commandProtocolToken)
     const mergedEnv = { ...env, ...localeEnv, ...envOverrides }
 
     const ptyProcess = pty.spawn(shell, args, {
@@ -439,13 +663,14 @@ export class NodePtyBackend implements TerminalBackend {
       useConpty: os.platform() === 'win32',
     })
 
-    const isWindows = os.platform() === 'win32'
+    const waitsForPrivateReadyMarker =
+      commandShellFamily === 'powershell'
     const instance: PtyInstance = {
       pty: ptyProcess,
       dataCallbacks: new Set(),
       exitCallbacks: new Set(),
-      oscBuffer: '',
-      isInitializing: isWindows,
+      pendingData: '',
+      isInitializing: waitsForPrivateReadyMarker,
       buffer: '',
     }
 
@@ -453,33 +678,35 @@ export class NodePtyBackend implements TerminalBackend {
       const chunk = data.toString()
       if (instance.isInitializing) {
         instance.buffer += chunk
-        if (instance.buffer!.includes(GYSHELL_READY_MARKER)) {
+        const postInitializationData = consumeInitializationReadyMarker(
+          instance.buffer!,
+          initializationReadyMarker
+        )
+        if (postInitializationData !== undefined) {
           instance.isInitializing = false
-          const parts = instance.buffer!.split(GYSHELL_READY_MARKER)
-          if (parts.length > 1) {
-            const realContent = this.stripReadyMarker(parts.slice(1).join(GYSHELL_READY_MARKER)).trimStart()
-            if (realContent) {
-              this.consumeOscMarkers(config.id, realContent)
-              instance.dataCallbacks.forEach((callback) => callback(realContent))
-            }
+          const realContent = postInitializationData.trimStart()
+          if (realContent) {
+            this.emitPtyData(instance, realContent)
           }
           instance.buffer = ''
         }
       } else {
-        const sanitizedChunk = this.stripReadyMarker(chunk)
-        this.consumeOscMarkers(config.id, sanitizedChunk)
-        if (sanitizedChunk) {
-          instance.dataCallbacks.forEach((callback) => callback(sanitizedChunk))
-        }
+        this.emitPtyData(instance, chunk)
       }
     })
 
     ptyProcess.onExit(({ exitCode }) => {
+      // TerminalService can synchronously auto-restart a local terminal from
+      // an exit callback using the same public pty id. Retire this exact
+      // instance before notifying consumers so the old callback cannot erase
+      // replacement maps after spawn repopulates them.
+      if (this.ptys.get(config.id) === instance) {
+        this.ptys.delete(config.id)
+        this.cwdByPtyId.delete(config.id)
+        this.homeDirByPtyId.delete(config.id)
+        this.cleanupTempArtifacts(config.id)
+      }
       instance.exitCallbacks.forEach((callback) => callback(exitCode))
-      this.ptys.delete(config.id)
-      this.cwdByPtyId.delete(config.id)
-      this.homeDirByPtyId.delete(config.id)
-      this.cleanupTempArtifacts(config.id)
     })
 
     this.ptys.set(config.id, instance)
@@ -488,7 +715,61 @@ export class NodePtyBackend implements TerminalBackend {
     if (promptMarkerPath) this.promptMarkerPathByPtyId.set(config.id, promptMarkerPath)
     if (commandRequestPath) this.commandRequestPathByPtyId.set(config.id, commandRequestPath)
     if (commandOutputPath) this.commandOutputPathByPtyId.set(config.id, commandOutputPath)
+    this.commandProtocolAvailabilityByPtyId.set(
+      config.id,
+      this.shellSupportsCommandProtocol(shell)
+    )
+    if (commandProtocolToken) {
+      this.commandProtocolTokenByPtyId.set(config.id, commandProtocolToken)
+    }
+    if (commandShellFamily) {
+      this.commandShellFamilyByPtyId.set(config.id, commandShellFamily)
+    }
     return config.id
+  }
+
+  getCommandProtocolAvailability(ptyId: string): boolean | undefined {
+    return this.commandProtocolAvailabilityByPtyId.get(ptyId)
+  }
+
+  getCommandProtocolToken(ptyId: string): string | undefined {
+    return this.commandProtocolTokenByPtyId.get(ptyId)
+  }
+
+  getCommandShellFamily(
+    ptyId: string
+  ): TerminalCommandShellFamily | undefined {
+    return this.commandShellFamilyByPtyId.get(ptyId)
+  }
+
+  getCommandTrackingMode(
+    ptyId: string
+  ): TerminalCommandTrackingMode | undefined {
+    return this.commandTrackingModeByPtyId.get(ptyId) ===
+      'windows-powershell-sidecar'
+      ? 'windows-powershell-sidecar'
+      : undefined
+  }
+
+  private shellSupportsCommandProtocol(shellPath: string): boolean {
+    return this.resolveCommandShellFamily(shellPath) !== undefined
+  }
+
+  private resolveCommandShellFamily(
+    shellPath: string
+  ): TerminalCommandShellFamily | undefined {
+    const shellBase = path.basename(shellPath).toLowerCase()
+    if (shellBase.includes('zsh') || shellBase.includes('bash')) {
+      return 'unix'
+    }
+    if (
+      shellBase.includes('powershell') ||
+      shellBase.includes('pwsh') ||
+      shellBase.includes('cmd.exe')
+    ) {
+      return 'powershell'
+    }
+    return undefined
   }
 
   /**
@@ -499,7 +780,7 @@ export class NodePtyBackend implements TerminalBackend {
    * - bash: DEBUG trap (preexec-ish) and PROMPT_COMMAND (precmd-ish)
    * - zsh: preexec + precmd hooks
    */
-  private buildShellIntegration(shellPath: string): {
+  private buildShellIntegration(shellPath: string, runtimeToken?: string): {
     args: string[]
     envOverrides: Record<string, string>
     tmpPath?: string
@@ -509,11 +790,32 @@ export class NodePtyBackend implements TerminalBackend {
     commandOutputPath?: string
   } {
     const shellBase = path.basename(shellPath).toLowerCase()
+    const commandMarkerPrefix = buildCommandProtocolMarkerPrefix(runtimeToken)
+    const privateIdentifierPrefix = runtimeToken
+      ? `__gyshell_${runtimeToken}`
+      : '__gyshell'
     const packagedCliDirectory = process.env[PACKAGED_CLI_DIRECTORY_ENV]
     const packagedCliPathSnippet = buildPackagedCliPathShellSnippet(packagedCliDirectory)
 
     // zsh integration via ZDOTDIR/.zshrc (no visible setup commands)
     if (shellBase.includes('zsh')) {
+      const commandSequenceName = `${privateIdentifierPrefix}_command_seq`
+      const commandNonceName = `${privateIdentifierPrefix}_command_nonce`
+      const inCommandName = `${privateIdentifierPrefix}_in_command`
+      const dispatchActiveName = `${privateIdentifierPrefix}_dispatch_active`
+      const dispatchCompletionReadyName = `${privateIdentifierPrefix}_dispatch_completion_ready`
+      const dispatcherName = `${privateIdentifierPrefix}_dispatch`
+      const savedPromptEolName = `${privateIdentifierPrefix}_saved_prompt_eol_mark`
+      const savedExitName = `${privateIdentifierPrefix}_command_exit`
+      const preexecHookName = runtimeToken
+        ? `${privateIdentifierPrefix}_preexec`
+        : 'gyshell_preexec'
+      const precmdHookName = runtimeToken
+        ? `${privateIdentifierPrefix}_precmd`
+        : 'gyshell_precmd'
+      const precmdBeginHookName = runtimeToken
+        ? `${privateIdentifierPrefix}_precmd_begin`
+        : 'gyshell_precmd_begin'
       const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'gyshell-zsh-'))
       const wrapperZdotDir = quotePosixShellLiteral(tmpDir)
       const userZdotDirEnv = 'GYSHELL_USER_ZDOTDIR'
@@ -546,6 +848,12 @@ export class NodePtyBackend implements TerminalBackend {
           sourceUserProfile('zlogin') +
           captureUserZdotDir +
           `${packagedCliPathSnippet}\n` +
+          // .zlogin runs after .zshrc. Re-assert the private hooks in case a
+          // user login profile replaced the hook arrays during startup.
+          `autoload -Uz add-zsh-hook 2>/dev/null || true\n` +
+          `add-zsh-hook preexec ${preexecHookName}\n` +
+          `precmd_functions=(${precmdBeginHookName} \${precmd_functions:#${precmdBeginHookName}})\n` +
+          `precmd_functions=(\${precmd_functions:#${precmdHookName}} ${precmdHookName})\n` +
           `export ZDOTDIR="\${${userZdotDirEnv}:-$HOME}"\n` +
           `unset ${userZdotDirEnv}\n`,
         'utf8'
@@ -559,10 +867,23 @@ export class NodePtyBackend implements TerminalBackend {
         `${packagedCliPathSnippet}\n` +
         `autoload -Uz add-zsh-hook 2>/dev/null || true\n` +
         // Use builtin printf with octal escapes for better cross-shell portability.
-        `gyshell_preexec() { builtin printf "\\\\033]1337;gyshell_preexec\\\\007"; }\n` +
-        `gyshell_precmd() { local ec=$? cwd_b64; cwd_b64=$(printf "%s" "$PWD" | base64 | tr -d "\\n"); builtin printf "\\\\033]1337;gyshell_precmd;ec=%s;cwd_b64=%s\\\\007" "$ec" "$cwd_b64"; }\n` +
-        `add-zsh-hook preexec gyshell_preexec\n` +
-        `add-zsh-hook precmd gyshell_precmd\n`
+        `typeset -gi ${commandSequenceName}=0\n` +
+        `typeset -g ${commandNonceName}=\n` +
+        `typeset -gi ${inCommandName}=0\n` +
+        `typeset -gi ${dispatchActiveName}=0\n` +
+        `typeset -gi ${dispatchCompletionReadyName}=0\n` +
+        `typeset -g ${savedPromptEolName}=\n` +
+        `typeset -gi ${savedExitName}=0\n` +
+        `${preexecHookName}() { if [[ "\${1-}" == ${dispatcherName}\\ * ]]; then return 0; fi; (( ${commandSequenceName} += 1 )); ${inCommandName}=1; ${savedPromptEolName}=\${PROMPT_EOL_MARK-}; builtin printf -v ${commandNonceName} "%04x%04x%04x%04x%04x%04x%04x%04x" "$RANDOM" "$RANDOM" "$RANDOM" "$RANDOM" "$RANDOM" "$RANDOM" "$RANDOM" "$RANDOM"; PROMPT_EOL_MARK="$(builtin printf "\\\\033]1337;${commandMarkerPrefix}preend;seq=%s;nonce=%s\\\\007" "$${commandSequenceName}" "$${commandNonceName}")$${savedPromptEolName}"; builtin printf "\\\\033]1337;${commandMarkerPrefix}preexec;seq=%s;nonce=%s\\\\007" "$${commandSequenceName}" "$${commandNonceName}"; }\n` +
+        // PROMPT_EOL_MARK is only rendered when zsh needs to repair a missing
+        // trailing newline. Always close the command transcript in our first
+        // precmd hook as well, before any user hook can print prompt content.
+        `${precmdBeginHookName}() { local prior=$?; if [ "\${${dispatchCompletionReadyName}-0}" != 1 ]; then ${savedExitName}=$prior; fi; builtin printf "\\\\033]1337;${commandMarkerPrefix}preend;seq=%s;nonce=%s\\\\007" "$${commandSequenceName}" "$${commandNonceName}"; }\n` +
+        `${precmdHookName}() { local ec=$${savedExitName} cwd_b64 home_b64; cwd_b64=$(printf "%s" "$PWD" | base64 | tr -d "\\n"); home_b64=$(printf "%s" "$HOME" | base64 | tr -d "\\n"); builtin printf "\\\\033]1337;${commandMarkerPrefix}precmd;seq=%s;nonce=%s;ec=%s;cwd_b64=%s;home_b64=%s\\\\007" "$${commandSequenceName}" "$${commandNonceName}" "$ec" "$cwd_b64" "$home_b64"; PROMPT_EOL_MARK=$${savedPromptEolName}; ${dispatchCompletionReadyName}=0; ${inCommandName}=0; ${dispatchActiveName}=0; return "$ec"; }\n` +
+        `${buildUnixCommandDispatcherScript(runtimeToken!)}\n` +
+        `add-zsh-hook preexec ${preexecHookName}\n` +
+        `precmd_functions=(${precmdBeginHookName} \${precmd_functions:#${precmdBeginHookName}})\n` +
+        `precmd_functions=(\${precmd_functions:#${precmdHookName}} ${precmdHookName})\n`
       fs.writeFileSync(rcPath, script, 'utf8')
 
       // -l: login shell, -i: interactive
@@ -578,6 +899,18 @@ export class NodePtyBackend implements TerminalBackend {
 
     // bash integration via --rcfile (works on macOS bash 3.2)
     if (shellBase.includes('bash')) {
+      const inCommandName = `${privateIdentifierPrefix}_in_command`
+      const commandSequenceName = `${privateIdentifierPrefix}_command_seq`
+      const commandNonceName = `${privateIdentifierPrefix}_command_nonce`
+      const preexecHookName = `${privateIdentifierPrefix}_preexec`
+      const precmdBeginHookName = `${privateIdentifierPrefix}_precmd_begin`
+      const precmdHookName = `${privateIdentifierPrefix}_precmd`
+      const savedExitName = `${privateIdentifierPrefix}_command_exit`
+      const dispatchActiveName = `${privateIdentifierPrefix}_dispatch_active`
+      const dispatchCompletionReadyName = `${privateIdentifierPrefix}_dispatch_completion_ready`
+      const debugPriorName = `${privateIdentifierPrefix}_debug_prior`
+      const dispatcherName = `${privateIdentifierPrefix}_dispatch`
+      const completionName = `${dispatcherName}_complete`
       const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'gyshell-bash-'))
       const rcPath = path.join(tmpDir, 'bashrc')
       // Improve based on VS Code reference logic
@@ -593,29 +926,59 @@ export class NodePtyBackend implements TerminalBackend {
         'if [ -f "$HOME/.bashrc" ]; then source "$HOME/.bashrc"; fi',
         packagedCliPathSnippet,
         '',
-        '__gyshell_in_command=0',
-        '__gyshell_preexec() {',
+        `${inCommandName}=0`,
+        `${commandSequenceName}=0`,
+        `${commandNonceName}=`,
+        `${savedExitName}=0`,
+        `${dispatchActiveName}=0`,
+        `${dispatchCompletionReadyName}=0`,
+        `${preexecHookName}() {`,
+        `  local ${debugPriorName}=$?`,
+        `  if shopt -q extdebug; then builtin trap - DEBUG; return 0; fi`,
+        `  if [ "\${${dispatchActiveName}-0}" = 1 ]; then`,
+        `    return 0`,
+        `  fi`,
         '  # DEBUG trap fires a lot; only emit once per user command.',
         '  # Avoid firing for PROMPT_COMMAND / our own helper.',
         '  case "$BASH_COMMAND" in',
-        '    __gyshell_precmd*|__gyshell_preexec* ) return ;;',
+        `    ${dispatcherName}*|${completionName}*|${precmdBeginHookName}*|${precmdHookName}*|${preexecHookName}* ) return "$${debugPriorName}" ;;`,
         '  esac',
-        '  if [ "$__gyshell_in_command" = "0" ]; then',
-        '    __gyshell_in_command=1',
-        '    builtin printf "\\033]1337;gyshell_preexec\\007"',
+        `  case "\${FUNCNAME[1]-}" in ${dispatcherName}|${completionName}) return "$${debugPriorName}" ;; esac`,
+        `  if [ "$${inCommandName}" = "0" ]; then`,
+        `    ${inCommandName}=1`,
+        `    ${commandSequenceName}=$(($${commandSequenceName} + 1))`,
+        `    printf -v ${commandNonceName} "%04x%04x%04x%04x%04x%04x%04x%04x" "$RANDOM" "$RANDOM" "$RANDOM" "$RANDOM" "$RANDOM" "$RANDOM" "$RANDOM" "$RANDOM"`,
+        `    builtin printf "\\033]1337;${commandMarkerPrefix}preexec;seq=%s;nonce=%s\\007" "$${commandSequenceName}" "$${commandNonceName}"`,
         '  fi',
+        `  return "$${debugPriorName}"`,
         '}',
-        "trap '__gyshell_preexec' DEBUG",
+        buildUnixCommandDispatcherScript(runtimeToken!),
+        `if ! shopt -q extdebug; then trap '${preexecHookName}' DEBUG; fi`,
         '',
-        '__gyshell_precmd() {',
-        '  local ec=$?',
-        '  local cwd_b64',
-        '  __gyshell_in_command=0',
-        '  cwd_b64=$(printf "%s" "$PWD" | base64 | tr -d "\\n")',
-        '  builtin printf "\\033]1337;gyshell_precmd;ec=%s;cwd_b64=%s\\007" "${ec}" "${cwd_b64}"',
+        `${precmdBeginHookName}() {`,
+        `  local ${debugPriorName}=$?`,
+        `  if [ "\${${dispatchCompletionReadyName}-0}" != 1 ]; then ${savedExitName}="$${debugPriorName}"; fi`,
+        `  ${inCommandName}=1`,
+        `  builtin printf "\\033]1337;${commandMarkerPrefix}preend;seq=%s;nonce=%s\\007" "$${commandSequenceName}" "$${commandNonceName}"`,
         '}',
-        // Preserve existing PROMPT_COMMAND if set
-        'PROMPT_COMMAND="__gyshell_precmd${PROMPT_COMMAND:+; $PROMPT_COMMAND}"',
+        `${precmdHookName}() {`,
+        `  local ec="$${savedExitName}"`,
+        '  local cwd_b64 home_b64',
+        '  cwd_b64=$(printf "%s" "$PWD" | base64 | tr -d "\\n")',
+        '  home_b64=$(printf "%s" "$HOME" | base64 | tr -d "\\n")',
+        `  builtin printf "\\033]1337;${commandMarkerPrefix}precmd;seq=%s;nonce=%s;ec=%s;cwd_b64=%s;home_b64=%s\\007" "$${commandSequenceName}" "$${commandNonceName}" "\${ec}" "\${cwd_b64}" "\${home_b64}"`,
+        `  ${dispatchCompletionReadyName}=0`,
+        `  ${inCommandName}=0`,
+        `  ${dispatchActiveName}=0`,
+        `  return "$ec"`,
+        '}',
+        // Freeze the user's exit status before existing prompt hooks, keep the
+        // DEBUG trap guarded while they run, then publish our marker last.
+        `if [[ "$(declare -p PROMPT_COMMAND 2>/dev/null)" == "declare -a"* ]]; then`,
+        `  PROMPT_COMMAND=(${precmdBeginHookName} "\${PROMPT_COMMAND[@]}" ${precmdHookName})`,
+        'else',
+        `  PROMPT_COMMAND="${precmdBeginHookName}\${PROMPT_COMMAND:+; $PROMPT_COMMAND}; ${precmdHookName}"`,
+        'fi',
         '',
       ].join('\n')
       fs.writeFileSync(rcPath, script, 'utf8')
@@ -633,17 +996,39 @@ export class NodePtyBackend implements TerminalBackend {
     if (shellBase.includes('powershell') || shellBase.includes('pwsh') || shellBase.includes('cmd.exe')) {
       const { commandTrackingMode, promptMarkerPath, commandRequestPath, commandOutputPath, tmpPath } =
         this.resolveWindowsShellTracking(shellBase)
-      const b64 = this.buildWindowsPowerShellEncodedCommand(
-        commandTrackingMode,
-        promptMarkerPath,
-        commandRequestPath,
-        commandOutputPath
-      )
+      let launchPayload: string
+      if (commandTrackingMode === 'windows-powershell-sidecar' && tmpPath) {
+        const bootstrapPath = path.join(tmpPath, 'bootstrap.ps1')
+        const bootstrapScript = buildWindowsPowerShellBootstrapScript({
+          readyMarker: buildInitializationReadyMarker(runtimeToken),
+          commandTrackingMode,
+          promptMarkerPath,
+          commandRequestPath,
+          commandOutputPath,
+          commandProtocolToken: runtimeToken,
+        })
+        fs.writeFileSync(bootstrapPath, `\ufeff${bootstrapScript}`, 'utf8')
+        launchPayload = buildWindowsPowerShellBootstrapLoaderEncodedCommand(
+          bootstrapPath
+        )
+      } else {
+        launchPayload = this.buildWindowsPowerShellEncodedCommand(
+          commandTrackingMode,
+          promptMarkerPath,
+          commandRequestPath,
+          commandOutputPath,
+          runtimeToken
+        )
+      }
+      const executionPolicyArgs =
+        commandTrackingMode === 'windows-powershell-sidecar'
+          ? ['-ExecutionPolicy', 'Bypass']
+          : []
       // If it's cmd.exe, we'll force it to powershell via arguments
       const isCmd = shellBase.includes('cmd.exe')
       if (isCmd) {
         return {
-          args: ['/K', 'powershell', '-NoLogo', '-NoProfile', '-NoExit', '-EncodedCommand', b64],
+          args: ['/K', 'powershell', '-NoLogo', '-NoProfile', '-NoExit', ...executionPolicyArgs, '-EncodedCommand', launchPayload],
           envOverrides: {},
           tmpPath,
           promptMarkerPath,
@@ -653,7 +1038,7 @@ export class NodePtyBackend implements TerminalBackend {
         }
       }
       return {
-        args: ['-NoLogo', '-NoProfile', '-NoExit', '-EncodedCommand', b64],
+        args: ['-NoLogo', '-NoProfile', '-NoExit', ...executionPolicyArgs, '-EncodedCommand', launchPayload],
         envOverrides: {},
         tmpPath,
         promptMarkerPath,
@@ -780,14 +1165,16 @@ export class NodePtyBackend implements TerminalBackend {
     commandTrackingMode: WindowsCommandTrackingMode,
     promptMarkerPath?: string,
     commandRequestPath?: string,
-    commandOutputPath?: string
+    commandOutputPath?: string,
+    commandProtocolToken?: string
   ): string {
     return buildWindowsPowerShellEncodedCommand({
-      readyMarker: GYSHELL_READY_MARKER,
+      readyMarker: buildInitializationReadyMarker(commandProtocolToken),
       commandTrackingMode,
       promptMarkerPath,
       commandRequestPath,
       commandOutputPath,
+      commandProtocolToken,
     })
   }
 
@@ -820,7 +1207,20 @@ export class NodePtyBackend implements TerminalBackend {
     const instance = this.ptys.get(ptyId)
     if (instance) {
       instance.dataCallbacks.add(callback)
+      if (instance.pendingData) {
+        const pendingData = instance.pendingData
+        instance.pendingData = ''
+        callback(pendingData)
+      }
     }
+  }
+
+  private emitPtyData(instance: PtyInstance, data: string): void {
+    if (instance.dataCallbacks.size === 0) {
+      instance.pendingData += data
+      return
+    }
+    instance.dataCallbacks.forEach((callback) => callback(data))
   }
 
   onExit(ptyId: string, callback: (code: number) => void): void {
@@ -1031,6 +1431,24 @@ export class NodePtyBackend implements TerminalBackend {
     return this.homeDirByPtyId.get(ptyId) || os.homedir()
   }
 
+  applyCommandProtocolMetadata(
+    ptyId: string,
+    metadata: TerminalCommandProtocolMetadata
+  ): void {
+    if (metadata.cwd !== undefined) {
+      const normalized = this.normalizeDecodedLocalPath(metadata.cwd)
+      if (normalized) {
+        this.cwdByPtyId.set(ptyId, normalized)
+      }
+    }
+    if (metadata.homeDir !== undefined) {
+      const normalized = this.normalizeDecodedLocalPath(metadata.homeDir)
+      if (normalized) {
+        this.homeDirByPtyId.set(ptyId, normalized)
+      }
+    }
+  }
+
   getRemoteOs(_ptyId: string): 'unix' | 'windows' | undefined {
     return os.platform() === 'win32' ? 'windows' : 'unix'
   }
@@ -1126,55 +1544,6 @@ export class NodePtyBackend implements TerminalBackend {
 
   async writeFileBytes(_ptyId: string, filePath: string, content: Buffer): Promise<void> {
     await fs.promises.writeFile(filePath, content)
-  }
-
-  private consumeOscMarkers(ptyId: string, chunk: string): void {
-    const instance = this.ptys.get(ptyId)
-    if (!instance) return
-    instance.oscBuffer += chunk
-
-    const prefix = '\x1b]1337;gyshell_precmd'
-    const suffix = '\x07'
-
-    while (true) {
-      const start = instance.oscBuffer.indexOf(prefix)
-      if (start === -1) break
-      const end = instance.oscBuffer.indexOf(suffix, start)
-      if (end === -1) break
-
-      const marker = instance.oscBuffer.slice(start, end)
-      const cwdMatch = marker.match(/cwd_b64=([^;]+)/)
-      if (cwdMatch && cwdMatch[1]) {
-        try {
-          const decoded = Buffer.from(cwdMatch[1], 'base64').toString('utf8')
-          const normalized = this.normalizeDecodedLocalPath(decoded)
-          if (normalized) {
-            this.cwdByPtyId.set(ptyId, normalized)
-          }
-        } catch {
-          // ignore decode errors
-        }
-      }
-
-      const homeMatch = marker.match(/home_b64=([^;]+)/)
-      if (homeMatch && homeMatch[1]) {
-        try {
-          const decoded = Buffer.from(homeMatch[1], 'base64').toString('utf8')
-          const normalized = this.normalizeDecodedLocalPath(decoded)
-          if (normalized) {
-            this.homeDirByPtyId.set(ptyId, normalized)
-          }
-        } catch {
-          // ignore decode errors
-        }
-      }
-
-      instance.oscBuffer = instance.oscBuffer.slice(end + suffix.length)
-    }
-
-    if (instance.oscBuffer.length > 8192) {
-      instance.oscBuffer = instance.oscBuffer.slice(-4096)
-    }
   }
 
   private normalizeDecodedLocalPath(decodedPath: string): string | null {

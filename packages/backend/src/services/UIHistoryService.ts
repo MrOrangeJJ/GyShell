@@ -1,4 +1,9 @@
 import { v4 as uuidv4 } from "uuid";
+import {
+  extractCommandOutputDisplayText,
+  parseCommandOutputContractV1,
+  type CommandOutputContractV1,
+} from "@gyshell/shared";
 import type { AgentEvent, AgentEventType } from "../types";
 import type {
   ChatMessage,
@@ -39,7 +44,12 @@ export class UIHistoryService {
   ): Record<string, UISessionSummary> {
     const cache: Record<string, UISessionSummary> = {};
     for (const summary of summaries) {
-      cache[summary.id] = summary;
+      cache[summary.id] = {
+        ...summary,
+        lastMessagePreview: extractCommandOutputDisplayText(
+          summary.lastMessagePreview || "",
+        ),
+      };
     }
     return cache;
   }
@@ -87,7 +97,10 @@ export class UIHistoryService {
     return actions;
   }
 
-  flush(sessionId?: string): void {
+  flush(
+    sessionId?: string,
+    options?: { preserveLiveTransientState?: boolean },
+  ): void {
     const sessionIds = sessionId
       ? this.dirtySessions.has(sessionId)
         ? [sessionId]
@@ -107,8 +120,12 @@ export class UIHistoryService {
         this.dirtySessions.delete(id);
         return;
       }
-      const sanitized = sanitizeUiSession(session);
-      this.sessionsCache[id] = sanitized;
+      const sanitized = sanitizeUiSession(session, {
+        recoverInterruptedCommands: false,
+      });
+      if (options?.preserveLiveTransientState !== true) {
+        this.sessionsCache[id] = sanitized;
+      }
       const summary = buildUiSessionSummary(sanitized);
       this.sessionSummaryCache[id] = summary;
       entries.push({ session: sanitized, summary });
@@ -201,7 +218,8 @@ export class UIHistoryService {
             commandId: event.commandId,
             tabName: event.tabName || "Terminal",
             output: "",
-            isNowait: !!(event as any).isNowait,
+            isNowait: event.isNowait === true,
+            commandOutput: event.commandOutput,
             collapsed: false,
           },
           streaming: true,
@@ -235,10 +253,15 @@ export class UIHistoryService {
             ...message.metadata,
             exitCode: event.exitCode,
             output:
-              (message.metadata?.output || "") +
-              (event.outputDelta || "") +
-              (event.message ? `\nError: ${event.message}` : ""),
-            isNowait: (event as any).isNowait ?? message.metadata?.isNowait,
+              event.outputMode === "replace"
+                ? (event.outputDelta || "") +
+                  (event.message ? `\nError: ${event.message}` : "")
+                : (message.metadata?.output || "") +
+                  (event.outputDelta || "") +
+                  (event.message ? `\nError: ${event.message}` : ""),
+            isNowait: event.isNowait ?? message.metadata?.isNowait,
+            commandOutput:
+              event.commandOutput ?? message.metadata?.commandOutput,
           },
           streaming: false,
         };
@@ -263,6 +286,7 @@ export class UIHistoryService {
             output: event.output || "",
             toolName: event.toolName || "Tool Call",
             subToolLevel: event.level,
+            commandOutput: event.commandOutput,
           },
           streaming: false,
           backendMessageId: event.messageId,
@@ -879,6 +903,43 @@ export class UIHistoryService {
     return removedCount;
   }
 
+  validateBranchFromMessage(
+    sourceSessionId: string,
+    backendMessageId: string,
+  ): { ok: boolean; reason?: string } {
+    const source = this.getOrLoadSession(sourceSessionId);
+    if (!source) {
+      return { ok: false, reason: "Source UI session not found." };
+    }
+    const index = source.messages.findIndex(
+      (message) => message.backendMessageId === backendMessageId,
+    );
+    if (index === -1) {
+      return { ok: false, reason: "Branch target UI message not found." };
+    }
+
+    const containsUnsettledMessage = source.messages
+      .slice(0, index + 1)
+      .some((message) => {
+        const commandOutput = parseCommandOutputContractV1(
+          message.metadata?.commandOutput,
+        );
+        return (
+          message.type === "command" &&
+          (commandOutput?.executionState === "running" ||
+            message.streaming === true)
+        );
+      });
+    if (containsUnsettledMessage) {
+      return {
+        ok: false,
+        reason:
+          "Cannot branch through an unfinished message or running command. Wait for it to settle, then try again.",
+      };
+    }
+    return { ok: true };
+  }
+
   branchFromMessage(
     sourceSessionId: string,
     branchSessionId: string,
@@ -891,16 +952,16 @@ export class UIHistoryService {
     messageCount?: number;
     reason?: string;
   } {
-    const source = this.getOrLoadSession(sourceSessionId);
-    if (!source) {
-      return { ok: false, reason: "Source UI session not found." };
-    }
+    const validation = this.validateBranchFromMessage(
+      sourceSessionId,
+      backendMessageId,
+    );
+    if (!validation.ok) return validation;
+
+    const source = this.getOrLoadSession(sourceSessionId)!;
     const index = source.messages.findIndex(
       (message) => message.backendMessageId === backendMessageId,
     );
-    if (index === -1) {
-      return { ok: false, reason: "Branch target UI message not found." };
-    }
 
     const updatedAt = Date.now();
     const branch: UIChatSession = {
@@ -1015,15 +1076,25 @@ export class UIHistoryService {
         break;
       }
       case "command": {
+        const commandOutput = parseCommandOutputContractV1(
+          message.metadata?.commandOutput,
+        );
         const commandText = this.normalizeText(
           message.content || message.metadata?.command || "",
         );
-        const outputText = this.normalizeText(message.metadata?.output || "");
+        const outputText = this.normalizeText(
+          extractCommandOutputDisplayText(message.metadata?.output || ""),
+        );
         if (commandText) {
           chunks.push("Command:");
           chunks.push("```bash");
           chunks.push(commandText);
           chunks.push("```");
+        }
+        if (commandOutput) {
+          chunks.push(
+            this.formatReadableCommandOutputStatus(commandOutput),
+          );
         }
         if (outputText) {
           chunks.push("Output:");
@@ -1034,8 +1105,13 @@ export class UIHistoryService {
         break;
       }
       case "tool_call": {
+        const commandOutput = parseCommandOutputContractV1(
+          message.metadata?.commandOutput,
+        );
         const inputText = this.normalizeText(message.content || "");
-        const outputText = this.normalizeText(message.metadata?.output || "");
+        const outputText = this.normalizeText(
+          extractCommandOutputDisplayText(message.metadata?.output || ""),
+        );
         const toolName = this.normalizeText(
           message.metadata?.toolName || "Tool Call",
         );
@@ -1045,6 +1121,11 @@ export class UIHistoryService {
           chunks.push("```text");
           chunks.push(inputText);
           chunks.push("```");
+        }
+        if (commandOutput) {
+          chunks.push(
+            this.formatReadableCommandOutputStatus(commandOutput),
+          );
         }
         if (outputText) {
           chunks.push("Output:");
@@ -1113,6 +1194,43 @@ export class UIHistoryService {
     }
 
     return this.normalizeText(chunks.join("\n\n"));
+  }
+
+  private formatReadableCommandOutputStatus(
+    contract: CommandOutputContractV1,
+  ): string {
+    const executionLabel =
+      contract.executionState === "outcome_unknown"
+        ? "outcome unknown"
+        : contract.executionState;
+    const exitLabel =
+      contract.executionState === "finished" &&
+      typeof contract.exitCode === "number"
+        ? String(contract.exitCode)
+        : "not verified";
+    const captureReason = contract.capture.reason
+      ? `; reason: ${contract.capture.reason}`
+      : "";
+    const continuationLabel = contract.presentation.pollCursor
+      ? "this is a running snapshot; poll the live session for newer output"
+      : contract.presentation.hasMoreCapturedOutput
+        ? contract.presentation.nextCursor
+          ? "more retained output is available in the live session"
+          : "more output was reported, but no continuation is available"
+        : "no further retained output is advertised";
+    const lines = [
+      "Command result status:",
+      `- Execution: ${executionLabel}`,
+      `- Exit code: ${exitLabel}`,
+      `- Capture: ${contract.capture.state}${captureReason}; observed ${contract.capture.observedUtf8Bytes} UTF-8 bytes, retained ${contract.capture.retainedUtf8Bytes}, ${contract.capture.availableLineCount} available lines`,
+      `- Presentation: ${contract.presentation.state}; returned ${contract.presentation.returnedUtf8Bytes} UTF-8 bytes; ${continuationLabel}`,
+    ];
+    if (contract.capture.terminalControlsObserved) {
+      lines.push(
+        "- Terminal controls: observed and projected into the append-only transcript",
+      );
+    }
+    return lines.join("\n");
   }
 
   private normalizeText(input: string): string {

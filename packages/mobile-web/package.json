@@ -6,6 +6,9 @@
   "exports": {
     ".": "./src/main.tsx"
   },
+  "dependencies": {
+    "@gyshell/shared": "0.1.0"
+  },
   "scripts": {
     "build": "echo \"mobile-web-core: built by app wrapper\"",
     "typecheck": "echo \"mobile-web-core: checked by workspace consumers\""

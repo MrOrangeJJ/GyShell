@@ -1,3 +1,8 @@
+import {
+  extractCommandOutputDisplayText,
+  parseCommandOutputContractV1,
+  type CommandCaptureReason,
+} from '@gyshell/shared'
 import type { ChatMessage } from '../../stores/ChatStore'
 
 export type SeamlessStepTone = 'neutral' | 'warning' | 'error'
@@ -27,7 +32,29 @@ export interface SeamlessStepPresentation {
   details: SeamlessStepDetail[]
 }
 
+export interface CommandOutputUiPresentation {
+  executionLabel: string
+  captureLabel: string
+  presentationLabel: string
+  meta: string
+  tone: SeamlessStepTone
+  executionTone: SeamlessStepTone
+  captureTone: SeamlessStepTone
+  isRunning: boolean
+  isDone: boolean
+}
+
 export const SEAMLESS_DETAIL_PREVIEW_LIMIT = 12_000
+
+export const isSeamlessGroupRunning = (
+  messages: readonly ChatMessage[],
+): boolean =>
+  messages.some(
+    (message) =>
+      message.streaming === true ||
+      (message.type === 'command' &&
+        message.metadata?.commandOutput?.executionState === 'running'),
+  )
 
 const MAX_SUMMARY_LENGTH = 96
 const MAX_INLINE_VALUE_LENGTH = 44
@@ -39,9 +66,62 @@ const compactWhitespace = (value: unknown): string =>
     .replace(/\s+/g, ' ')
     .trim()
 
+const isHighSurrogate = (codeUnit: number): boolean =>
+  codeUnit >= 0xd800 && codeUnit <= 0xdbff
+
+const isLowSurrogate = (codeUnit: number): boolean =>
+  codeUnit >= 0xdc00 && codeUnit <= 0xdfff
+
+export const sliceFromStartAtUnicodeBoundary = (
+  value: string,
+  maxCodeUnits: number,
+): string => {
+  let end = Math.min(value.length, Math.max(0, maxCodeUnits))
+  if (
+    end > 0 &&
+    end < value.length &&
+    isHighSurrogate(value.charCodeAt(end - 1)) &&
+    isLowSurrogate(value.charCodeAt(end))
+  ) {
+    end -= 1
+  }
+  return value.slice(0, end)
+}
+
+const sliceFromEndAtUnicodeBoundary = (
+  value: string,
+  maxCodeUnits: number,
+): string => {
+  let start = Math.max(0, value.length - Math.max(0, maxCodeUnits))
+  if (
+    start > 0 &&
+    start < value.length &&
+    isHighSurrogate(value.charCodeAt(start - 1)) &&
+    isLowSurrogate(value.charCodeAt(start))
+  ) {
+    start += 1
+  }
+  return value.slice(start)
+}
+
+const UI_PREVIEW_OMISSION_MARKER =
+  '\n\n[UI preview omitted middle content; showing beginning and end.]\n\n'
+
+const createBoundedDetailPreview = (content: string): string => {
+  if (content.length <= SEAMLESS_DETAIL_PREVIEW_LIMIT) return content
+
+  const availableCodeUnits = Math.max(
+    0,
+    SEAMLESS_DETAIL_PREVIEW_LIMIT - UI_PREVIEW_OMISSION_MARKER.length,
+  )
+  const headBudget = Math.ceil(availableCodeUnits / 2)
+  const tailBudget = Math.floor(availableCodeUnits / 2)
+  return `${sliceFromStartAtUnicodeBoundary(content, headBudget)}${UI_PREVIEW_OMISSION_MARKER}${sliceFromEndAtUnicodeBoundary(content, tailBudget)}`
+}
+
 const truncate = (value: string, maxLength: number): string => {
   if (value.length <= maxLength) return value
-  return `${value.slice(0, Math.max(0, maxLength - 1)).trimEnd()}…`
+  return `${sliceFromStartAtUnicodeBoundary(value, maxLength - 1).trimEnd()}…`
 }
 
 const cleanHint = (value: unknown): string =>
@@ -119,9 +199,7 @@ const createDetail = (
   return {
     key,
     label,
-    content: truncated
-      ? `${content.slice(0, SEAMLESS_DETAIL_PREVIEW_LIMIT)}\n…`
-      : content,
+    content: createBoundedDetailPreview(content),
     kind,
     truncated,
   }
@@ -178,6 +256,129 @@ const getDiffSummary = (diff: string): string | undefined => {
 const joinSummary = (...parts: Array<string | undefined>): string =>
   parts.filter((part): part is string => !!part).join(' · ')
 
+const getCaptureReasonLabel = (
+  reason: CommandCaptureReason | undefined,
+): string | undefined => {
+  switch (reason) {
+    case 'retention_limit':
+      return 'retention limit'
+    case 'tracking_lost':
+      return 'tracking lost'
+    case 'runtime_boundary':
+      return 'runtime ended'
+    case 'tracking_unavailable':
+      return 'tracking unavailable'
+    case 'projection_ambiguous':
+      return 'ambiguous terminal control sequence'
+    case 'record_expired':
+      return 'record expired'
+    default:
+      return undefined
+  }
+}
+
+export const getCommandOutputUiPresentation = (
+  message: ChatMessage,
+): CommandOutputUiPresentation | null => {
+  const contract = parseCommandOutputContractV1(
+    message.metadata?.commandOutput,
+  )
+  if (!contract) return null
+
+  const executionLabel = (() => {
+    switch (contract.executionState) {
+      case 'running':
+        return 'Running'
+      case 'finished':
+        return typeof contract.exitCode === 'number'
+          ? `Exit ${contract.exitCode}`
+          : 'Finished'
+      case 'aborted':
+        return 'Aborted'
+      case 'outcome_unknown':
+        return 'Outcome unknown'
+    }
+  })()
+  const captureReason = getCaptureReasonLabel(contract.capture.reason)
+  const captureBaseLabel = (() => {
+    switch (contract.capture.state) {
+      case 'in_progress':
+        return 'Capture in progress'
+      case 'complete':
+        return 'Capture complete'
+      case 'incomplete':
+        return captureReason
+          ? `Capture incomplete (${captureReason})`
+          : 'Capture incomplete'
+      case 'unknown':
+        return captureReason
+          ? `Capture unknown (${captureReason})`
+          : 'Capture unknown'
+    }
+  })()
+  const captureDiagnostics: string[] = []
+  if (
+    contract.capture.observedUtf8Bytes !== contract.capture.retainedUtf8Bytes
+  ) {
+    captureDiagnostics.push(
+      `retained ${contract.capture.retainedUtf8Bytes}/${contract.capture.observedUtf8Bytes} UTF-8 bytes`,
+    )
+  }
+  if (contract.capture.terminalControlsObserved) {
+    captureDiagnostics.push('terminal controls observed')
+  }
+  const captureLabel = `${captureBaseLabel}${
+    captureDiagnostics.length > 0
+      ? `; ${captureDiagnostics.join('; ')}`
+      : ''
+  }`
+  const presentationLabel = (() => {
+    switch (contract.presentation.state) {
+      case 'none':
+        return contract.executionState === 'running'
+          ? 'Result: none yet'
+          : 'Result: no captured output'
+      case 'full':
+        return 'Result: all captured output'
+      case 'excerpt':
+        return 'Result: captured-output excerpt'
+    }
+  })()
+
+  const hasFailedExit =
+    contract.executionState === 'finished' &&
+    typeof contract.exitCode === 'number' &&
+    contract.exitCode !== 0
+  const hasUncertainState =
+    contract.executionState === 'aborted' ||
+    contract.executionState === 'outcome_unknown' ||
+    contract.capture.state === 'incomplete' ||
+    contract.capture.state === 'unknown'
+  const executionTone: SeamlessStepTone = hasFailedExit
+    ? 'error'
+    : contract.executionState === 'aborted' ||
+        contract.executionState === 'outcome_unknown'
+      ? 'warning'
+      : 'neutral'
+  const captureTone: SeamlessStepTone =
+    contract.capture.state === 'incomplete' ||
+    contract.capture.state === 'unknown'
+      ? 'warning'
+      : 'neutral'
+
+  return {
+    executionLabel,
+    captureLabel,
+    presentationLabel,
+    meta: [executionLabel, captureLabel, presentationLabel].join(' · '),
+    tone: hasFailedExit ? 'error' : hasUncertainState ? 'warning' : 'neutral',
+    executionTone,
+    captureTone,
+    isRunning: contract.executionState === 'running',
+    isDone: contract.executionState !== 'running',
+  }
+}
+
 const getToolActivityTone = (message: ChatMessage): SeamlessStepTone => {
   const explicitLevel = message.metadata?.subToolLevel
   if (explicitLevel === 'error') return 'error'
@@ -219,17 +420,19 @@ export const buildSeamlessStepPresentation = (
       ? `on ${compactWhitespace(message.metadata.tabName)}`
       : undefined
     const exitCode = message.metadata?.exitCode
+    const commandOutputPresentation = getCommandOutputUiPresentation(message)
     const isBackgroundTransition =
       message.metadata?.isNowait === true && exitCode === -3
-    const meta = message.streaming
-      ? 'Running'
-      : isBackgroundTransition
-        ? 'Async'
-        : typeof exitCode === 'number'
-          ? `Exit ${exitCode}`
-          : message.metadata?.isNowait
-            ? 'Async'
-            : undefined
+    const meta = commandOutputPresentation?.meta ??
+      (message.streaming
+        ? 'Running'
+        : isBackgroundTransition
+          ? 'Async'
+          : typeof exitCode === 'number'
+            ? `Exit ${exitCode}`
+            : message.metadata?.isNowait
+              ? 'Async'
+              : undefined)
     if (
       rawCommand.trim() &&
       (rawCommand.trim() !== command || title.length > MAX_SUMMARY_LENGTH)
@@ -241,7 +444,12 @@ export const buildSeamlessStepPresentation = (
     }
     appendDetail(
       details,
-      createDetail('output', 'Output', message.metadata?.output, 'output'),
+      createDetail(
+        'output',
+        'Output',
+        extractCommandOutputDisplayText(message.metadata?.output || ''),
+        'output',
+      ),
       [command, title],
     )
     const fullSummary = joinSummary(title, subtitle)
@@ -253,9 +461,10 @@ export const buildSeamlessStepPresentation = (
       fullSummary,
       meta,
       tone:
-        typeof exitCode === 'number' && exitCode !== 0 && !isBackgroundTransition
+        commandOutputPresentation?.tone ??
+        (typeof exitCode === 'number' && exitCode !== 0 && !isBackgroundTransition
           ? 'error'
-          : 'neutral',
+          : 'neutral'),
       details,
     }
   }
@@ -271,17 +480,31 @@ export const buildSeamlessStepPresentation = (
     )
     appendDetail(
       details,
-      createDetail('result', 'Result', message.metadata?.output, 'output'),
+      createDetail(
+        'result',
+        'Result',
+        extractCommandOutputDisplayText(message.metadata?.output || ''),
+        'output',
+      ),
       [title, input.detail],
     )
     const fullSummary = joinSummary(title, subtitle)
+    const commandOutputPresentation = getCommandOutputUiPresentation(message)
+    const toolTone = getToolActivityTone(message)
     return {
       kindLabel: 'Tool',
       title,
       subtitle,
       summary: truncate(fullSummary, MAX_SUMMARY_LENGTH),
       fullSummary,
-      tone: getToolActivityTone(message),
+      meta: commandOutputPresentation?.meta,
+      tone:
+        toolTone === 'error' || commandOutputPresentation?.tone === 'error'
+          ? 'error'
+          : toolTone === 'warning' ||
+              commandOutputPresentation?.tone === 'warning'
+            ? 'warning'
+            : 'neutral',
       details,
     }
   }

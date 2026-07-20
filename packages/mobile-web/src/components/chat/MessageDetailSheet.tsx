@@ -39,7 +39,11 @@ export const MessageDetailSheet: React.FC<MessageDetailSheetProps> = ({
       .map((message) => {
         const contentLength = String(message.content || "").length;
         const outputLength = String(message.metadata?.output || "").length;
-        return `${message.id}:${message.streaming ? "1" : "0"}:${contentLength}:${outputLength}`;
+        const commandOutput = message.metadata?.commandOutput;
+        const commandOutputState = commandOutput
+          ? `${commandOutput.executionState}:${commandOutput.capture.state}:${commandOutput.presentation.state}:${commandOutput.capture.revision}`
+          : "legacy";
+        return `${message.id}:${message.streaming ? "1" : "0"}:${contentLength}:${outputLength}:${commandOutputState}`;
       })
       .join("|");
   }, [messages]);

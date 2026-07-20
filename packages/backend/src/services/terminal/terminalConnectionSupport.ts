@@ -1,4 +1,5 @@
 import {
+  COMMAND_OUTPUT_IDENTIFIER_MAX_UTF8_BYTES,
   getTerminalConnectionCapabilities,
   getTerminalConnectionTypeDefinition,
 } from '@gyshell/shared'
@@ -56,6 +57,13 @@ const asPositiveInt = (value: unknown, fallback: number): number => {
 
 const isObject = (value: unknown): value is Record<string, unknown> =>
   typeof value === 'object' && value !== null
+
+export const isValidTerminalRuntimeId = (value: unknown): value is string =>
+  typeof value === 'string' &&
+  value.length > 0 &&
+  !/[\u0000-\u001f\u007f]/.test(value) &&
+  Buffer.byteLength(value, 'utf8') <=
+    COMMAND_OUTPUT_IDENTIFIER_MAX_UTF8_BYTES
 
 const resolveRequestedTerminalType = (value: unknown): string => {
   if (typeof value !== 'string') {
@@ -205,7 +213,7 @@ export const normalizePersistedTerminalConfig = (
 
   const id = typeof raw.id === 'string' ? raw.id.trim() : ''
   const title = typeof raw.title === 'string' ? raw.title.trim() : ''
-  if (!id || !title) return null
+  if (!isValidTerminalRuntimeId(id) || !title) return null
 
   const cols = asPositiveInt(raw.cols, 80)
   const rows = asPositiveInt(raw.rows, 24)

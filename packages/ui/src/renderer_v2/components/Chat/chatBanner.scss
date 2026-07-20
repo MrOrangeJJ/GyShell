@@ -213,6 +213,14 @@
   background: color-mix(in srgb, var(--warning) 5%, var(--control-bg));
 }
 
+.message-banner.command.warning {
+  border-color: color-mix(in srgb, var(--warning) 42%, transparent);
+
+  .banner-icon {
+    color: var(--warning);
+  }
+}
+
 .message-banner.ask {
   border-color: color-mix(in srgb, var(--accent) 40%, transparent);
   background: color-mix(in srgb, var(--accent) 4%, var(--panel-bg));
@@ -443,6 +451,48 @@
 .banner-target {
   opacity: 0.5;
   font-size: 11px;
+}
+
+.command-output-status-chips {
+  display: inline-flex;
+  min-width: 0;
+  align-items: center;
+  gap: 4px;
+  overflow: hidden;
+  text-transform: none;
+  letter-spacing: 0;
+}
+
+.command-output-status-chip {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  padding: 1px 4px;
+  border: 1px solid color-mix(in srgb, var(--fg) 14%, transparent);
+  border-radius: 3px;
+  color: var(--fg-muted);
+  font-size: 9px;
+  line-height: 1.25;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+
+  &.execution.neutral {
+    color: color-mix(in srgb, var(--accent) 70%, var(--fg));
+  }
+
+  &.warning {
+    border-color: color-mix(in srgb, var(--warning) 36%, transparent);
+    color: var(--warning);
+  }
+
+  &.error {
+    border-color: color-mix(in srgb, var(--danger) 36%, transparent);
+    color: var(--danger);
+  }
+
+  &.presentation {
+    opacity: 0.78;
+  }
 }
 
 .banner-info {
@@ -793,11 +843,14 @@
 }
 
 .stg-step-info {
-  flex: 0 0 auto;
+  flex: 0 1 auto;
+  min-width: 0;
   margin-left: 6px;
+  overflow: hidden;
   color: var(--fg-muted);
   font-size: 9.2px;
   opacity: 0.58;
+  text-overflow: ellipsis;
   white-space: nowrap;
 }
 

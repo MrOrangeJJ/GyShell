@@ -35,7 +35,12 @@ import {
   createUnloadedRenamedSession,
   createSessionState,
   findLatestPendingAsk,
+  formatTuiCommandOutputStatus,
+  getTuiCommandOutputStatus,
+  getTuiDisplayOutput,
+  getTuiHumanDisplayText,
   reorderSessionIdsByUpdatedAt,
+  summarizeTuiTerminalOutput,
   type SessionState,
 } from "./state";
 
@@ -1754,7 +1759,8 @@ function buildBootState(
       updatedAt: summary.updatedAt || existing?.updatedAt || Date.now(),
       messagesCount: summary.messagesCount || existing?.messagesCount || 0,
       lastMessagePreview:
-        summary.lastMessagePreview || existing?.lastMessagePreview,
+        getTuiHumanDisplayText(summary.lastMessagePreview || "") ||
+        existing?.lastMessagePreview,
       loaded: summary.id === data.initialSessionId,
       uiRevision:
         summary.id === data.initialSessionId
@@ -2196,16 +2202,19 @@ function messageBodyLines(message: ChatMessage): string[] {
     const command = normalizeOutputText(
       message.metadata?.command || message.content,
     );
-    const output = normalizeOutputText(message.metadata?.output ?? "");
+    const output = normalizeOutputText(getTuiDisplayOutput(message.metadata));
+    const commandOutputStatus = getTuiCommandOutputStatus(message);
     const commandTag = message.metadata?.isNowait ? "RUN ASYNC" : "RUN";
     const lines = [
       `[${commandTag}] ${truncateLine(command || "(empty command)", 160)}`,
     ];
-    const summary = summarizeTerminalOutput(output);
+    const summary = summarizeTuiTerminalOutput(output);
     if (summary) {
       lines.push(`  ${truncateLine(summary, 160)}`);
     }
-    if (typeof message.metadata?.exitCode === "number") {
+    if (commandOutputStatus) {
+      lines.push(`  ${formatTuiCommandOutputStatus(commandOutputStatus)}`);
+    } else if (typeof message.metadata?.exitCode === "number") {
       lines.push(`  exit ${message.metadata.exitCode}`);
     }
     return lines;
@@ -2215,7 +2224,12 @@ function messageBodyLines(message: ChatMessage): string[] {
     const toolName = message.metadata?.toolName || "tool";
     const toolTag = toolTagForName(toolName);
     const summary = summarizeToolCall(message);
-    return [`[${toolTag}] ${truncateLine(summary, 160)}`];
+    const lines = [`[${toolTag}] ${truncateLine(summary, 160)}`];
+    const commandOutputStatus = getTuiCommandOutputStatus(message);
+    if (commandOutputStatus) {
+      lines.push(`  ${formatTuiCommandOutputStatus(commandOutputStatus)}`);
+    }
+    return lines;
   }
 
   if (message.type === "file_edit") {
@@ -2239,7 +2253,7 @@ function messageBodyLines(message: ChatMessage): string[] {
     const output = normalizeOutputText(
       message.metadata?.output ?? message.content,
     );
-    const summary = summarizeTerminalOutput(output);
+    const summary = summarizeTuiTerminalOutput(output);
     if (summary)
       return [`[COMPACT] ${truncateLine(`${title} | ${summary}`, 180)}`];
     if (output) return [`[COMPACT] ${truncateLine(output, 180)}`];
@@ -2256,7 +2270,7 @@ function messageBodyLines(message: ChatMessage): string[] {
       ? ` (${message.metadata.subToolHint})`
       : "";
     const output = normalizeOutputText(message.metadata?.output ?? "");
-    const summary = summarizeTerminalOutput(output);
+    const summary = summarizeTuiTerminalOutput(output);
     if (summary)
       return [`[STEP] ${truncateLine(`${title}${hint} | ${summary}`, 180)}`];
     return [`[STEP] ${title}${hint}`];
@@ -2302,32 +2316,15 @@ function toolTagForName(toolName: string): string {
 function summarizeToolCall(message: ChatMessage): string {
   const toolName = message.metadata?.toolName || "tool";
   const normalizedInput = normalizeOutputText(message.content || "");
-  const normalizedOutput = normalizeOutputText(message.metadata?.output || "");
-  const outputSummary = summarizeTerminalOutput(normalizedOutput);
+  const normalizedOutput = normalizeOutputText(
+    getTuiDisplayOutput(message.metadata),
+  );
+  const outputSummary = summarizeTuiTerminalOutput(normalizedOutput);
 
   if (outputSummary) return `${toolName}: ${outputSummary}`;
   if (normalizedInput)
     return `${toolName}: ${truncateLine(normalizedInput, 140)}`;
   return `${toolName} finished`;
-}
-
-function summarizeTerminalOutput(raw: string): string {
-  const content = extractTerminalContent(raw) || raw;
-  const firstLine = content
-    .split("\n")
-    .map((line) => line.trim())
-    .find((line) => !!line && !line.startsWith("="));
-  if (!firstLine) return "";
-  return firstLine;
-}
-
-function extractTerminalContent(raw: string): string {
-  if (!raw) return "";
-  const match = raw.match(
-    /<terminal_content>\s*([\s\S]*?)\s*<\/terminal_content>/i,
-  );
-  if (!match) return "";
-  return String(match[1] || "").trim();
 }
 
 function messagePrimaryText(message: ChatMessage): string {

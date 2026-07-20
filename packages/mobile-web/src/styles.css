@@ -2402,6 +2402,45 @@ button:disabled {
   vertical-align: middle;
 }
 
+.command-output-status {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  min-width: 0;
+}
+
+.event-card > .command-output-status {
+  margin-top: 8px;
+}
+
+.command-output-status-chip {
+  display: inline-flex;
+  min-width: 0;
+  padding: 2px 5px;
+  border: 1px solid color-mix(in srgb, var(--ink-soft) 24%, transparent);
+  border-radius: 4px;
+  background: color-mix(in srgb, var(--surface) 76%, var(--surface-muted));
+  color: var(--ink-soft);
+  font-size: 9px;
+  font-weight: 700;
+  line-height: 1.25;
+  overflow-wrap: anywhere;
+}
+
+.command-output-status-chip.execution {
+  color: var(--accent-strong);
+}
+
+.command-output-status-chip.warning {
+  border-color: color-mix(in srgb, var(--warning) 42%, transparent);
+  color: color-mix(in srgb, var(--warning) 78%, var(--ink));
+}
+
+.command-output-status-chip.error {
+  border-color: color-mix(in srgb, var(--danger) 42%, transparent);
+  color: var(--danger);
+}
+
 /* ---- Settings sub-page nav cards ---- */
 .settings-nav-card {
   display: flex;

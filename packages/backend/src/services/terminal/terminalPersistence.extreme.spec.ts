@@ -1,7 +1,14 @@
 import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import type { FileStatInfo, FileSystemEntry, TerminalBackend, TerminalConfig, TerminalSystemInfo } from '../../types'
+import type {
+  FileStatInfo,
+  FileSystemEntry,
+  TerminalBackend,
+  TerminalCommandShellFamily,
+  TerminalConfig,
+  TerminalSystemInfo,
+} from '../../types'
 import { TerminalService } from '../TerminalService'
 import { TerminalStateStore } from './TerminalStateStore'
 import { createAutoTerminalConfig } from './terminalConnectionSupport'
@@ -69,6 +76,10 @@ class FakeTerminalBackend implements TerminalBackend {
   private readonly spawnConfigs: TerminalConfig[] = []
   private readonly resizeCalls: Array<{ ptyId: string; cols: number; rows: number }> = []
   private readonly writeCalls: Array<{ ptyId: string; data: string }> = []
+  private readonly commandShellFamilyByPtyId = new Map<
+    string,
+    TerminalCommandShellFamily
+  >()
   private spawnDelayMs = 0
   private emitExitOnKill = true
   private throwOnKill = false
@@ -172,6 +183,16 @@ class FakeTerminalBackend implements TerminalBackend {
 
   setSpawnDelayMs(delayMs: number): void {
     this.spawnDelayMs = Math.max(0, Math.floor(delayMs))
+  }
+
+  setCommandShellFamilyForTerminalId(
+    terminalId: string,
+    family: TerminalCommandShellFamily
+  ): void {
+    this.commandShellFamilyByPtyId.set(
+      this.getPtyIdForTerminalId(terminalId),
+      family
+    )
   }
 
   setEmitExitOnKill(value: boolean): void {
@@ -352,6 +373,12 @@ class FakeTerminalBackend implements TerminalBackend {
     ptyId: string
   ): 'initializing' | 'ready' | 'failed' | undefined {
     return this.initializationStateByPtyId.get(ptyId)
+  }
+
+  getCommandShellFamily(
+    ptyId: string
+  ): TerminalCommandShellFamily | undefined {
+    return this.commandShellFamilyByPtyId.get(ptyId)
   }
 
   async refreshSessionState(ptyId: string): Promise<void> {
@@ -691,7 +718,7 @@ const run = async (): Promise<void> => {
       )
     })
 
-    await runCase('terminal service must strip internal ready marker from renderer stream and ring buffer', async () => {
+    await runCase('terminal service preserves ready-marker lookalikes after backend initialization', async () => {
       const backend = new FakeTerminalBackend()
       const service = createService(stateFilePath, backend)
       const terminalDataEvents: Array<{ terminalId: string; data: string; offset?: number }> = []
@@ -708,26 +735,25 @@ const run = async (): Promise<void> => {
         rows: 24
       })
 
-      backend.emitDataForTerminalId('local-ready-marker-filter', 'hello\r\n')
       backend.emitDataForTerminalId(
         'local-ready-marker-filter',
-        '__GYSHELL_READY__\r\nPS C:\\Users\\TUOTUO_Server> '
+        'before__GYSHELL_READY__after\r\nPS C:\\Users\\TUOTUO_Server> '
       )
 
       await sleep(20)
 
       const buffered = service.getBufferDelta('local-ready-marker-filter', 0)
       assertCondition(
-        !buffered.includes('__GYSHELL_READY__'),
-        'ring buffer should never contain internal ready marker'
+        buffered.includes('before__GYSHELL_READY__after'),
+        'ordinary terminal data must not be mistaken for an initialization control marker'
       )
       assertCondition(
         buffered.includes('PS C:\\Users\\TUOTUO_Server> '),
         'shell prompt after ready marker should be preserved'
       )
       assertCondition(
-        terminalDataEvents.every((item) => !item.data.includes('__GYSHELL_READY__')),
-        'renderer stream should never contain internal ready marker'
+        terminalDataEvents.some((item) => item.data.includes('before__GYSHELL_READY__after')),
+        'renderer output must preserve the same ordinary marker-like text'
       )
     })
 
@@ -1100,50 +1126,72 @@ const run = async (): Promise<void> => {
       assertEqual(resizeCall?.rows, 40, 'remount resize should forward the changed rows')
     })
 
-    await runCase('local terminals remain writable while renderer-visible state is initializing', async () => {
+    await runCase('local PowerShell rejects input until its private bootstrap is ready', async () => {
       const backend = new FakeTerminalBackend()
       const service = createService(stateFilePath, backend)
+      backend.setCommandShellFamilyForTerminalId(
+        'local-powershell-initializing',
+        'powershell'
+      )
 
       await service.createTerminal({
         type: 'local',
-        id: 'local-writable-initializing',
-        title: 'Local Writable Initializing',
+        id: 'local-powershell-initializing',
+        title: 'Local PowerShell Initializing',
         cols: 80,
         rows: 24
       })
 
-      const tab = service
-        .getDisplayTerminals()
-        .find((terminal) => terminal.id === 'local-writable-initializing')
-      assertCondition(!!tab, 'local terminal should exist before write test')
-      tab!.runtimeState = 'initializing'
-
-      const runtimeSnapshot = service.getTerminalRuntimeSnapshot('local-writable-initializing')
+      const runtimeSnapshot = service.getTerminalRuntimeSnapshot(
+        'local-powershell-initializing'
+      )
+      assertEqual(
+        runtimeSnapshot?.runtimeState,
+        'initializing',
+        'PowerShell family should control bootstrap state independently of the host OS'
+      )
+      assertEqual(
+        runtimeSnapshot?.canWrite,
+        false,
+        'PowerShell bootstrap must not accept terminal input'
+      )
       assertEqual(
         runtimeSnapshot?.canUseFilesystem,
         true,
         'initializing local terminal should still expose filesystem operations'
       )
 
-      await service.listDirectory('local-writable-initializing', '/tmp')
+      await service.listDirectory('local-powershell-initializing', '/tmp')
       assertEqual(
         backend.getLastListDirectoryCall()?.ptyId,
-        'pty-local-writable-initializing',
+        'pty-local-powershell-initializing',
         'initializing local terminal filesystem calls should still target the backend pty'
       )
 
-      service.write('local-writable-initializing', 'echo ok\n')
-
-      const writeCall = backend.getWriteCalls()[0]
+      service.write('local-powershell-initializing', 'echo blocked\r')
       assertEqual(
-        writeCall?.ptyId,
-        'pty-local-writable-initializing',
-        'initializing local terminal writes should still target the backend pty'
+        backend.getWriteCalls().length,
+        0,
+        'input during PowerShell bootstrap must not reach the backend'
       )
+      await assertRejects(
+        service.runCommandNoWait(
+          'local-powershell-initializing',
+          'Write-Output blocked'
+        ),
+        /not ready/,
+        'agent commands during PowerShell bootstrap must fail before task creation'
+      )
+
+      backend.emitDataForTerminalId(
+        'local-powershell-initializing',
+        'PS /tmp> '
+      )
+      service.write('local-powershell-initializing', 'echo allowed\r')
       assertEqual(
-        writeCall?.data,
-        'echo ok\n',
-        'initializing local terminal writes should preserve input data'
+        backend.getWriteCalls()[0]?.data,
+        'echo allowed\r',
+        'input should resume after bootstrap reaches ready'
       )
     })
 
@@ -1211,6 +1259,77 @@ const run = async (): Promise<void> => {
         writeCall?.ptyId,
         'pty-local-auto-restart',
         'writes after local auto-restart should target the respawned pty'
+      )
+    })
+
+    await runCase('local auto-restart never publishes the dead runtime as command-ready', async () => {
+      const backend = new FakeTerminalBackend()
+      const service = createService(stateFilePath, backend)
+
+      await service.createTerminal({
+        type: 'local',
+        id: 'local-auto-restart-spawn-window',
+        title: 'Local Auto Restart Spawn Window',
+        cols: 80,
+        rows: 24
+      })
+
+      backend.setSpawnDelayMs(80)
+      backend.emitExitForTerminalId('local-auto-restart-spawn-window', 129)
+
+      const restartingSnapshot = service.getTerminalRuntimeSnapshot(
+        'local-auto-restart-spawn-window'
+      )
+      assertEqual(
+        restartingSnapshot?.runtimeState,
+        'initializing',
+        'the tab must remain initializing while replacement spawn is pending'
+      )
+      assertEqual(
+        restartingSnapshot?.canRunCommand,
+        false,
+        'the dead PTY must not be exposed as command-ready during replacement spawn'
+      )
+      assertEqual(
+        restartingSnapshot?.canWrite,
+        false,
+        'the dead PTY must not accept manual input during replacement spawn'
+      )
+
+      service.write('local-auto-restart-spawn-window', 'echo blocked\n')
+      await assertRejects(
+        service.runCommandNoWait(
+          'local-auto-restart-spawn-window',
+          'echo blocked'
+        ),
+        /not ready/,
+        'a synchronous command attempt in the spawn window must fail closed'
+      )
+      assertEqual(
+        backend.getWriteCalls().length,
+        0,
+        'neither manual nor agent input may be submitted to the exited PTY'
+      )
+      assertEqual(
+        service.getActiveTaskId('local-auto-restart-spawn-window'),
+        undefined,
+        'a rejected spawn-window command must not create a permanently running task'
+      )
+
+      await sleep(100)
+      const restartedSnapshot = service.getTerminalRuntimeSnapshot(
+        'local-auto-restart-spawn-window'
+      )
+      assertEqual(
+        restartedSnapshot?.runtimeState,
+        'ready',
+        'a Unix-family local runtime should become ready after replacement spawn'
+      )
+      service.write('local-auto-restart-spawn-window', 'echo allowed\n')
+      assertEqual(
+        backend.getWriteCalls()[0]?.data,
+        'echo allowed\n',
+        'input should target the replacement runtime after it becomes ready'
       )
     })
 
@@ -1755,7 +1874,22 @@ const run = async (): Promise<void> => {
       assertEqual(
         callbackObservedCleanState,
         true,
-        'terminal close should clear task state before notifying completion listeners'
+        'terminal close should detach task state before notifying completion listeners'
+      )
+      assertEqual(
+        service.getCommandOutputSnapshot(terminal.id, taskId)?.executionState,
+        'outcome_unknown',
+        'terminal close should leave a read-only historical snapshot addressable by exact terminal id'
+      )
+      assertEqual(
+        service.getCommandOutputSnapshot(terminal.id, taskId)?.capture.reason,
+        'runtime_boundary',
+        'the detached snapshot must preserve why capture ended without a trusted boundary'
+      )
+      assertEqual(
+        (service as any).detachedTasksByTerminal.has(terminal.id),
+        true,
+        'closed command history should use a detached namespace'
       )
     })
 
@@ -1796,13 +1930,19 @@ const run = async (): Promise<void> => {
         'terminal close should preserve the unknown command outcome boundary for waiters'
       )
       assertCondition(
-        /terminal tab was closed/i.test(result.stdoutDelta),
-        'terminal close should explain why the waiting command was aborted'
+        /terminal tab was closed/i.test(result.terminalStatus || ''),
+        'terminal close should explain why the waiting command was aborted without forging stdout'
       )
+      assertEqual(result.stdoutDelta, '', 'terminal lifecycle status must not become captured command output')
       assertEqual(
         (service as any).tasksByTerminal.has(terminal.id),
         false,
-        'settling a closed command wait should not retain terminal task state'
+        'settling a closed command wait should remove the live execution namespace'
+      )
+      assertEqual(
+        service.getCommandTask(terminal.id, taskId)?.id,
+        taskId,
+        'settling a closed command wait should retain bounded read-only history'
       )
       assertEqual(
         (service as any).activeTaskByTerminal.has(terminal.id),

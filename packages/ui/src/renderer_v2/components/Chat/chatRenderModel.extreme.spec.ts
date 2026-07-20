@@ -4,6 +4,7 @@ import {
   resolveSeamlessOverlayMessages,
 } from './chatRenderModel'
 import type { ChatMessage, ChatSession } from '../../stores/ChatStore'
+import type { CommandOutputContractV1 } from '@gyshell/shared'
 
 const assertEqual = <T>(actual: T, expected: T, message: string): void => {
   if (actual !== expected) {
@@ -65,6 +66,30 @@ const createSession = (messages: ChatMessage[]): ChatSession => {
     lockedProfileId: null,
   }
 }
+
+const createCommandOutputContract = (
+  executionState: CommandOutputContractV1['executionState'],
+): CommandOutputContractV1 => ({
+  contractVersion: 1,
+  terminalId: 'terminal-1',
+  historyCommandMatchId: 'command-1',
+  executionState,
+  exitCode: executionState === 'finished' ? 0 : null,
+  capture: {
+    state: executionState === 'running' ? 'in_progress' : 'complete',
+    observedUtf8Bytes: 0,
+    retainedUtf8Bytes: 0,
+    availableLineCount: 0,
+    revision: 1,
+    terminalControlsObserved: false,
+  },
+  presentation: {
+    state: 'none',
+    returnedUtf8Bytes: 0,
+    hasMoreCapturedOutput: false,
+    ...(executionState === 'running' ? { pollCursor: 'poll-command-1' } : {}),
+  },
+})
 
 runCase(
   'assistant runs are computed once and expose group-copy only on the tail row',
@@ -381,6 +406,60 @@ runCase(
       items[1]?.assistantGroupBranchMessageId,
       null,
       'a streaming tool group should not expose a branch target yet',
+    )
+  },
+)
+
+runCase(
+  'typed running command blocks branch cuts throughout its cloned prefix',
+  () => {
+    const session = createSession([
+      createMessage({ id: 'u1', role: 'user', type: 'text', content: 'start' }),
+      createMessage({
+        id: 'command-running',
+        role: 'assistant',
+        type: 'command',
+        content: 'long task',
+        backendMessageId: 'backend-command-running',
+        streaming: false,
+        metadata: {
+          commandOutput: createCommandOutputContract('running'),
+        },
+      }),
+      createMessage({
+        id: 'a1',
+        role: 'assistant',
+        type: 'text',
+        content: 'the task continues in the background',
+        backendMessageId: 'backend-a1',
+        streaming: false,
+      }),
+      createMessage({ id: 'u2', role: 'user', type: 'text', content: 'next' }),
+      createMessage({
+        id: 'a2',
+        role: 'assistant',
+        type: 'text',
+        content: 'later reply',
+        backendMessageId: 'backend-a2',
+        streaming: false,
+      }),
+    ])
+
+    const items = buildChatRenderItems(session, false, 'seamless')
+    assertEqual(
+      items[1]?.seamlessGroupStreaming,
+      true,
+      'typed running state must retain the command row like legacy streaming',
+    )
+    assertEqual(
+      items[2]?.showAssistantGroupCopy,
+      false,
+      'settled text must not expose a branch cut that clones an earlier live command',
+    )
+    assertEqual(
+      items[4]?.assistantGroupBranchMessageId,
+      null,
+      'a later user turn must remain non-branchable until the earlier command settles',
     )
   },
 )

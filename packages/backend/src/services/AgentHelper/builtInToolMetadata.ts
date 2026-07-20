@@ -2,6 +2,7 @@ export const WRITE_STDIN_TOOL_DESCRIPTION = [
   'Send characters to a specific terminal tab WITHOUT a trailing newline.',
   'If the target terminal tab is disconnected or not ready, this tool returns an explicit terminal_status instead of pretending input was sent.',
   'This is a specialized, advanced tool for control/interactive programs (e.g. vim, tmux, REPLs) and for sending C0 control characters like Ctrl+C.',
+  'When a command is expected to prompt for input, prefer starting it with exec_command waitMode="nowait", inspect the live prompt with read_terminal_tab, then answer with write_stdin. Include "CR" as its own final item when Enter is required.',
   'For normal commands, always use exec_command/run_command instead.',
   '',
   'Send a list of items in order. Each item may be either:',
@@ -88,11 +89,11 @@ export const CREATE_OR_EDIT_TOOL_DESCRIPTION = [
 ].join('\n')
 
 export const EXEC_COMMAND_DESCRIPTION =
-  'Execute a shell command in a specific terminal tab. This appends a trailing "\\n" to run the command automatically. If you do NOT want auto-execute, use write_stdin instead. You must provide waitMode: "wait" (synchronous; wait for command result) or "nowait" (asynchronous; return immediately). If the terminal is disconnected or not ready, the tool returns an explicit terminal_status and does not run the command. Command output may be truncated; use read_command_output with history_command_match_id and terminalId to read full output.'
+  'Execute one physical shell submission in a specific terminal tab. CR, LF, and NUL are rejected before anything is written; for a multi-line script, use write_file in the terminal temporary directory and execute that file with a one-line command. This appends the shell Enter key automatically. You must provide waitMode: "wait" or "nowait". Use nowait for commands that may request interactive input; inspect their live terminal prompt with read_terminal_tab and answer with write_stdin. The result begins with a machine-readable gyshell_command_result contract that independently reports execution state, capture state, and presentation state (none/full/excerpt). If presentation.state is excerpt, pass nextCursor unchanged to read_command_output. If capture.state is incomplete/unknown, missing process text cannot be recovered and a command with side effects must not be replayed automatically.'
 export const READ_TERMINAL_TAB_DESCRIPTION =
   'Read the recent visible output and runtime status of a specific terminal tab. If the tab is disconnected, the output is retained history and may be stale.'
 export const READ_COMMAND_OUTPUT_DESCRIPTION =
-  'Read historical output of a specific command by history_command_match_id and terminal tab. Supports offset/limit for paging large outputs. The result includes terminal_status so you can tell whether the tab is still connected.'
+  'Read retained captured output for one command. Prefer the opaque cursor returned in gyshell_command_result and pass it back unchanged; cursor paging can continue inside an arbitrarily long line. Legacy line offset/limit remains available but cannot be combined with cursor. presentation.state=none means this snapshot returned no retained text. Reaching the current tail while executionState is running is only a snapshot; use pollCursor later. For an interactive running command, its live prompt may be visible through read_terminal_tab before it enters this retained record. capture.state=complete means the retained transcript is complete, while incomplete/unknown is an explicit warning that pagination cannot recover missing process output.'
 export const READ_FILE_DESCRIPTION =
   'Read a file from a specific terminal tab. If the terminal is disconnected or not ready, the tool returns an explicit terminal_status instead of a raw backend session error.'
 export const WAIT_TOOL_DESCRIPTION =
@@ -113,7 +114,7 @@ export const CREATE_TERMINAL_TAB_DESCRIPTION = [
 ].join('\n')
 export const CLOSE_TERMINAL_TAB_DESCRIPTION = [
   'Close an existing terminal tab and terminate its backend session.',
-  'This can stop running commands, disconnect SSH, cancel terminal-scoped transfers, and close port forwards. The closed tab and retained terminal output are removed from GyShell.',
+  'This can stop running commands, disconnect SSH, cancel terminal-scoped transfers, and close port forwards. The visual tab and terminal scrollback are removed. Bounded read-only exec_command transcripts may remain in process-local history until retention eviction so an Agent can inspect the outcome without replaying side effects.',
   'This is an experimental, destructive tool. Its availability means the user already enabled and accepted the risk, so do not request another approval before calling it.',
   'Use the exact terminal tab id or an unambiguous tab name.'
 ].join('\n')

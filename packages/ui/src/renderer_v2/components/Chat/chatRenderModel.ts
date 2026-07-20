@@ -1,5 +1,8 @@
 import type { ChatMessage, ChatSession } from '../../stores/ChatStore'
-import { buildSeamlessStepPresentation } from './seamlessToolPresentation'
+import {
+  buildSeamlessStepPresentation,
+  isSeamlessGroupRunning,
+} from './seamlessToolPresentation'
 
 export type ChatVisibleRowKind = 'assistant' | 'user' | 'boundary'
 
@@ -232,6 +235,10 @@ export const buildChatRenderItems = (
   })
 
   const items: ChatRenderItem[] = []
+  // A branch clones every message up to its target, while command completion
+  // events remain scoped to the source session. Keep all later branch/copy
+  // controls hidden whenever their cloned prefix would contain live state.
+  let hasUnsettledMessageInPrefix = false
   let visibleIndex = 0
   while (visibleIndex < visibleRows.length) {
     const row = visibleRows[visibleIndex]
@@ -255,7 +262,7 @@ export const buildChatRenderItems = (
       const groupFirstId = row.id
       const seamlessGroupMessageIds: string[] = [row.id]
       const seamlessGroupMessages: ChatMessage[] = [row.msg]
-      let isGroupStreaming = !!row.msg.streaming
+      let isGroupStreaming = isSeamlessGroupRunning([row.msg])
 
       while (
         visibleIndex + 1 < visibleRows.length &&
@@ -266,8 +273,9 @@ export const buildChatRenderItems = (
         const nextRow = visibleRows[visibleIndex]
         seamlessGroupMessageIds.push(nextRow.id)
         seamlessGroupMessages.push(nextRow.msg)
-        if (nextRow.msg.streaming) isGroupStreaming = true
+        if (isSeamlessGroupRunning([nextRow.msg])) isGroupStreaming = true
       }
+      hasUnsettledMessageInPrefix ||= isGroupStreaming
 
       // Merge if this is not the first assistant item in the turn.
       const prevIsAssistant =
@@ -285,7 +293,7 @@ export const buildChatRenderItems = (
       )
       const nextVisibleKind = nextVisibleRow?.kind ?? null
       const isTurnTail =
-        !isGroupStreaming &&
+        !hasUnsettledMessageInPrefix &&
         (nextVisibleKind === 'user' || (!nextVisibleRow && !isThinking))
 
       items.push({
@@ -338,9 +346,11 @@ export const buildChatRenderItems = (
     const runMessages = visibleRows
       .slice(runStart, runEnd + 1)
       .map((entry) => entry.msg)
+    hasUnsettledMessageInPrefix ||=
+      isSeamlessGroupRunning(runMessages)
     const canShowGroupCopy =
       runMessages.length > 0 &&
-      runMessages.every((message) => !message.streaming) &&
+      !hasUnsettledMessageInPrefix &&
       (nextVisibleKind === 'user' || (!nextVisibleRow && !isThinking))
     const branchTargetMessageId = visibleRows[runEnd]?.id ?? null
 

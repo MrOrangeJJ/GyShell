@@ -1,9 +1,13 @@
 import type { ChatMessage } from '../../stores/ChatStore'
+import type { CommandOutputContractV1 } from '@gyshell/shared'
 import {
   SEAMLESS_DETAIL_PREVIEW_LIMIT,
   buildSeamlessStepPresentation,
+  getCommandOutputUiPresentation,
   getSeamlessDiffLineTone,
   getSeamlessGroupTone,
+  isSeamlessGroupRunning,
+  sliceFromStartAtUnicodeBoundary,
 } from './seamlessToolPresentation'
 
 const assertEqual = <T>(actual: T, expected: T, message: string): void => {
@@ -36,6 +40,54 @@ const runCase = (name: string, fn: () => void): void => {
   fn()
   console.log(`PASS ${name}`)
 }
+
+const createCommandOutputContract = (
+  overrides: Partial<CommandOutputContractV1> = {},
+): CommandOutputContractV1 => ({
+  contractVersion: 1,
+  terminalId: 'terminal-1',
+  historyCommandMatchId: 'command-1',
+  executionState: 'finished',
+  exitCode: 0,
+  capture: {
+    state: 'complete',
+    observedUtf8Bytes: 12,
+    retainedUtf8Bytes: 12,
+    availableLineCount: 1,
+    revision: 1,
+    terminalControlsObserved: false,
+  },
+  presentation: {
+    state: 'full',
+    returnedUtf8Bytes: 12,
+    hasMoreCapturedOutput: false,
+  },
+  ...overrides,
+})
+
+const containsUnpairedSurrogate = (value: string): boolean => {
+  for (let index = 0; index < value.length; index += 1) {
+    const codeUnit = value.charCodeAt(index)
+    if (codeUnit >= 0xd800 && codeUnit <= 0xdbff) {
+      const next = value.charCodeAt(index + 1)
+      if (!(next >= 0xdc00 && next <= 0xdfff)) return true
+      index += 1
+    } else if (codeUnit >= 0xdc00 && codeUnit <= 0xdfff) {
+      return true
+    }
+  }
+  return false
+}
+
+runCase('Unicode-safe prefix slicing never cuts an emoji surrogate pair', () => {
+  const value = `${'a'.repeat(86)}🙂tail`
+  const preview = sliceFromStartAtUnicodeBoundary(value, 87)
+  assertEqual(preview, 'a'.repeat(86), 'a split pair should be excluded as a unit')
+  assertCondition(
+    !containsUnpairedSurrogate(preview),
+    'the compact preview boundary must not retain an unpaired surrogate',
+  )
+})
 
 runCase(
   'skill activities expose the skill name and rich result details',
@@ -244,6 +296,218 @@ runCase(
     )
   },
 )
+
+runCase('typed command metadata keeps all three output axes distinct', () => {
+  const presentation = buildSeamlessStepPresentation(
+    createMessage({
+      type: 'command',
+      content: 'generate-report',
+      metadata: {
+        output: 'beginning\n...\nend',
+        commandOutput: createCommandOutputContract({
+          presentation: {
+            state: 'excerpt',
+            returnedUtf8Bytes: 16,
+            hasMoreCapturedOutput: true,
+            nextCursor: 'next-page',
+          },
+        }),
+      },
+    }),
+  )
+
+  assertEqual(
+    presentation.meta,
+    'Exit 0 · Capture complete · Result: captured-output excerpt',
+    'a response excerpt must not be described as incomplete capture',
+  )
+  assertEqual(
+    presentation.tone,
+    'neutral',
+    'complete capture with a recoverable excerpt is not a warning',
+  )
+})
+
+runCase('incomplete capture remains a warning even when all retained output is shown', () => {
+  const presentation = buildSeamlessStepPresentation(
+    createMessage({
+      type: 'command',
+      content: 'very-chatty-command',
+      metadata: {
+        commandOutput: createCommandOutputContract({
+          capture: {
+            state: 'incomplete',
+            reason: 'retention_limit',
+            observedUtf8Bytes: 20_000_000,
+            retainedUtf8Bytes: 16_000_000,
+            availableLineCount: 200_000,
+            revision: 4,
+            terminalControlsObserved: true,
+          },
+        }),
+      },
+    }),
+  )
+
+  assertEqual(
+    presentation.meta,
+    'Exit 0 · Capture incomplete (retention limit); retained 16000000/20000000 UTF-8 bytes; terminal controls observed · Result: all captured output',
+    'capture loss and presentation completeness should remain separate facts',
+  )
+  assertEqual(
+    presentation.tone,
+    'warning',
+    'capture loss must remain visible even for exit zero',
+  )
+})
+
+runCase('running commands distinguish capture progress from an empty presentation', () => {
+  const presentation = buildSeamlessStepPresentation(
+    createMessage({
+      type: 'command',
+      content: 'long-running-command',
+      streaming: true,
+      metadata: {
+        commandOutput: createCommandOutputContract({
+          executionState: 'running',
+          exitCode: null,
+          capture: {
+            state: 'in_progress',
+            observedUtf8Bytes: 0,
+            retainedUtf8Bytes: 0,
+            availableLineCount: 0,
+            revision: 0,
+            terminalControlsObserved: false,
+          },
+          presentation: {
+            state: 'none',
+            returnedUtf8Bytes: 0,
+            hasMoreCapturedOutput: false,
+            pollCursor: 'poll-here',
+          },
+        }),
+      },
+    }),
+  )
+
+  assertEqual(
+    presentation.meta,
+    'Running · Capture in progress · Result: none yet',
+    'running state should not imply that capture or presentation is complete',
+  )
+})
+
+runCase('typed nowait execution keeps its seamless group running after streaming ends', () => {
+  const running = createMessage({
+    type: 'command',
+    streaming: false,
+    metadata: {
+      commandOutput: createCommandOutputContract({
+        executionState: 'running',
+        exitCode: null,
+      }),
+    },
+  })
+  const finished = createMessage({
+    type: 'command',
+    streaming: false,
+    metadata: {
+      commandOutput: createCommandOutputContract(),
+    },
+  })
+
+  assertEqual(
+    isSeamlessGroupRunning([running]),
+    true,
+    'typed background execution must outrank the transport streaming flag',
+  )
+  assertEqual(
+    getCommandOutputUiPresentation(running)?.isDone,
+    false,
+    'the standalone desktop command banner must not render a running nowait command as completed',
+  )
+  assertEqual(
+    isSeamlessGroupRunning([finished]),
+    false,
+    'the group should become done when the typed execution state finishes',
+  )
+  const runningReadSnapshot = createMessage({
+    type: 'tool_call',
+    streaming: false,
+    metadata: {
+      toolName: 'read_command_output',
+      commandOutput: createCommandOutputContract({
+        executionState: 'running',
+        exitCode: null,
+      }),
+    },
+  })
+  assertEqual(
+    isSeamlessGroupRunning([runningReadSnapshot]),
+    false,
+    'a completed read snapshot must not keep its group running forever',
+  )
+})
+
+runCase('read_command_output tool calls expose the same typed recovery state', () => {
+  const presentation = buildSeamlessStepPresentation(
+    createMessage({
+      type: 'tool_call',
+      content: '{"history_command_match_id":"command-1"}',
+      metadata: {
+        toolName: 'read_command_output',
+        output: 'next captured page',
+        commandOutput: createCommandOutputContract({
+          presentation: {
+            state: 'excerpt',
+            returnedUtf8Bytes: 18,
+            hasMoreCapturedOutput: true,
+            nextCursor: 'next-page',
+          },
+        }),
+      },
+    }),
+  )
+
+  assertEqual(
+    presentation.meta,
+    'Exit 0 · Capture complete · Result: captured-output excerpt',
+    'paging tool results should preserve command-output semantics in history',
+  )
+  assertEqual(
+    presentation.tone,
+    'neutral',
+    'a recoverable read page should not look like command failure',
+  )
+})
+
+runCase('typed command details hide the model-facing result envelope', () => {
+  const contract = createCommandOutputContract()
+  const presentation = buildSeamlessStepPresentation(
+    createMessage({
+      type: 'tool_call',
+      content: '{"history_command_match_id":"command-1"}',
+      metadata: {
+        toolName: 'read_command_output',
+        output: [
+          '<gyshell_command_result>',
+          JSON.stringify(contract),
+          '</gyshell_command_result>',
+          '<terminal_content>',
+          'actual terminal text',
+          '</terminal_content>',
+        ].join('\n'),
+        commandOutput: contract,
+      },
+    }),
+  )
+
+  assertEqual(
+    presentation.details[1]?.content,
+    'actual terminal text',
+    'expanded UI details should show terminal text rather than the Agent envelope',
+  )
+})
 
 runCase('expanded details preserve whitespace-sensitive output', () => {
   const output = '  aligned\n'
@@ -462,8 +726,39 @@ runCase('large outputs are bounded and clearly marked as previews', () => {
 
   assertEqual(detail?.truncated, true, 'oversized content should be bounded')
   assertCondition(
-    (detail?.content.length || 0) <= SEAMLESS_DETAIL_PREVIEW_LIMIT + 2,
+    (detail?.content.length || 0) <= SEAMLESS_DETAIL_PREVIEW_LIMIT,
     'bounded previews should not render the full oversized result',
+  )
+  assertCondition(
+    detail?.content.includes('UI preview omitted middle content') === true,
+    'UI-only omission should be explicit and not resemble capture loss',
+  )
+})
+
+runCase('large Unicode previews preserve both ends without broken surrogate pairs', () => {
+  const tail = 'TAIL-SENTINEL-😀'
+  const output = `a${'😀'.repeat(7_000)}${tail}`
+  const presentation = buildSeamlessStepPresentation(
+    createMessage({
+      type: 'command',
+      content: 'unicode-output',
+      metadata: { output },
+    }),
+  )
+  const preview = presentation.details[0]?.content || ''
+
+  assertCondition(
+    preview.endsWith(tail),
+    'head-and-tail previews should preserve the recovery-relevant tail',
+  )
+  assertEqual(
+    containsUnpairedSurrogate(preview),
+    false,
+    'preview boundaries must not split a Unicode surrogate pair',
+  )
+  assertCondition(
+    preview.length <= SEAMLESS_DETAIL_PREVIEW_LIMIT,
+    'the omission marker must fit inside the UI preview budget',
   )
 })
 
@@ -479,7 +774,7 @@ runCase('large tool inputs are bounded before JSON formatting work', () => {
 
   assertEqual(detail?.truncated, true, 'large inputs should become previews')
   assertCondition(
-    (detail?.content.length || 0) <= SEAMLESS_DETAIL_PREVIEW_LIMIT + 2,
+    (detail?.content.length || 0) <= SEAMLESS_DETAIL_PREVIEW_LIMIT,
     'large input details should stay inside the shared preview limit',
   )
 })

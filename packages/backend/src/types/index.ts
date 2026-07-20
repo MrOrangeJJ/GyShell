@@ -1,6 +1,14 @@
 import type {
+  CommandCaptureMetadata,
+  CommandExecutionState,
+  CommandOutputContractV1,
   ModelRequestParameters,
   TerminalConnectionCapabilities,
+} from '@gyshell/shared'
+export type {
+  CommandCaptureMetadata,
+  CommandExecutionState,
+  CommandOutputContractV1,
 } from '@gyshell/shared'
 
 // ============ Settings Types ============
@@ -333,17 +341,36 @@ export interface CommandResult {
   exitCode?: number
   history_command_match_id: string
   runtimeBoundary?: boolean
+  /** Service/runtime explanation kept separate from captured terminal bytes. */
+  terminalStatus?: string
+  executionState?: CommandExecutionState
+  capture?: CommandCaptureMetadata
 }
 
 export type TerminalCommandTrackingMode = 'windows-powershell-sidecar'
 
+/**
+ * Interactive command-boundary protocol family. This is intentionally
+ * independent from the host OS: PowerShell Core can run on Unix, while Bash
+ * and Zsh can run on Windows.
+ */
+export type TerminalCommandShellFamily = 'unix' | 'powershell'
+
 export interface TerminalCommandTrackingToken {
   mode: TerminalCommandTrackingMode
+  /** Random identity of the backend runtime that prepared this token. */
+  trackingScopeId?: string
   baselineSequence: number
   awaitingInitialFreshMarker?: boolean
   dispatchedAtMs?: number
   dispatchMode?: 'prompt-file'
+  /** Runtime-bound top-level input that consumes the hidden request file. */
+  dispatchInput?: string
   displayMode?: 'synthetic-transcript'
+  /** The next marker must have a readable task-owned output file. */
+  expectCommandOutput?: boolean
+  /** Runtime-private request identity required on the completion marker. */
+  expectedRequestId?: string
   commandRequestPath?: string
   commandOutputPath?: string
 }
@@ -352,9 +379,15 @@ export interface TerminalCommandTrackingUpdate {
   mode: TerminalCommandTrackingMode
   sequence: number
   exitCode?: number
+  /** False means the shell completed, but exact exit provenance was ambiguous. */
+  outcomeKnown?: boolean
+  requestId?: string
   cwd?: string
   homeDir?: string
   output?: string
+  outputObservedUtf8Bytes?: number
+  outputRetainedUtf8Bytes?: number
+  outputTruncated?: boolean
 }
 
 export interface CommandTask {
@@ -369,13 +402,29 @@ export interface CommandTask {
   endOffset?: number
   exitCode?: number
   output?: string
+  capture?: CommandCaptureMetadata
+  captureBoundaryState?:
+    | 'awaiting-start'
+    | 'capturing'
+    | 'awaiting-end'
+    | 'sealed'
+    | 'unverified'
+  expectedShellSequence?: number
+  activeShellSequence?: number
+  activeShellNonce?: string
   lastOutputAtMs?: number
   capturedOutput?: string
+  capturedOutputObservedUtf8Bytes?: number
+  capturedOutputTruncated?: boolean
+  syntheticRawDisplayObserved?: boolean
+  syntheticRawDisplayEndsWithLineBreak?: boolean
+  syntheticSidecarDisplayOutput?: string
   runtimeBoundary?: boolean
+  outcomeUnknown?: boolean
+  terminalStatus?: string
   suppressFinishCallback?: boolean
   startTime: number
   endTime?: number
-  startAbsLine?: number
 }
 
 export interface FileStatInfo {
@@ -485,6 +534,9 @@ export interface AgentEvent {
   diff?: string
   exitCode?: number
   outputDelta?: string
+  commandOutput?: CommandOutputContractV1
+  outputMode?: 'append' | 'replace'
+  isNowait?: boolean
   summary?: string
   message?: string
   details?: string
@@ -679,6 +731,11 @@ export interface ResourceSnapshot {
 }
 
 // ============ Terminal Backend Interface ============
+export interface TerminalCommandProtocolMetadata {
+  cwd?: string
+  homeDir?: string
+}
+
 export interface TerminalSessionBackend {
   /**
    * Spawns a connection.
@@ -730,6 +787,45 @@ export interface TerminalSessionBackend {
    * Get detailed system information.
    */
   getSystemInfo(ptyId: string): Promise<TerminalSystemInfo | undefined>
+
+  /**
+   * Whether this interactive shell exposes command boundaries that can
+   * settle exec_command. Undefined preserves compatibility for backends that
+   * have not declared a capability; false must fail closed.
+   */
+  getCommandProtocolAvailability?(ptyId: string): boolean | undefined
+
+  /**
+   * Private namespace token for this Unix shell runtime. Real backends use a
+   * fresh value per spawn; omitted tokens preserve legacy fake-backend tests.
+   */
+  getCommandProtocolToken?(ptyId: string): string | undefined
+
+  /**
+   * Declares which interactive shell protocol owns command dispatch and
+   * completion. Callers must not infer this from filesystem/host semantics.
+   */
+  getCommandShellFamily?(
+    ptyId: string,
+  ): TerminalCommandShellFamily | undefined
+
+  /**
+   * Declares the runtime's active out-of-band command tracker independently
+   * from the host OS. PowerShell Core can use the same sidecar on Unix hosts,
+   * where remoteOs must remain `unix` for paths and filesystem behavior.
+   */
+  getCommandTrackingMode?(
+    ptyId: string,
+  ): TerminalCommandTrackingMode | undefined
+
+  /**
+   * Applies cwd/home metadata only after TerminalService has validated and
+   * paired the marker that carried it.
+   */
+  applyCommandProtocolMetadata?(
+    ptyId: string,
+    metadata: TerminalCommandProtocolMetadata,
+  ): void
 
   /**
    * Execute a side-band command on the session and collect stdout/stderr when supported.

@@ -8,7 +8,12 @@ import type {
   GatewayTerminalSummary,
   UIUpdateAction,
 } from './protocol'
-import { compactMessageSummary } from './state'
+import {
+  compactMessageSummary,
+  formatTuiCommandOutputStatus,
+  getTuiCommandOutputStatusFromMetadata,
+  getTuiDisplayOutput,
+} from './state'
 import type { GatewayClient } from './gateway-client'
 
 export async function startTuiCli(argv: string[] = process.argv.slice(2)): Promise<void> {
@@ -296,10 +301,17 @@ async function runHookMode(client: GatewayClient, sessionId: string, userText: s
 async function runHeadlessMode(client: GatewayClient, sessionId: string, userText: string): Promise<void> {
   const outputCache = new Map<string, string>()
   const messageTypes = new Map<string, ChatMessage['type']>()
+  const commandStatusCache = new Map<string, string>()
 
   const unsubscribeUi = client.on('uiUpdate', (update) => {
     if (update.sessionId !== sessionId) return
-    handleHeadlessUiUpdate(client, update, outputCache, messageTypes)
+    handleHeadlessUiUpdate(
+      client,
+      update,
+      outputCache,
+      messageTypes,
+      commandStatusCache,
+    )
   })
   const unsubscribeClose = client.on('close', (code, reason) => {
     process.stderr.write(`\nGateway disconnected (${code}) ${reason}\n`)
@@ -317,16 +329,23 @@ async function runHeadlessMode(client: GatewayClient, sessionId: string, userTex
   }
 }
 
-function handleHeadlessUiUpdate(
+export function handleHeadlessUiUpdate(
   client: GatewayClient,
   update: UIUpdateAction,
   outputCache: Map<string, string>,
   messageTypes: Map<string, ChatMessage['type']>,
+  commandStatusCache: Map<string, string>,
+  write: (value: string) => unknown = (value) => process.stdout.write(value),
 ): void {
   if (update.type === 'ADD_MESSAGE') {
     const message = update.message
     messageTypes.set(message.id, message.type)
-    outputCache.set(message.id, message.metadata?.output || '')
+    outputCache.set(message.id, getTuiDisplayOutput(message.metadata))
+    const commandStatus = getTuiCommandOutputStatusFromMetadata(message.metadata)
+    commandStatusCache.set(
+      message.id,
+      commandStatus ? formatTuiCommandOutputStatus(commandStatus) : '',
+    )
 
     if (message.type === 'ask') {
       void autoDenyAsk(client, message)
@@ -336,40 +355,68 @@ function handleHeadlessUiUpdate(
     if (message.role !== 'assistant') return
 
     if (message.type === 'text') {
-      if (message.content) process.stdout.write(message.content)
+      if (message.content) write(message.content)
       return
     }
 
     const summary = compactMessageSummary(message, true)
     if (summary) {
-      process.stdout.write(`\n${summary}\n`)
+      write(`\n${summary}\n`)
     }
     return
   }
 
   if (update.type === 'APPEND_CONTENT') {
-    if (update.content) process.stdout.write(update.content)
+    if (update.content) write(update.content)
     return
   }
 
   if (update.type === 'APPEND_OUTPUT') {
-    if (update.outputDelta) process.stdout.write(update.outputDelta)
+    if (update.outputDelta) write(update.outputDelta)
     return
   }
 
   if (update.type === 'UPDATE_MESSAGE') {
-    const nextOutput = update.patch.metadata?.output
-    if (typeof nextOutput !== 'string') return
-
-    const previous = outputCache.get(update.messageId) || ''
-    outputCache.set(update.messageId, nextOutput)
-
     const type = messageTypes.get(update.messageId)
     if (type !== 'command' && type !== 'sub_tool' && type !== 'reasoning' && type !== 'compaction') return
-    if (!nextOutput) return
 
-    const delta = nextOutput.startsWith(previous) ? nextOutput.slice(previous.length) : nextOutput
-    if (delta) process.stdout.write(delta)
+    const rawNextOutput = update.patch.metadata?.output
+    const previous = outputCache.get(update.messageId) || ''
+    const previousStatus = commandStatusCache.get(update.messageId) || ''
+    const nextOutput =
+      typeof rawNextOutput === 'string'
+        ? getTuiDisplayOutput(update.patch.metadata)
+        : previous
+    if (typeof rawNextOutput === 'string') {
+      outputCache.set(update.messageId, nextOutput)
+    }
+
+    if (nextOutput) {
+      const isAppend = nextOutput.startsWith(previous)
+      const refreshesExcerpt =
+        previous.length > 0 &&
+        !isAppend &&
+        (previousStatus.includes('presentation=excerpt') ||
+          update.patch.metadata?.commandOutput?.presentation.state === 'excerpt')
+      if (refreshesExcerpt) {
+        write(
+          '\n[COMMAND OUTPUT REFRESHED] Captured-output excerpt replaces the previous snapshot.\n',
+        )
+      }
+      const delta = isAppend ? nextOutput.slice(previous.length) : nextOutput
+      if (delta) write(delta)
+    }
+
+    const commandStatus = getTuiCommandOutputStatusFromMetadata(
+      update.patch.metadata,
+    )
+    if (commandStatus) {
+      const nextStatus = formatTuiCommandOutputStatus(commandStatus)
+      commandStatusCache.set(update.messageId, nextStatus)
+      if (type === 'command' && nextStatus !== previousStatus) {
+        write(`\n[COMMAND] ${nextStatus}\n`)
+      }
+    }
   }
 }
 
