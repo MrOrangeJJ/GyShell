@@ -21,6 +21,8 @@ const assertEqual = <T>(actual: T, expected: T, message: string): void => {
   }
 }
 
+const compactTerminalWhitespace = (value: string): string => value.replace(/\s+/g, '')
+
 const waitUntil = async (
   predicate: () => boolean,
   message: string,
@@ -88,7 +90,17 @@ const runShellMatrix = async (shell: string): Promise<void> => {
   const shellName = shell.split('/').pop() || 'shell'
   const terminalId = `real-output-${shellName}-${process.pid}`
   const service = new TerminalService()
-  service.setRawEventPublisher(() => {})
+  let focusedLiveDisplay: string | undefined
+  service.setRawEventPublisher((channel, payload) => {
+    const event = payload as { terminalId?: string; data?: string }
+    if (
+      focusedLiveDisplay !== undefined &&
+      channel === 'terminal:data' &&
+      event.terminalId === terminalId
+    ) {
+      focusedLiveDisplay += event.data || ''
+    }
+  })
 
   const previousPromptCommand = process.env.PROMPT_COMMAND
   const previousZdotDir = process.env.ZDOTDIR
@@ -101,7 +113,10 @@ const runShellMatrix = async (shell: string): Promise<void> => {
   } else if (zshFixtureDir) {
     fs.writeFileSync(
       path.join(zshFixtureDir, '.zshrc'),
-      'gyshell_real_user_precmd() { printf ZSH_PROMPT_NOISE; return 0; }\nprecmd_functions+=(gyshell_real_user_precmd)\n',
+      'gyshell_real_user_preexec() { printf "ZSH_PREEXEC_NOISE\\n"; [[ "$1" == *GYSHELL_ABORT_BEFORE_START* ]] && sleep 2; return 0; }\n' +
+        'preexec_functions+=(gyshell_real_user_preexec)\n' +
+        'gyshell_real_user_precmd() { printf ZSH_PROMPT_NOISE; return 0; }\n' +
+        'precmd_functions+=(gyshell_real_user_precmd)\n',
       'utf8',
     )
     process.env.ZDOTDIR = zshFixtureDir
@@ -112,7 +127,7 @@ const runShellMatrix = async (shell: string): Promise<void> => {
       id: terminalId,
       title: `Real output ${shellName}`,
       shell,
-      cols: 80,
+      cols: 40,
       rows: 24,
     })
   } finally {
@@ -130,6 +145,133 @@ const runShellMatrix = async (shell: string): Promise<void> => {
 
   try {
     await waitForShellPrompt(service, terminalId)
+
+    const visibleCommand = 'printf __gyshell_x'
+    const visibleBaseline = service.getCurrentOffset(terminalId)
+    focusedLiveDisplay = ''
+    const visibleResult = await runTrackedCommand(
+      service,
+      terminalId,
+      visibleCommand,
+    )
+    const visibleLiveData = focusedLiveDisplay
+    focusedLiveDisplay = undefined
+    assertEqual(
+      visibleResult.snapshot.output,
+      '__gyshell_x',
+      `${shellName} focused display fixture must retain exact command output`,
+    )
+    await waitUntil(
+      () => service.getRecentOutput(terminalId, 24).includes('__gyshell_x'),
+      `${shellName} headless terminal did not render the focused command output`,
+    )
+    for (const surface of [
+      { name: 'terminal:data', value: visibleLiveData },
+      { name: 'ring buffer', value: service.getBufferDelta(terminalId, visibleBaseline) },
+      { name: 'headless terminal', value: service.getRecentOutput(terminalId, 24) },
+    ]) {
+      // xterm inserts visual line breaks when a prompt plus command exceeds the
+      // terminal width. Compact whitespace so the assertion follows the cells
+      // the user sees and still catches a private dispatcher split by wrapping.
+      const compactSurface = compactTerminalWhitespace(surface.value)
+      const compactCommand = compactTerminalWhitespace(visibleCommand)
+      assertEqual(
+        compactSurface.split(compactCommand).length - 1,
+        1,
+        `${shellName} ${surface.name} must show the original command exactly once`,
+      )
+      assert(
+        surface.value.includes('__gyshell_x'),
+        `${shellName} ${surface.name} must retain private-looking user output`,
+      )
+      if (shellName === 'zsh') {
+        assert(
+          surface.value.includes('ZSH_PREEXEC_NOISE'),
+          `${shellName} ${surface.name} must retain safe user preexec-hook output`,
+        )
+      }
+      assert(
+        !/__gyshell_[0-9a-f]{32}_dispatch/.test(compactSurface) &&
+          !compactSurface.includes('_command_exit') &&
+          !compactSurface.includes('builtintrap'),
+        `${shellName} ${surface.name} exposed the private Unix dispatcher`,
+      )
+    }
+
+    if (shellName === 'zsh') {
+      service.resize(terminalId, 4, 100)
+      await new Promise((resolve) => setTimeout(resolve, 50))
+
+      const narrowCommand = 'printf OK'
+      const narrowBaseline = service.getCurrentOffset(terminalId)
+      focusedLiveDisplay = ''
+      const narrowResult = await runTrackedCommand(service, terminalId, narrowCommand)
+      const narrowLiveData = focusedLiveDisplay
+      focusedLiveDisplay = undefined
+      assertEqual(narrowResult.snapshot.output, 'OK', 'narrow zsh capture must remain exact')
+      const narrowSurfaces = [
+        { name: 'terminal:data', value: narrowLiveData },
+        { name: 'ring buffer', value: service.getBufferDelta(terminalId, narrowBaseline) },
+        { name: 'headless terminal', value: service.getRecentOutput(terminalId, 2000) },
+      ]
+      for (const surface of narrowSurfaces) {
+        const compactSurface = compactTerminalWhitespace(surface.value)
+        assertEqual(
+          compactSurface.split(compactTerminalWhitespace(narrowCommand)).length - 1,
+          1,
+          `4-column zsh ${surface.name} must show the original command exactly once`,
+        )
+        assert(
+          !compactSurface.includes('_command_exit') &&
+            !compactSurface.includes('builtintrap') &&
+            !compactSurface.includes('dispatch_restore'),
+          `4-column zsh ${surface.name} exposed redrawn private dispatcher fragments`,
+        )
+      }
+      assert(
+        narrowLiveData.length < 2048,
+        `4-column zsh emitted an unexpectedly large hidden-command projection (${narrowLiveData.length} bytes)`,
+      )
+
+      const abortCommand = 'printf GYSHELL_ABORT_BEFORE_START'
+      const abortBaseline = service.getCurrentOffset(terminalId)
+      focusedLiveDisplay = ''
+      const abortTaskId = await service.runCommandNoWait(terminalId, abortCommand)
+      const abortController = new AbortController()
+      setTimeout(() => abortController.abort(), 50)
+      const abortResult = await service.waitForTask(terminalId, abortTaskId, {
+        signal: abortController.signal,
+      })
+      assertEqual(abortResult.executionState, 'aborted', 'narrow zsh fixture must abort before preexec')
+      await waitUntil(
+        () => service.getTerminalRuntimeSnapshot(terminalId)?.canRunCommand === true,
+        'narrow zsh did not release its hidden-display guard at the authenticated prompt',
+        5_000,
+      )
+      const abortLiveData = focusedLiveDisplay
+      focusedLiveDisplay = undefined
+      for (const surface of [
+        { name: 'terminal:data', value: abortLiveData },
+        { name: 'ring buffer', value: service.getBufferDelta(terminalId, abortBaseline) },
+      ]) {
+        const compactSurface = compactTerminalWhitespace(surface.value)
+        assert(
+          !compactSurface.includes('__gyshell_') &&
+            !compactSurface.includes('_command_exit') &&
+            !compactSurface.includes('builtintrap'),
+          `aborted 4-column zsh ${surface.name} exposed private dispatcher text`,
+        )
+      }
+
+      const recovered = await runTrackedCommand(service, terminalId, 'printf RECOVERED')
+      assertEqual(
+        recovered.snapshot.output,
+        'RECOVERED',
+        'narrow zsh must accept and capture the command after an early abort',
+      )
+      service.resize(terminalId, 40, 24)
+      await new Promise((resolve) => setTimeout(resolve, 50))
+    }
 
     if (shellName === 'zsh') {
       const existingPromptHook = await runTrackedCommand(
@@ -532,7 +674,12 @@ const runShellMatrix = async (shell: string): Promise<void> => {
       `${shellName} protocol state must survive public helper-name collisions`,
     )
 
-    const parseError = await runTrackedCommand(service, terminalId, 'echo )')
+    const parseCommand = 'echo )'
+    const parseVisibleBaseline = service.getCurrentOffset(terminalId)
+    focusedLiveDisplay = ''
+    const parseError = await runTrackedCommand(service, terminalId, parseCommand)
+    const parseLiveData = focusedLiveDisplay
+    focusedLiveDisplay = undefined
     assertEqual(
       parseError.snapshot.executionState,
       'finished',
@@ -558,6 +705,32 @@ const runShellMatrix = async (shell: string): Promise<void> => {
         parseError.snapshot.capture.state === 'unknown',
       `${shellName} parse-error capture must be either paired-complete or explicitly unverified`,
     )
+    await waitUntil(
+      () => /(?:parse error|syntax error)/i.test(service.getRecentOutput(terminalId, 24)),
+      `${shellName} headless terminal did not render the parse diagnostic`,
+    )
+    for (const surface of [
+      { name: 'terminal:data', value: parseLiveData },
+      { name: 'ring buffer', value: service.getBufferDelta(terminalId, parseVisibleBaseline) },
+      { name: 'headless terminal', value: service.getRecentOutput(terminalId, 24) },
+    ]) {
+      const compactSurface = compactTerminalWhitespace(surface.value)
+      const compactCommand = compactTerminalWhitespace(parseCommand)
+      assertEqual(
+        compactSurface.split(compactCommand).length - 1,
+        1,
+        `${shellName} ${surface.name} must show the parse-error command exactly once`,
+      )
+      assert(
+        /(?:parse error|syntax error)/i.test(surface.value),
+        `${shellName} ${surface.name} must retain the parse diagnostic`,
+      )
+      assert(
+        !/__gyshell_[0-9a-f]{32}_dispatch/.test(compactSurface) &&
+          !compactSurface.includes('_command_exit'),
+        `${shellName} ${surface.name} exposed private dispatch text for a parse error`,
+      )
+    }
 
     const nowaitTaskId = await service.runCommandNoWait(
       terminalId,

@@ -1290,6 +1290,257 @@ const run = async (): Promise<void> => {
     service.kill(terminalId)
   })
 
+  await runCase('Unix dispatcher echo stays private across local and SSH display surfaces', async () => {
+    for (const connectionType of ['local', 'ssh'] as const) {
+      const terminalId = `unix-private-dispatch-${connectionType}`
+      const runtimeToken = connectionType === 'local'
+        ? 'a1111111111111111111111111111111'
+        : 'b2222222222222222222222222222222'
+      const backend = createUnixBackend()
+      backend.setCommandProtocol(true, runtimeToken)
+      backend.setCommandShellFamily('unix')
+      const service = createService(backend)
+      let liveDisplay = ''
+      service.setRawEventPublisher((channel, payload) => {
+        const event = payload as { terminalId?: string; data?: string }
+        if (channel === 'terminal:data' && event.terminalId === terminalId) {
+          liveDisplay += event.data || ''
+        }
+      })
+      if (connectionType === 'local') {
+        await service.createTerminal({
+          type: 'local',
+          id: terminalId,
+          title: terminalId,
+          cols: 40,
+          rows: 16,
+        })
+      } else {
+        await createReadySshTerminal(service, terminalId)
+        service.resize(terminalId, 40, 16)
+      }
+      backend.emitData(
+        terminalId,
+        tokenizedUnixBoundary(runtimeToken, 'precmd', 0, 'initial_private_echo')
+      )
+
+      const baselineOffset = service.getCurrentOffset(terminalId)
+      liveDisplay = ''
+      const command = "printf 'VISIBLE_STDOUT'"
+      const taskId = await service.runCommandNoWait(terminalId, command)
+      const wireInput = backend.getLastWrite(terminalId)
+      assertCondition(
+        wireInput.includes(`__gyshell_${runtimeToken}_dispatch`) &&
+          wireInput.includes('_command_exit'),
+        `${connectionType} fixture must exercise the private Unix dispatcher`,
+      )
+
+      const chunkSizes = [1, 2, 7, 31]
+      let cursor = 0
+      let chunkIndex = 0
+      while (cursor < wireInput.length) {
+        const size = chunkSizes[chunkIndex % chunkSizes.length]!
+        backend.emitData(terminalId, wireInput.slice(cursor, cursor + size))
+        cursor += size
+        chunkIndex += 1
+      }
+      backend.emitData(
+        terminalId,
+        '\x1b[?2004l\r\nPREEXEC_HOOK_VISIBLE\r\n'
+      )
+
+      const nonce = taskId.replace(/-/g, '')
+      const privateLookingUserOutput = '__gyshell_user_literal'
+      backend.emitData(
+        terminalId,
+        tokenizedUnixBoundary(runtimeToken, 'preexec', 1, nonce) +
+          'VISIBLE_STDOUT' +
+          privateLookingUserOutput +
+          tokenizedUnixBoundary(runtimeToken, 'preend', 1, nonce) +
+          tokenizedUnixBoundary(runtimeToken, 'precmd', 1, nonce),
+      )
+      const result = await service.waitForTask(terminalId, taskId)
+      assertEqual(
+        result.stdoutDelta,
+        `VISIBLE_STDOUT${privateLookingUserOutput}`,
+        `${connectionType} command capture must remain exact`,
+      )
+      await waitUntil(
+        () => service.getRecentOutput(terminalId, 16).includes(privateLookingUserOutput),
+        `${connectionType} headless terminal did not render the filtered stream`,
+      )
+
+      const surfaces = [
+        { name: 'terminal:data', value: liveDisplay },
+        { name: 'ring buffer', value: service.getBufferDelta(terminalId, baselineOffset) },
+        { name: 'headless terminal', value: service.getRecentOutput(terminalId, 16) },
+      ]
+      for (const surface of surfaces) {
+        assertEqual(
+          surface.value.split(command).length - 1,
+          1,
+          `${connectionType} ${surface.name} must show the original command exactly once`,
+        )
+        assertCondition(
+          surface.value.includes('VISIBLE_STDOUT') &&
+            surface.value.includes(privateLookingUserOutput) &&
+            surface.value.includes('PREEXEC_HOOK_VISIBLE'),
+          `${connectionType} ${surface.name} must retain safe hook and post-preexec output`,
+        )
+        assertCondition(
+          !surface.value.includes(`__gyshell_${runtimeToken}_dispatch`) &&
+            !surface.value.includes('_command_exit') &&
+            !surface.value.includes('builtin trap'),
+          `${connectionType} ${surface.name} must never expose the private dispatcher`,
+        )
+      }
+      service.kill(terminalId)
+    }
+  })
+
+  await runCase('aborting before Unix preexec cannot release a delayed private echo', async () => {
+    const terminalId = 'unix-private-dispatch-abort-race'
+    const runtimeToken = 'c3333333333333333333333333333333'
+    const backend = createUnixBackend()
+    backend.setCommandProtocol(true, runtimeToken)
+    backend.setCommandShellFamily('unix')
+    const service = createService(backend)
+    let liveDisplay = ''
+    service.setRawEventPublisher((channel, payload) => {
+      const event = payload as { terminalId?: string; data?: string }
+      if (channel === 'terminal:data' && event.terminalId === terminalId) {
+        liveDisplay += event.data || ''
+      }
+    })
+    await createLocalTerminal(service, terminalId)
+    backend.emitData(
+      terminalId,
+      tokenizedUnixBoundary(runtimeToken, 'precmd', 0, 'initial_abort_race')
+    )
+
+    const baselineOffset = service.getCurrentOffset(terminalId)
+    liveDisplay = ''
+    const command = "printf 'AFTER_ABORT'"
+    const taskId = await service.runCommandNoWait(terminalId, command)
+    const wireInput = backend.getLastWrite(terminalId)
+    ;(service as any).markTaskAborted(terminalId, taskId)
+    backend.emitData(terminalId, wireInput.slice(0, 19))
+    backend.emitData(terminalId, wireInput.slice(19))
+
+    assertCondition(
+      !liveDisplay.includes(`__gyshell_${runtimeToken}_dispatch`) &&
+        !service
+          .getBufferDelta(terminalId, baselineOffset)
+          .includes(`__gyshell_${runtimeToken}_dispatch`),
+      'removing the active task must not release delayed dispatcher suppression',
+    )
+
+    const nonce = taskId.replace(/-/g, '')
+    backend.emitData(
+      terminalId,
+      tokenizedUnixBoundary(runtimeToken, 'preexec', 1, nonce) +
+        'OUTPUT_AFTER_ABORT' +
+        tokenizedUnixBoundary(runtimeToken, 'preend', 1, nonce) +
+        tokenizedUnixBoundary(runtimeToken, 'precmd', 1, nonce) +
+        '\r\n$ ',
+    )
+    await new Promise((resolve) => setTimeout(resolve, 20))
+    const recentOutput = service.getRecentOutput(terminalId, 32)
+    assertCondition(
+      recentOutput.includes('OUTPUT_AFTER_ABORT'),
+      `post-abort verified output did not reach the headless terminal: ${JSON.stringify({
+        liveDisplay,
+        ring: service.getBufferDelta(terminalId, baselineOffset),
+        recentOutput,
+        pending: (service as any).pendingUnixCommandDisplayByTerminal.get(terminalId),
+        boundary: (service as any).activeShellBoundaryByTerminal.get(terminalId),
+      })}`,
+    )
+    for (const surface of [
+      { name: 'terminal:data', value: liveDisplay },
+      { name: 'ring buffer', value: service.getBufferDelta(terminalId, baselineOffset) },
+      { name: 'headless terminal', value: recentOutput },
+    ]) {
+      assertEqual(
+        surface.value.split(command).length - 1,
+        1,
+        `${surface.name} must show the accepted command once after a preexec race`,
+      )
+      assertCondition(
+        surface.value.includes('OUTPUT_AFTER_ABORT') &&
+          !surface.value.includes(`__gyshell_${runtimeToken}_dispatch`) &&
+          !surface.value.includes('_command_exit'),
+        `${surface.name} must stay private after task removal and retain later output`,
+      )
+    }
+    assertEqual(
+      (service as any).pendingUnixCommandDisplayByTerminal.has(terminalId),
+      false,
+      'the verified start boundary should release the independent display guard',
+    )
+
+    const promptFallbackBaseline = service.getCurrentOffset(terminalId)
+    liveDisplay = ''
+    const promptFallbackCommand = "printf 'NEVER_STARTED'"
+    const promptFallbackTaskId = await service.runCommandNoWait(
+      terminalId,
+      promptFallbackCommand
+    )
+    const promptFallbackWire = backend.getLastWrite(terminalId)
+    ;(service as any).markTaskAborted(terminalId, promptFallbackTaskId)
+    backend.emitData(
+      terminalId,
+      tokenizedUnixBoundary(runtimeToken, 'precmd', 1, 'stale_before_echo')
+    )
+    assertEqual(
+      (service as any).pendingUnixCommandDisplayByTerminal.has(terminalId),
+      true,
+      'a duplicate prompt received before this dispatcher echo must not release the guard',
+    )
+    backend.emitData(terminalId, promptFallbackWire)
+    backend.emitData(
+      terminalId,
+      tokenizedUnixBoundary(
+        runtimeToken,
+        'precmd',
+        1,
+        'abort_before_start_prompt'
+      ) + 'PROMPT_AFTER_ABORT'
+    )
+    await new Promise((resolve) => setTimeout(resolve, 20))
+    for (const surface of [
+      { name: 'terminal:data', value: liveDisplay },
+      {
+        name: 'ring buffer',
+        value: service.getBufferDelta(terminalId, promptFallbackBaseline),
+      },
+      { name: 'headless terminal', value: service.getRecentOutput(terminalId, 32) },
+    ]) {
+      assertEqual(
+        surface.value.split(promptFallbackCommand).length - 1,
+        1,
+        `${surface.name} must show an input cancelled before preexec exactly once`,
+      )
+      assertCondition(
+        surface.value.includes('PROMPT_AFTER_ABORT') &&
+          !surface.value.includes(`__gyshell_${runtimeToken}_dispatch`) &&
+          !surface.value.includes('_command_exit'),
+        `${surface.name} must recover at the authenticated prompt without leaking the cancelled dispatcher`,
+      )
+    }
+    assertEqual(
+      (service as any).pendingUnixCommandDisplayByTerminal.has(terminalId),
+      false,
+      'an authenticated same-sequence prompt after observed echo should release the guard',
+    )
+    assertEqual(
+      service.getTerminalRuntimeSnapshot(terminalId)?.canRunCommand,
+      true,
+      'a verified post-cancellation prompt should reopen the command gate',
+    )
+    service.kill(terminalId)
+  })
+
   await runCase('Windows sidecar initial prompt cannot complete input submitted before baseline', async () => {
     const backend = new FakeCommandBackend('windows', {
       os: 'Windows',
@@ -5306,13 +5557,24 @@ const run = async (): Promise<void> => {
     backend.setCommandProtocol(true, runtimeToken)
     const service = createService(backend)
     const terminalId = 'unix-bash-parse-error'
+    let liveDisplay = ''
+    service.setRawEventPublisher((channel, payload) => {
+      const event = payload as { terminalId?: string; data?: string }
+      if (channel === 'terminal:data' && event.terminalId === terminalId) {
+        liveDisplay += event.data || ''
+      }
+    })
     await createLocalTerminal(service, terminalId)
     backend.emitData(
       terminalId,
       tokenizedUnixBoundary(runtimeToken, 'precmd', 0, 'initial_nonce_0000')
     )
 
-    const taskId = await service.runCommandNoWait(terminalId, 'if then')
+    const baselineOffset = service.getCurrentOffset(terminalId)
+    liveDisplay = ''
+    const command = 'if then'
+    const taskId = await service.runCommandNoWait(terminalId, command)
+    backend.emitData(terminalId, backend.getLastWrite(terminalId))
     backend.emitData(terminalId, 'bash: syntax error near unexpected token `then`\r\n')
     backend.emitData(
       terminalId,
@@ -5345,6 +5607,22 @@ const run = async (): Promise<void> => {
       false,
       'prompt-hook output after the private preend marker must stay outside diagnostics'
     )
+    for (const surface of [
+      { name: 'terminal:data', value: liveDisplay },
+      { name: 'ring buffer', value: service.getBufferDelta(terminalId, baselineOffset) },
+    ]) {
+      assertEqual(
+        surface.value.split(command).length - 1,
+        1,
+        `${surface.name} should replace the hidden dispatcher with the original parse-error command`,
+      )
+      assertCondition(
+        surface.value.includes('syntax error') &&
+          !surface.value.includes(`__gyshell_${runtimeToken}_dispatch`) &&
+          !surface.value.includes('_command_exit'),
+        `${surface.name} should retain diagnostics without exposing private dispatch text`,
+      )
+    }
     assertEqual(backend.getWrites(terminalId).length, 1, 'parse-error recovery must never replay the command')
   })
 

@@ -395,7 +395,7 @@ export interface CommandTask {
   command: string
   wireCommand?: string
   completionTracking?: TerminalCommandTrackingToken
-  displayMode?: 'synthetic-transcript'
+  displayMode?: 'synthetic-transcript' | 'synthetic-command-echo'
   type: 'wait' | 'nowait'
   status: 'running' | 'finished' | 'aborted' | 'timeout'
   startOffset: number

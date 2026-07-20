@@ -45,6 +45,8 @@ import { buildWindowsPowerShellDispatchRequest } from './windowsPowerShellTracki
 const MAX_BUFFER_SIZE = 200000 // 200KB
 const SCROLLBACK_SIZE = 5000 // Keep up to 5000 lines in virtual terminal
 const PERSIST_FLUSH_DELAY_MS = 120
+const PRIVATE_UNIX_ECHO_SCAN_SIZE = 4096
+const UNIX_INTERACTIVE_SUBMISSION_BOUNDARY = '\x1b[?2004l'
 // Shell hooks provide normal interactive boundaries. Agent commands use a
 // top-level eval bookended by runtime-private helpers, which preserves native
 // interactive semantics while restoring the hidden ready hook after a command
@@ -54,6 +56,21 @@ const ANSI_OSC_SEQUENCE_PATTERN = /\x1b\][^\x07]*(?:\x07|\x1b\\)/g
 const OTHER_CONTROL_CHAR_PATTERN = /[\u0000-\u0008\u000b-\u001a\u001c-\u001f\u007f]/g
 const WINDOWS_PROMPT_ONLY_PATTERN = /^(?:PS (?:[A-Za-z]:\\|\/).*?>|[A-Za-z]:\\.*?>)\s*$/
 const WINDOWS_PROMPT_PREFIX_PATTERN = /^(?:PS (?:[A-Za-z]:\\|\/).*?>|[A-Za-z]:\\.*?>)\s*/
+
+const renderTerminalSafeCommand = (command: string): string =>
+  Array.from(command, (scalar) => {
+    const codePoint = scalar.codePointAt(0)!
+    if (codePoint <= 0x1f) {
+      return `^${String.fromCharCode(codePoint + 0x40)}`
+    }
+    if (codePoint === 0x7f) {
+      return '^?'
+    }
+    if (codePoint >= 0x80 && codePoint <= 0x9f) {
+      return `\\u{${codePoint.toString(16).padStart(4, '0')}}`
+    }
+    return scalar
+  }).join('')
 
 function stripGyShellOscMarkers(s: string): string {
   return s.replace(
@@ -145,6 +162,20 @@ interface CommandStartReservation {
   waitForRelease: Promise<void>
   releaseWaiters: () => void
   startedTaskId?: string
+}
+
+interface PendingUnixCommandDisplay {
+  taskId: string
+  command: string
+  expectedSequence: number
+  expectedNonce: string
+  privateDispatcherName: string
+  privateEchoEndAnchor: string
+  suppressedTextTail: string
+  privateEchoObserved: boolean
+  submissionBoundaryObserved: boolean
+  postSubmitDisplay: string
+  postSubmitDisplayOverflowed: boolean
 }
 
 interface WindowsPromptInitialization {
@@ -301,6 +332,10 @@ export class TerminalService {
   private deferredWritesUntilTaskFinishByTaskId: Map<string, string[]> = new Map()
   private promptFileIoTailByTerminal: Map<string, Promise<void>> = new Map()
   private internalRawDisplaySuppressionByTerminal: Map<string, symbol> = new Map()
+  private pendingUnixCommandDisplayByTerminal: Map<
+    string,
+    PendingUnixCommandDisplay
+  > = new Map()
   private promptFileIoReleaseByCommandStartToken: Map<symbol, () => void> = new Map()
   private terminalInputSequenceTailByTerminal: Map<string, Promise<void>> = new Map()
   private commandStreamProtocolByTerminal: Map<string, CommandStreamProtocol> = new Map()
@@ -690,6 +725,7 @@ export class TerminalService {
     ptyId: string
   ): void {
     this.clearWindowsPromptRuntimeState(terminalId)
+    this.pendingUnixCommandDisplayByTerminal.delete(terminalId)
     this.nextBackendRuntimeGeneration += 1
     const runtimeGeneration = this.nextBackendRuntimeGeneration
     this.backendRuntimeGenerationByTerminal.set(
@@ -1101,11 +1137,11 @@ export class TerminalService {
       }
     }
 
-    const syntheticRawTaskActive = this.shouldSuppressRawTaskDisplay(terminalId)
+    const taskRawDisplaySuppressed = this.shouldSuppressRawTaskDisplay(terminalId)
     const internalRawDisplaySuppressed =
       this.internalRawDisplaySuppressionByTerminal.has(terminalId)
     const suppressRawDisplay =
-      syntheticRawTaskActive || internalRawDisplaySuppressed
+      taskRawDisplaySuppressed || internalRawDisplaySuppressed
     const headless = this.headlessPtys.get(terminalId)
     let writeSeq = 0
     if (!suppressRawDisplay && headless && data) {
@@ -1123,9 +1159,9 @@ export class TerminalService {
 
     // Process OSC markers and strip markers from visual output
     const cleanedData = this.processIncomingData(terminalId, data, writeSeq)
-    const displayRequestBoundSyntheticRaw =
-      syntheticRawTaskActive && !internalRawDisplaySuppressed
-    if (displayRequestBoundSyntheticRaw && headless && cleanedData) {
+    const displayFilteredTaskData =
+      taskRawDisplaySuppressed && !internalRawDisplaySuppressed
+    if (displayFilteredTaskData && headless && cleanedData) {
       writeSeq = (this.headlessWriteSeqByTerminal.get(terminalId) || 0) + 1
       this.headlessWriteSeqByTerminal.set(terminalId, writeSeq)
       headless.write(cleanedData, () => {
@@ -1141,7 +1177,7 @@ export class TerminalService {
       })
     }
     if (
-      (!suppressRawDisplay || displayRequestBoundSyntheticRaw) &&
+      (!suppressRawDisplay || displayFilteredTaskData) &&
       cleanedData
     ) {
       const buffer = this.buffers.get(terminalId)
@@ -1188,7 +1224,11 @@ export class TerminalService {
   }
 
   private shouldSuppressRawTaskDisplay(terminalId: string): boolean {
-    return this.getActiveTask(terminalId)?.displayMode === 'synthetic-transcript'
+    const task = this.getActiveTask(terminalId)
+    return (
+      task?.displayMode === 'synthetic-transcript' ||
+      this.pendingUnixCommandDisplayByTerminal.has(terminalId)
+    )
   }
 
   private appendSyntheticDisplayData(terminalId: string, data: string): void {
@@ -1288,6 +1328,89 @@ export class TerminalService {
     return `${clearCurrentPrompt ? '\x1b[2K\r' : ''}${promptPrefix}${command}\r\n`
   }
 
+  private buildSyntheticUnixCommandEcho(command: string, output = ''): string {
+    const normalizedOutput = output
+      .replace(/\r\n/g, '\n')
+      .replace(/\r/g, '\n')
+      .replace(/\n/g, '\r\n')
+    return `${renderTerminalSafeCommand(command)}\r\n${normalizedOutput}`
+  }
+
+  private stagePendingUnixPostSubmitDisplay(
+    pending: PendingUnixCommandDisplay,
+    text: string
+  ): void {
+    let postSubmitText: string
+    if (!pending.submissionBoundaryObserved) {
+      const anchorIndex = pending.suppressedTextTail.lastIndexOf(
+        pending.privateEchoEndAnchor
+      )
+      if (anchorIndex < 0) {
+        return
+      }
+      const boundaryIndex = pending.suppressedTextTail.lastIndexOf(
+        UNIX_INTERACTIVE_SUBMISSION_BOUNDARY
+      )
+      if (
+        boundaryIndex <
+        anchorIndex + pending.privateEchoEndAnchor.length
+      ) {
+        return
+      }
+      const lineEnd = pending.suppressedTextTail.indexOf(
+        '\n',
+        boundaryIndex + UNIX_INTERACTIVE_SUBMISSION_BOUNDARY.length
+      )
+      if (lineEnd < 0) {
+        return
+      }
+      // Require both a runtime-bound suffix from the wire command and the
+      // non-rendering Readline/ZLE submission boundary. Text after the next
+      // line break can belong to user preexec hooks; without both positive
+      // signals the safe behavior is to keep suppressing.
+      pending.submissionBoundaryObserved = true
+      postSubmitText = pending.suppressedTextTail.slice(lineEnd + 1)
+    } else {
+      postSubmitText = text
+    }
+    if (!postSubmitText || pending.postSubmitDisplayOverflowed) {
+      return
+    }
+    if (
+      pending.postSubmitDisplay.length + postSubmitText.length >
+      MAX_BUFFER_SIZE
+    ) {
+      pending.postSubmitDisplay = ''
+      pending.postSubmitDisplayOverflowed = true
+      return
+    }
+    pending.postSubmitDisplay += postSubmitText
+  }
+
+  private getSafePendingUnixPostSubmitDisplay(
+    pending: PendingUnixCommandDisplay
+  ): string {
+    if (pending.postSubmitDisplayOverflowed || !pending.postSubmitDisplay) {
+      return ''
+    }
+    return this.containsPrivateUnixDisplay(pending.postSubmitDisplay, pending)
+      ? ''
+      : pending.postSubmitDisplay
+  }
+
+  private containsPrivateUnixDisplay(
+    display: string,
+    pending: PendingUnixCommandDisplay
+  ): boolean {
+    const plain = stripTerminalControlSequences(display)
+    const compact = plain.replace(/\s+/g, '')
+    return (
+      compact.includes('__gyshell_') ||
+      compact.includes(pending.privateDispatcherName) ||
+      compact.includes(pending.expectedNonce)
+    )
+  }
+
   private buildSyntheticTaskCompletionDisplay(terminalId: string, terminal: TerminalTab, output: string): string {
     const normalizedOutput = output.replace(/\r\n/g, '\n').replace(/\r/g, '\n').replace(/\n+$/g, '')
     const promptPrefix = this.resolveVisibleWindowsPromptPrefix(terminalId, terminal)
@@ -1340,14 +1463,41 @@ export class TerminalService {
         const displayRequestBoundRaw =
           syntheticTask?.displayMode === 'synthetic-transcript' &&
           syntheticTask.captureBoundaryState === 'capturing'
+        // Zsh can redraw one submitted line through hundreds of cursor-control
+        // fragments, and preexec hooks can themselves print that private line.
+        // Nothing before the request-bound start marker is safe to project.
+        const pendingUnixDisplay =
+          this.pendingUnixCommandDisplayByTerminal.get(terminalId)
+        const hideUnixDispatchEcho = pendingUnixDisplay !== undefined
+        if (pendingUnixDisplay && !pendingUnixDisplay.privateEchoObserved) {
+          pendingUnixDisplay.suppressedTextTail =
+            (pendingUnixDisplay.suppressedTextTail + event.text).slice(
+              -PRIVATE_UNIX_ECHO_SCAN_SIZE
+            )
+          pendingUnixDisplay.privateEchoObserved = this.containsPrivateUnixDisplay(
+            pendingUnixDisplay.suppressedTextTail,
+            pendingUnixDisplay
+          ) || pendingUnixDisplay.suppressedTextTail.includes(
+            UNIX_INTERACTIVE_SUBMISSION_BOUNDARY
+          )
+        } else if (pendingUnixDisplay) {
+          pendingUnixDisplay.suppressedTextTail =
+            (pendingUnixDisplay.suppressedTextTail + event.text).slice(
+              -PRIVATE_UNIX_ECHO_SCAN_SIZE
+            )
+        }
+        if (pendingUnixDisplay) {
+          this.stagePendingUnixPostSubmitDisplay(pendingUnixDisplay, event.text)
+        }
         const cleanedText = this.processTextControlMarkers(
           terminalId,
           event.text,
           writeSeq
         )
         if (
-          syntheticTask?.displayMode !== 'synthetic-transcript' ||
-          displayRequestBoundRaw
+          !hideUnixDispatchEcho &&
+          (syntheticTask?.displayMode !== 'synthetic-transcript' ||
+            displayRequestBoundRaw)
         ) {
           cleanedData += cleanedText
         }
@@ -1357,7 +1507,50 @@ export class TerminalService {
             /[\r\n]$/.test(cleanedText)
         }
       } else if (event.type === 'marker') {
+        const pendingUnixEchoTask = this.getActiveTask(terminalId)
+        const pendingUnixDisplay =
+          this.pendingUnixCommandDisplayByTerminal.get(terminalId)
         this.handleShellBoundaryMarker(terminalId, event.marker, writeSeq)
+        if (!pendingUnixDisplay) {
+          continue
+        }
+        const activeBoundary =
+          this.activeShellBoundaryByTerminal.get(terminalId)
+        const verifiedStart =
+          event.marker.kind === 'preexec' &&
+          !event.marker.legacy &&
+          event.marker.sequence === pendingUnixDisplay.expectedSequence &&
+          event.marker.nonce === pendingUnixDisplay.expectedNonce &&
+          activeBoundary?.sequence === event.marker.sequence &&
+          activeBoundary.nonce === event.marker.nonce
+        const verifiedFallback =
+          event.marker.kind === 'precmd' &&
+          pendingUnixEchoTask?.id === pendingUnixDisplay.taskId &&
+          pendingUnixEchoTask.status !== 'running' &&
+          pendingUnixEchoTask.capture?.reason === 'tracking_unavailable'
+        const pendingTask =
+          this.getTaskMap(terminalId)[pendingUnixDisplay.taskId]
+        const verifiedAbortedPrompt =
+          event.marker.kind === 'precmd' &&
+          !event.marker.legacy &&
+          event.marker.sequence === pendingUnixDisplay.expectedSequence - 1 &&
+          pendingUnixDisplay.privateEchoObserved &&
+          pendingTask?.status === 'aborted' &&
+          this.getActiveTask(terminalId) === undefined
+        if (verifiedStart || verifiedFallback || verifiedAbortedPrompt) {
+          this.pendingUnixCommandDisplayByTerminal.delete(terminalId)
+          if (verifiedAbortedPrompt) {
+            this.shellInputStateByTerminal.set(terminalId, 'idle')
+            this.applyVerifiedShellMetadata(terminalId, event.marker)
+          }
+          cleanedData += verifiedFallback
+            ? this.buildSyntheticUnixCommandEcho(
+                pendingUnixDisplay.command,
+                this.getTaskCapture(pendingUnixDisplay.taskId)?.getText() || ''
+              )
+            : this.buildSyntheticUnixCommandEcho(pendingUnixDisplay.command) +
+              this.getSafePendingUnixPostSubmitDisplay(pendingUnixDisplay)
+        }
       } else {
         const task = this.getActiveTask(terminalId)
         if (task?.captureBoundaryState === 'capturing') {
@@ -1845,6 +2038,7 @@ export class TerminalService {
     }
     this.terminalInputSequenceTailByTerminal.delete(terminalId)
     this.internalRawDisplaySuppressionByTerminal.delete(terminalId)
+    this.pendingUnixCommandDisplayByTerminal.delete(terminalId)
     this.clearWindowsPromptRuntimeState(terminalId)
     this.pendingTaskFinishByTerminal.delete(terminalId)
     this.unverifiedCaptureByTaskId.delete(activeTaskId || '')
@@ -2313,6 +2507,7 @@ export class TerminalService {
       this.selectionByTerminal.delete(terminalId)
       this.commandStreamProtocolByTerminal.delete(terminalId)
       this.internalRawDisplaySuppressionByTerminal.delete(terminalId)
+      this.pendingUnixCommandDisplayByTerminal.delete(terminalId)
       this.commandProtocolTokenByTerminal.delete(terminalId)
       this.shellInputStateByTerminal.delete(terminalId)
       this.lastShellSequenceByTerminal.delete(terminalId)
@@ -4567,6 +4762,8 @@ export class TerminalService {
     const usesSyntheticTranscript =
       usedPromptFileDispatch &&
       completionTracking?.displayMode === 'synthetic-transcript'
+    const usesSyntheticCommandEcho =
+      !usesPowerShellLifecycle && wireCommand !== command
     const capture = new CommandTranscriptCapture()
     const unverifiedCapture = new CommandTranscriptCapture()
     const lastShellSequence = this.lastShellSequenceByTerminal.get(terminalId)
@@ -4588,7 +4785,9 @@ export class TerminalService {
           : 'awaiting-start',
       ...(usesSyntheticTranscript
         ? { displayMode: 'synthetic-transcript' as const }
-        : {}),
+        : usesSyntheticCommandEcho
+          ? { displayMode: 'synthetic-command-echo' as const }
+          : {}),
       ...(lastShellSequence !== undefined
         ? { expectedShellSequence: lastShellSequence + 1 }
         : {})
@@ -4598,6 +4797,26 @@ export class TerminalService {
     this.captureByTaskId.set(taskId, capture)
     this.unverifiedCaptureByTaskId.set(taskId, unverifiedCapture)
     this.activeTaskByTerminal.set(terminalId, taskId)
+    if (usesSyntheticCommandEcho && lastShellSequence !== undefined) {
+      const privateDispatcherName = wireCommand.split(' ', 1)[0] || wireCommand
+      const runtimeTokenSuffix = privateDispatcherName
+        .replace(/^__gyshell_/, '')
+        .replace(/_dispatch$/, '')
+        .slice(-8)
+      this.pendingUnixCommandDisplayByTerminal.set(terminalId, {
+        taskId,
+        command,
+        expectedSequence: lastShellSequence + 1,
+        expectedNonce: taskId.replace(/-/g, ''),
+        privateDispatcherName,
+        privateEchoEndAnchor: `${runtimeTokenSuffix}_command_exit`,
+        suppressedTextTail: '',
+        privateEchoObserved: false,
+        submissionBoundaryObserved: false,
+        postSubmitDisplay: '',
+        postSubmitDisplayOverflowed: false,
+      })
+    }
     if (onFinished) this.onTaskFinishedCallbacks.set(taskId, onFinished)
     if (task.displayMode === 'synthetic-transcript') {
       this.appendSyntheticDisplayData(
@@ -4635,6 +4854,12 @@ export class TerminalService {
         this.activeTaskByTerminal.delete(terminalId)
       }
       this.onTaskFinishedCallbacks.delete(taskId)
+      if (
+        this.pendingUnixCommandDisplayByTerminal.get(terminalId)?.taskId ===
+        taskId
+      ) {
+        this.pendingUnixCommandDisplayByTerminal.delete(terminalId)
+      }
       await clearPendingPromptRequest()
       throw error
     }
