@@ -5,8 +5,12 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { COMMAND_CAPTURE_MAX_UTF8_BYTES } from "@gyshell/shared";
-import { buildInitializationReadyMarker } from "./terminal/CommandStreamProtocol";
+import {
+  buildInitializationReadyMarker,
+  buildPowerShellInitializationReadySequence,
+} from "./terminal/CommandStreamProtocol";
 import { PrivateShellInitializationGate } from "./terminal/PrivateShellInitializationGate";
+import { WINDOWS_POWERSHELL_INITIAL_PROMPT_SEQUENCE } from "./windowsPowerShellTracking";
 
 const assertEqual = <T>(actual: T, expected: T, message: string): void => {
   if (actual !== expected) {
@@ -160,6 +164,33 @@ const run = async (): Promise<void> => {
   );
 
   await runCase(
+    "private SSH initialization gate accepts a split PowerShell OSC record only",
+    async () => {
+      const token = "fedcba9876543210fedcba9876543210";
+      const readySequence = buildPowerShellInitializationReadySequence(token, 3);
+      const gate = new PrivateShellInitializationGate();
+      const attempt = gate.beginAttempt(readySequence);
+
+      assertEqual(
+        gate.accept(`private gyshell-init-ready;runtime=${token};attempt=3`).kind,
+        "suppressed",
+        "a printable PowerShell readiness lookalike must remain private",
+      );
+      assertEqual(
+        gate.accept(readySequence.slice(0, -1)).kind,
+        "suppressed",
+        "a split PowerShell readiness sequence must remain buffered",
+      );
+      const opened = gate.accept(`${readySequence.slice(-1)}PS C:\\> `);
+      assertCondition(
+        opened.kind === "opened" && opened.visibleData === "PS C:\\> ",
+        "only the complete exact PowerShell OSC record should open the gate",
+      );
+      assertEqual(await attempt, true, "the exact PowerShell OSC should settle readiness");
+    },
+  );
+
+  await runCase(
     "SSH readiness is committed before the marker-only chunk is published",
     async () => {
       const backend = new SSHBackend() as any;
@@ -175,7 +206,7 @@ const run = async (): Promise<void> => {
       const stream = new EventEmitter() as any;
       session.stream = stream;
       backend.sessions.set("marker-only", session);
-      const marker = buildInitializationReadyMarker(
+      const marker = buildPowerShellInitializationReadySequence(
         session.commandProtocolToken,
         1,
       );
@@ -187,7 +218,7 @@ const run = async (): Promise<void> => {
         "marker-only",
         session,
         stream,
-        `\r\n${marker}\r\n`,
+        marker,
         () => {
           observedStates.push(session.initializationState);
           observedProtocolAvailability.push(
@@ -215,6 +246,32 @@ const run = async (): Promise<void> => {
         observedProtocolAvailability[0],
         true,
         "the first public event must observe the committed command protocol state",
+      );
+    },
+  );
+
+  await runCase(
+    "SSH PowerShell exposes its bootstrap-proven prompt baseline only after readiness",
+    () => {
+      const backend = new SSHBackend() as any;
+      const session = createSession();
+      session.commandProtocolToken = "13131313131313131313131313131313";
+      session.commandTrackingMode = "windows-powershell-sidecar";
+      backend.sessions.set("initial-prompt-baseline", session);
+
+      assertEqual(
+        backend.getInitialCommandTrackingToken("initial-prompt-baseline"),
+        undefined,
+        "an initializing shell must not expose an unproven prompt baseline",
+      );
+      session.initializationState = "ready";
+      const token = backend.getInitialCommandTrackingToken(
+        "initial-prompt-baseline",
+      );
+      assertCondition(
+        token?.baselineSequence === WINDOWS_POWERSHELL_INITIAL_PROMPT_SEQUENCE &&
+          token.trackingScopeId === session.commandProtocolToken,
+        "the ready sidecar should expose the exact runtime-scoped bootstrap prompt",
       );
     },
   );
@@ -300,6 +357,152 @@ const run = async (): Promise<void> => {
           data.includes("Initialization timeout, retrying"),
         ),
         "a timed-out first attempt should report one public retry status",
+      );
+    },
+  );
+
+  await runCase(
+    "PowerShell SSH retries use distinct non-rendering readiness records",
+    async () => {
+      const readyRecords: string[] = [];
+      class PowerShellRetryStream extends EventEmitter {
+        launchCount = 0;
+        retryCount = 0;
+        writes: string[] = [];
+
+        write(
+          input: string,
+          callback?: (error?: Error | null) => void,
+        ): boolean {
+          this.writes.push(input);
+          setTimeout(() => {
+            callback?.(null);
+            if (input.startsWith("launch-")) {
+              this.launchCount += 1;
+            } else if (input.startsWith("rearm-")) {
+              this.retryCount += 1;
+            } else {
+              return;
+            }
+            if (this.launchCount + this.retryCount === 2) {
+              session.initializationGate.accept(readyRecords[1]);
+              session.initializationState = "ready";
+            }
+          }, 5);
+          return false;
+        }
+      }
+
+      const backend = new SSHBackend() as any;
+      const session = createSession();
+      session.commandProtocolToken = "12121212121212121212121212121212";
+      session.commandShellFamily = "powershell";
+      session.commandTrackingMode = "windows-powershell-sidecar";
+      const stream = new PowerShellRetryStream();
+      session.stream = stream;
+      backend.sessions.set("powershell-retry-pty", session);
+      backend.waitForShellInitializationDelay = async () => true;
+      backend.getShellInitRetryIntervalMs = () => 10;
+      backend.buildWindowsPowerShellLaunchCommand = (
+        _session: unknown,
+        readyRecord: string,
+      ): string => {
+        readyRecords.push(readyRecord);
+        return `launch-${readyRecords.length}`;
+      };
+      backend.buildWindowsPowerShellRetryCommand = (
+        _session: unknown,
+        readyRecord: string,
+      ): string => {
+        readyRecords.push(readyRecord);
+        return `rearm-${readyRecords.length}`;
+      };
+
+      await backend.runShellInitializationAttempts(
+        "powershell-retry-pty",
+        session,
+        stream,
+        () => {},
+        () => {
+          throw new Error("a successful PowerShell retry must not exit");
+        },
+      );
+
+      assertEqual(
+        stream.launchCount,
+        1,
+        "a PowerShell readiness retry must not launch a nested -NoExit shell",
+      );
+      assertEqual(
+        stream.retryCount,
+        1,
+        "the second PowerShell attempt should re-arm the initialized shell",
+      );
+      assertCondition(
+        stream.writes.includes("\x03") &&
+          !stream.writes.includes("\x03\n\n"),
+        "a PowerShell retry must interrupt without queuing newline prompts across -NoExit shells",
+      );
+      assertCondition(
+        readyRecords.length === 2 &&
+          readyRecords[0] !== readyRecords[1] &&
+          readyRecords[0] ===
+            buildPowerShellInitializationReadySequence(
+              session.commandProtocolToken,
+              1,
+            ) &&
+          readyRecords[1] ===
+            buildPowerShellInitializationReadySequence(
+              session.commandProtocolToken,
+              2,
+            ),
+        "each PowerShell retry must have an exact attempt-scoped OSC readiness record",
+      );
+    },
+  );
+
+  await runCase(
+    "PowerShell SSH retry re-arms an installed shell or reloads the staged bootstrap",
+    async () => {
+      const backend = new SSHBackend() as any;
+      const session = createSession();
+      session.commandProtocolToken = "34343434343434343434343434343434";
+      session.commandTrackingMode = "windows-powershell-sidecar";
+      session.windowsPowerShellBootstrapPath =
+        "C:/Windows/Temp/GyShell/prompt-markers/bootstrap.ps1";
+      const readySequence = buildPowerShellInitializationReadySequence(
+        session.commandProtocolToken,
+        2,
+      );
+
+      const command = backend.buildWindowsPowerShellRetryCommand(
+        session,
+        readySequence,
+      ) as string;
+      const encodedReadySequence = Buffer.from(readySequence, "utf8").toString(
+        "base64",
+      );
+      const encodedBootstrapPath = Buffer.from(
+        "C:\\Windows\\Temp\\GyShell\\prompt-markers\\bootstrap.ps1",
+        "utf8",
+      ).toString("base64");
+      assertCondition(
+        command.includes(encodedReadySequence) &&
+          command.includes(encodedBootstrapPath) &&
+          command.includes(
+            `$global:__gyshell_${session.commandProtocolToken}_bootstrap_installed`,
+          ) &&
+          command.includes(
+            `$global:__gyshell_${session.commandProtocolToken}_pending_ready_sequence`,
+          ) &&
+          command.includes(
+            `$global:__gyshell_${session.commandProtocolToken}_prompt_seq=0`,
+          ) &&
+          command.includes("Clear-Host;") &&
+          command.includes(". $__gyshell_retry_bootstrap_path") &&
+          !command.includes("-NoExit") &&
+          !command.includes("-EncodedCommand"),
+        "retry should clear an installed ConPTY screen and fall back to the staged script without nesting a shell",
       );
     },
   );
@@ -948,6 +1151,10 @@ const run = async (): Promise<void> => {
         commandProtocolToken: runtimeToken,
       }) as string;
       const decoded = Buffer.from(encoded, "base64").toString("utf16le");
+      const readySequenceBase64 = Buffer.from(
+        buildPowerShellInitializationReadySequence(runtimeToken),
+        "utf8",
+      ).toString("base64");
 
       assertCondition(
         decoded.includes(
@@ -956,8 +1163,10 @@ const run = async (): Promise<void> => {
         "modern Windows SSH shells must use UTF-8 for input, output, and native pipelines",
       );
       assertCondition(
-        decoded.includes(buildInitializationReadyMarker(runtimeToken)),
-        "the Windows SSH bootstrap completion marker must be scoped to this runtime",
+        decoded.includes(`FromBase64String('${readySequenceBase64}')`) &&
+          decoded.includes("[Console]::OpenStandardOutput()") &&
+          decoded.includes(`${privatePrefix}_ready_stdout.Write(`),
+        "the Windows SSH bootstrap must emit its runtime-scoped readiness record through raw stdout",
       );
       assertCondition(
         decoded.includes(
@@ -1035,16 +1244,64 @@ const run = async (): Promise<void> => {
         ),
         "sidecar init should journal prompt states so a later unrelated prompt cannot erase a matching completion",
       );
+      const promptDefinitionIndex = decoded.indexOf(
+        "Set-Item -Path Function:\\Global:prompt",
+      );
+      const promptJournalIndex = decoded.indexOf(
+        "[IO.File]::AppendAllText($global:__gyshell_marker_path",
+        promptDefinitionIndex,
+      );
+      const promptReadyWriteIndex = decoded.indexOf(
+        "$__gyshell_ready_stdout.Write(",
+        promptJournalIndex,
+      );
+      const promptReturnIndex = decoded.indexOf(
+        "'PS '+$PWD.Path+'> '",
+        promptReadyWriteIndex,
+      );
       assertCondition(
-        decoded.includes(
-          ";Clear-Host;prompt|Out-Null;Write-Output '';Write-Output",
-        ),
-        "sidecar readiness must follow a verified initial prompt marker instead of racing the host prompt",
+        promptDefinitionIndex >= 0 &&
+          promptJournalIndex > promptDefinitionIndex &&
+          promptReadyWriteIndex > promptJournalIndex &&
+          promptReturnIndex > promptReadyWriteIndex &&
+          (decoded.match(/\$__gyshell_ready_stdout\.Write\(/g) || []).length === 1 &&
+          !decoded.includes("prompt|Out-Null") &&
+          decoded.endsWith(";Clear-Host"),
+        "sidecar readiness must be emitted by the first naturally rendered, journaled prompt",
       );
       assertCondition(
         decoded.includes("Set-Item -Path Function:\\Global:prompt") &&
           decoded.includes("-Options 'AllScope,ReadOnly'"),
         "the sidecar should protect its managed prompt from accidental replacement",
+      );
+      const submissionRuntimeToken = "abcdef0123456789abcdef0123456789";
+      const submissionDecoded = Buffer.from(
+        (backend as any).buildWindowsPowerShellEncodedCommand({
+          commandTrackingMode: "windows-powershell-sidecar",
+          promptMarkerPath:
+            "C:/Windows/Temp/GyShell/prompt-markers/submission-prompt.log",
+          commandRequestPath:
+            "C:/Windows/Temp/GyShell/prompt-markers/submission-request.b64",
+          commandOutputPath:
+            "C:/Windows/Temp/GyShell/prompt-markers/submission-output.txt",
+          commandProtocolToken: submissionRuntimeToken,
+        }),
+        "base64",
+      ).toString("utf16le");
+      assertCondition(
+        submissionDecoded.includes(
+          "Register-EngineEvent -SourceIdentifier PowerShell.OnIdle",
+        ) &&
+          submissionDecoded.includes(
+            `gyshell_${submissionRuntimeToken}_inputidle;seq=`,
+          ) &&
+          submissionDecoded.includes(";rev='+") &&
+          submissionDecoded.includes("nonce=manual_input_drained") &&
+          submissionDecoded.includes("input_revision_path") &&
+          submissionDecoded.includes("PSConsoleReadLine]::GetBufferState") &&
+          !submissionDecoded.includes("Set-PSReadLineKeyHandler") &&
+          !submissionDecoded.includes("AddToHistoryHandler"),
+        "the runtime-authenticated sidecar should publish revision-bound empty-input idle without replacing PSReadLine key semantics",
       );
       assertCondition(
         decoded.includes(
@@ -1215,7 +1472,7 @@ const run = async (): Promise<void> => {
   );
 
   await runCase(
-    "staged Unix SSH initialization uses a short first command and an inline retry fallback",
+    "staged Unix SSH initialization reuses one bounded source command for every retry",
     () => {
       const backend = new SSHBackend() as any;
       const runtimeToken = "abcdef0123456789abcdef0123456789";
@@ -1251,10 +1508,10 @@ const run = async (): Promise<void> => {
       );
       assertCondition(
         retryCommand.includes("initialization_attempt=2") &&
-          retryCommand.includes("base64") &&
-          !retryCommand.includes(session.unixShellBootstrapPath) &&
+          retryCommand.includes(session.unixShellBootstrapPath) &&
+          !retryCommand.includes("base64") &&
           !retryCommand.includes("__GYSHELL_READY__"),
-        "a timed-out staged bootstrap should retry through the marker-free inline compatibility path",
+        "a timed-out staged bootstrap should reuse the same bounded private source file",
       );
       assertCondition(
         script.includes(buildInitializationReadyMarker(runtimeToken)) &&
@@ -1283,7 +1540,7 @@ const run = async (): Promise<void> => {
         );
         assertCondition(
           retryResult.status === 0 && retryResult.stdout.includes(retryMarker),
-          `a real Bash process should execute the inline fallback and emit the retry marker: ${retryResult.stderr}`,
+          `a real Bash process should source the staged retry and emit its attempt marker: ${retryResult.stderr}`,
         );
       } finally {
         rmSync(tempDirectory, { recursive: true, force: true });
@@ -1489,18 +1746,19 @@ const run = async (): Promise<void> => {
         invocations.every((command) => command.startsWith("pwsh ")),
         "every remote PowerShell helper must use pwsh on a Unix host",
       );
-      const readyMarker = buildInitializationReadyMarker(
+      const readySequence = buildPowerShellInitializationReadySequence(
         session.commandProtocolToken,
         2,
       );
       const launchCommand = backend.buildWindowsPowerShellLaunchCommand(
         session,
-        readyMarker,
+        readySequence,
       ) as string;
       const loaderEncoded = launchCommand.split("-EncodedCommand ")[1] || "";
       const loader = Buffer.from(loaderEncoded, "base64").toString("utf16le");
-      const encodedBootstrapPath =
-        loader.match(/FromBase64String\('([^']+)'\)/)?.[1] || "";
+      const encodedBootstrapPath = Array.from(
+        loader.matchAll(/FromBase64String\('([^']+)'\)/g),
+      ).at(-1)?.[1] || "";
       const decodedBootstrapPath = Buffer.from(
         encodedBootstrapPath,
         "base64",
@@ -1512,9 +1770,12 @@ const run = async (): Promise<void> => {
           !decodedBootstrapPath.includes("\\tmp\\GyShell"),
         "interactive Unix pwsh bootstrap must use pwsh and a native Unix path",
       );
+      const encodedReadySequence = Buffer.from(readySequence, "utf8").toString(
+        "base64",
+      );
       assertCondition(
-        loader.includes(readyMarker) &&
-          !uploadedBootstrap.includes(readyMarker) &&
+        loader.includes(encodedReadySequence) &&
+          !uploadedBootstrap.includes(encodedReadySequence) &&
           uploadedBootstrap.includes(
             `__gyshell_${session.commandProtocolToken}_initialization_ready_marker`,
           ),
@@ -1673,22 +1934,25 @@ const run = async (): Promise<void> => {
             .includes(`gyshell_${first.commandProtocolToken}_preexec`),
         "bootstrap should be uploaded as BOM-tagged UTF-8 and scoped to the runtime token",
       );
-      const readyMarker = buildInitializationReadyMarker(
+      const readySequence = buildPowerShellInitializationReadySequence(
         first.commandProtocolToken,
         1,
       );
       const launchCommand = backend.buildWindowsPowerShellLaunchCommand(
         first,
-        readyMarker,
+        readySequence,
       ) as string;
       const loaderEncoded = launchCommand.split("-EncodedCommand ")[1] || "";
       const loader = Buffer.from(loaderEncoded, "base64").toString("utf16le");
+      const encodedReadySequence = Buffer.from(readySequence, "utf8").toString(
+        "base64",
+      );
       assertCondition(
         launchCommand.length < 8_191 &&
           launchCommand.includes("-ExecutionPolicy Bypass") &&
           loader.includes("[Convert]::FromBase64String") &&
           loader.includes(". $__gyshell_bootstrap_path") &&
-          loader.includes(readyMarker) &&
+          loader.includes(encodedReadySequence) &&
           !loader.includes("Out-String -Stream"),
         "SSH startup should pass cmd.exe a short path loader, never the full sidecar program",
       );
@@ -2614,6 +2878,58 @@ const run = async (): Promise<void> => {
         backend.getShellInitRetryIntervalMs("unix"),
         8000,
         "unix bootstrap should keep the existing faster retry cadence",
+      );
+    },
+  );
+
+  await runCase(
+    "PowerShell input revision commits after the interactive SSH write barrier",
+    async () => {
+      const backend = new SSHBackend() as any;
+      const session = createSession();
+      session.commandTrackingMode = "windows-powershell-sidecar";
+      session.windowsPromptMarkerPath =
+        "C:/Windows/Temp/GyShell/prompt-markers/input-barrier.log";
+      let finishInteractiveWrite: ((error?: Error | null) => void) | undefined;
+      session.stream = {
+        write: (
+          _input: string,
+          callback?: (error?: Error | null) => void,
+        ): boolean => {
+          finishInteractiveWrite = callback;
+          return false;
+        },
+      };
+      backend.sessions.set("pty-input-barrier", session);
+      const fileWrites: Array<{ path: string; content: string }> = [];
+      backend.writeFile = async (
+        _ptyId: string,
+        filePath: string,
+        content: string,
+      ): Promise<void> => {
+        fileWrites.push({ path: filePath, content });
+      };
+
+      backend.write("pty-input-barrier", "Write-Output 'SECOND'\r");
+      const committing = backend.commitPowerShellInputRevision(
+        "pty-input-barrier",
+        7,
+        4,
+      );
+      await Promise.resolve();
+      assertEqual(
+        fileWrites.length,
+        0,
+        "the sidecar revision must not overtake PTY bytes under SSH backpressure",
+      );
+
+      finishInteractiveWrite?.(null);
+      await committing;
+      assertCondition(
+        fileWrites.length === 1 &&
+          fileWrites[0]?.path.endsWith(".input-revision") &&
+          fileWrites[0]?.content === "7:4",
+        "the released transport barrier should commit the revision and prompt floor",
       );
     },
   );

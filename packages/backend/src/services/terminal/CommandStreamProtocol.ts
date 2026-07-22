@@ -1,10 +1,12 @@
 import { Buffer } from 'node:buffer'
 
 const GYSHELL_OSC_INTRODUCER = '\x1b]1337;'
+const GYSHELL_OSC_TERMINATOR = '\x07'
 const LEGACY_GYSHELL_MARKER_PREFIX = 'gyshell_'
 const COMMAND_PROTOCOL_TOKEN_PATTERN = /^[0-9a-f]{32}$/
 const MAX_PROTOCOL_MARKER_LENGTH = 16 * 1024
 const INITIALIZATION_READY_MARKER_PREFIX = '__GYSHELL_READY__'
+const POWERSHELL_INITIALIZATION_READY_OSC = 'gyshell-init-ready'
 
 /**
  * Builds a per-runtime marker used only while a backend is consuming shell
@@ -30,6 +32,32 @@ export const buildInitializationReadyMarker = (
     throw new Error('Invalid shell initialization attempt')
   }
   return `${runtimeMarker}:${attempt}`
+}
+
+/**
+ * Builds the non-rendering readiness record used by PowerShell runtimes.
+ * Unlike a printable line, an OSC record is not retained in the Windows
+ * console screen and therefore cannot be replayed by a ConPTY resize.
+ */
+export const buildPowerShellInitializationReadySequence = (
+  runtimeToken?: string,
+  attempt?: number
+): string => {
+  if (runtimeToken === undefined) {
+    if (attempt !== undefined) {
+      throw new Error('Initialization attempt requires a runtime token')
+    }
+  } else if (!COMMAND_PROTOCOL_TOKEN_PATTERN.test(runtimeToken)) {
+    throw new Error('Invalid command protocol runtime token')
+  }
+  if (attempt !== undefined && (!Number.isSafeInteger(attempt) || attempt < 1)) {
+    throw new Error('Invalid shell initialization attempt')
+  }
+
+  const fields = [POWERSHELL_INITIALIZATION_READY_OSC]
+  if (runtimeToken !== undefined) fields.push(`runtime=${runtimeToken}`)
+  if (attempt !== undefined) fields.push(`attempt=${attempt}`)
+  return `${GYSHELL_OSC_INTRODUCER}${fields.join(';')}${GYSHELL_OSC_TERMINATOR}`
 }
 
 /**
@@ -59,6 +87,20 @@ export const findInitializationReadyMarkerLine = (
   return -1
 }
 
+/** Finds either a framed Unix marker line or an exact PowerShell OSC record. */
+export const findInitializationReadyRecord = (
+  buffer: string,
+  record: string
+): number => {
+  if (
+    record.startsWith(GYSHELL_OSC_INTRODUCER) &&
+    record.endsWith(GYSHELL_OSC_TERMINATOR)
+  ) {
+    return buffer.indexOf(record)
+  }
+  return findInitializationReadyMarkerLine(buffer, record)
+}
+
 /**
  * Consumes exactly the first complete expected marker line from an
  * initialization buffer. Bytes after it are ordinary terminal data,
@@ -72,6 +114,17 @@ export const consumeInitializationReadyMarker = (
   return markerOffset === -1
     ? undefined
     : buffer.slice(markerOffset + marker.length)
+}
+
+/** Consumes one complete initialization record while preserving its suffix. */
+export const consumeInitializationReadyRecord = (
+  buffer: string,
+  record: string
+): string | undefined => {
+  const recordOffset = findInitializationReadyRecord(buffer, record)
+  return recordOffset === -1
+    ? undefined
+    : buffer.slice(recordOffset + record.length)
 }
 
 /**
@@ -335,9 +388,10 @@ export const buildUnixCommandDispatcherScript = (
 }
 
 export interface GyShellBoundaryMarker {
-  kind: 'preexec' | 'preend' | 'precmd'
+  kind: 'preexec' | 'preend' | 'precmd' | 'inputidle'
   sequence?: number
   nonce?: string
+  inputRevision?: number
   exitCode?: number
   cwdBase64?: string
   homeBase64?: string
@@ -359,7 +413,12 @@ const parseInteger = (value: string | undefined): number | undefined => {
 
 const parseMarker = (body: string): GyShellBoundaryMarker | null => {
   const [kind, ...parts] = body.split(';')
-  if (kind !== 'preexec' && kind !== 'preend' && kind !== 'precmd') {
+  if (
+    kind !== 'preexec' &&
+    kind !== 'preend' &&
+    kind !== 'precmd' &&
+    kind !== 'inputidle'
+  ) {
     return null
   }
 
@@ -381,10 +440,12 @@ const parseMarker = (body: string): GyShellBoundaryMarker | null => {
     return null
   }
   const exitCode = parseInteger(fields.get('ec'))
+  const inputRevision = parseInteger(fields.get('rev'))
   return {
     kind,
     ...(sequence !== undefined ? { sequence } : {}),
     ...(nonce ? { nonce } : {}),
+    ...(inputRevision !== undefined ? { inputRevision } : {}),
     ...(exitCode !== undefined ? { exitCode } : {}),
     ...(fields.has('cwd_b64') ? { cwdBase64: fields.get('cwd_b64') } : {}),
     ...(fields.has('home_b64') ? { homeBase64: fields.get('home_b64') } : {}),

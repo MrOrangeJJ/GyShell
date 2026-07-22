@@ -1,6 +1,9 @@
 import { COMMAND_CAPTURE_MAX_UTF8_BYTES } from '@gyshell/shared'
 
 export const WINDOWS_PROMPT_MARKER_PREFIX = '__GYSHELL_PROMPT__::'
+// Sidecar readiness is emitted from the first naturally rendered prompt only
+// after that prompt has durably appended this sequence to its journal.
+export const WINDOWS_POWERSHELL_INITIAL_PROMPT_SEQUENCE = 1
 export const WINDOWS_POWERSHELL_SIDECAR_BUILD_THRESHOLD = 17763
 export const WINDOWS_POWERSHELL_LOCAL_SIDECAR_DIR_PREFIX = 'gyshell-winps-'
 export const WINDOWS_POWERSHELL_REMOTE_SIDECAR_DIR_NAME = 'GyShell/prompt-markers'
@@ -64,6 +67,37 @@ export const buildWindowsPowerShellInitializationReadyVariableName = (
   return `__gyshell_${runtimeToken.toLowerCase()}_${WINDOWS_POWERSHELL_INITIALIZATION_READY_VARIABLE_SUFFIX}`
 }
 
+export const buildWindowsPowerShellInitializationRetryCommand = (
+  runtimeToken: string,
+  readySequence: string,
+  bootstrapPath: string
+): string => {
+  const normalizedToken = runtimeToken.toLowerCase()
+  const readyVariable = buildWindowsPowerShellInitializationReadyVariableName(
+    normalizedToken
+  )
+  const pendingVariable = `__gyshell_${normalizedToken}_pending_ready_sequence`
+  const installedVariable = `__gyshell_${normalizedToken}_bootstrap_installed`
+  const promptSequenceVariable = `__gyshell_${normalizedToken}_prompt_seq`
+  const encodedReadySequence = Buffer.from(readySequence, 'utf8').toString(
+    'base64'
+  )
+  const encodedBootstrapPath = Buffer.from(bootstrapPath, 'utf8').toString(
+    'base64'
+  )
+  return (
+    `$global:${readyVariable}=[Text.Encoding]::UTF8.GetString(` +
+    `[Convert]::FromBase64String('${encodedReadySequence}'));` +
+    `if($global:${installedVariable} -eq $true){` +
+    `$global:${promptSequenceVariable}=0;` +
+    `Clear-Host;` +
+    `$global:${pendingVariable}=[string]$global:${readyVariable}}else{` +
+    `$__gyshell_retry_bootstrap_path=[Text.Encoding]::UTF8.GetString(` +
+    `[Convert]::FromBase64String('${encodedBootstrapPath}'));` +
+    `. $__gyshell_retry_bootstrap_path}`
+  )
+}
+
 export const buildWindowsPowerShellRequestMarkerPath = (
   promptMarkerPath: string,
   requestId: string
@@ -72,6 +106,23 @@ export const buildWindowsPowerShellRequestMarkerPath = (
     throw new Error('Invalid Windows PowerShell sidecar request identity.')
   }
   return `${promptMarkerPath}.${requestId.toLowerCase()}`
+}
+
+export const buildWindowsPowerShellInputRevisionPath = (
+  promptMarkerPath: string
+): string => `${promptMarkerPath}.input-revision`
+
+export const serializeWindowsPowerShellInputRevision = (
+  revision: number,
+  minimumPromptSequence: number
+): string => {
+  if (!Number.isSafeInteger(revision) || revision < 1) {
+    throw new Error('Invalid PowerShell input revision.')
+  }
+  if (!Number.isSafeInteger(minimumPromptSequence) || minimumPromptSequence < 1) {
+    throw new Error('Invalid PowerShell input prompt sequence.')
+  }
+  return `${revision}:${minimumPromptSequence}`
 }
 
 export const buildWindowsPowerShellDispatchInput = (
@@ -94,8 +145,8 @@ export const buildWindowsPowerShellDispatchRequest = (options: {
 }
 
 export const buildWindowsPowerShellBootstrapScript = (options: {
-  readyMarker: string
-  readyMarkerFromRuntimeVariable?: boolean
+  readySequence: string
+  readySequenceFromRuntimeVariable?: boolean
   commandTrackingMode: WindowsCommandTrackingMode
   promptMarkerPath?: string
   commandRequestPath?: string
@@ -111,7 +162,7 @@ export const buildWindowsPowerShellBootstrapScript = (options: {
   const privateIdentifierPrefix = runtimeToken
     ? `__gyshell_${runtimeToken}`
     : '__gyshell'
-  if (options.readyMarkerFromRuntimeVariable && !runtimeToken) {
+  if (options.readySequenceFromRuntimeVariable && !runtimeToken) {
     throw new Error(
       'A runtime-scoped PowerShell ready variable requires a command protocol token.'
     )
@@ -166,6 +217,78 @@ export const buildWindowsPowerShellBootstrapScript = (options: {
   const sidecarDispatchBody = sidecarDispatchRequestBody
     ? `if($NestedPromptLevel -eq 0 -and -not $global:__gyshell_completion_pending -and -not $global:__gyshell_dispatch_active){$global:__gyshell_dispatch_active=$true;try{${sidecarDispatchRequestBody}}finally{$global:__gyshell_dispatch_active=$false}}`
     : ''
+  const readySequenceExpression = options.readySequenceFromRuntimeVariable
+    ? `[string]$global:__gyshell_${WINDOWS_POWERSHELL_INITIALIZATION_READY_VARIABLE_SUFFIX}`
+    : `[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${Buffer.from(options.readySequence, 'utf8').toString('base64')}'))`
+  const readySequenceAssignment =
+    `$__gyshell_ready_sequence=${readySequenceExpression}`
+  const readyOutputStatement =
+    `${readySequenceAssignment};` +
+    '$__gyshell_ready_bytes=$__gyshell_utf8.GetBytes($__gyshell_ready_sequence);' +
+    '$__gyshell_ready_stdout=[Console]::OpenStandardOutput();' +
+    '$__gyshell_ready_stdout.Write($__gyshell_ready_bytes,0,$__gyshell_ready_bytes.Length);' +
+    '$__gyshell_ready_stdout.Flush()'
+  // -NoExit invokes prompt after the encoded bootstrap returns. Publishing
+  // readiness inside that natural prompt makes one event prove both the
+  // journal baseline and the visible prompt; an explicit prompt invocation
+  // would create a stale extra sequence before the user can type.
+  const sidecarReadySetup =
+    `$global:__gyshell_pending_ready_sequence=${readySequenceExpression}`
+  const sidecarReadyPromptStatement =
+    'if($null -ne $global:__gyshell_pending_ready_sequence){' +
+    '$__gyshell_ready_sequence=[string]$global:__gyshell_pending_ready_sequence;' +
+    '$__gyshell_ready_bytes=[Text.Encoding]::UTF8.GetBytes($__gyshell_ready_sequence);' +
+    '$__gyshell_ready_stdout=[Console]::OpenStandardOutput();' +
+    '$__gyshell_ready_stdout.Write($__gyshell_ready_bytes,0,$__gyshell_ready_bytes.Length);' +
+    '$__gyshell_ready_stdout.Flush();' +
+    '$global:__gyshell_pending_ready_sequence=$null}'
+  const sidecarPromptFrameStatement = runtimeToken
+    ? '$__gyshell_prompt_frame=([string][char]27)+\']1337;' +
+      commandProtocolNamespace +
+      'precmd;seq=\'+$global:__gyshell_prompt_seq+\';ec=\'+$__ec+\';cwd_b64=\'+$__cwd_b64+\';home_b64=\'+$__home_b64+([string][char]7);' +
+      '$__gyshell_prompt_stdout=[Console]::OpenStandardOutput();' +
+      '$__gyshell_prompt_bytes=$__gyshell_utf8.GetBytes($__gyshell_prompt_frame);' +
+      '$__gyshell_prompt_stdout.Write($__gyshell_prompt_bytes,0,$__gyshell_prompt_bytes.Length);' +
+      '$__gyshell_prompt_stdout.Flush()'
+    : ''
+  // The client commits a monotonic input revision and its minimum prompt
+  // sequence through the sidecar after writing the matching PTY bytes.
+  // PowerShell.OnIdle does not consume the revision until both that prompt
+  // floor and an empty PSReadLine buffer are observed. This is required
+  // because PTY and SFTP are independent SSH channels: the sidecar write may
+  // become visible while PowerShell is still sitting at the older prompt.
+  // Multiline input and foreground stdin naturally defer the acknowledgement
+  // until their one final top-level prompt without replacing any key binding.
+  const sidecarInputIdleTrackingSetup = runtimeToken
+    ? 'Get-PSReadLineOption -ErrorAction Stop|Out-Null;' +
+      '$global:__gyshell_last_input_idle_revision=0;' +
+      '$global:__gyshell_input_idle_subscription=Register-EngineEvent -SourceIdentifier PowerShell.OnIdle -SupportEvent -ErrorAction Stop -Action {' +
+      'try{' +
+      'if($NestedPromptLevel -eq 0){' +
+      '$__gyshell_input_revision_text=[IO.File]::ReadAllText($global:__gyshell_input_revision_path,$global:__gyshell_utf8).Trim();' +
+      '$__gyshell_input_revision_parts=$__gyshell_input_revision_text.Split(\':\');' +
+      'if($__gyshell_input_revision_parts.Length -eq 2 -and $__gyshell_input_revision_parts[0] -match \'^[1-9][0-9]{0,15}$\' -and $__gyshell_input_revision_parts[1] -match \'^[1-9][0-9]{0,9}$\'){' +
+      '$__gyshell_input_revision=[int64]$__gyshell_input_revision_parts[0];' +
+      '$__gyshell_input_minimum_prompt_seq=[int]$__gyshell_input_revision_parts[1];' +
+      'if($__gyshell_input_revision -gt [int64]$global:__gyshell_last_input_idle_revision -and [int]$global:__gyshell_prompt_seq -ge $__gyshell_input_minimum_prompt_seq){' +
+      '$__gyshell_input_line=$null;$__gyshell_input_cursor=0;' +
+      '[Microsoft.PowerShell.PSConsoleReadLine]::GetBufferState([ref]$__gyshell_input_line,[ref]$__gyshell_input_cursor);' +
+      'if([string]::IsNullOrEmpty([string]$__gyshell_input_line) -and $__gyshell_input_cursor -eq 0){' +
+      '$__gyshell_input_idle_seq=[int]$global:__gyshell_prompt_seq;' +
+      '$__gyshell_input_idle_frame=([string][char]27)+\']1337;' +
+      commandProtocolNamespace +
+      'inputidle;seq=\'+$__gyshell_input_idle_seq+\';rev=\'+$__gyshell_input_revision+\';nonce=manual_input_drained\'+([string][char]7);' +
+      '$__gyshell_input_idle_stdout=[Console]::OpenStandardOutput();' +
+      '$__gyshell_input_idle_bytes=$global:__gyshell_utf8.GetBytes($__gyshell_input_idle_frame);' +
+      '$__gyshell_input_idle_stdout.Write($__gyshell_input_idle_bytes,0,$__gyshell_input_idle_bytes.Length);' +
+      '$__gyshell_input_idle_stdout.Flush();' +
+      '$global:__gyshell_last_input_idle_revision=$__gyshell_input_revision}' +
+      '}' +
+      '}' +
+      '}' +
+      '}catch{}' +
+      '}'
+    : ''
   const sidecarPromptBody = [
     '$__gyshell_prompt_ok=$?;$__gyshell_prompt_native=$LASTEXITCODE;$__gyshell_prompt_native_exists=[bool](Test-Path Variable:Global:LASTEXITCODE);$__gyshell_prompt_error_count=@($Error).Count;$__gyshell_prompt_error_ref=if($Error.Count -gt 0){$Error[0]}else{$null}',
     '$__gyshell_has_request=$global:__gyshell_completion_pending -and $global:__gyshell_completed_request_id -match \'^[a-fA-F0-9]{32}$\' -and $global:__gyshell_completed_request_kind -match \'^[pc]$\';$__gyshell_request_id=if($__gyshell_has_request){$global:__gyshell_completed_request_id}else{\'\'};$__gyshell_request_kind=if($__gyshell_has_request){$global:__gyshell_completed_request_kind}else{\'\'}',
@@ -173,7 +296,10 @@ export const buildWindowsPowerShellBootstrapScript = (options: {
     '$__has_new_error=($__error_count -gt 0) -and (($__error_count -ne [int]$__error_baseline_count) -or ($__error_ref -ne $__error_baseline_ref));$__has_native_error=$__has_new_error -and (([string]$__error_ref.FullyQualifiedErrorId) -like \'NativeCommandError*\');$__user_threw=$__gyshell_has_request -and $null -ne $global:__gyshell_user_exception;$__returned_without_sample=$__gyshell_has_request -and -not $global:__gyshell_user_outcome_sampled -and -not $__user_threw',
     '$__outcome_known=$true;$__ec=if($__returned_without_sample){$__outcome_known=$false;1}elseif($__ok){0}elseif($__user_threw){1}elseif($__has_native_error){$__outcome_known=$false;if($__native -is [int]){$__native}else{1}}elseif($__native -is [int] -and $__native -ne 0){$__outcome_known=$false;$__native}else{1}',
     'if(-not $__gyshell_has_request -or $__gyshell_request_kind -eq \'c\'){$global:__gyshell_logical_user_ok=[bool]$__ok;$global:__gyshell_logical_user_native=$__native;$global:__gyshell_logical_user_native_exists=[bool]$__native_exists};$global:__gyshell_last_error_count=$__error_count;$global:__gyshell_last_error_ref=$__error_ref;$__output_observed=if($__gyshell_has_request){[int64]$global:__gyshell_output_observed}else{[int64]0};$__output_retained=if($__gyshell_has_request){[int64]$global:__gyshell_output_retained}else{[int64]0};$__output_truncated=if($__gyshell_has_request -and $global:__gyshell_output_truncated){1}else{0};$__outcome_known_int=if($__outcome_known){1}else{0};$global:__gyshell_prompt_seq=[int]$global:__gyshell_prompt_seq+1;$__cwd_b64=[Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($PWD.Path));$__home_b64=[Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($HOME));$__line=\'__GYSHELL_PROMPT__::seq=\'+$global:__gyshell_prompt_seq+\';ec=\'+$__ec+\';outcome_known=\'+$__outcome_known_int+\';request_id=\'+$__gyshell_request_id+\';output_bytes=\'+$__output_observed+\';retained_bytes=\'+$__output_retained+\';output_truncated=\'+$__output_truncated+\';cwd_b64=\'+$__cwd_b64+\';home_b64=\'+$__home_b64',
-    '[IO.File]::AppendAllText($global:__gyshell_marker_path,$__line+[Environment]::NewLine,$__gyshell_utf8);if($__gyshell_has_request){$__gyshell_request_marker=$global:__gyshell_marker_path+\'.\'+$__gyshell_request_id;$__gyshell_request_marker_tmp=$__gyshell_request_marker+\'.tmp\';if(Test-Path -LiteralPath $__gyshell_request_marker_tmp){Remove-Item -LiteralPath $__gyshell_request_marker_tmp -Force -ErrorAction SilentlyContinue};[IO.File]::WriteAllText($__gyshell_request_marker_tmp,$__line+[Environment]::NewLine,$__gyshell_utf8);if(Test-Path -LiteralPath $__gyshell_request_marker){Remove-Item -LiteralPath $__gyshell_request_marker -Force};[IO.File]::Move($__gyshell_request_marker_tmp,$__gyshell_request_marker);$global:__gyshell_completion_pending=$false;$global:__gyshell_completed_request_id=\'\';$global:__gyshell_completed_request_kind=\'\'};\'PS \'+$PWD.Path+\'> \'',
+    '[IO.File]::AppendAllText($global:__gyshell_marker_path,$__line+[Environment]::NewLine,$__gyshell_utf8);if($__gyshell_has_request){$__gyshell_request_marker=$global:__gyshell_marker_path+\'.\'+$__gyshell_request_id;$__gyshell_request_marker_tmp=$__gyshell_request_marker+\'.tmp\';if(Test-Path -LiteralPath $__gyshell_request_marker_tmp){Remove-Item -LiteralPath $__gyshell_request_marker_tmp -Force -ErrorAction SilentlyContinue};[IO.File]::WriteAllText($__gyshell_request_marker_tmp,$__line+[Environment]::NewLine,$__gyshell_utf8);if(Test-Path -LiteralPath $__gyshell_request_marker){Remove-Item -LiteralPath $__gyshell_request_marker -Force};[IO.File]::Move($__gyshell_request_marker_tmp,$__gyshell_request_marker);$global:__gyshell_completion_pending=$false;$global:__gyshell_completed_request_id=\'\';$global:__gyshell_completed_request_kind=\'\'}',
+    sidecarPromptFrameStatement,
+    sidecarReadyPromptStatement,
+    '\'PS \'+$PWD.Path+\'> \'',
   ]
     .filter(Boolean)
     .join(';')
@@ -189,15 +315,13 @@ export const buildWindowsPowerShellBootstrapScript = (options: {
     '$global:__gyshell_last_error_count=$__gyshell_error_count;$global:__gyshell_last_error_ref=$__gyshell_error_ref;$global:__gyshell_prompt_seq=[int]$global:__gyshell_prompt_seq+1;$__gyshell_cwd_b64=[Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($PWD.Path));$__gyshell_home_b64=[Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($HOME));$__gyshell_ec_field=if($__gyshell_outcome_known){\';ec=\'+$__gyshell_ec}else{\'\'}',
     `Write-Host -NoNewline "$([char]27)]1337;${commandProtocolNamespace}precmd;seq=$($global:__gyshell_prompt_seq)$__gyshell_ec_field;cwd_b64=$__gyshell_cwd_b64;home_b64=$__gyshell_home_b64$([char]7)";"PS $($PWD.Path)> "`,
   ].join(';')
-  const readyOutputStatement = options.readyMarkerFromRuntimeVariable
-    ? `Write-Output '';Write-Output ([string]$global:__gyshell_${WINDOWS_POWERSHELL_INITIALIZATION_READY_VARIABLE_SUFFIX})`
-    : `Write-Output '';Write-Output '${escapePowerShellSingleQuotedString(options.readyMarker)}'`
   const psInit =
     options.commandTrackingMode === 'windows-powershell-sidecar' && options.promptMarkerPath
       ? [
           '$global:__gyshell_logical_user_ok=[bool]$?;$global:__gyshell_logical_user_native=$LASTEXITCODE;$global:__gyshell_logical_user_native_exists=[bool](Test-Path Variable:Global:LASTEXITCODE)',
           utf8ConsoleInit,
           `$global:__gyshell_marker_path=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${encodePath(options.promptMarkerPath)}'))`,
+          `$global:__gyshell_input_revision_path=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${encodePath(buildWindowsPowerShellInputRevisionPath(options.promptMarkerPath))}'))`,
           `$global:__gyshell_request_path=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${encodePath(options.commandRequestPath)}'))`,
           `$global:__gyshell_output_path=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${encodePath(options.commandOutputPath)}'))`,
           `$global:__gyshell_output_max_bytes=[int64]${COMMAND_CAPTURE_MAX_UTF8_BYTES}`,
@@ -209,26 +333,27 @@ export const buildWindowsPowerShellBootstrapScript = (options: {
           '$global:__gyshell_completed_request_kind=\'\'',
           '$global:__gyshell_completion_pending=$false',
           '$global:__gyshell_dispatch_active=$false',
-          '$global:__gyshell_prompt_seq=0',
+          `$global:__gyshell_prompt_seq=${WINDOWS_POWERSHELL_INITIAL_PROMPT_SEQUENCE - 1}`,
           '$global:__gyshell_last_error_count=@($Error).Count',
           '$global:__gyshell_last_error_ref=if($Error.Count -gt 0){$Error[0]}else{$null}',
           '[IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($global:__gyshell_marker_path))|Out-Null',
           "[IO.File]::WriteAllText($global:__gyshell_marker_path,'',$__gyshell_utf8)",
+          "[IO.File]::WriteAllText($global:__gyshell_input_revision_path,'0:0',$__gyshell_utf8)",
           options.commandRequestPath
             ? "[IO.File]::WriteAllText($global:__gyshell_request_path,'',$__gyshell_utf8)"
             : '',
           options.commandOutputPath
             ? "[IO.File]::WriteAllText($global:__gyshell_output_path,'',$__gyshell_utf8)"
             : '',
+          sidecarInputIdleTrackingSetup,
           'function Global:__gyshell_capture_text{param([AllowNull()][object]$value);try{$__gyshell_text=[string]$value;$__gyshell_bytes=$global:__gyshell_utf8.GetBytes($__gyshell_text);$global:__gyshell_output_observed=[int64]$global:__gyshell_output_observed+[int64]$__gyshell_bytes.Length;if($global:__gyshell_output_truncated){return};$__gyshell_remaining=[int64]$global:__gyshell_output_max_bytes-[int64]$global:__gyshell_output_retained;if($__gyshell_remaining -le 0){if($__gyshell_bytes.Length -gt 0){$global:__gyshell_output_truncated=$true};return};$__gyshell_take=[int][Math]::Min([int64]$__gyshell_bytes.Length,$__gyshell_remaining);if($__gyshell_take -lt $__gyshell_bytes.Length){while($__gyshell_take -gt 0 -and (($__gyshell_bytes[$__gyshell_take] -band 0xC0) -eq 0x80)){$__gyshell_take--};$global:__gyshell_output_truncated=$true};if($__gyshell_take -gt 0){$global:__gyshell_output_stream.Write($__gyshell_bytes,0,$__gyshell_take);$global:__gyshell_output_retained=[int64]$global:__gyshell_output_retained+[int64]$__gyshell_take};if($__gyshell_take -lt $__gyshell_bytes.Length){$global:__gyshell_output_truncated=$true}}catch{$global:__gyshell_output_truncated=$true}}',
           `Set-Variable -Scope Global -Name '${WINDOWS_POWERSHELL_OUTCOME_RECORDER_VARIABLE}' -Value {param([bool]$ok);$global:__gyshell_user_ok=$ok;$global:__gyshell_user_native=$LASTEXITCODE;$global:__gyshell_user_native_exists=[bool](Test-Path Variable:Global:LASTEXITCODE);$global:__gyshell_user_error_count=@($Error).Count;$global:__gyshell_user_error_ref=if($Error.Count -gt 0){$Error[0]}else{$null};$global:__gyshell_user_outcome_sampled=$true;$global:__gyshell_user_outcome_set=$true} -Option ReadOnly -Force`,
           `function Global:__gyshell_emit_raw_boundary{param([string]$kind,[string]$nonce);try{$__gyshell_seq=[int]$global:__gyshell_prompt_seq+1;$__gyshell_stdout=[Console]::OpenStandardOutput();if($kind -eq 'preexec'){$__gyshell_sync=([string][char]27)+']1337;${commandProtocolNamespace}preexec;seq='+$__gyshell_seq+';nonce=00000000000000000000000000000000'+([string][char]7)+([string][char]27)+'[m';$__gyshell_sync_bytes=$global:__gyshell_utf8.GetBytes($__gyshell_sync);$__gyshell_stdout.Write($__gyshell_sync_bytes,0,$__gyshell_sync_bytes.Length);$__gyshell_stdout.Flush()};$__gyshell_frame=([string][char]27)+']1337;${commandProtocolNamespace}'+$kind+';seq='+$__gyshell_seq+';nonce='+$nonce+([string][char]7);$__gyshell_frame_bytes=$global:__gyshell_utf8.GetBytes($__gyshell_frame);$__gyshell_stdout.Write($__gyshell_frame_bytes,0,$__gyshell_frame_bytes.Length);$__gyshell_stdout.Flush()}catch{}}`,
           `Set-Variable -Scope Global -Name '${WINDOWS_POWERSHELL_DISPATCH_VARIABLE}' -Value ([scriptblock]::Create(@'\n${sidecarDispatchBody}\n'@\n)) -Option ReadOnly -Force`,
+          sidecarReadySetup,
           `Set-Item -Path Function:\\Global:prompt -Value {${sidecarPromptBody}} -Force -Options 'AllScope,ReadOnly'`,
+          '$global:__gyshell_bootstrap_installed=$true',
           'Clear-Host',
-          // Make the first verifiable sidecar prompt a readiness prerequisite.
-          'prompt|Out-Null',
-          readyOutputStatement,
         ]
           .filter(Boolean)
           .join(';')
@@ -258,7 +383,7 @@ export const buildWindowsPowerShellEncodedCommand = (
 export const buildWindowsPowerShellBootstrapLoaderEncodedCommand = (
   bootstrapPath: string,
   options?: {
-    readyMarker: string
+    readySequence: string
     readyMarkerVariableName: string
   }
 ): string => {
@@ -269,9 +394,12 @@ export const buildWindowsPowerShellBootstrapLoaderEncodedCommand = (
     throw new Error('Invalid Windows PowerShell initialization variable name.')
   }
   const encodedPath = Buffer.from(bootstrapPath, 'utf8').toString('base64')
+  const encodedReadySequence = options
+    ? Buffer.from(options.readySequence, 'utf8').toString('base64')
+    : ''
   const loader =
     (options
-      ? `$global:${options.readyMarkerVariableName}='${escapePowerShellSingleQuotedString(options.readyMarker)}';`
+      ? `$global:${options.readyMarkerVariableName}=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${encodedReadySequence}'));`
       : '') +
     `$__gyshell_bootstrap_path=[Text.Encoding]::UTF8.GetString(` +
     `[Convert]::FromBase64String('${encodedPath}'));. $__gyshell_bootstrap_path`

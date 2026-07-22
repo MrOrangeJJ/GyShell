@@ -178,17 +178,13 @@ interface PendingUnixCommandDisplay {
   postSubmitDisplayOverflowed: boolean
 }
 
-interface WindowsPromptInitialization {
-  ptyId: string
-  runtimeGeneration: number | undefined
-  cancelled: boolean
-  promise: Promise<TerminalCommandTrackingToken | undefined>
-}
-
 interface WindowsManualPromptWatcher {
   ptyId: string
   runtimeGeneration: number | undefined
   expectedInputRevision: number
+  expectedPromptSequence: number
+  inputIdleSequence?: number
+  restoreIdleOnCompletion: boolean
   ownedInputReservation: symbol
   cancelled: boolean
 }
@@ -201,6 +197,7 @@ interface PromptFileIoLease {
 interface TerminalInputSequenceOptions {
   intervalMs?: number
   signal?: AbortSignal
+  inputOwner?: 'active-task'
 }
 
 const createTerminalAbortError = (): Error => {
@@ -351,7 +348,12 @@ export class TerminalService {
   private lastShellSequenceByTerminal: Map<string, number> = new Map()
   private activeShellBoundaryByTerminal: Map<
     string,
-    { sequence?: number; nonce?: string; legacy: boolean }
+    {
+      sequence?: number
+      nonce?: string
+      legacy: boolean
+      inputRevisionAtStart: number
+    }
   > = new Map()
   private headlessWriteSeqByTerminal: Map<string, number> = new Map()
   private headlessFlushedSeqByTerminal: Map<string, number> = new Map()
@@ -359,10 +361,6 @@ export class TerminalService {
   private backendRuntimeGenerationByTerminal: Map<string, number> = new Map()
   private nextBackendRuntimeGeneration = 0
   private commandTrackingWatcherByTaskId: Map<string, { cancelled: boolean }> = new Map()
-  private windowsPromptInitializationByTerminal: Map<
-    string,
-    WindowsPromptInitialization
-  > = new Map()
   private windowsPromptBaselineByTerminal: Map<
     string,
     TerminalCommandTrackingToken
@@ -371,7 +369,19 @@ export class TerminalService {
     string,
     WindowsManualPromptWatcher
   > = new Map()
+  /**
+   * Highest prompt sequence that any probe, agent command, or human input may
+   * produce. Ambiguous failures retain this floor so delayed older prompts can
+   * never complete newer input.
+   */
+  private windowsPromptSequenceFloorByTerminal: Map<string, number> = new Map()
+  private windowsPowerShellBracketedPasteByTerminal: Map<string, boolean> =
+    new Map()
   private terminalInputRevisionByTerminal: Map<string, number> = new Map()
+  private windowsInputRevisionCommitByTerminal: Map<
+    string,
+    { runtimeGeneration: number | undefined; tail: Promise<void> }
+  > = new Map()
   private pendingInputReservationsByTerminal: Map<string, Set<symbol>> = new Map()
   private onTaskFinishedCallbacks: Map<string, (result: CommandResult) => void> = new Map()
   private primaryLocalTerminalId: string | null = null
@@ -552,6 +562,21 @@ export class TerminalService {
     return this.getCommandShellFamily(terminal) === 'powershell'
   }
 
+  private canObserveManualPowerShellPrompt(
+    terminalId: string,
+    terminal: TerminalTab
+  ): boolean {
+    if (!this.usesPowerShellCommandLifecycle(terminal)) {
+      return false
+    }
+    const activeTask = this.getActiveTask(terminalId)
+    return (
+      !activeTask ||
+      (this.backendUsesPowerShellSidecar(terminal) &&
+        activeTask.observedShellPromptSequence !== undefined)
+    )
+  }
+
   private runtimeNeedsInitializationSilence(
     config: TerminalConfig,
     ptyId: string
@@ -706,17 +731,85 @@ export class TerminalService {
   }
 
   private clearWindowsPromptRuntimeState(terminalId: string): void {
-    const initialization = this.windowsPromptInitializationByTerminal.get(terminalId)
-    if (initialization) initialization.cancelled = true
-    this.windowsPromptInitializationByTerminal.delete(terminalId)
     const manualWatcher = this.windowsManualPromptWatcherByTerminal.get(terminalId)
     if (manualWatcher) manualWatcher.cancelled = true
     this.windowsManualPromptWatcherByTerminal.delete(terminalId)
     this.windowsPromptBaselineByTerminal.delete(terminalId)
+    this.windowsPromptSequenceFloorByTerminal.delete(terminalId)
+    this.windowsPowerShellBracketedPasteByTerminal.delete(terminalId)
     this.terminalInputRevisionByTerminal.delete(terminalId)
+    this.windowsInputRevisionCommitByTerminal.delete(terminalId)
     // A stale sequence owns its captured Set. Replacing the map entry means
     // its eventual finally block cannot delete reservations for this runtime.
     this.pendingInputReservationsByTerminal.delete(terminalId)
+  }
+
+  private countWindowsPromptSubmissions(
+    terminalId: string,
+    input: string
+  ): number {
+    let count = 0
+    let inBracketedPaste =
+      this.windowsPowerShellBracketedPasteByTerminal.get(terminalId) === true
+    for (let index = 0; index < input.length; index += 1) {
+      if (input.startsWith('\x1b[200~', index)) {
+        inBracketedPaste = true
+        index += 5
+        continue
+      }
+      if (input.startsWith('\x1b[201~', index)) {
+        inBracketedPaste = false
+        index += 5
+        continue
+      }
+      if (inBracketedPaste) continue
+      const code = input.charCodeAt(index)
+      if (code === 13) {
+        count += 1
+        if (input.charCodeAt(index + 1) === 10) index += 1
+      } else if (code === 10 || code === 3) {
+        count += 1
+      }
+    }
+    if (inBracketedPaste) {
+      this.windowsPowerShellBracketedPasteByTerminal.set(terminalId, true)
+    } else {
+      this.windowsPowerShellBracketedPasteByTerminal.delete(terminalId)
+    }
+    return count
+  }
+
+  private noteWindowsPowerShellInputIdle(
+    terminalId: string,
+    sequence: number,
+    inputRevision: number
+  ): void {
+    if (
+      !Number.isSafeInteger(sequence) ||
+      sequence < 1 ||
+      !Number.isSafeInteger(inputRevision) ||
+      inputRevision < 1
+    ) {
+      return
+    }
+    const terminal = this.terminals.get(terminalId)
+    if (terminal) {
+      const baseline = this.getWindowsPromptBaselineWithoutIo(
+        terminalId,
+        terminal
+      )
+      if (baseline && sequence >= baseline.baselineSequence) {
+        this.rememberWindowsPromptBaseline(terminalId, baseline, sequence)
+      }
+    }
+    const watcher = this.windowsManualPromptWatcherByTerminal.get(terminalId)
+    if (watcher?.expectedInputRevision === inputRevision) {
+      watcher.inputIdleSequence = Math.max(
+        watcher.inputIdleSequence || 0,
+        sequence
+      )
+      this.tryCompleteWindowsManualPromptWatcher(terminalId)
+    }
   }
 
   private registerBackendRuntimeHandlers(
@@ -1136,7 +1229,6 @@ export class TerminalService {
         this.publishTerminalTabsChanged()
       }
     }
-
     const taskRawDisplaySuppressed = this.shouldSuppressRawTaskDisplay(terminalId)
     const internalRawDisplaySuppressed =
       this.internalRawDisplaySuppressionByTerminal.has(terminalId)
@@ -1614,6 +1706,17 @@ export class TerminalService {
     )
   }
 
+  private taskOwnsLatestTerminalInput(
+    terminalId: string,
+    task: CommandTask
+  ): boolean {
+    return (
+      task.inputRevisionAtDispatch === undefined ||
+      task.inputRevisionAtDispatch ===
+        (this.terminalInputRevisionByTerminal.get(terminalId) || 0)
+    )
+  }
+
   private handleShellBoundaryMarker(
     terminalId: string,
     marker: GyShellBoundaryMarker,
@@ -1627,6 +1730,24 @@ export class TerminalService {
     ): boolean =>
       (boundary.sequence === undefined || candidate.sequence === boundary.sequence) &&
       (boundary.nonce === undefined || candidate.nonce === boundary.nonce)
+
+    if (marker.kind === 'inputidle') {
+      if (
+        this.backendUsesPowerShellSidecar(terminal) &&
+        this.commandProtocolTokenByTerminal.get(terminalId) !== undefined &&
+        !marker.legacy &&
+        marker.nonce === 'manual_input_drained' &&
+        marker.sequence !== undefined &&
+        marker.inputRevision !== undefined
+      ) {
+        this.noteWindowsPowerShellInputIdle(
+          terminalId,
+          marker.sequence,
+          marker.inputRevision
+        )
+      }
+      return
+    }
 
     if (marker.kind === 'preexec') {
       if (this.usesPowerShellCommandLifecycle(terminal)) {
@@ -1680,6 +1801,8 @@ export class TerminalService {
         ...(marker.sequence !== undefined ? { sequence: marker.sequence } : {}),
         ...(marker.nonce ? { nonce: marker.nonce } : {}),
         legacy: marker.legacy,
+        inputRevisionAtStart:
+          this.terminalInputRevisionByTerminal.get(terminalId) || 0,
       }
       this.activeShellBoundaryByTerminal.set(terminalId, boundary)
       this.shellInputStateByTerminal.set(terminalId, 'busy')
@@ -1771,6 +1894,27 @@ export class TerminalService {
 
     if (this.usesPowerShellCommandLifecycle(terminal)) {
       const previous = this.lastShellSequenceByTerminal.get(terminalId)
+      const manualWatcher =
+        this.windowsManualPromptWatcherByTerminal.get(terminalId)
+      if (
+        marker.sequence !== undefined &&
+        this.backendUsesPowerShellSidecar(terminal)
+      ) {
+        const baseline = this.getWindowsPromptBaselineWithoutIo(
+          terminalId,
+          terminal!
+        )
+        if (baseline && marker.sequence >= baseline.baselineSequence) {
+          this.rememberWindowsPromptBaseline(
+            terminalId,
+            baseline,
+            marker.sequence
+          )
+          if (task?.status === 'running') {
+            task.observedShellPromptSequence = marker.sequence
+          }
+        }
+      }
       if (task?.status === 'running' && task.captureBoundaryState === 'unverified') {
         if (
           task.expectedShellSequence !== undefined &&
@@ -1786,7 +1930,9 @@ export class TerminalService {
         // marker. Prompt rendering may follow in the same PTY chunk and is
         // shell-owned rather than command output.
         task.captureBoundaryState = 'sealed'
-        this.shellInputStateByTerminal.set(terminalId, 'idle')
+        if (this.taskOwnsLatestTerminalInput(terminalId, task)) {
+          this.shellInputStateByTerminal.set(terminalId, 'idle')
+        }
         this.applyVerifiedShellMetadata(terminalId, marker)
         this.scheduleTaskFinishAfterHeadlessFlush(terminalId, marker.exitCode, writeSeq)
         return
@@ -1810,9 +1956,10 @@ export class TerminalService {
         // already-delivered input was consumed. Only an advancing marker may
         // clear an explicitly busy/unknown Windows gate.
         if (
-          trackedState === undefined ||
-          trackedState === 'idle' ||
-          advancesPrompt
+          !manualWatcher &&
+          (trackedState === undefined ||
+            trackedState === 'idle' ||
+            advancesPrompt)
         ) {
           this.shellInputStateByTerminal.set(terminalId, 'idle')
         }
@@ -1856,7 +2003,9 @@ export class TerminalService {
         // DEBUG/preexec hook. The per-runtime namespace makes accidental
         // marker collisions unlikely; this same-sequence prompt confirms the
         // outcome, but without a start boundary capture remains unverified.
-        this.shellInputStateByTerminal.set(terminalId, 'idle')
+        if (this.taskOwnsLatestTerminalInput(terminalId, task)) {
+          this.shellInputStateByTerminal.set(terminalId, 'idle')
+        }
         this.applyVerifiedShellMetadata(terminalId, marker)
         this.promoteUnverifiedUnixCapture(terminalId, terminal, task)
         this.getTaskCapture(task.id)?.markUnknown('tracking_unavailable')
@@ -1873,7 +2022,16 @@ export class TerminalService {
     if (marker.sequence !== undefined) {
       this.lastShellSequenceByTerminal.set(terminalId, marker.sequence)
     }
-    this.shellInputStateByTerminal.set(terminalId, 'idle')
+    const boundaryOwnsLatestInput =
+      boundary.inputRevisionAtStart ===
+      (this.terminalInputRevisionByTerminal.get(terminalId) || 0)
+    if (
+      task
+        ? this.taskOwnsLatestTerminalInput(terminalId, task)
+        : boundaryOwnsLatestInput
+    ) {
+      this.shellInputStateByTerminal.set(terminalId, 'idle')
+    }
     this.applyVerifiedShellMetadata(terminalId, marker)
 
     if (
@@ -2102,6 +2260,7 @@ export class TerminalService {
     options?: {
       signal?: AbortSignal
       rejectOnRuntimeChange?: boolean
+      inputOwner?: 'active-task'
     }
   ): Promise<void> | undefined {
     const runtimePtyId = terminal.ptyId
@@ -2140,7 +2299,9 @@ export class TerminalService {
           return
         }
         const backend = this.getBackend(currentTerminal.type)
-        this.deliverTerminalInput(terminalId, backend, runtimePtyId, data)
+        this.deliverTerminalInput(terminalId, backend, runtimePtyId, data, {
+          inputOwner: options?.inputOwner,
+        })
       } finally {
         promptFileIo.release()
       }
@@ -2158,12 +2319,11 @@ export class TerminalService {
     const terminal = this.terminals.get(terminalId)
     if (terminal && this.canWriteToTerminal(terminal)) {
       const requiresOrderedWindowsPromptTracking =
-        this.usesPowerShellCommandLifecycle(terminal) &&
+        this.canObserveManualPowerShellPrompt(terminalId, terminal) &&
         this.getBackend(terminal.type).getCommandProtocolAvailability?.(
           terminal.ptyId
         ) === true &&
-        !this.activeTaskByTerminal.has(terminalId) &&
-        (/[\r\n\x03\x04\x1a]/.test(data) ||
+        (/[\r\n\x03]/.test(data) ||
           this.terminalInputSequenceTailByTerminal.has(terminalId))
       if (requiresOrderedWindowsPromptTracking) {
         void this.writeInputSequence(terminalId, [data]).catch((error) => {
@@ -2197,7 +2357,8 @@ export class TerminalService {
     terminalId: string,
     backend: TerminalBackend,
     ptyId: string,
-    data: string
+    data: string,
+    options?: { inputOwner?: 'active-task' }
   ): void {
     if (!data) {
       backend.write(ptyId, data)
@@ -2205,16 +2366,26 @@ export class TerminalService {
     }
     const hadPreviousState = this.shellInputStateByTerminal.has(terminalId)
     const previousState = this.shellInputStateByTerminal.get(terminalId)
+    const activeTask = this.getActiveTask(terminalId)
+    const inputBelongsToActiveTask =
+      options?.inputOwner === 'active-task' &&
+      activeTask?.status === 'running' &&
+      activeTask.observedShellPromptSequence === undefined
     // Treat the state transition and backend write as one transaction. Marking
     // first prevents a synchronously delivered prompt marker from being
     // overwritten; a rejected write restores the exact previous gate state.
     this.shellInputStateByTerminal.set(terminalId, 'busy')
     try {
       backend.write(ptyId, data)
+      const inputRevision =
+        (this.terminalInputRevisionByTerminal.get(terminalId) || 0) + 1
       this.terminalInputRevisionByTerminal.set(
         terminalId,
-        (this.terminalInputRevisionByTerminal.get(terminalId) || 0) + 1
+        inputRevision
       )
+      if (inputBelongsToActiveTask && activeTask?.status === 'running') {
+        activeTask.inputRevisionAtDispatch = inputRevision
+      }
     } catch (error) {
       if (hadPreviousState && previousState) {
         this.shellInputStateByTerminal.set(terminalId, previousState)
@@ -2265,15 +2436,6 @@ export class TerminalService {
 
     try {
       await waitForPromiseOrAbort(predecessor, options?.signal)
-      let lastNonemptyIndex = -1
-      let lastPromptProducingIndex = -1
-      for (let index = 0; index < sequence.length; index += 1) {
-        if (sequence[index].length > 0) lastNonemptyIndex = index
-        if (/[\r\n\x03\x04\x1a]/.test(sequence[index])) {
-          lastPromptProducingIndex = index
-        }
-      }
-
       if (startupReservation) {
         await waitForPromiseOrAbort(
           startupReservation.waitForRelease,
@@ -2320,16 +2482,61 @@ export class TerminalService {
           `Terminal ${terminalId} changed while the input sequence was waiting to start.`
         )
       }
-      const shouldTrackManualWindowsPrompt =
-        this.usesPowerShellCommandLifecycle(terminal) &&
-        !this.activeTaskByTerminal.has(terminalId) &&
-        lastPromptProducingIndex !== -1 &&
-        lastPromptProducingIndex === lastNonemptyIndex
-      const manualTrackingToken = shouldTrackManualWindowsPrompt
-        ? await this.ensureWindowsPromptBaseline(terminalId, {
-            forceRetry: true,
-          })
+      const shouldObserveManualWindowsPrompt =
+        this.canObserveManualPowerShellPrompt(terminalId, terminal)
+      // Human input is the in-band event that can produce the next prompt.
+      // Never wait for out-of-band baseline I/O before delivering it.
+      const manualTrackingToken = shouldObserveManualWindowsPrompt
+        ? this.getWindowsPromptBaselineWithoutIo(terminalId, terminal)
         : undefined
+      const observePromptAfterInput = (index: number): void => {
+        const input = sequence[index]
+        // This scanner is stateful across xterm writes (notably bracketed
+        // paste), so advance it only after the input was actually delivered.
+        const submissionCount = this.countWindowsPromptSubmissions(
+          terminalId,
+          input
+        )
+        if (
+          !manualTrackingToken ||
+          submissionCount === 0 ||
+          !this.isCurrentTerminalRuntime(
+            terminalId,
+            runtimePtyId,
+            runtimeGeneration
+          )
+        ) {
+          return
+        }
+        const expectedInputRevision =
+          this.terminalInputRevisionByTerminal.get(terminalId) || 0
+        const backend = this.getBackend(terminal.type)
+        if (!backend.commitPowerShellInputRevision) {
+          return
+        }
+        const minimumPromptSequence = this.startWindowsManualPromptWatcher(
+          terminal,
+          {
+            ...manualTrackingToken,
+            dispatchedAtMs: Date.now(),
+          },
+          expectedInputRevision,
+          inputReservation,
+          {
+            // If a later planned item is aborted, this submitted item may be
+            // the sequence's actual last interaction. Its verified idle must
+            // therefore remain eligible to restore the gate. A later write
+            // replaces the watcher before the reservation is released.
+            restoreIdleOnCompletion: /[\r\n\x03]$/.test(input),
+          }
+        )
+        this.commitWindowsPowerShellInputRevision(
+          terminal,
+          backend,
+          expectedInputRevision,
+          minimumPromptSequence
+        )
+      }
       throwIfTerminalOperationAborted(options?.signal)
       const requestedIntervalMs = options?.intervalMs ?? 0
       const intervalMs =
@@ -2367,7 +2574,8 @@ export class TerminalService {
             sequence[index],
             {
               signal: options?.signal,
-              rejectOnRuntimeChange: true
+              rejectOnRuntimeChange: true,
+              inputOwner: options?.inputOwner,
             }
           )
           if (queuedWrite) {
@@ -2378,33 +2586,16 @@ export class TerminalService {
               terminalId,
               backend,
               runtimePtyId,
-              sequence[index]
+              sequence[index],
+              { inputOwner: options?.inputOwner }
             )
           }
           break
         }
+        observePromptAfterInput(index)
         if (index < sequence.length - 1 && intervalMs > 0) {
           await waitForTerminalDelay(intervalMs, options?.signal)
         }
-      }
-      if (
-        manualTrackingToken &&
-        shouldTrackManualWindowsPrompt &&
-        this.isCurrentTerminalRuntime(
-          terminalId,
-          runtimePtyId,
-          runtimeGeneration
-        )
-      ) {
-        this.startWindowsManualPromptWatcher(
-          terminal,
-          {
-            ...manualTrackingToken,
-            dispatchedAtMs: Date.now(),
-          },
-          this.terminalInputRevisionByTerminal.get(terminalId) || 0,
-          inputReservation
-        )
       }
     } finally {
       inputReservations.delete(inputReservation)
@@ -2415,6 +2606,7 @@ export class TerminalService {
       ) {
         this.pendingInputReservationsByTerminal.delete(terminalId)
       }
+      this.tryCompleteWindowsManualPromptWatcher(terminalId)
       releaseTurn()
       void queuedTail.then(() => {
         if (
@@ -3467,9 +3659,78 @@ export class TerminalService {
     }
   }
 
-  private ensureWindowsPromptBaseline(
+  private rememberWindowsPromptBaseline(
     terminalId: string,
-    options?: { forceRetry?: boolean }
+    token: TerminalCommandTrackingToken,
+    sequence: number
+  ): TerminalCommandTrackingToken {
+    const baseline: TerminalCommandTrackingToken = {
+      mode: token.mode,
+      ...(token.trackingScopeId
+        ? { trackingScopeId: token.trackingScopeId }
+        : {}),
+      baselineSequence: sequence,
+    }
+    this.windowsPromptBaselineByTerminal.set(terminalId, baseline)
+    this.windowsPromptSequenceFloorByTerminal.set(
+      terminalId,
+      Math.max(
+        sequence,
+        this.windowsPromptSequenceFloorByTerminal.get(terminalId) || 0
+      )
+    )
+    return { ...baseline }
+  }
+
+  private reserveWindowsPromptSequence(
+    terminalId: string,
+    token: TerminalCommandTrackingToken
+  ): number {
+    const expectedSequence =
+      Math.max(
+        token.baselineSequence,
+        this.windowsPromptSequenceFloorByTerminal.get(terminalId) || 0
+      ) + 1
+    this.windowsPromptSequenceFloorByTerminal.set(
+      terminalId,
+      expectedSequence
+    )
+    return expectedSequence
+  }
+
+  private getWindowsPromptBaselineWithoutIo(
+    terminalId: string,
+    terminal: TerminalTab
+  ): TerminalCommandTrackingToken | undefined {
+    const cached = this.windowsPromptBaselineByTerminal.get(terminalId)
+    if (cached) {
+      return this.rememberWindowsPromptBaseline(
+        terminalId,
+        cached,
+        cached.baselineSequence
+      )
+    }
+
+    const initial = this.getBackend(
+      terminal.type
+    ).getInitialCommandTrackingToken?.(terminal.ptyId)
+    if (
+      !initial ||
+      !Number.isSafeInteger(initial.baselineSequence) ||
+      initial.baselineSequence < 1 ||
+      this.terminals.get(terminalId) !== terminal
+    ) {
+      return undefined
+    }
+    return this.rememberWindowsPromptBaseline(
+      terminalId,
+      initial,
+      initial.baselineSequence
+    )
+  }
+
+  private ensureWindowsPromptBaseline(
+    terminalId: string
   ): Promise<TerminalCommandTrackingToken | undefined> {
     const terminal = this.terminals.get(terminalId)
     if (
@@ -3478,128 +3739,32 @@ export class TerminalService {
     ) {
       return Promise.resolve(undefined)
     }
-    const cached = this.windowsPromptBaselineByTerminal.get(terminalId)
-    if (cached && !options?.forceRetry) {
-      return Promise.resolve({ ...cached })
+    const baseline = this.getWindowsPromptBaselineWithoutIo(
+      terminalId,
+      terminal
+    )
+    if (!baseline) {
+      if (
+        this.backendUsesPowerShellSidecar(terminal) &&
+        !this.shellInputStateByTerminal.has(terminalId)
+      ) {
+        this.shellInputStateByTerminal.set(terminalId, 'unknown')
+      }
+      return Promise.resolve(undefined)
     }
-    const runtimePtyId = terminal.ptyId
-    const runtimeGeneration =
-      this.backendRuntimeGenerationByTerminal.get(terminalId)
-    const existing = this.windowsPromptInitializationByTerminal.get(terminalId)
+
+    const trackedState = this.shellInputStateByTerminal.get(terminalId)
+    const hasPendingInput =
+      (this.pendingInputReservationsByTerminal.get(terminalId)?.size || 0) > 0
     if (
-      existing &&
-      !existing.cancelled &&
-      existing.ptyId === runtimePtyId &&
-      existing.runtimeGeneration === runtimeGeneration
+      !hasPendingInput &&
+      !this.activeTaskByTerminal.has(terminalId) &&
+      !this.commandStartReservationByTerminal.has(terminalId) &&
+      (trackedState === undefined || trackedState === 'idle')
     ) {
-      return existing.promise
+      this.shellInputStateByTerminal.set(terminalId, 'idle')
     }
-
-    const inputRevisionAtStart =
-      this.terminalInputRevisionByTerminal.get(terminalId) || 0
-    const initialization: WindowsPromptInitialization = {
-      ptyId: runtimePtyId,
-      runtimeGeneration,
-      cancelled: false,
-      promise: Promise.resolve(undefined),
-    }
-    const isCurrent = (): boolean =>
-      !initialization.cancelled &&
-      this.windowsPromptInitializationByTerminal.get(terminalId) ===
-        initialization &&
-      this.isCurrentTerminalRuntime(
-        terminalId,
-        runtimePtyId,
-        runtimeGeneration
-      )
-    initialization.promise = (async () => {
-      const token = await this.prepareCommandTracking(terminal)
-      if (!token || !isCurrent()) {
-        return undefined
-      }
-
-      let verified = { ...token }
-      if (
-        verified.baselineSequence <= 0 ||
-        verified.awaitingInitialFreshMarker === true
-      ) {
-        const backend = this.getBackend(terminal.type)
-        if (typeof backend.pollCommandTracking !== 'function') {
-          return undefined
-        }
-        let consecutiveUnavailablePolls = 0
-        while (isCurrent()) {
-          try {
-            const update = await this.awaitCommandTrackingIo(
-              backend.pollCommandTracking(runtimePtyId, verified),
-              'Windows prompt baseline poll'
-            )
-            if (!isCurrent()) {
-              return undefined
-            }
-            if (update) {
-              verified = this.advanceWindowsPromptBaseline(
-                verified,
-                update.sequence
-              )
-              this.applyCommandTrackingMetadata(terminalId, update)
-              break
-            }
-            consecutiveUnavailablePolls += 1
-          } catch {
-            if (!isCurrent()) {
-              return undefined
-            }
-            consecutiveUnavailablePolls += 1
-          }
-          if (
-            consecutiveUnavailablePolls >=
-            this.commandTrackingMaxConsecutiveErrors
-          ) {
-            if (isCurrent()) {
-              this.shellInputStateByTerminal.set(terminalId, 'unknown')
-            }
-            // Preserve the zero baseline for a recovery Enter/Ctrl-C. The
-            // caller may send that input and attach a manual watcher, but this
-            // unverified token is deliberately not cached as an idle prompt.
-            return { ...verified }
-          }
-          await new Promise((resolve) =>
-            setTimeout(resolve, this.commandTrackingPollIntervalMs)
-          )
-        }
-      }
-      if (!isCurrent()) {
-        return undefined
-      }
-
-      this.windowsPromptBaselineByTerminal.set(terminalId, { ...verified })
-      const inputRevisionUnchanged =
-        (this.terminalInputRevisionByTerminal.get(terminalId) || 0) ===
-        inputRevisionAtStart
-      const trackedState = this.shellInputStateByTerminal.get(terminalId)
-      const hasPendingInput =
-        (this.pendingInputReservationsByTerminal.get(terminalId)?.size || 0) > 0
-      if (
-        inputRevisionUnchanged &&
-        !hasPendingInput &&
-        !this.activeTaskByTerminal.has(terminalId) &&
-        !this.commandStartReservationByTerminal.has(terminalId) &&
-        (trackedState === undefined || trackedState === 'idle')
-      ) {
-        this.shellInputStateByTerminal.set(terminalId, 'idle')
-      }
-      return { ...verified }
-    })().finally(() => {
-      if (
-        this.windowsPromptInitializationByTerminal.get(terminalId) ===
-        initialization
-      ) {
-        this.windowsPromptInitializationByTerminal.delete(terminalId)
-      }
-    })
-    this.windowsPromptInitializationByTerminal.set(terminalId, initialization)
-    return initialization.promise
+    return Promise.resolve(baseline)
   }
 
   private applyCommandTrackingMetadata(
@@ -3636,15 +3801,21 @@ export class TerminalService {
       activeTask.capturedOutputTruncated = update.outputTruncated === true
     }
     if (activeTask?.completionTracking) {
-      this.windowsPromptBaselineByTerminal.set(
+      this.rememberWindowsPromptBaseline(
         terminalId,
-        this.advanceWindowsPromptBaseline(
-          activeTask.completionTracking,
-          update.sequence
-        )
+        activeTask.completionTracking,
+        update.sequence
       )
     }
-    this.shellInputStateByTerminal.set(terminalId, 'idle')
+    const manualWatcher =
+      this.windowsManualPromptWatcherByTerminal.get(terminalId)
+    if (
+      !manualWatcher &&
+      (!activeTask ||
+        this.taskOwnsLatestTerminalInput(terminalId, activeTask))
+    ) {
+      this.shellInputStateByTerminal.set(terminalId, 'idle')
+    }
     this.applyCommandTrackingMetadata(terminalId, update)
   }
 
@@ -3704,15 +3875,32 @@ export class TerminalService {
     terminal: TerminalTab,
     token: TerminalCommandTrackingToken,
     expectedInputRevision: number,
-    ownedInputReservation: symbol
-  ): void {
-    const backend = this.getBackend(terminal.type)
-    if (typeof backend.pollCommandTracking !== 'function') {
-      return
+    ownedInputReservation: symbol,
+    options: {
+      restoreIdleOnCompletion: boolean
     }
+  ): number {
     const terminalId = terminal.id
     const previous = this.windowsManualPromptWatcherByTerminal.get(terminalId)
     if (previous) previous.cancelled = true
+    const previousIsUnsettled =
+      previous !== undefined &&
+      previous.expectedPromptSequence > token.baselineSequence
+    const sequenceFloor =
+      this.windowsPromptSequenceFloorByTerminal.get(terminalId) || 0
+    // Raw Enter is ambiguous: it can submit a top-level command, complete a
+    // multiline block, or feed a foreground program. Reserve one later prompt
+    // for the whole unsettled interaction. The authenticated PSReadLine-idle
+    // boundary, rather than the number of Enter bytes, proves when all queued
+    // input has drained at an empty prompt. Input sent to an active agent task
+    // remains owned by that task's exact completion marker instead.
+    const expectedPromptSequence = previousIsUnsettled
+      ? Math.max(previous.expectedPromptSequence, sequenceFloor)
+      : Math.max(token.baselineSequence, sequenceFloor) + 1
+    this.windowsPromptSequenceFloorByTerminal.set(
+      terminalId,
+      expectedPromptSequence
+    )
     const runtimePtyId = terminal.ptyId
     const runtimeGeneration =
       this.backendRuntimeGenerationByTerminal.get(terminalId)
@@ -3720,96 +3908,136 @@ export class TerminalService {
       ptyId: runtimePtyId,
       runtimeGeneration,
       expectedInputRevision,
+      expectedPromptSequence,
+      restoreIdleOnCompletion: options.restoreIdleOnCompletion,
       ownedInputReservation,
       cancelled: false,
     }
     this.windowsManualPromptWatcherByTerminal.set(terminalId, watcher)
-    const isCurrent = (): boolean =>
-      !watcher.cancelled &&
-      this.windowsManualPromptWatcherByTerminal.get(terminalId) === watcher &&
-      this.isCurrentTerminalRuntime(
-        terminalId,
-        runtimePtyId,
-        runtimeGeneration
-      )
+    return expectedPromptSequence
+  }
 
-    void (async () => {
-      let consecutiveUnavailablePolls = 0
-      try {
-        while (isCurrent()) {
-          try {
-            const update = await this.awaitCommandTrackingIo(
-              backend.pollCommandTracking!(runtimePtyId, token),
-              'Windows manual prompt poll'
-            )
-            if (!isCurrent()) {
-              return
-            }
-            if (update) {
-              const advanced = this.advanceWindowsPromptBaseline(
-                token,
-                update.sequence
-              )
-              this.windowsPromptBaselineByTerminal.set(terminalId, advanced)
-              this.applyCommandTrackingMetadata(terminalId, update)
-
-              // The update can race the async input sequence's finally block.
-              // Wait for this watcher's own reservation to retire, but never
-              // ignore a newer sequence or command reservation.
-              while (
-                isCurrent() &&
-                this.pendingInputReservationsByTerminal
-                  .get(terminalId)
-                  ?.has(ownedInputReservation)
-              ) {
-                await new Promise((resolve) => setTimeout(resolve, 0))
-              }
-              const reservations =
-                this.pendingInputReservationsByTerminal.get(terminalId)
-              if (
-                isCurrent() &&
-                (this.terminalInputRevisionByTerminal.get(terminalId) || 0) ===
-                  expectedInputRevision &&
-                (!reservations || reservations.size === 0) &&
-                !this.activeTaskByTerminal.has(terminalId) &&
-                !this.commandStartReservationByTerminal.has(terminalId)
-              ) {
-                this.shellInputStateByTerminal.set(terminalId, 'idle')
-              }
-              return
-            }
-            consecutiveUnavailablePolls += 1
-          } catch {
-            if (!isCurrent()) {
-              return
-            }
-            consecutiveUnavailablePolls += 1
-          }
-          if (
-            consecutiveUnavailablePolls >=
-            this.commandTrackingMaxConsecutiveErrors
-          ) {
-            if (
-              isCurrent() &&
-              (this.terminalInputRevisionByTerminal.get(terminalId) || 0) ===
-                expectedInputRevision
-            ) {
-              this.shellInputStateByTerminal.set(terminalId, 'unknown')
-            }
-            return
-          }
-          await new Promise((resolve) =>
-            setTimeout(resolve, this.commandTrackingPollIntervalMs)
-          )
-        }
-      } finally {
+  private commitWindowsPowerShellInputRevision(
+    terminal: TerminalTab,
+    backend: TerminalBackend,
+    revision: number,
+    minimumPromptSequence: number
+  ): void {
+    const commit = backend.commitPowerShellInputRevision
+    if (!commit || !Number.isSafeInteger(revision) || revision < 1) {
+      return
+    }
+    const terminalId = terminal.id
+    const runtimeGeneration =
+      this.backendRuntimeGenerationByTerminal.get(terminalId)
+    const previous = this.windowsInputRevisionCommitByTerminal.get(terminalId)
+    const commitCurrentRevision = async (): Promise<void> => {
+      let lastError: unknown
+      for (let attempt = 1; attempt <= 3; attempt += 1) {
         if (
-          this.windowsManualPromptWatcherByTerminal.get(terminalId) === watcher
+          !this.isCurrentTerminalRuntime(
+            terminalId,
+            terminal.ptyId,
+            runtimeGeneration
+          )
         ) {
-          this.windowsManualPromptWatcherByTerminal.delete(terminalId)
+          return
+        }
+        try {
+          await commit.call(
+            backend,
+            terminal.ptyId,
+            revision,
+            minimumPromptSequence
+          )
+          return
+        } catch (error) {
+          lastError = error
+          if (attempt < 3) {
+            await waitForTerminalDelay(
+              Math.min(250, Math.max(10, this.commandTrackingPollIntervalMs))
+            )
+          }
         }
       }
-    })()
+      throw lastError instanceof Error
+        ? lastError
+        : new Error(String(lastError))
+    }
+    const pending =
+      previous && previous.runtimeGeneration === runtimeGeneration
+        ? previous.tail.then(commitCurrentRevision, commitCurrentRevision)
+        : commitCurrentRevision()
+    const settled = pending.catch((error) => {
+      if (
+        this.isCurrentTerminalRuntime(
+          terminalId,
+          terminal.ptyId,
+          runtimeGeneration
+        )
+      ) {
+        const watcher =
+          this.windowsManualPromptWatcherByTerminal.get(terminalId)
+        if (
+          watcher?.expectedInputRevision === revision &&
+          watcher.expectedPromptSequence === minimumPromptSequence
+        ) {
+          // Keep the watcher so a later human recovery submission can replace
+          // it, but make the loss explicit instead of leaving a silent busy
+          // state that looks like a running command.
+          this.shellInputStateByTerminal.set(terminalId, 'unknown')
+        }
+        console.warn(
+          `[TerminalService] Failed to commit PowerShell input revision for ${terminalId}.`,
+          error
+        )
+      }
+    })
+    const entry = { runtimeGeneration, tail: settled }
+    this.windowsInputRevisionCommitByTerminal.set(terminalId, entry)
+    void settled.finally(() => {
+      if (this.windowsInputRevisionCommitByTerminal.get(terminalId) === entry) {
+        this.windowsInputRevisionCommitByTerminal.delete(terminalId)
+      }
+    })
+  }
+
+  private tryCompleteWindowsManualPromptWatcher(terminalId: string): boolean {
+    const watcher = this.windowsManualPromptWatcherByTerminal.get(terminalId)
+    if (
+      !watcher ||
+      watcher.cancelled ||
+      this.windowsManualPromptWatcherByTerminal.get(terminalId) !== watcher ||
+      !this.isCurrentTerminalRuntime(
+        terminalId,
+        watcher.ptyId,
+        watcher.runtimeGeneration
+      ) ||
+      (watcher.inputIdleSequence || 0) < watcher.expectedPromptSequence
+    ) {
+      return false
+    }
+
+    const reservations = this.pendingInputReservationsByTerminal.get(terminalId)
+    if (
+      reservations?.has(watcher.ownedInputReservation) ||
+      this.activeTaskByTerminal.has(terminalId) ||
+      this.commandStartReservationByTerminal.has(terminalId)
+    ) {
+      return false
+    }
+
+    if (
+      watcher.restoreIdleOnCompletion &&
+      (this.terminalInputRevisionByTerminal.get(terminalId) || 0) ===
+        watcher.expectedInputRevision &&
+      (!reservations || reservations.size === 0)
+    ) {
+      this.shellInputStateByTerminal.set(terminalId, 'idle')
+    }
+    watcher.cancelled = true
+    this.windowsManualPromptWatcherByTerminal.delete(terminalId)
+    return true
   }
 
   private isWindowsPromptRendered(terminalId: string, cwd?: string): boolean {
@@ -4658,6 +4886,10 @@ export class TerminalService {
             runtimePtyId,
             `${completionTracking.dispatchInput}${eol}`
           )
+          this.reserveWindowsPromptSequence(
+            terminalId,
+            completionTracking
+          )
         } catch (writeError) {
           await clearPendingPromptRequest()
           restoreShellStateAfterPromptDispatchFailure()
@@ -4698,9 +4930,11 @@ export class TerminalService {
         probeUpdate.sequence
       )
       Object.assign(completionTracking, advancedTracking)
-      this.windowsPromptBaselineByTerminal.set(terminalId, {
-        ...advancedTracking,
-      })
+      this.rememberWindowsPromptBaseline(
+        terminalId,
+        advancedTracking,
+        probeUpdate.sequence
+      )
       this.applyCommandTrackingMetadata(terminalId, probeUpdate)
       promptProbeVerified = true
 
@@ -4772,6 +5006,8 @@ export class TerminalService {
       command,
       wireCommand,
       completionTracking,
+      inputRevisionAtDispatch:
+        this.terminalInputRevisionByTerminal.get(terminalId) || 0,
       type,
       status: 'running',
       startOffset,
@@ -4838,6 +5074,12 @@ export class TerminalService {
       }
       try {
         backend.write(runtimePtyId, dispatchedInput)
+        if (completionTracking) {
+          this.reserveWindowsPromptSequence(
+            terminalId,
+            completionTracking
+          )
+        }
       } catch (error) {
         if (previousShellInputState) {
           this.shellInputStateByTerminal.set(terminalId, previousShellInputState)
@@ -5066,6 +5308,7 @@ export class TerminalService {
     if (!task.runtimeBoundary) {
       this.replayDeferredTerminalWrites(terminalId, deferredWrites)
     }
+    this.tryCompleteWindowsManualPromptWatcher(terminalId)
 
     const callback = this.onTaskFinishedCallbacks.get(taskId)
     if (callback) {
@@ -5300,6 +5543,7 @@ export class TerminalService {
     this.stopCommandTrackingWatcher(taskId)
     this.unverifiedCaptureByTaskId.delete(taskId)
     this.activeTaskByTerminal.delete(terminalId)
+    this.tryCompleteWindowsManualPromptWatcher(terminalId)
     this.pendingTaskFinishByTerminal.delete(terminalId)
     this.deferredWritesUntilTaskFinishByTaskId.delete(taskId)
     this.onTaskFinishedCallbacks.delete(taskId)

@@ -1,4 +1,4 @@
-import { findInitializationReadyMarkerLine } from './CommandStreamProtocol'
+import { findInitializationReadyRecord } from './CommandStreamProtocol'
 
 const MAX_PENDING_INITIALIZATION_CHARS = 256 * 1024
 
@@ -15,7 +15,7 @@ export type PrivateShellInitializationChunk =
     }
 
 interface PendingInitializationAttempt {
-  marker: string
+  readyRecord: string
   settle: (opened: boolean) => void
 }
 
@@ -29,9 +29,9 @@ export class PrivateShellInitializationGate {
   private pendingAttempt: PendingInitializationAttempt | undefined
   private bufferedData = ''
 
-  beginAttempt(marker: string): Promise<boolean> {
-    if (!marker) {
-      throw new Error('Private shell initialization marker is empty')
+  beginAttempt(readyRecord: string): Promise<boolean> {
+    if (!readyRecord) {
+      throw new Error('Private shell initialization ready record is empty')
     }
     if (this.state !== 'pending') {
       return Promise.resolve(this.state === 'ready')
@@ -41,7 +41,7 @@ export class PrivateShellInitializationGate {
     this.bufferedData = ''
     return new Promise<boolean>((resolve) => {
       this.pendingAttempt = {
-        marker,
+        readyRecord,
         settle: resolve
       }
     })
@@ -57,25 +57,25 @@ export class PrivateShellInitializationGate {
     }
 
     const combined = this.bufferedData + data
-    const markerOffset = findInitializationReadyMarkerLine(
+    const readyRecordOffset = findInitializationReadyRecord(
       combined,
-      this.pendingAttempt.marker
+      this.pendingAttempt.readyRecord
     )
-    if (markerOffset < 0) {
+    if (readyRecordOffset < 0) {
       this.bufferedData = combined.slice(-MAX_PENDING_INITIALIZATION_CHARS)
       return { kind: 'suppressed' }
     }
 
     const attempt = this.pendingAttempt
-    const markerEnd = markerOffset + attempt.marker.length
+    const readyRecordEnd = readyRecordOffset + attempt.readyRecord.length
     this.state = 'ready'
     this.pendingAttempt = undefined
     this.bufferedData = ''
     attempt.settle(true)
     return {
       kind: 'opened',
-      suppressedData: combined.slice(0, markerOffset),
-      visibleData: combined.slice(markerEnd)
+      suppressedData: combined.slice(0, readyRecordOffset),
+      visibleData: combined.slice(readyRecordEnd)
     }
   }
 

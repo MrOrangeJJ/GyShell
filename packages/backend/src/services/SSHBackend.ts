@@ -35,6 +35,9 @@ import {
   buildWindowsPowerShellBootstrapLoaderEncodedCommand,
   buildWindowsPowerShellDispatchInput,
   buildWindowsPowerShellEncodedCommand,
+  buildWindowsPowerShellInputRevisionPath,
+  buildWindowsPowerShellInitializationRetryCommand,
+  serializeWindowsPowerShellInputRevision,
   buildWindowsPowerShellInitializationReadyVariableName,
   buildWindowsPowerShellRequestMarkerPath,
   WINDOWS_POWERSHELL_COMMAND_OUTPUT_FILE_PREFIX,
@@ -44,6 +47,7 @@ import {
   parseWindowsPowerShellRequestMarkerFile,
   shouldUseWindowsPowerShellSidecar,
   WINDOWS_POWERSHELL_COMMAND_REQUEST_FILE_PREFIX,
+  WINDOWS_POWERSHELL_INITIAL_PROMPT_SEQUENCE,
   WINDOWS_POWERSHELL_SIDECAR_BUILD_THRESHOLD,
   WINDOWS_POWERSHELL_REMOTE_SIDECAR_DIR_NAME,
   WINDOWS_POWERSHELL_REQUEST_MARKER_MAX_UTF8_BYTES,
@@ -54,6 +58,7 @@ import {
 import {
   buildCommandProtocolMarkerPrefix,
   buildInitializationReadyMarker,
+  buildPowerShellInitializationReadySequence,
   buildUnixCommandDispatcherScript,
 } from "./terminal/CommandStreamProtocol";
 import { PrivateShellInitializationGate } from "./terminal/PrivateShellInitializationGate";
@@ -90,6 +95,7 @@ interface SSHInstance {
   client: ssh2.Client;
   sshConfig?: SSHConnectionConfig;
   stream?: ssh2.ClientChannel;
+  interactiveWriteBarrier?: Promise<void>;
   sftp?: ssh2.SFTPWrapper;
   sftpInitPromise?: Promise<ssh2.SFTPWrapper>;
   sftpInitError?: string;
@@ -584,6 +590,24 @@ export class SSHBackend implements TerminalBackend {
       : undefined;
   }
 
+  getInitialCommandTrackingToken(
+    ptyId: string,
+  ): TerminalCommandTrackingToken | undefined {
+    const instance = this.sessions.get(ptyId);
+    if (
+      !instance ||
+      instance.initializationState !== "ready" ||
+      instance.commandTrackingMode !== "windows-powershell-sidecar"
+    ) {
+      return undefined;
+    }
+    return {
+      mode: "windows-powershell-sidecar",
+      trackingScopeId: instance.commandProtocolToken,
+      baselineSequence: WINDOWS_POWERSHELL_INITIAL_PROMPT_SEQUENCE,
+    };
+  }
+
   getCommandShellFamily(
     ptyId: string,
   ): TerminalCommandShellFamily | undefined {
@@ -965,12 +989,12 @@ export class SSHBackend implements TerminalBackend {
     commandRequestPath?: string;
     commandOutputPath?: string;
     commandProtocolToken?: string;
-    readyMarker?: string;
+    readySequence?: string;
   }): string {
     return buildWindowsPowerShellEncodedCommand({
-      readyMarker:
-        options?.readyMarker ||
-        buildInitializationReadyMarker(options?.commandProtocolToken),
+      readySequence:
+        options?.readySequence ||
+        buildPowerShellInitializationReadySequence(options?.commandProtocolToken),
       commandTrackingMode: options?.commandTrackingMode || "shell-integration",
       promptMarkerPath: options?.promptMarkerPath,
       commandRequestPath: options?.commandRequestPath,
@@ -987,17 +1011,17 @@ export class SSHBackend implements TerminalBackend {
     commandProtocolToken: string;
   }): string {
     return buildWindowsPowerShellBootstrapScript({
-      readyMarker: buildInitializationReadyMarker(
+      readySequence: buildPowerShellInitializationReadySequence(
         options.commandProtocolToken,
       ),
-      readyMarkerFromRuntimeVariable: true,
+      readySequenceFromRuntimeVariable: true,
       ...options,
     });
   }
 
   private buildWindowsPowerShellLaunchCommand(
     instance: SSHInstance,
-    readyMarker: string,
+    readySequence: string,
   ): string {
     if (
       instance.commandTrackingMode === "windows-powershell-sidecar" &&
@@ -1009,7 +1033,7 @@ export class SSHBackend implements TerminalBackend {
           instance.windowsPowerShellBootstrapPath,
         ),
         {
-          readyMarker,
+          readySequence,
           readyMarkerVariableName:
             buildWindowsPowerShellInitializationReadyVariableName(
               instance.commandProtocolToken,
@@ -1027,11 +1051,32 @@ export class SSHBackend implements TerminalBackend {
       commandRequestPath: instance.windowsCommandRequestPath,
       commandOutputPath: instance.windowsCommandOutputPath,
       commandProtocolToken: instance.commandProtocolToken,
-      readyMarker,
+      readySequence,
     });
     return this.buildPowerShellEncodedInvocation(instance, encoded, {
       noExit: true,
     });
+  }
+
+  private buildWindowsPowerShellRetryCommand(
+    instance: SSHInstance,
+    readySequence: string,
+  ): string | undefined {
+    if (
+      instance.commandTrackingMode !== "windows-powershell-sidecar" ||
+      !instance.commandProtocolToken ||
+      !instance.windowsPowerShellBootstrapPath
+    ) {
+      return undefined;
+    }
+    return buildWindowsPowerShellInitializationRetryCommand(
+      instance.commandProtocolToken,
+      readySequence,
+      this.normalizePowerShellPath(
+        instance,
+        instance.windowsPowerShellBootstrapPath,
+      ),
+    );
   }
 
   private getShellInitRetryIntervalMs(
@@ -2326,21 +2371,32 @@ export class SSHBackend implements TerminalBackend {
       attempt += 1
     ) {
       if (!isCurrent()) return;
-      const readyMarker = buildInitializationReadyMarker(
-        instance.commandProtocolToken,
-        attempt,
-      );
-      const opened = instance.initializationGate.beginAttempt(readyMarker);
+      const readyRecord =
+        instance.commandShellFamily === "powershell"
+          ? buildPowerShellInitializationReadySequence(
+              instance.commandProtocolToken,
+              attempt,
+            )
+          : buildInitializationReadyMarker(
+              instance.commandProtocolToken,
+              attempt,
+            );
+      const opened = instance.initializationGate.beginAttempt(readyRecord);
       const attemptTimeoutMs = this.getShellInitRetryIntervalMs(
         instance.commandShellFamily,
       );
 
       console.log(`[SSH] Injection attempt ${attempt}...`);
       if (instance.commandShellFamily !== "powershell" || attempt > 1) {
+        // PowerShell handles Ctrl-C immediately. Extra newline bytes can stay
+        // queued across a nested -NoExit retry and generate a prompt after
+        // readiness, invalidating the bootstrap-proven sidecar baseline.
+        const recoveryInput =
+          instance.commandShellFamily === "powershell" ? "\x03" : "\x03\n\n";
         if (
           !(await this.writeShellInitializationInput(
             stream,
-            "\x03\n\n",
+            recoveryInput,
             attemptTimeoutMs,
             signal,
           ))
@@ -2368,9 +2424,13 @@ export class SSHBackend implements TerminalBackend {
         return;
       }
 
+      const retryCommand =
+        instance.commandShellFamily === "powershell" && attempt > 1
+          ? this.buildWindowsPowerShellRetryCommand(instance, readyRecord)
+          : undefined;
       const launchCommand =
         instance.commandShellFamily === "powershell"
-          ? `${this.buildWindowsPowerShellLaunchCommand(instance, readyMarker)}\r`
+          ? `${retryCommand ?? this.buildWindowsPowerShellLaunchCommand(instance, readyRecord)}\r`
           : this.buildUnixShellLaunchCommand(instance, attempt);
       if (
         !(await this.writeShellInitializationInput(
@@ -2416,9 +2476,9 @@ export class SSHBackend implements TerminalBackend {
   }
 
   private handleShellStreamData(
-    ptyId: string,
+    _ptyId: string,
     instance: SSHInstance,
-    stream: ssh2.ClientChannel,
+    _stream: ssh2.ClientChannel,
     chunk: string,
     emit: (data: string) => void,
   ): void {
@@ -2429,10 +2489,6 @@ export class SSHBackend implements TerminalBackend {
       return;
     }
 
-    const sawContinuation =
-      /(?:\r?\n)>>\s*\r?\n/.test(projected.suppressedData) ||
-      projected.suppressedData.trimEnd().endsWith("\n>>") ||
-      projected.suppressedData.trimEnd().endsWith("\r\n>>");
     instance.commandProtocolAvailable =
       instance.commandShellFamily === "powershell"
         ? this.hasReliableWindowsCommandProtocol(instance)
@@ -2448,20 +2504,6 @@ export class SSHBackend implements TerminalBackend {
     if (visibleData) emit(visibleData);
     if (instance.commandShellFamily === "unix") {
       void this.cleanupUnixShellBootstrap(instance).catch(() => {});
-    }
-    if (sawContinuation && instance.commandShellFamily === "powershell") {
-      setTimeout(() => {
-        if (
-          this.sessions.get(ptyId) !== instance ||
-          instance.stream !== stream ||
-          instance.initializationState !== "ready"
-        ) {
-          return;
-        }
-        try {
-          stream.write("\r");
-        } catch {}
-      }, 50);
     }
   }
 
@@ -2810,7 +2852,74 @@ export class SSHBackend implements TerminalBackend {
   write(ptyId: string, data: string): void {
     const instance = this.sessions.get(ptyId);
     if (instance && instance.stream) {
-      instance.stream.write(data);
+      const stream = instance.stream;
+      let resolveWrite: () => void = () => {};
+      let rejectWrite: (error: Error) => void = () => {};
+      const writeBarrier = new Promise<void>((resolve, reject) => {
+        resolveWrite = resolve;
+        rejectWrite = reject;
+      });
+      try {
+        stream.write(data, (error?: Error | null) => {
+          if (error) {
+            rejectWrite(error);
+          } else {
+            resolveWrite();
+          }
+        });
+      } catch (error) {
+        rejectWrite(error instanceof Error ? error : new Error(String(error)));
+        throw error;
+      }
+      instance.interactiveWriteBarrier = writeBarrier;
+      // A normal keystroke may never request a sidecar commit. Attach a sink
+      // now while preserving rejection for any later revision barrier await.
+      void writeBarrier.catch(() => {});
+    }
+  }
+
+  async commitPowerShellInputRevision(
+    ptyId: string,
+    revision: number,
+    minimumPromptSequence: number,
+  ): Promise<void> {
+    const revisionState = serializeWindowsPowerShellInputRevision(
+      revision,
+      minimumPromptSequence,
+    );
+    const instance = this.sessions.get(ptyId);
+    const markerPath = instance?.windowsPromptMarkerPath;
+    if (
+      !instance ||
+      instance.commandTrackingMode !== "windows-powershell-sidecar" ||
+      !markerPath
+    ) {
+      throw new Error("PowerShell input revision sidecar is unavailable.");
+    }
+    const interactiveWriteBarrier = instance.interactiveWriteBarrier;
+    if (interactiveWriteBarrier) {
+      await interactiveWriteBarrier;
+    }
+    if (
+      this.sessions.get(ptyId) !== instance ||
+      instance.windowsPromptMarkerPath !== markerPath
+    ) {
+      throw new Error(
+        "PowerShell input revision runtime changed before commit.",
+      );
+    }
+    await this.writeFile(
+      ptyId,
+      buildWindowsPowerShellInputRevisionPath(markerPath),
+      revisionState,
+    );
+    if (
+      this.sessions.get(ptyId) !== instance ||
+      instance.windowsPromptMarkerPath !== markerPath
+    ) {
+      throw new Error(
+        "PowerShell input revision runtime changed during commit.",
+      );
     }
   }
 
@@ -3112,7 +3221,7 @@ export class SSHBackend implements TerminalBackend {
   ): string {
     const attemptVariable = `__gyshell_${instance.commandProtocolToken}_initialization_attempt`;
     const assignment = `${attemptVariable}=${attempt};`;
-    if (instance.unixShellBootstrapPath && attempt === 1) {
+    if (instance.unixShellBootstrapPath) {
       return `  ${assignment} . ${quotePosixShellLiteral(instance.unixShellBootstrapPath)}\n`;
     }
 

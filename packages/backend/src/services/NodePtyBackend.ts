@@ -32,6 +32,8 @@ import {
   buildWindowsPowerShellBootstrapLoaderEncodedCommand,
   buildWindowsPowerShellBootstrapScript,
   buildWindowsPowerShellDispatchInput,
+  buildWindowsPowerShellInputRevisionPath,
+  serializeWindowsPowerShellInputRevision,
   buildWindowsPowerShellRequestMarkerPath,
   buildWindowsPowerShellEncodedCommand,
   parseWindowsBuildNumber,
@@ -40,6 +42,7 @@ import {
   shouldUseWindowsPowerShellSidecar,
   WINDOWS_POWERSHELL_COMMAND_OUTPUT_FILE_PREFIX,
   WINDOWS_POWERSHELL_COMMAND_REQUEST_FILE_PREFIX,
+  WINDOWS_POWERSHELL_INITIAL_PROMPT_SEQUENCE,
   WINDOWS_POWERSHELL_LOCAL_SIDECAR_DIR_PREFIX,
   WINDOWS_POWERSHELL_REQUEST_MARKER_MAX_UTF8_BYTES,
   WINDOWS_POWERSHELL_SIDECAR_RETENTION_MS,
@@ -49,8 +52,9 @@ import {
 import {
   buildCommandProtocolMarkerPrefix,
   buildInitializationReadyMarker,
+  buildPowerShellInitializationReadySequence,
   buildUnixCommandDispatcherScript,
-  consumeInitializationReadyMarker,
+  consumeInitializationReadyRecord,
 } from './terminal/CommandStreamProtocol'
 
 const execFileAsync = promisify(execFile)
@@ -641,7 +645,10 @@ export class NodePtyBackend implements TerminalBackend {
     const commandProtocolToken = this.shellSupportsCommandProtocol(shell)
       ? randomBytes(16).toString('hex')
       : undefined
-    const initializationReadyMarker = buildInitializationReadyMarker(commandProtocolToken)
+    const initializationReadyRecord =
+      commandShellFamily === 'powershell'
+        ? buildPowerShellInitializationReadySequence(commandProtocolToken)
+        : buildInitializationReadyMarker(commandProtocolToken)
 
     const {
       args,
@@ -678,9 +685,9 @@ export class NodePtyBackend implements TerminalBackend {
       const chunk = data.toString()
       if (instance.isInitializing) {
         instance.buffer += chunk
-        const postInitializationData = consumeInitializationReadyMarker(
+        const postInitializationData = consumeInitializationReadyRecord(
           instance.buffer!,
-          initializationReadyMarker
+          initializationReadyRecord
         )
         if (postInitializationData !== undefined) {
           instance.isInitializing = false
@@ -749,6 +756,56 @@ export class NodePtyBackend implements TerminalBackend {
       'windows-powershell-sidecar'
       ? 'windows-powershell-sidecar'
       : undefined
+  }
+
+  getInitialCommandTrackingToken(
+    ptyId: string
+  ): TerminalCommandTrackingToken | undefined {
+    const instance = this.ptys.get(ptyId)
+    if (
+      instance?.isInitializing !== false ||
+      this.commandTrackingModeByPtyId.get(ptyId) !==
+        'windows-powershell-sidecar'
+    ) {
+      return undefined
+    }
+    return {
+      mode: 'windows-powershell-sidecar',
+      trackingScopeId: this.commandProtocolTokenByPtyId.get(ptyId),
+      baselineSequence: WINDOWS_POWERSHELL_INITIAL_PROMPT_SEQUENCE,
+    }
+  }
+
+  async commitPowerShellInputRevision(
+    ptyId: string,
+    revision: number,
+    minimumPromptSequence: number
+  ): Promise<void> {
+    const revisionState = serializeWindowsPowerShellInputRevision(
+      revision,
+      minimumPromptSequence
+    )
+    const runtimeInstance = this.ptys.get(ptyId)
+    const markerPath = this.promptMarkerPathByPtyId.get(ptyId)
+    if (
+      !runtimeInstance ||
+      this.commandTrackingModeByPtyId.get(ptyId) !==
+        'windows-powershell-sidecar' ||
+      !markerPath
+    ) {
+      throw new Error('PowerShell input revision sidecar is unavailable.')
+    }
+    await fs.promises.writeFile(
+      buildWindowsPowerShellInputRevisionPath(markerPath),
+      revisionState,
+      'utf8'
+    )
+    if (
+      this.ptys.get(ptyId) !== runtimeInstance ||
+      this.promptMarkerPathByPtyId.get(ptyId) !== markerPath
+    ) {
+      throw new Error('PowerShell input revision runtime changed during commit.')
+    }
   }
 
   private shellSupportsCommandProtocol(shellPath: string): boolean {
@@ -1000,7 +1057,7 @@ export class NodePtyBackend implements TerminalBackend {
       if (commandTrackingMode === 'windows-powershell-sidecar' && tmpPath) {
         const bootstrapPath = path.join(tmpPath, 'bootstrap.ps1')
         const bootstrapScript = buildWindowsPowerShellBootstrapScript({
-          readyMarker: buildInitializationReadyMarker(runtimeToken),
+          readySequence: buildPowerShellInitializationReadySequence(runtimeToken),
           commandTrackingMode,
           promptMarkerPath,
           commandRequestPath,
@@ -1169,7 +1226,7 @@ export class NodePtyBackend implements TerminalBackend {
     commandProtocolToken?: string
   ): string {
     return buildWindowsPowerShellEncodedCommand({
-      readyMarker: buildInitializationReadyMarker(commandProtocolToken),
+      readySequence: buildPowerShellInitializationReadySequence(commandProtocolToken),
       commandTrackingMode,
       promptMarkerPath,
       commandRequestPath,

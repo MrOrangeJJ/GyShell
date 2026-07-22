@@ -395,6 +395,10 @@ export interface CommandTask {
   command: string
   wireCommand?: string
   completionTracking?: TerminalCommandTrackingToken
+  /** Manual input after this authenticated prompt belongs to a later command. */
+  /** Human-input revision captured immediately before this task was dispatched. */
+  inputRevisionAtDispatch?: number
+  observedShellPromptSequence?: number
   displayMode?: 'synthetic-transcript' | 'synthetic-command-echo'
   type: 'wait' | 'nowait'
   status: 'running' | 'finished' | 'aborted' | 'timeout'
@@ -749,6 +753,19 @@ export interface TerminalSessionBackend {
   write(ptyId: string, data: string): void
 
   /**
+   * Commits a monotonic manual-input revision through the PowerShell
+   * sidecar channel after the corresponding PTY bytes were written. The
+   * shell consumes it only from an empty PSReadLine prompt at or beyond the
+   * supplied prompt floor, giving TerminalService a cross-channel causal
+   * acknowledgement.
+   */
+  commitPowerShellInputRevision?(
+    ptyId: string,
+    revision: number,
+    minimumPromptSequence: number,
+  ): Promise<void>
+
+  /**
    * Resize the terminal session.
    */
   resize(ptyId: string, cols: number, rows: number): void
@@ -849,6 +866,15 @@ export interface TerminalSessionBackend {
     targetPath: string,
     options: PeerFileTransferOptions,
   ): Promise<PeerFileTransferResult>
+
+  /**
+   * Returns a prompt baseline proven by the private shell bootstrap without
+   * performing I/O. This is the only baseline safe to read before immediate
+   * human input; mutable prompt journals must not be sampled afterward.
+   */
+  getInitialCommandTrackingToken?(
+    ptyId: string,
+  ): TerminalCommandTrackingToken | undefined
 
   /**
    * Capture backend-specific command tracking state before dispatching a command.

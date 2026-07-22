@@ -1036,7 +1036,8 @@ export async function writeStdin(args: z.infer<typeof writeStdinSchema>, context
 
   await terminalService.writeInputSequence(bestMatch.id, resolvedSequence, {
     intervalMs: resolvedSequence.length > 1 ? 100 : 0,
-    signal: context.signal
+    signal: context.signal,
+    inputOwner: 'active-task'
   })
 
   await waitWithSignal(1000, context.signal)

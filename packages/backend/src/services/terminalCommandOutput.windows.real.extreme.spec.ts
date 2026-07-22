@@ -11,6 +11,7 @@ import {
 } from './AgentHelper/tools/command_output_contract'
 
 const RUN_FLAG = '--run-real-windows-ssh'
+const FORCE_FIRST_INIT_RETRY_FLAG = '--force-first-init-retry'
 const CONNECTION_NAME = process.env.GYSHELL_REAL_WINDOWS_CONNECTION || 'WIN'
 
 function assert(condition: unknown, message: string): asserts condition {
@@ -109,25 +110,300 @@ const run = async (): Promise<void> => {
 
   const config = loadSavedConnection()
   const service = new TerminalService()
-  service.setRawEventPublisher(() => {})
+  const sshBackend = (service as any).getBackend('ssh') as any
+  const forceFirstInitRetry = process.argv.includes(FORCE_FIRST_INIT_RETRY_FLAG)
+  let initializationLaunchCount = 0
+  let initializationRetryCount = 0
+  if (forceFirstInitRetry) {
+    const backendConstructor = sshBackend.constructor as any
+    backendConstructor.WINDOWS_SHELL_INIT_RETRY_INTERVAL_MS = 4000
+    const buildLaunchCommand =
+      sshBackend.buildWindowsPowerShellLaunchCommand.bind(sshBackend)
+    sshBackend.buildWindowsPowerShellLaunchCommand = (
+      instance: unknown,
+      readySequence: string,
+    ): string => {
+      initializationLaunchCount += 1
+      const emittedReadySequence = initializationLaunchCount === 1
+        ? readySequence.replace(';attempt=1\x07', ';attempt=999\x07')
+        : readySequence
+      assert(
+        initializationLaunchCount !== 1 || emittedReadySequence !== readySequence,
+        'The forced retry fixture could not replace the first readiness record.',
+      )
+      return buildLaunchCommand(instance, emittedReadySequence)
+    }
+    const buildRetryCommand =
+      sshBackend.buildWindowsPowerShellRetryCommand.bind(sshBackend)
+    sshBackend.buildWindowsPowerShellRetryCommand = (
+      instance: unknown,
+      readySequence: string,
+    ): string | undefined => {
+      initializationRetryCount += 1
+      return buildRetryCommand(instance, readySequence)
+    }
+  }
+  const prepareCommandTracking = sshBackend.prepareCommandTracking.bind(
+    sshBackend,
+  ) as (...args: unknown[]) => Promise<unknown>
+  let prepareCommandTrackingCalls = 0
+  sshBackend.prepareCommandTracking = async (...args: unknown[]) => {
+    prepareCommandTrackingCalls += 1
+    return await prepareCommandTracking(...args)
+  }
+  let liveTerminalData = ''
+  service.setRawEventPublisher((channel, payload) => {
+    const event = payload as { terminalId?: string; data?: string }
+    if (channel === 'terminal:data' && event.terminalId === config.id) {
+      liveTerminalData += event.data || ''
+    }
+  })
   await service.createTerminal(config)
   try {
     await waitUntil(
       () => service.getTerminalRuntimeSnapshot(config.id)?.canRunCommand === true,
       `Saved SSH connection ${CONNECTION_NAME} did not become command-ready.`,
     )
+    if (forceFirstInitRetry) {
+      assert(
+        initializationLaunchCount === 1 && initializationRetryCount >= 1,
+        'The real Windows SSH fixture did not re-arm the first initialized PowerShell.',
+      )
+    }
+    service.resize(config.id, 121, 41)
+    service.resize(config.id, 120, 40)
+    await new Promise((resolve) => setTimeout(resolve, 1200))
     const startupOutput = service.getBufferDelta(config.id, 0)
     for (const privateBootstrapFragment of [
       '__GYSHELL_',
       '__gyshell_',
       '__GyShell_Internal',
       '-EncodedCommand',
+      'gyshell-init-ready',
     ]) {
       assert(
-        !startupOutput.includes(privateBootstrapFragment),
-        `Windows SSH startup exposed private bootstrap data: ${privateBootstrapFragment}`,
+        !startupOutput.includes(privateBootstrapFragment) &&
+          !liveTerminalData.includes(privateBootstrapFragment),
+        `Windows SSH startup or resize exposed private bootstrap data: ${privateBootstrapFragment}`,
       )
     }
+
+    const manualFeedback = `GYSHELL_MANUAL_FEEDBACK_${process.pid}`
+    const manualDispatchStartedAt = Date.now()
+    await service.writeInputSequence(config.id, [
+      `Start-Sleep -Milliseconds 3000; Write-Output ('GYSHELL_MANUAL_'+'FEEDBACK_${process.pid}')`,
+      '\r',
+    ])
+    const manualDispatchMs = Date.now() - manualDispatchStartedAt
+    assert(
+      manualDispatchMs < 1000,
+      `PowerShell manual input waited ${manualDispatchMs}ms before reaching SSH.`,
+    )
+    await new Promise((resolve) => setTimeout(resolve, 250))
+    assert(
+      service.getTerminalRuntimeSnapshot(config.id)?.canRunCommand === false,
+      'PowerShell reopened the agent gate before the slow manual command reached its own prompt.',
+    )
+    await new Promise((resolve) => setTimeout(resolve, 2200))
+    assert(
+      service.getTerminalRuntimeSnapshot(config.id)?.shellInputState === 'busy',
+      'PowerShell treated normal empty prompt polls as errors during a long manual command.',
+    )
+    await waitUntil(
+      () => service.getBufferDelta(config.id, 0).includes(manualFeedback),
+      'PowerShell manual input produced no terminal feedback.',
+    )
+    await waitUntil(
+      () => service.getTerminalRuntimeSnapshot(config.id)?.canRunCommand === true,
+      'PowerShell did not return to a verified prompt after manual input.',
+    )
+
+    const firstChainedFeedback = `GYSHELL_CHAIN_FIRST_${process.pid}`
+    const secondChainedFeedback = `GYSHELL_CHAIN_SECOND_${process.pid}`
+    await service.writeInputSequence(
+      config.id,
+      [
+        `Write-Output ('GYSHELL_CHAIN_'+'FIRST_${process.pid}')`,
+        '\r',
+        `Start-Sleep -Milliseconds 1200; Write-Output ('GYSHELL_CHAIN_'+'SECOND_${process.pid}')`,
+        '\r',
+      ],
+      { intervalMs: 100 },
+    )
+    await waitUntil(
+      () => service.getBufferDelta(config.id, 0).includes(firstChainedFeedback),
+      'The first queued manual PowerShell command produced no feedback.',
+    )
+    await new Promise((resolve) => setTimeout(resolve, 600))
+    assert(
+      service.getTerminalRuntimeSnapshot(config.id)?.canRunCommand === false,
+      'The first queued prompt incorrectly completed the still-running second manual command.',
+    )
+    await waitUntil(
+      () => service.getBufferDelta(config.id, 0).includes(secondChainedFeedback),
+      'The second queued manual PowerShell command produced no feedback.',
+    )
+    await waitUntil(
+      () => service.getTerminalRuntimeSnapshot(config.id)?.canRunCommand === true,
+      'PowerShell did not verify the second queued manual command prompt.',
+    )
+
+    const readHostPrompt = `GYSHELL_READHOST_PROMPT_${process.pid}`
+    const readHostValue = `GYSHELL_READHOST_VALUE_${process.pid}`
+    await service.writeInputSequence(config.id, [
+      `$__answer=Read-Host '${readHostPrompt}'; Write-Output ('GYSHELL_READHOST_VALUE_'+$__answer)`,
+      '\r',
+    ])
+    await waitUntil(
+      () => service.getBufferDelta(config.id, 0).includes(readHostPrompt),
+      'PowerShell did not enter foreground Read-Host input.',
+    )
+    assert(
+      service.getTerminalRuntimeSnapshot(config.id)?.canRunCommand === false,
+      'PowerShell reopened the agent gate while Read-Host was waiting for stdin.',
+    )
+    await service.writeInputSequence(config.id, [`${process.pid}`, '\r'])
+    await waitUntil(
+      () => service.getBufferDelta(config.id, 0).includes(readHostValue),
+      'PowerShell foreground stdin did not reach Read-Host.',
+    )
+    await waitUntil(
+      () => service.getTerminalRuntimeSnapshot(config.id)?.canRunCommand === true,
+      'A foreground stdin Enter reserved a nonexistent extra PowerShell prompt.',
+    )
+
+    assert(
+      Number(prepareCommandTrackingCalls) === 0,
+      'PowerShell startup and manual input performed destructive prompt-journal preparation.',
+    )
+    const agentReadHostPrompt = `GYSHELL_AGENT_READHOST_${process.pid}`
+    const agentReadHostTaskId = await service.runCommandNoWait(
+      config.id,
+      `$__agent_answer=Read-Host '${agentReadHostPrompt}'; Write-Output ('GYSHELL_AGENT_ANSWER_'+$__agent_answer)`,
+    )
+    await waitUntil(
+      () => service.getBufferDelta(config.id, 0).includes(agentReadHostPrompt),
+      'The real sidecar agent command did not enter Read-Host.',
+    )
+    await service.writeInputSequence(
+      config.id,
+      [`${process.pid}`, '\r'],
+      { inputOwner: 'active-task' },
+    )
+    const agentReadHostResult = await service.waitForTask(
+      config.id,
+      agentReadHostTaskId,
+    )
+    assert(
+      agentReadHostResult.stdoutDelta.includes(
+        `GYSHELL_AGENT_ANSWER_${process.pid}`,
+      ),
+      'Agent Read-Host stdin did not reach the tracked sidecar command.',
+    )
+    await waitUntil(
+      () => service.getTerminalRuntimeSnapshot(config.id)?.canRunCommand === true,
+      'Agent Read-Host stdin did not settle at its task prompt revision.',
+    )
+
+    const spoofOffset = service.getCurrentOffset(config.id)
+    const spoofFeedback = `GYSHELL_SPOOF_DONE_${process.pid}`
+    await service.writeInputSequence(
+      config.id,
+      [
+        "Write-Output ('>'+'> ')",
+        '\r',
+        `Start-Sleep -Milliseconds 1200; Write-Output ('GYSHELL_SPOOF_'+'DONE_${process.pid}')`,
+        '\r',
+      ],
+      { intervalMs: 100 },
+    )
+    await waitUntil(
+      () => /(?:\r?\n)>> (?:\r?\n)/.test(
+        service.getBufferDelta(config.id, spoofOffset),
+      ),
+      'PowerShell did not render the ordinary output used for continuation-spoof coverage.',
+    )
+    await new Promise((resolve) => setTimeout(resolve, 500))
+    assert(
+      service.getTerminalRuntimeSnapshot(config.id)?.canRunCommand === false,
+      'Ordinary output shaped like a continuation prompt completed a newer command.',
+    )
+    await waitUntil(
+      () => service.getBufferDelta(config.id, spoofOffset).includes(spoofFeedback),
+      'PowerShell continuation-spoof regression command produced no feedback.',
+    )
+    await waitUntil(
+      () => service.getTerminalRuntimeSnapshot(config.id)?.canRunCommand === true,
+      'PowerShell did not verify the prompt after continuation-shaped output.',
+    )
+
+    const continuationOffset = service.getCurrentOffset(config.id)
+    const continuationFeedback = `GYSHELL_CONTINUATION_${process.pid}`
+    await service.writeInputSequence(config.id, ['if ($true) {', '\r'])
+    await waitUntil(
+      () => service.getBufferDelta(config.id, continuationOffset).includes('>> '),
+      'PowerShell did not enter its continuation prompt.',
+    )
+    await service.writeInputSequence(config.id, [
+      `Write-Output ('GYSHELL_'+'CONTINUATION_${process.pid}')`,
+      '\r',
+    ])
+    await waitUntil(
+      () =>
+        (service
+          .getBufferDelta(config.id, continuationOffset)
+          .match(/>> /g) || []).length >= 2,
+      'PowerShell did not retain the multiline continuation prompt.',
+    )
+    await service.writeInputSequence(config.id, ['}', '\r'])
+    await waitUntil(
+      () =>
+        service
+          .getBufferDelta(config.id, continuationOffset)
+          .includes(continuationFeedback),
+      'PowerShell multiline manual input produced no feedback.',
+    )
+    await waitUntil(
+      () => {
+        const continuationDisplay = service.getBufferDelta(
+          config.id,
+          continuationOffset,
+        )
+        const feedbackOffset = continuationDisplay.indexOf(continuationFeedback)
+        return (
+          feedbackOffset >= 0 &&
+          continuationDisplay
+            .slice(feedbackOffset + continuationFeedback.length)
+            .includes('PS ')
+        )
+      },
+      'PowerShell did not render its authenticated prompt after multiline input.',
+    )
+
+    await service.writeInputSequence(config.id, [
+      'Start-Sleep -Seconds 30',
+      '\r',
+    ])
+    await new Promise((resolve) => setTimeout(resolve, 300))
+    assert(
+      service.getTerminalRuntimeSnapshot(config.id)?.canRunCommand === false,
+      'A stale continuation prompt reopened the agent gate during the next command.',
+    )
+    const interruptStartedAt = Date.now()
+    await service.writeInputSequence(config.id, ['\x03'])
+    assert(
+      Date.now() - interruptStartedAt < 1000,
+      'PowerShell Ctrl-C was delayed before reaching SSH.',
+    )
+    await waitUntil(
+      () => service.getTerminalRuntimeSnapshot(config.id)?.canRunCommand === true,
+      'PowerShell waited for an extra prompt after Ctrl-C completed a pending command.',
+      15_000,
+    )
+    assert(
+      prepareCommandTrackingCalls === 1,
+      'Only the explicit agent task should prepare command tracking.',
+    )
 
     const unicode = await runTracked(
       service,

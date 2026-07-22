@@ -86,6 +86,7 @@ class FakeTerminalService {
   readonly terminal: TerminalTab
   readonly writeCalls: string[] = []
   readonly writeInputSequenceCalls: string[][] = []
+  readonly writeInputSequenceOwners: Array<string | undefined> = []
   reconnectCalls = 0
   readonly killCalls: string[] = []
   killed = false
@@ -151,9 +152,11 @@ class FakeTerminalService {
 
   async writeInputSequence(
     _terminalId: string,
-    sequence: readonly string[]
+    sequence: readonly string[],
+    options?: { inputOwner?: string }
   ): Promise<void> {
     this.writeInputSequenceCalls.push([...sequence])
+    this.writeInputSequenceOwners.push(options?.inputOwner)
     this.writeCalls.push(...sequence)
   }
 
@@ -886,6 +889,11 @@ async function run(): Promise<void> {
       JSON.stringify(terminalService.writeInputSequenceCalls),
       JSON.stringify([['\x03', 'continue']]),
       'write_stdin should submit one atomic, control-code-resolved sequence'
+    )
+    assertEqual(
+      JSON.stringify(terminalService.writeInputSequenceOwners),
+      JSON.stringify(['active-task']),
+      'write_stdin should explicitly attribute its bytes to the active task'
     )
   }
 

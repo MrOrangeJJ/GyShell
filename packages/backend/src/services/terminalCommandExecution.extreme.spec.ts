@@ -29,7 +29,7 @@ const unixBoundary = (
 
 const tokenizedUnixBoundary = (
   runtimeToken: string,
-  kind: 'preexec' | 'preend' | 'precmd',
+  kind: 'preexec' | 'preend' | 'precmd' | 'inputidle',
   sequence: number,
   nonce: string,
   options?: { exitCode?: number; cwd?: string; homeDir?: string }
@@ -41,6 +41,13 @@ const tokenizedUnixBoundary = (
     : ''
   return `\x1b]1337;gyshell_${runtimeToken}_${kind};seq=${sequence};nonce=${nonce}${metadata}\x07`
 }
+
+const tokenizedPowerShellInputIdle = (
+  runtimeToken: string,
+  sequence: number,
+  inputRevision: number,
+): string =>
+  `\x1b]1337;gyshell_${runtimeToken}_inputidle;seq=${sequence};rev=${inputRevision};nonce=manual_input_drained\x07`
 
 const assertEqual = <T>(actual: T, expected: T, message: string): void => {
   if (actual !== expected) {
@@ -122,6 +129,9 @@ class FakeCommandBackend implements TerminalBackend {
   private readonly fileWritesByPtyId = new Map<string, Array<{ path: string; content: string }>>()
   private readonly filesByPtyId = new Map<string, Map<string, string>>()
   private readonly trackingStateByPtyId = new Map<string, TerminalCommandTrackingUpdate>()
+  private readonly committedInputRevisionByPtyId = new Map<string, number>()
+  private readonly minimumInputPromptSequenceByPtyId = new Map<string, number>()
+  private readonly lastEmittedInputRevisionByPtyId = new Map<string, number>()
   private readonly lastUserRequestIdByPtyId = new Map<string, string>()
   private prepareTrackingError?: Error
   private pollTrackingError?: Error
@@ -151,6 +161,7 @@ class FakeCommandBackend implements TerminalBackend {
   private commandProtocolAvailable?: boolean
   private commandProtocolToken?: string
   private commandShellFamily?: TerminalCommandShellFamily
+  private initialTrackingBaselineSequence?: number
   private exposesCommandTrackingMode = false
   private autoAcknowledgePromptFileProbe = true
   private consumePromptFileUserRequests = true
@@ -181,6 +192,9 @@ class FakeCommandBackend implements TerminalBackend {
     this.writesByPtyId.set(ptyId, [])
     this.fileWritesByPtyId.set(ptyId, [])
     this.filesByPtyId.set(ptyId, new Map())
+    this.committedInputRevisionByPtyId.set(ptyId, 0)
+    this.minimumInputPromptSequenceByPtyId.set(ptyId, 0)
+    this.lastEmittedInputRevisionByPtyId.set(ptyId, 0)
     if (this.promptFileRequestPath) {
       this.promptFileRequestPathByPtyId.set(
         ptyId,
@@ -262,6 +276,30 @@ class FakeCommandBackend implements TerminalBackend {
     }
   }
 
+  async commitPowerShellInputRevision(
+    ptyId: string,
+    revision: number,
+    minimumPromptSequence: number
+  ): Promise<void> {
+    if (!this.sessions.has(ptyId)) {
+      throw new Error(`Missing fake session for ${ptyId}`)
+    }
+    if (!Number.isSafeInteger(revision) || revision < 1) {
+      throw new Error('Invalid fake PowerShell input revision')
+    }
+    if (
+      !Number.isSafeInteger(minimumPromptSequence) ||
+      minimumPromptSequence < 1
+    ) {
+      throw new Error('Invalid fake PowerShell input prompt sequence')
+    }
+    this.committedInputRevisionByPtyId.set(ptyId, revision)
+    this.minimumInputPromptSequenceByPtyId.set(
+      ptyId,
+      minimumPromptSequence
+    )
+  }
+
   resize(_ptyId: string, _cols: number, _rows: number): void {}
 
   kill(ptyId: string): void {
@@ -326,6 +364,17 @@ class FakeCommandBackend implements TerminalBackend {
     return this.exposesCommandTrackingMode ? this.trackingMode : undefined
   }
 
+  getInitialCommandTrackingToken(): TerminalCommandTrackingToken | undefined {
+    if (!this.trackingMode || this.initialTrackingBaselineSequence === undefined) {
+      return undefined
+    }
+    return {
+      mode: this.trackingMode,
+      trackingScopeId: this.commandProtocolToken,
+      baselineSequence: this.initialTrackingBaselineSequence,
+    }
+  }
+
   applyCommandProtocolMetadata(
     ptyId: string,
     metadata: TerminalCommandProtocolMetadata
@@ -345,6 +394,10 @@ class FakeCommandBackend implements TerminalBackend {
 
   setExposeCommandTrackingMode(expose: boolean): void {
     this.exposesCommandTrackingMode = expose
+  }
+
+  setInitialTrackingBaseline(sequence: number | undefined): void {
+    this.initialTrackingBaselineSequence = sequence
   }
 
   getRemoteOs(_ptyId: string): 'unix' | 'windows' | undefined {
@@ -422,6 +475,66 @@ class FakeCommandBackend implements TerminalBackend {
       throw new Error(`Missing fake session for ${terminalId}`)
     }
     session.dataCallbacks.forEach((callback) => callback(data))
+  }
+
+  captureDataCallbacks(terminalId: string): Array<(data: string) => void> {
+    const session = this.sessions.get(this.getPtyId(terminalId))
+    if (!session) {
+      throw new Error(`Missing fake session for ${terminalId}`)
+    }
+    return [...session.dataCallbacks]
+  }
+
+  emitPowerShellPrompt(
+    terminalId: string,
+    sequence: number,
+    options?: { idle?: boolean; exitCode?: number }
+  ): void {
+    if (!this.commandProtocolToken) {
+      throw new Error(`Missing command protocol token for ${terminalId}`)
+    }
+    setTimeout(() => {
+      this.emitData(
+        terminalId,
+        tokenizedUnixBoundary(
+          this.commandProtocolToken!,
+          'precmd',
+          sequence,
+          `prompt_${sequence}`,
+          { exitCode: options?.exitCode ?? 0 }
+        )
+      )
+      if (
+        options?.idle !== false &&
+        sequence >=
+          (this.minimumInputPromptSequenceByPtyId.get(
+            this.getPtyId(terminalId)
+          ) || 0) &&
+        (this.committedInputRevisionByPtyId.get(
+          this.getPtyId(terminalId)
+        ) || 0) >
+          (this.lastEmittedInputRevisionByPtyId.get(
+            this.getPtyId(terminalId)
+          ) || 0)
+      ) {
+        const inputRevision =
+          this.committedInputRevisionByPtyId.get(
+            this.getPtyId(terminalId)
+          ) || 0
+        this.lastEmittedInputRevisionByPtyId.set(
+          this.getPtyId(terminalId),
+          inputRevision
+        )
+        this.emitData(
+          terminalId,
+          tokenizedPowerShellInputIdle(
+            this.commandProtocolToken!,
+            sequence,
+            inputRevision
+          )
+        )
+      }
+    }, 0)
   }
 
   getLastWrite(terminalId: string): string {
@@ -778,6 +891,58 @@ const waitUntil = async (
   throw new Error(message)
 }
 
+const createReadyWindowsManualFixture = async (
+  terminalId: string
+): Promise<{
+  backend: FakeCommandBackend
+  service: any
+  runtimeToken: string
+}> => {
+  const runtimeToken = '56565656565656565656565656565656'
+  const backend = new FakeCommandBackend('windows', {
+    os: 'Windows',
+    platform: 'win32',
+    release: '10.0.22631',
+    arch: 'x64',
+    hostname: terminalId,
+    isRemote: false,
+    shell: 'powershell.exe'
+  }, 'windows-powershell-sidecar')
+  backend.setCommandProtocol(true, runtimeToken)
+  backend.setExposeCommandTrackingMode(true)
+  backend.setInitialTrackingBaseline(1)
+  backend.setTrackingState(terminalId, {
+    mode: 'windows-powershell-sidecar',
+    sequence: 1,
+    exitCode: 0,
+  })
+  const service = createService(backend) as TerminalService & any
+  service.commandTrackingPollIntervalMs = 5
+  await createLocalTerminal(service, terminalId)
+  backend.emitData(terminalId, 'PS sidecar ready')
+  await waitUntil(
+    () => service.getTerminalRuntimeSnapshot(terminalId)?.canRunCommand === true,
+    `the ${terminalId} fixture needs a verified initial prompt`
+  )
+  return { backend, service, runtimeToken }
+}
+
+const createReadyWindowsPromptFileManualFixture = async (
+  terminalId: string
+): Promise<{
+  backend: FakeCommandBackend
+  service: any
+  runtimeToken: string
+}> => {
+  const fixture = await createReadyWindowsManualFixture(terminalId)
+  fixture.backend.setPromptFileDispatch(
+    `C:/Windows/Temp/GyShell/${terminalId}-request.b64`,
+    `C:/Windows/Temp/GyShell/${terminalId}-output.txt`
+  )
+  fixture.service.syntheticCommandQuietWindowMs = 5
+  return fixture
+}
+
 const dumpViewport = (service: TerminalService, terminalId: string, rows: number): string => {
   const headless = (service as any).headlessPtys.get(terminalId)
   if (!headless) {
@@ -1073,6 +1238,34 @@ const run = async (): Promise<void> => {
     service.kill(terminalId)
   })
 
+  await runCase('Windows in-band fallback accepts its natural first prompt', async () => {
+    const runtimeToken = '34343434343434343434343434343434'
+    const terminalId = 'windows-in-band-first-prompt'
+    const backend = new FakeCommandBackend('windows', {
+      os: 'Windows',
+      platform: 'win32',
+      release: '10.0.26200',
+      arch: 'x64',
+      hostname: terminalId,
+      isRemote: true,
+      shell: 'powershell.exe'
+    })
+    backend.setCommandProtocol(true, runtimeToken)
+    const service = createService(backend)
+    await createLocalTerminal(service, terminalId)
+
+    backend.emitData(
+      terminalId,
+      tokenizedUnixBoundary(runtimeToken, 'precmd', 1, 'first_in_band_prompt')
+    )
+    assertEqual(
+      service.getTerminalRuntimeSnapshot(terminalId)?.canRunCommand,
+      true,
+      'the first reliable in-band prompt should establish idle without a sidecar baseline'
+    )
+    service.kill(terminalId)
+  })
+
   await runCase('Windows sidecar manual input returns idle only after its next prompt sequence', async () => {
     const backend = new FakeCommandBackend('windows', {
       os: 'Windows',
@@ -1083,7 +1276,9 @@ const run = async (): Promise<void> => {
       isRemote: false,
       shell: 'powershell.exe'
     }, 'windows-powershell-sidecar')
-    backend.setCommandProtocol(true)
+    backend.setCommandProtocol(true, '61616161616161616161616161616161')
+    backend.setExposeCommandTrackingMode(true)
+    backend.setInitialTrackingBaseline(1)
     backend.setTrackingState('sidecar-manual-gate', {
       mode: 'windows-powershell-sidecar',
       sequence: 1,
@@ -1108,7 +1303,7 @@ const run = async (): Promise<void> => {
     service.write(terminalId, '\r')
     await waitUntil(
       () => backend.getWrites(terminalId).includes('\r'),
-      'the tracked Enter should be delivered after its baseline is captured',
+      'the tracked Enter should be delivered immediately from the cached baseline',
     )
     assertEqual(
       service.getTerminalRuntimeSnapshot(terminalId)?.canRunCommand,
@@ -1116,14 +1311,691 @@ const run = async (): Promise<void> => {
       'delivering Enter is not evidence that the manual command finished',
     )
 
-    backend.setTrackingState(terminalId, {
-      mode: 'windows-powershell-sidecar',
-      sequence: 2,
-      exitCode: 0,
-    })
+    backend.emitPowerShellPrompt(terminalId, 2)
     await waitUntil(
       () => service.getTerminalRuntimeSnapshot(terminalId)?.canRunCommand === true,
       'the next verified sidecar prompt should restore agent command availability',
+    )
+    service.kill(terminalId)
+  })
+
+  await runCase('Windows manual Enter uses its bootstrap baseline without prompt-journal I/O', async () => {
+    const backend = new FakeCommandBackend('windows', {
+      os: 'Windows',
+      platform: 'win32',
+      release: '10.0.22631',
+      arch: 'x64',
+      hostname: 'sidecar-pending-baseline',
+      isRemote: false,
+      shell: 'powershell.exe'
+    }, 'windows-powershell-sidecar')
+    backend.setCommandProtocol(true, '62626262626262626262626262626262')
+    backend.setExposeCommandTrackingMode(true)
+    backend.setInitialTrackingBaseline(1)
+    backend.setTrackingState('sidecar-pending-baseline', {
+      mode: 'windows-powershell-sidecar',
+      sequence: 1,
+      exitCode: 0,
+    })
+    const prepareRelease = createDeferred()
+    let prepareStarted = false
+    backend.delayNextPrepare(prepareRelease.promise, () => {
+      prepareStarted = true
+    })
+    const service = createService(backend) as any
+    service.commandTrackingPollIntervalMs = 5
+    const terminalId = 'sidecar-pending-baseline'
+    await createLocalTerminal(service, terminalId)
+    backend.emitData(terminalId, 'PS sidecar ready')
+    await waitUntil(
+      () => service.getTerminalRuntimeSnapshot(terminalId)?.shellInputState === 'idle',
+      'the private bootstrap baseline should establish idle synchronously'
+    )
+
+    const writing = service.writeInputSequence(terminalId, ['\r'])
+    await waitUntil(
+      () => backend.getWrites(terminalId).includes('\r'),
+      'human Enter was blocked by out-of-band prompt-baseline I/O',
+      250
+    )
+    await writing
+    assertEqual(
+      prepareStarted,
+      false,
+      'manual input must not start destructive prompt-journal preparation'
+    )
+
+    backend.emitPowerShellPrompt(terminalId, 2)
+    await waitUntil(
+      () => service.getTerminalRuntimeSnapshot(terminalId)?.canRunCommand === true,
+      'the prompt after immediate manual input should restore the verified idle state'
+    )
+    prepareRelease.resolve()
+    service.kill(terminalId)
+  })
+
+  await runCase('a long Windows manual command stays busy until its prompt becomes input-idle', async () => {
+    const terminalId = 'sidecar-long-manual-command'
+    const backend = new FakeCommandBackend('windows', {
+      os: 'Windows',
+      platform: 'win32',
+      release: '10.0.22631',
+      arch: 'x64',
+      hostname: terminalId,
+      isRemote: false,
+      shell: 'powershell.exe'
+    }, 'windows-powershell-sidecar')
+    backend.setCommandProtocol(true, '63636363636363636363636363636363')
+    backend.setExposeCommandTrackingMode(true)
+    backend.setInitialTrackingBaseline(1)
+    backend.setTrackingState(terminalId, {
+      mode: 'windows-powershell-sidecar',
+      sequence: 1,
+      exitCode: 0,
+    })
+    const service = createService(backend) as any
+    service.commandTrackingPollIntervalMs = 5
+    service.commandTrackingMaxConsecutiveErrors = 2
+    await createLocalTerminal(service, terminalId)
+    backend.emitData(terminalId, 'PS sidecar ready')
+    await waitUntil(
+      () => service.getTerminalRuntimeSnapshot(terminalId)?.canRunCommand === true,
+      'the long-command fixture needs a verified initial prompt'
+    )
+
+    await service.writeInputSequence(terminalId, [
+      'Start-Sleep -Seconds 5',
+      '\r',
+    ])
+    await new Promise((resolve) => setTimeout(resolve, 30))
+    assertEqual(
+      service.getTerminalRuntimeSnapshot(terminalId)?.shellInputState,
+      'busy',
+      'normal empty polls must not exhaust the manual watcher error budget'
+    )
+    assertEqual(
+      service.windowsManualPromptWatcherByTerminal.has(terminalId),
+      true,
+      'the manual watcher must survive while no newer prompt exists'
+    )
+
+    backend.emitPowerShellPrompt(terminalId, 2)
+    await waitUntil(
+      () => service.getTerminalRuntimeSnapshot(terminalId)?.canRunCommand === true,
+      'the long manual command should recover when its prompt finally arrives'
+    )
+    service.kill(terminalId)
+  })
+
+  await runCase('PowerShell continuation lines share one pending prompt', async () => {
+    const terminalId = 'sidecar-manual-continuation'
+    const { backend, service } = await createReadyWindowsManualFixture(terminalId)
+
+    await service.writeInputSequence(terminalId, ['if ($true) {', '\r'])
+    backend.emitData(terminalId, '\r\n>> ')
+    await service.writeInputSequence(terminalId, ["Write-Output 'OK'", '\r'])
+    backend.emitData(terminalId, '\r\n>> ')
+    await service.writeInputSequence(terminalId, ['}', '\r'])
+
+    assertEqual(
+      service.windowsPromptSequenceFloorByTerminal.get(terminalId),
+      2,
+      'continuation Enter keys must not reserve nonexistent top-level prompts'
+    )
+    backend.emitPowerShellPrompt(terminalId, 2)
+    await waitUntil(
+      () => service.getTerminalRuntimeSnapshot(terminalId)?.canRunCommand === true,
+      'the one natural prompt after a multiline block should restore idle'
+    )
+    service.kill(terminalId)
+  })
+
+  await runCase('one multiline Windows input sequence reuses its continuation prompt', async () => {
+    const terminalId = 'sidecar-one-sequence-continuation'
+    const { backend, service } = await createReadyWindowsManualFixture(terminalId)
+    const enterCount = (): number =>
+      backend.getWrites(terminalId).filter((write) => write === '\r').length
+
+    const writing = service.writeInputSequence(
+      terminalId,
+      ['if ($true) {', '\r', "Write-Output 'OK'", '\r', '}', '\r'],
+      { intervalMs: 30 }
+    )
+    await waitUntil(
+      () => enterCount() >= 1,
+      'the first multiline Enter should be delivered'
+    )
+    backend.emitData(terminalId, '\r\n>> ')
+    await waitUntil(
+      () => enterCount() >= 2,
+      'the second multiline Enter should be delivered'
+    )
+    backend.emitData(terminalId, '\r\n>> ')
+    await writing
+
+    assertEqual(
+      service.windowsPromptSequenceFloorByTerminal.get(terminalId),
+      2,
+      'continuation lines in one input sequence must share one top-level prompt'
+    )
+    backend.emitPowerShellPrompt(terminalId, 2)
+    await waitUntil(
+      () => service.getTerminalRuntimeSnapshot(terminalId)?.canRunCommand === true,
+      'the multiline input sequence should recover at its one natural prompt'
+    )
+    service.kill(terminalId)
+  })
+
+  await runCase('aborting later Windows input preserves the last verified idle prompt', async () => {
+    const terminalId = 'sidecar-aborted-later-input'
+    const { backend, service } = await createReadyWindowsManualFixture(terminalId)
+    const controller = new AbortController()
+    const writing = service.writeInputSequence(
+      terminalId,
+      ["Write-Output 'FIRST'\r", "Write-Output 'NEVER'\r"],
+      { intervalMs: 10_000, signal: controller.signal }
+    )
+    await waitUntil(
+      () => backend.getWrites(terminalId).includes("Write-Output 'FIRST'\r"),
+      'the first submitted item should reach the shell before cancellation'
+    )
+    backend.emitPowerShellPrompt(terminalId, 2)
+    await waitUntil(
+      () =>
+        service.windowsManualPromptWatcherByTerminal.get(terminalId)
+          ?.inputIdleSequence === 2,
+      'the first item should retain its verified idle while the sequence owns its reservation'
+    )
+    controller.abort()
+    const outcome = await Promise.allSettled([writing])
+    assertEqual(outcome[0]?.status, 'rejected', 'the remaining input should abort')
+    await waitUntil(
+      () => service.getTerminalRuntimeSnapshot(terminalId)?.canRunCommand === true,
+      'cancelling unsent later input must not discard the shell idle already proved by the first item'
+    )
+    assertEqual(
+      backend.getWrites(terminalId).includes("Write-Output 'NEVER'\r"),
+      false,
+      'the cancelled later item must never reach the shell'
+    )
+    service.kill(terminalId)
+  })
+
+  await runCase('transient PowerShell revision commit failure retries without stranding the gate', async () => {
+    const terminalId = 'sidecar-input-revision-retry'
+    const { backend, service } = await createReadyWindowsManualFixture(terminalId)
+    ;(service as any).commandTrackingPollIntervalMs = 5
+    const commit = backend.commitPowerShellInputRevision.bind(backend)
+    let attempts = 0
+    backend.commitPowerShellInputRevision = async (
+      ptyId: string,
+      revision: number,
+      minimumPromptSequence: number
+    ): Promise<void> => {
+      attempts += 1
+      if (attempts < 3) {
+        throw new Error('transient sidecar failure')
+      }
+      await commit(ptyId, revision, minimumPromptSequence)
+    }
+
+    await service.writeInputSequence(terminalId, ["Write-Output 'RETRY'\r"])
+    await waitUntil(
+      () => attempts === 3,
+      'the sidecar commit should retry a bounded transient failure'
+    )
+    backend.emitPowerShellPrompt(terminalId, 2)
+    await waitUntil(
+      () => service.getTerminalRuntimeSnapshot(terminalId)?.canRunCommand === true,
+      'a successful retry should let the exact prompt restore the gate'
+    )
+    service.kill(terminalId)
+  })
+
+  await runCase('persistent PowerShell revision loss becomes unknown and remains recoverable', async () => {
+    const terminalId = 'sidecar-input-revision-loss'
+    const { backend, service } = await createReadyWindowsManualFixture(terminalId)
+    ;(service as any).commandTrackingPollIntervalMs = 5
+    const commit = backend.commitPowerShellInputRevision.bind(backend)
+    backend.commitPowerShellInputRevision = async (): Promise<void> => {
+      throw new Error('persistent sidecar failure')
+    }
+
+    await service.writeInputSequence(terminalId, ["Write-Output 'UNKNOWN'\r"])
+    await waitUntil(
+      () =>
+        service.getTerminalRuntimeSnapshot(terminalId)?.shellInputState ===
+        'unknown',
+      'an exhausted sidecar commit should become explicit tracking loss'
+    )
+    backend.emitPowerShellPrompt(terminalId, 2)
+    await new Promise((resolve) => setTimeout(resolve, 30))
+    assertEqual(
+      service.getTerminalRuntimeSnapshot(terminalId)?.canRunCommand,
+      false,
+      'a prompt without the missing revision acknowledgement must fail closed'
+    )
+
+    backend.commitPowerShellInputRevision = commit
+    await service.writeInputSequence(terminalId, ['\r'])
+    backend.emitPowerShellPrompt(terminalId, 3)
+    await waitUntil(
+      () => service.getTerminalRuntimeSnapshot(terminalId)?.canRunCommand === true,
+      'a later verified human submission should recover the same runtime'
+    )
+    service.kill(terminalId)
+  })
+
+  await runCase('multiline Enter keys reserve one prompt without parsing visible continuation text', async () => {
+    const terminalId = 'sidecar-delayed-continuation'
+    const { backend, service } = await createReadyWindowsManualFixture(terminalId)
+
+    await service.writeInputSequence(terminalId, [
+      "if ($true) {\rWrite-Output 'OK'\r}\r",
+    ])
+    assertEqual(
+      service.windowsPromptSequenceFloorByTerminal.get(terminalId),
+      2,
+      'one foreground interaction should initially reserve one natural prompt'
+    )
+    backend.emitData(terminalId, '\r\n>> \r\n>> ')
+    assertEqual(
+      service.windowsPromptSequenceFloorByTerminal.get(terminalId),
+      2,
+      'visible continuation text must not mutate authenticated prompt state'
+    )
+
+    backend.emitPowerShellPrompt(terminalId, 2)
+    await waitUntil(
+      () => service.getTerminalRuntimeSnapshot(terminalId)?.canRunCommand === true,
+      'the delayed multiline fixture should recover at its actual prompt'
+    )
+    service.kill(terminalId)
+  })
+
+  await runCase('ordinary output cannot spoof authenticated PowerShell submissions', async () => {
+    const terminalId = 'sidecar-continuation-output-spoof'
+    const { backend, service } = await createReadyWindowsManualFixture(terminalId)
+
+    await service.writeInputSequence(terminalId, [
+      'Write-Output ">> "\rStart-Sleep -Seconds 30\r',
+    ])
+    backend.emitData(terminalId, '\r\n>> ')
+    assertEqual(
+      service.windowsPromptSequenceFloorByTerminal.get(terminalId),
+      2,
+      'one unsettled foreground interaction should reserve one later prompt'
+    )
+    backend.emitPowerShellPrompt(terminalId, 2, { idle: false })
+    await new Promise((resolve) => setTimeout(resolve, 350))
+    assertEqual(
+      service.getTerminalRuntimeSnapshot(terminalId)?.canRunCommand,
+      false,
+      'a prompt without authenticated empty-input idle must not release queued input'
+    )
+    backend.emitPowerShellPrompt(terminalId, 3)
+    await waitUntil(
+      () => service.getTerminalRuntimeSnapshot(terminalId)?.canRunCommand === true,
+      'the queued command should recover only at its own authenticated prompt'
+    )
+    service.kill(terminalId)
+  })
+
+  await runCase('Ctrl-C completes the pending PowerShell prompt instead of reserving another', async () => {
+    const terminalId = 'sidecar-manual-interrupt'
+    const { backend, service } = await createReadyWindowsManualFixture(terminalId)
+
+    await service.writeInputSequence(terminalId, ['Start-Sleep -Seconds 30', '\r'])
+    await service.writeInputSequence(terminalId, ['\x03'])
+    assertEqual(
+      service.windowsPromptSequenceFloorByTerminal.get(terminalId),
+      2,
+      'interrupting a pending command should keep its existing prompt target'
+    )
+    backend.emitPowerShellPrompt(terminalId, 2, { exitCode: 1 })
+    await waitUntil(
+      () => service.getTerminalRuntimeSnapshot(terminalId)?.canRunCommand === true,
+      'the interrupted command prompt should restore idle without an extra Enter'
+    )
+    service.kill(terminalId)
+  })
+
+  await runCase('foreground PowerShell stdin does not reserve nonexistent shell prompts', async () => {
+    const terminalId = 'sidecar-foreground-stdin'
+    const { backend, service } = await createReadyWindowsManualFixture(terminalId)
+
+    await service.writeInputSequence(terminalId, ['Read-Host', '\r'])
+    await service.writeInputSequence(terminalId, ['interactive answer', '\r'])
+    assertEqual(
+      service.windowsPromptSequenceFloorByTerminal.get(terminalId),
+      2,
+      'stdin Enter must keep waiting for the foreground command final prompt'
+    )
+
+    backend.emitPowerShellPrompt(terminalId, 2)
+    await waitUntil(
+      () => service.getTerminalRuntimeSnapshot(terminalId)?.canRunCommand === true,
+      'Read-Host should recover when its one top-level prompt returns'
+    )
+    service.kill(terminalId)
+  })
+
+  await runCase('a prompt before trailing typed text cannot complete the later submission', async () => {
+    const terminalId = 'sidecar-manual-trailing-text'
+    const { backend, service } = await createReadyWindowsManualFixture(terminalId)
+
+    await service.writeInputSequence(terminalId, [
+      "Write-Output 'FIRST'",
+      '\r',
+      'Start-Sleep -Seconds 5',
+    ])
+    backend.emitPowerShellPrompt(terminalId, 2, { idle: false })
+    await waitUntil(
+      () => service.windowsPromptBaselineByTerminal.get(terminalId)?.baselineSequence === 2,
+      'the observer should retain the prompt that preceded trailing text'
+    )
+    assertEqual(
+      service.getTerminalRuntimeSnapshot(terminalId)?.canRunCommand,
+      false,
+      'a prompt preceding already typed text must not restore idle'
+    )
+
+    await service.writeInputSequence(terminalId, ['\r'])
+    await new Promise((resolve) => setTimeout(resolve, 30))
+    assertEqual(
+      service.getTerminalRuntimeSnapshot(terminalId)?.canRunCommand,
+      false,
+      'the older prompt must not complete the command submitted by the final Enter'
+    )
+    backend.emitPowerShellPrompt(terminalId, 3)
+    await waitUntil(
+      () => service.getTerminalRuntimeSnapshot(terminalId)?.canRunCommand === true,
+      'the trailing command should recover only at its own prompt'
+    )
+    service.kill(terminalId)
+  })
+
+  await runCase('rapid Windows manual submissions wait for their own prompt sequence', async () => {
+    const terminalId = 'sidecar-consecutive-manual-input'
+    const { backend, service } = await createReadyWindowsManualFixture(terminalId)
+
+    await Promise.all([
+      service.writeInputSequence(terminalId, ["Write-Output 'FIRST'", '\r']),
+      service.writeInputSequence(terminalId, ["Write-Output 'SECOND'", '\r']),
+    ])
+    backend.emitPowerShellPrompt(terminalId, 2, { idle: false })
+    await new Promise((resolve) => setTimeout(resolve, 350))
+    assertEqual(
+      service.getTerminalRuntimeSnapshot(terminalId)?.canRunCommand,
+      false,
+      'the first command prompt must not complete the second queued command'
+    )
+
+    backend.emitPowerShellPrompt(terminalId, 3)
+    await waitUntil(
+      () => service.getTerminalRuntimeSnapshot(terminalId)?.canRunCommand === true,
+      'the second command should become idle only at its own prompt sequence'
+    )
+    service.kill(terminalId)
+  })
+
+  await runCase('one Windows input sequence reserves every submitted command prompt', async () => {
+    const terminalId = 'sidecar-multi-command-input-sequence'
+    const { backend, service } = await createReadyWindowsManualFixture(terminalId)
+
+    await service.writeInputSequence(terminalId, [
+      "Write-Output 'FIRST'\rStart-Sleep -Seconds 30\r",
+    ])
+    assertEqual(
+      service.windowsPromptSequenceFloorByTerminal.get(terminalId),
+      2,
+      'one unsettled input sequence should reserve one later prompt'
+    )
+
+    backend.emitPowerShellPrompt(terminalId, 2, { idle: false })
+    await new Promise((resolve) => setTimeout(resolve, 350))
+    assertEqual(
+      service.getTerminalRuntimeSnapshot(terminalId)?.canRunCommand,
+      false,
+      'the first prompt in one input sequence must not complete its second command'
+    )
+
+    backend.emitPowerShellPrompt(terminalId, 3)
+    await waitUntil(
+      () => service.getTerminalRuntimeSnapshot(terminalId)?.canRunCommand === true,
+      'the final prompt in one input sequence should restore idle'
+    )
+    service.kill(terminalId)
+  })
+
+  await runCase('PowerShell bracketed paste newlines do not reserve prompts', async () => {
+    const terminalId = 'sidecar-bracketed-paste'
+    const { backend, service } = await createReadyWindowsManualFixture(terminalId)
+
+    await service.writeInputSequence(terminalId, [
+      "\x1b[200~Write-Output 'FIRST'\r\nWrite-Output 'SECOND'\x1b[201~",
+    ])
+    assertEqual(
+      service.windowsPromptSequenceFloorByTerminal.get(terminalId),
+      1,
+      'newlines inserted inside bracketed paste must not look like submitted commands'
+    )
+
+    await service.writeInputSequence(terminalId, ['\r'])
+    assertEqual(
+      service.windowsPromptSequenceFloorByTerminal.get(terminalId),
+      2,
+      'the Enter after bracketed paste should reserve exactly one natural prompt'
+    )
+    backend.emitPowerShellPrompt(terminalId, 2)
+    await waitUntil(
+      () => service.getTerminalRuntimeSnapshot(terminalId)?.canRunCommand === true,
+      'the pasted command block should recover at its one natural prompt'
+    )
+    service.kill(terminalId)
+  })
+
+  await runCase('a completed sidecar task leaves a generic baseline for later manual input', async () => {
+    const terminalId = 'sidecar-task-then-manual'
+    const { backend, service } =
+      await createReadyWindowsPromptFileManualFixture(terminalId)
+
+    const taskId = await service.runCommandNoWait(
+      terminalId,
+      "Write-Output 'AGENT_OK'"
+    )
+    backend.setTrackingState(terminalId, {
+      mode: 'windows-powershell-sidecar',
+      sequence: 3,
+      exitCode: 0,
+      output: 'AGENT_OK\r\n',
+      outputObservedUtf8Bytes: Buffer.byteLength('AGENT_OK\r\n', 'utf8'),
+      outputTruncated: false,
+    })
+    await service.waitForTask(terminalId, taskId)
+
+    const cachedBaseline = service.windowsPromptBaselineByTerminal.get(terminalId)
+    assertEqual(
+      cachedBaseline?.baselineSequence,
+      3,
+      'the completed task should advance the shared prompt baseline'
+    )
+    assertEqual(
+      cachedBaseline?.expectedRequestId,
+      undefined,
+      'a completed request identity must not leak into later manual polling'
+    )
+    assertEqual(
+      cachedBaseline?.expectCommandOutput,
+      undefined,
+      'manual polling must not inherit request-bound output requirements'
+    )
+
+    await service.writeInputSequence(terminalId, [
+      "Write-Output 'MANUAL_OK'",
+      '\r',
+    ])
+    backend.setAutoEmitPromptFileRawBoundaries(false)
+    backend.emitPowerShellPrompt(terminalId, 4)
+    await waitUntil(
+      () => service.getTerminalRuntimeSnapshot(terminalId)?.canRunCommand === true,
+      'manual input after a completed agent task should observe its own generic prompt'
+    )
+    service.kill(terminalId)
+  })
+
+  await runCase('a completed agent prompt cannot reopen the gate over newer manual input', async () => {
+    const terminalId = 'sidecar-agent-poll-manual-race'
+    const { backend, service, runtimeToken } =
+      await createReadyWindowsPromptFileManualFixture(terminalId)
+    service.commandTrackingMaxConsecutiveErrors = 1000
+    backend.onNextPromptFileUserRequestSuccess(() => {
+      backend.setPollTrackingError(new Error('hold task completion poll'))
+    })
+
+    const taskId = await service.runCommandNoWait(
+      terminalId,
+      "Write-Output 'AGENT_DONE'"
+    )
+    backend.emitData(
+      terminalId,
+      tokenizedUnixBoundary(runtimeToken, 'precmd', 3, '')
+    )
+    await service.writeInputSequence(terminalId, [
+      'Start-Sleep -Seconds 30',
+      '\r',
+    ])
+    backend.setTrackingState(terminalId, {
+      mode: 'windows-powershell-sidecar',
+      sequence: 3,
+      exitCode: 0,
+      output: 'AGENT_DONE\r\n',
+      outputObservedUtf8Bytes: Buffer.byteLength('AGENT_DONE\r\n', 'utf8'),
+      outputTruncated: false,
+    })
+    backend.setPollTrackingError(undefined)
+    await service.waitForTask(terminalId, taskId)
+    assertEqual(
+      service.getTerminalRuntimeSnapshot(terminalId)?.canRunCommand,
+      false,
+      'the older task poll must not mark the newer manual command idle'
+    )
+
+    backend.emitPowerShellPrompt(terminalId, 4)
+    await waitUntil(
+      () => service.getTerminalRuntimeSnapshot(terminalId)?.canRunCommand === true,
+      'the newer manual command should recover only at its own prompt'
+    )
+    service.kill(terminalId)
+  })
+
+  await runCase('active sidecar Read-Host stdin settles with its task prompt', async () => {
+    const terminalId = 'sidecar-agent-readhost-stdin'
+    const { backend, service } =
+      await createReadyWindowsPromptFileManualFixture(terminalId)
+    const taskId = await service.runCommandNoWait(
+      terminalId,
+      "$answer=Read-Host 'NAME'; Write-Output $answer"
+    )
+
+    await service.writeInputSequence(terminalId, ['Ada', '\r'], {
+      inputOwner: 'active-task',
+    })
+    assertEqual(
+      service.windowsPromptSequenceFloorByTerminal.get(terminalId),
+      3,
+      'foreground stdin should reuse the active task already-reserved prompt'
+    )
+    backend.setTrackingState(terminalId, {
+      mode: 'windows-powershell-sidecar',
+      sequence: 3,
+      exitCode: 0,
+      output: 'Ada\r\n',
+      outputObservedUtf8Bytes: Buffer.byteLength('Ada\r\n'),
+      outputTruncated: false,
+    })
+    backend.emitPowerShellPrompt(terminalId, 3)
+    await service.waitForTask(terminalId, taskId)
+    await waitUntil(
+      () => service.getTerminalRuntimeSnapshot(terminalId)?.canRunCommand === true,
+      'the exact task completion prompt should acknowledge foreground stdin'
+    )
+    service.kill(terminalId)
+  })
+
+  await runCase('sidecar task completion cannot clear unsubmitted human input', async () => {
+    const terminalId = 'sidecar-task-unsubmitted-input'
+    const { backend, service } =
+      await createReadyWindowsPromptFileManualFixture(terminalId)
+    const taskId = await service.runCommandNoWait(
+      terminalId,
+      "Write-Output 'AGENT_DONE'"
+    )
+
+    service.write(terminalId, 'Write-Output TYPEAHEAD')
+    backend.setTrackingState(terminalId, {
+      mode: 'windows-powershell-sidecar',
+      sequence: 3,
+      exitCode: 0,
+      output: 'AGENT_DONE\r\n',
+      outputObservedUtf8Bytes: Buffer.byteLength('AGENT_DONE\r\n'),
+      outputTruncated: false,
+    })
+    backend.emitPowerShellPrompt(terminalId, 3)
+    await service.waitForTask(terminalId, taskId)
+    assertEqual(
+      service.getTerminalRuntimeSnapshot(terminalId)?.canRunCommand,
+      false,
+      'the task prompt must not make an unsubmitted PSReadLine buffer agent-safe'
+    )
+    service.kill(terminalId)
+  })
+
+  await runCase('a delayed agent prompt cannot complete newer manual input', async () => {
+    const terminalId = 'sidecar-ambiguous-agent-then-manual'
+    const { backend, service } =
+      await createReadyWindowsPromptFileManualFixture(terminalId)
+    backend.setConsumePromptFileUserRequests(false)
+    backend.setAutoEmitPromptFileRawBoundaries(false)
+    service.promptFileProbeTimeoutMs = 25
+
+    const taskId = await service.runCommandNoWait(
+      terminalId,
+      "Write-Output 'UNACKNOWLEDGED_AGENT'"
+    )
+    const result = await service.waitForTask(terminalId, taskId)
+    assertEqual(
+      result.executionState,
+      'outcome_unknown',
+      'the fixture must leave an ambiguously dispatched agent command'
+    )
+    assertEqual(
+      service.windowsPromptSequenceFloorByTerminal.get(terminalId),
+      3,
+      'an ambiguously dispatched agent command must retain its prompt reservation'
+    )
+
+    await service.writeInputSequence(terminalId, [
+      'Start-Sleep -Seconds 5',
+      '\r',
+    ])
+    assertEqual(
+      service.windowsPromptSequenceFloorByTerminal.get(terminalId),
+      4,
+      'manual input must reserve beyond the possibly delayed agent prompt'
+    )
+    backend.emitPowerShellPrompt(terminalId, 3, { idle: false })
+    await new Promise((resolve) => setTimeout(resolve, 30))
+    assertEqual(
+      service.getTerminalRuntimeSnapshot(terminalId)?.canRunCommand,
+      false,
+      'the older agent prompt must not release the newer manual command gate'
+    )
+
+    backend.emitPowerShellPrompt(terminalId, 4)
+    await waitUntil(
+      () => service.getTerminalRuntimeSnapshot(terminalId)?.canRunCommand === true,
+      'only the manual command prompt should restore idle after an ambiguous agent dispatch'
     )
     service.kill(terminalId)
   })
@@ -1143,6 +2015,7 @@ const run = async (): Promise<void> => {
     backend.setCommandProtocol(true, runtimeToken)
     backend.setCommandShellFamily('powershell')
     backend.setExposeCommandTrackingMode(true)
+    backend.setInitialTrackingBaseline(1)
     backend.setPromptFileDispatch(
       `/tmp/${terminalId}-request.b64`,
       `/tmp/${terminalId}-output.txt`
@@ -1286,6 +2159,124 @@ const run = async (): Promise<void> => {
         ?.remoteOs,
       'windows',
       'shell-family selection must not rewrite filesystem host semantics',
+    )
+    service.kill(terminalId)
+  })
+
+  await runCase('modern PowerShell task completion cannot clear unsubmitted human input', async () => {
+    const terminalId = 'modern-powershell-task-unsubmitted-input'
+    const runtimeToken = '56565656565656565656565656565656'
+    const backend = new FakeCommandBackend('windows', {
+      os: 'Windows',
+      platform: 'win32',
+      release: '10.0.26200',
+      arch: 'x64',
+      hostname: 'modern-powershell',
+      isRemote: false,
+      shell: 'powershell.exe'
+    })
+    backend.setCommandProtocol(true, runtimeToken)
+    backend.setCommandShellFamily('powershell')
+    const service = createService(backend)
+    await createLocalTerminal(service, terminalId)
+    backend.emitData(
+      terminalId,
+      tokenizedUnixBoundary(runtimeToken, 'precmd', 0, 'initial_modern_prompt')
+    )
+
+    const taskId = await service.runCommandNoWait(
+      terminalId,
+      "Write-Output 'AGENT_DONE'"
+    )
+    service.write(terminalId, 'Write-Output TYPEAHEAD')
+    backend.emitData(
+      terminalId,
+      tokenizedUnixBoundary(runtimeToken, 'precmd', 1, 'modern_task_prompt')
+    )
+    await service.waitForTask(terminalId, taskId)
+    assertEqual(
+      service.getTerminalRuntimeSnapshot(terminalId)?.canRunCommand,
+      false,
+      'the in-band task prompt must not make an unsubmitted PSReadLine buffer agent-safe'
+    )
+    service.kill(terminalId)
+  })
+
+  await runCase('Unix task completion cannot clear unsubmitted human input', async () => {
+    const terminalId = 'unix-task-unsubmitted-input'
+    const runtimeToken = '57575757575757575757575757575757'
+    const backend = createUnixBackend()
+    backend.setCommandProtocol(true, runtimeToken)
+    backend.setCommandShellFamily('unix')
+    const service = createService(backend)
+    await createLocalTerminal(service, terminalId)
+    backend.emitData(
+      terminalId,
+      tokenizedUnixBoundary(runtimeToken, 'precmd', 0, 'initial_unix_prompt')
+    )
+
+    const taskId = await service.runCommandNoWait(terminalId, "printf 'AGENT_DONE'")
+    service.write(terminalId, 'TYPEAHEAD')
+    const nonce = 'unix_task_prompt_0001'
+    backend.emitData(
+      terminalId,
+      tokenizedUnixBoundary(runtimeToken, 'preexec', 1, nonce) +
+        'AGENT_DONE' +
+        tokenizedUnixBoundary(runtimeToken, 'preend', 1, nonce) +
+        tokenizedUnixBoundary(runtimeToken, 'precmd', 1, nonce)
+    )
+    await service.waitForTask(terminalId, taskId)
+    assertEqual(
+      service.getTerminalRuntimeSnapshot(terminalId)?.canRunCommand,
+      false,
+      'the Unix task prompt must not make unsubmitted terminal input agent-safe'
+    )
+    service.kill(terminalId)
+  })
+
+  await runCase('Unix manual prompt cannot clear typeahead received after preexec', async () => {
+    const terminalId = 'unix-manual-typeahead-input'
+    const runtimeToken = '58585858585858585858585858585858'
+    const backend = createUnixBackend()
+    backend.setCommandProtocol(true, runtimeToken)
+    backend.setCommandShellFamily('unix')
+    const service = createService(backend)
+    await createLocalTerminal(service, terminalId)
+    backend.emitData(
+      terminalId,
+      tokenizedUnixBoundary(runtimeToken, 'precmd', 0, 'initial_unix_prompt')
+    )
+
+    service.write(terminalId, 'sleep 1\n')
+    const firstNonce = 'unix_manual_sleep_0001'
+    backend.emitData(
+      terminalId,
+      tokenizedUnixBoundary(runtimeToken, 'preexec', 1, firstNonce)
+    )
+    service.write(terminalId, 'printf TYPEAHEAD_PENDING')
+    backend.emitData(
+      terminalId,
+      tokenizedUnixBoundary(runtimeToken, 'preend', 1, firstNonce) +
+        tokenizedUnixBoundary(runtimeToken, 'precmd', 1, firstNonce)
+    )
+    assertEqual(
+      service.getTerminalRuntimeSnapshot(terminalId)?.canRunCommand,
+      false,
+      'the first prompt must not clear bytes typed after its preexec boundary'
+    )
+
+    service.write(terminalId, '\n')
+    const secondNonce = 'unix_manual_typeahead_0002'
+    backend.emitData(
+      terminalId,
+      tokenizedUnixBoundary(runtimeToken, 'preexec', 2, secondNonce) +
+        tokenizedUnixBoundary(runtimeToken, 'preend', 2, secondNonce) +
+        tokenizedUnixBoundary(runtimeToken, 'precmd', 2, secondNonce)
+    )
+    assertEqual(
+      service.getTerminalRuntimeSnapshot(terminalId)?.canRunCommand,
+      true,
+      'the prompt for the submitted typeahead command should restore idle'
     )
     service.kill(terminalId)
   })
@@ -1541,7 +2532,7 @@ const run = async (): Promise<void> => {
     service.kill(terminalId)
   })
 
-  await runCase('Windows sidecar initial prompt cannot complete input submitted before baseline', async () => {
+  await runCase('Windows input without a bootstrap baseline stays fail closed', async () => {
     const backend = new FakeCommandBackend('windows', {
       os: 'Windows',
       platform: 'win32',
@@ -1552,46 +2543,43 @@ const run = async (): Promise<void> => {
       shell: 'powershell.exe'
     }, 'windows-powershell-sidecar')
     backend.setCommandProtocol(true)
+    const prepareRelease = createDeferred()
+    let prepareStarted = false
+    backend.delayNextPrepare(prepareRelease.promise, () => {
+      prepareStarted = true
+    })
     const service = createService(backend) as any
-    service.commandTrackingPollIntervalMs = 5
     const terminalId = 'sidecar-initial-race'
     await createLocalTerminal(service, terminalId)
     backend.emitData(terminalId, 'PS sidecar ready')
-    await waitUntil(
-      () => (service as any).windowsPromptInitializationByTerminal.has(terminalId),
-      'the sidecar should start waiting for its first prompt marker',
-    )
 
     service.write(terminalId, 'whoami')
     service.write(terminalId, '\r')
-    backend.setTrackingState(terminalId, {
-      mode: 'windows-powershell-sidecar',
-      sequence: 1,
-      exitCode: 0,
-    })
     await waitUntil(
       () => backend.getWrites(terminalId).includes('\r'),
-      'sequence one should establish the baseline and then release Enter',
+      'manual Enter must not wait for the initial sidecar baseline',
+      250
     )
     assertEqual(
       service.getTerminalRuntimeSnapshot(terminalId)?.canRunCommand,
       false,
-      'the initial sidecar prompt must not masquerade as manual command completion',
+      'input without a bootstrap-proven baseline must remain fail closed',
     )
-
-    backend.setTrackingState(terminalId, {
-      mode: 'windows-powershell-sidecar',
-      sequence: 2,
-      exitCode: 0,
-    })
-    await waitUntil(
-      () => service.getTerminalRuntimeSnapshot(terminalId)?.canRunCommand === true,
-      'only the post-input sidecar prompt may reopen the gate',
+    assertEqual(
+      prepareStarted,
+      false,
+      'manual input must never start destructive prompt-journal preparation'
     )
+    assertEqual(
+      service.windowsManualPromptWatcherByTerminal.has(terminalId),
+      false,
+      'manual input must not attach a watcher without a pre-dispatch baseline'
+    )
+    prepareRelease.resolve()
     service.kill(terminalId)
   })
 
-  await runCase('Windows zero-baseline empty polls release recovery input', async () => {
+  await runCase('Windows absent bootstrap baseline never blocks recovery input', async () => {
     const backend = new FakeCommandBackend('windows', {
       os: 'Windows',
       platform: 'win32',
@@ -1603,20 +2591,19 @@ const run = async (): Promise<void> => {
     }, 'windows-powershell-sidecar')
     backend.setCommandProtocol(true)
     const service = createService(backend) as any
-    service.commandTrackingPollIntervalMs = 5
-    service.commandTrackingMaxConsecutiveErrors = 4
     const terminalId = 'sidecar-zero-baseline-recovery'
     await createLocalTerminal(service, terminalId)
     backend.emitData(terminalId, 'PS sidecar ready')
     await waitUntil(
-      () => service.windowsPromptInitializationByTerminal.has(terminalId),
-      'the zero-baseline fixture should begin prompt initialization',
+      () => service.getTerminalRuntimeSnapshot(terminalId)?.shellInputState === 'unknown',
+      'an unavailable bootstrap baseline should become explicitly unknown'
     )
 
     service.write(terminalId, '\r')
     await waitUntil(
       () => backend.getWrites(terminalId).includes('\r'),
-      'successful empty marker polls must not gate recovery Enter forever',
+      'an absent bootstrap baseline must not delay recovery Enter',
+      250,
     )
     assertEqual(
       service.getTerminalRuntimeSnapshot(terminalId)?.canRunCommand,
@@ -1629,53 +2616,92 @@ const run = async (): Promise<void> => {
       'an unverified prompt baseline must remain user-recoverable',
     )
 
-    backend.setTrackingState(terminalId, {
-      mode: 'windows-powershell-sidecar',
-      sequence: 1,
-      exitCode: 0,
-    })
-    await waitUntil(
-      () => service.getTerminalRuntimeSnapshot(terminalId)?.canRunCommand === true,
-      'the marker produced by recovery Enter should establish the next idle baseline',
+    assertEqual(
+      service.windowsManualPromptWatcherByTerminal.has(terminalId),
+      false,
+      'manual input must not trigger destructive baseline acquisition after dispatch'
     )
     service.kill(terminalId)
   })
 
-  await runCase('Windows manual sidecar polling failure leaves an explicit unknown gate', async () => {
-    const backend = new FakeCommandBackend('windows', {
-      os: 'Windows',
-      platform: 'win32',
-      release: '10.0.14393',
-      arch: 'x64',
-      hostname: 'sidecar-manual-poll-loss',
-      isRemote: false,
-      shell: 'powershell.exe'
-    }, 'windows-powershell-sidecar')
-    backend.setCommandProtocol(true)
-    const terminalId = 'sidecar-manual-poll-loss'
-    backend.setTrackingState(terminalId, {
-      mode: 'windows-powershell-sidecar',
-      sequence: 1,
-      exitCode: 0,
-    })
-    const service = createService(backend) as any
-    service.commandTrackingPollIntervalMs = 5
-    service.commandTrackingMaxConsecutiveErrors = 2
-    await createLocalTerminal(service, terminalId)
-    backend.emitData(terminalId, 'PS sidecar ready')
-    await waitUntil(
-      () => service.getTerminalRuntimeSnapshot(terminalId)?.shellInputState === 'idle',
-      'the poll-loss fixture needs a verified initial prompt',
+  await runCase('forged PowerShell input-idle records cannot reopen a manual gate', async () => {
+    const terminalId = 'sidecar-input-idle-authentication'
+    const { backend, service, runtimeToken } =
+      await createReadyWindowsManualFixture(terminalId)
+
+    await service.writeInputSequence(terminalId, ["Write-Output 'BUSY'", '\r'])
+    backend.emitData(
+      terminalId,
+      '\x1b]1337;gyshell_inputidle;seq=2;rev=1;nonce=manual_input_drained\x07' +
+        `\x1b]1337;gyshell_${runtimeToken}_inputidle;seq=2;rev=1;nonce=forged_nonce\x07`
     )
-    backend.setPollTrackingError(new Error('sidecar marker channel lost'))
-    service.write(terminalId, '\r')
-    await waitUntil(
-      () => service.getTerminalRuntimeSnapshot(terminalId)?.shellInputState === 'unknown',
-      'repeated manual prompt polling errors should make the gate unknown',
-    )
+    await new Promise((resolve) => setTimeout(resolve, 350))
     const snapshot = service.getTerminalRuntimeSnapshot(terminalId)
-    assertEqual(snapshot?.canRunCommand, false, 'unknown sidecar state must reject agent commands')
-    assertEqual(snapshot?.canWrite, true, 'tracking loss must not disable user recovery input')
+    assertEqual(
+      snapshot?.canRunCommand,
+      false,
+      'legacy-namespace and wrong-nonce input-idle records must fail closed'
+    )
+    assertEqual(
+      snapshot?.canWrite,
+      true,
+      'rejected protocol records must not disable user recovery input'
+    )
+
+    backend.emitPowerShellPrompt(terminalId, 2)
+    await waitUntil(
+      () => service.getTerminalRuntimeSnapshot(terminalId)?.canRunCommand === true,
+      'the authenticated runtime-scoped input-idle record should restore idle'
+    )
+    service.kill(terminalId)
+  })
+
+  await runCase('an old prompt cannot consume a newer PowerShell input revision', async () => {
+    const terminalId = 'sidecar-input-idle-prompt-floor'
+    const { backend, service } =
+      await createReadyWindowsManualFixture(terminalId)
+
+    await service.writeInputSequence(terminalId, ["Write-Output 'NEXT'\r"])
+    backend.emitPowerShellPrompt(terminalId, 1)
+    await new Promise((resolve) => setTimeout(resolve, 50))
+    assertEqual(
+      service.getTerminalRuntimeSnapshot(terminalId)?.canRunCommand,
+      false,
+      'the sidecar revision must remain pending at its older prompt sequence'
+    )
+
+    backend.emitPowerShellPrompt(terminalId, 2)
+    await waitUntil(
+      () => service.getTerminalRuntimeSnapshot(terminalId)?.canRunCommand === true,
+      'the same revision should settle at its minimum prompt sequence'
+    )
+    service.kill(terminalId)
+  })
+
+  await runCase('an in-flight old input-idle revision cannot satisfy newer Windows input', async () => {
+    const terminalId = 'sidecar-input-idle-order'
+    const { backend, service, runtimeToken } =
+      await createReadyWindowsManualFixture(terminalId)
+
+    await service.writeInputSequence(terminalId, ["Write-Output 'FIRST'\r"])
+    await service.writeInputSequence(terminalId, ["Write-Output 'SECOND'\r"])
+    backend.emitData(
+      terminalId,
+      tokenizedUnixBoundary(runtimeToken, 'precmd', 2, 'old_prompt') +
+        tokenizedPowerShellInputIdle(runtimeToken, 2, 1)
+    )
+    await new Promise((resolve) => setTimeout(resolve, 350))
+    assertEqual(
+      service.getTerminalRuntimeSnapshot(terminalId)?.canRunCommand,
+      false,
+      'a genuine old prompt idle must not acknowledge the newer local input revision'
+    )
+
+    backend.emitPowerShellPrompt(terminalId, 3)
+    await waitUntil(
+      () => service.getTerminalRuntimeSnapshot(terminalId)?.canRunCommand === true,
+      'the final empty-input idle boundary should restore the gate'
+    )
     service.kill(terminalId)
   })
 
@@ -2702,7 +3728,8 @@ const run = async (): Promise<void> => {
     service.kill(terminalId)
   })
 
-  await runCase('a delayed old manual sidecar poll cannot restore stale prompt state after reconnect', async () => {
+  await runCase('an old runtime input-idle marker cannot restore prompt state after reconnect', async () => {
+    const runtimeToken = '78787878787878787878787878787878'
     const backend = new FakeCommandBackend('windows', {
       os: 'Windows',
       platform: 'win32',
@@ -2713,6 +3740,9 @@ const run = async (): Promise<void> => {
       shell: 'powershell.exe'
     }, 'windows-powershell-sidecar')
     const terminalId = 'stale-manual-poll'
+    backend.setCommandProtocol(true, runtimeToken)
+    backend.setExposeCommandTrackingMode(true)
+    backend.setInitialTrackingBaseline(1)
     backend.setTrackingState(terminalId, {
       mode: 'windows-powershell-sidecar',
       sequence: 1,
@@ -2720,17 +3750,13 @@ const run = async (): Promise<void> => {
     })
     const service = createService(backend)
     await createReadySshTerminal(service, terminalId)
-
-    const oldPollGate = createDeferred()
-    const oldPollStarted = createDeferred()
-    backend.delayNextPoll(oldPollGate.promise, oldPollStarted.resolve, {
-      mode: 'windows-powershell-sidecar',
-      sequence: 2,
-      exitCode: 0,
-      cwd: 'C:/stale-old-runtime'
-    })
+    backend.emitData(terminalId, 'PS sidecar ready')
+    await waitUntil(
+      () => service.getTerminalRuntimeSnapshot(terminalId)?.canRunCommand === true,
+      'the old runtime fixture needs an initial sidecar prompt baseline'
+    )
     await service.writeInputSequence(terminalId, ['\r'])
-    await oldPollStarted.promise
+    const oldRuntimeDataCallbacks = backend.captureDataCallbacks(terminalId)
 
     backend.kill(`pty-${terminalId}`)
     await service.reconnectTerminal(terminalId)
@@ -2743,17 +3769,19 @@ const run = async (): Promise<void> => {
     replacement.isInitializing = false
     replacement.runtimeState = 'ready'
 
-    oldPollGate.resolve()
-    await new Promise((resolve) => setTimeout(resolve, 20))
+    const staleMarker =
+      tokenizedUnixBoundary(runtimeToken, 'precmd', 2, 'stale_prompt') +
+      tokenizedPowerShellInputIdle(runtimeToken, 2, 1)
+    oldRuntimeDataCallbacks.forEach((callback) => callback(staleMarker))
     assertEqual(
       (service as any).windowsPromptBaselineByTerminal.has(terminalId),
       false,
-      'an old manual watcher must not repopulate a replacement runtime baseline'
+      'an old runtime callback must not repopulate a replacement baseline'
     )
     assertEqual(
       service.getTerminalRuntimeSnapshot(terminalId)?.shellInputState,
       'unknown',
-      'an old manual watcher must not reopen the replacement command gate'
+      'an old runtime input-idle marker must not reopen the replacement command gate'
     )
     service.kill(terminalId)
   })

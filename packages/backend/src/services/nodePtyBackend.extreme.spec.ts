@@ -5,13 +5,17 @@ import { COMMAND_CAPTURE_MAX_UTF8_BYTES } from '@gyshell/shared'
 import { NodePtyBackend } from './NodePtyBackend'
 import {
   buildInitializationReadyMarker,
+  buildPowerShellInitializationReadySequence,
   consumeInitializationReadyMarker,
+  consumeInitializationReadyRecord,
 } from './terminal/CommandStreamProtocol'
 import {
   buildWindowsPowerShellDispatchRequest,
   buildWindowsPowerShellDispatchInput,
+  buildWindowsPowerShellInputRevisionPath,
   parseWindowsPromptMarkerLine,
   parseWindowsPowerShellRequestMarkerFile,
+  WINDOWS_POWERSHELL_INITIAL_PROMPT_SEQUENCE,
   WINDOWS_POWERSHELL_REQUEST_MARKER_MAX_UTF8_BYTES,
 } from './windowsPowerShellTracking'
 
@@ -76,6 +80,63 @@ const run = async (): Promise<void> => {
       consumeInitializationReadyMarker(`\r\n${marker}`, marker),
       undefined,
       'a marker without its trailing line boundary must stay buffered'
+    )
+  })
+
+  await runCase('PowerShell initialization consumes an exact non-rendering ready sequence', () => {
+    const runtimeToken = '0123456789abcdef0123456789abcdef'
+    const readySequence = buildPowerShellInitializationReadySequence(
+      runtimeToken,
+      2
+    )
+    const remainder = consumeInitializationReadyRecord(
+      `discarded bootstrap output${readySequence}PS> visible`,
+      readySequence
+    )
+
+    assertEqual(
+      remainder,
+      'PS> visible',
+      'the exact PowerShell OSC readiness record should open initialization'
+    )
+    assertEqual(
+      consumeInitializationReadyRecord(
+        `gyshell-init-ready;runtime=${runtimeToken};attempt=2`,
+        readySequence
+      ),
+      undefined,
+      'a printable lookalike must not open PowerShell initialization'
+    )
+    assertEqual(
+      consumeInitializationReadyRecord(readySequence.slice(0, -1), readySequence),
+      undefined,
+      'a split PowerShell OSC readiness record must stay buffered'
+    )
+  })
+
+  await runCase('local PowerShell exposes its initial sidecar baseline only after readiness', () => {
+    const backend = new NodePtyBackend() as any
+    const ptyId = 'local-initial-prompt-baseline'
+    const runtimeToken = '14141414141414141414141414141414'
+    const instance = { isInitializing: true }
+    backend.ptys.set(ptyId, instance)
+    backend.commandTrackingModeByPtyId.set(
+      ptyId,
+      'windows-powershell-sidecar'
+    )
+    backend.commandProtocolTokenByPtyId.set(ptyId, runtimeToken)
+
+    assertEqual(
+      backend.getInitialCommandTrackingToken(ptyId),
+      undefined,
+      'an initializing local PowerShell must not expose a prompt baseline'
+    )
+    instance.isInitializing = false
+    const token = backend.getInitialCommandTrackingToken(ptyId)
+    assertCondition(
+      token?.baselineSequence === WINDOWS_POWERSHELL_INITIAL_PROMPT_SEQUENCE &&
+        token.trackingScopeId === runtimeToken,
+      'the ready local sidecar should expose its runtime-scoped bootstrap prompt'
     )
   })
 
@@ -396,12 +457,24 @@ const run = async (): Promise<void> => {
         'the short loader should only decode and dot-source the private bootstrap path'
       )
       assertCondition(
-        bootstrap.includes(`[Console]::InputEncoding=$${privatePrefix}_utf8`) &&
+          bootstrap.includes(`[Console]::InputEncoding=$${privatePrefix}_utf8`) &&
           bootstrap.includes(`function Global:${privatePrefix}_emit_raw_boundary`) &&
           bootstrap.includes(`]1337;gyshell_${runtimeToken}_`) &&
+          bootstrap.includes('Register-EngineEvent -SourceIdentifier PowerShell.OnIdle') &&
+          bootstrap.includes(`gyshell_${runtimeToken}_inputidle;seq=`) &&
+          bootstrap.includes(";rev='+") &&
+          bootstrap.includes('nonce=manual_input_drained') &&
+          bootstrap.includes('input_revision_path') &&
+          bootstrap.includes(`${privatePrefix}_input_minimum_prompt_seq`) &&
+          bootstrap.includes('PSConsoleReadLine]::GetBufferState') &&
+          !bootstrap.includes('Set-PSReadLineKeyHandler') &&
+          !bootstrap.includes('AddToHistoryHandler') &&
+          bootstrap.includes(
+            `$global:${privatePrefix}_bootstrap_installed=$true`
+          ) &&
           bootstrap.includes(`${privatePrefix}_emit_raw_boundary 'preexec'`) &&
           bootstrap.includes(`${privatePrefix}_emit_raw_boundary 'preend'`),
-        'the uploaded bootstrap should install UTF-8 capture and request-bound raw frames in the runtime-private namespace'
+        'the uploaded bootstrap should install UTF-8 capture plus revision-bound empty-input idle and request boundaries in the runtime-private namespace'
       )
       assertCondition(
         integration.args.includes('-ExecutionPolicy') && integration.args.includes('Bypass'),
@@ -481,9 +554,22 @@ const run = async (): Promise<void> => {
         decoded.includes(`$global:${privatePrefix}_output_observed`),
       'sidecar command and capture state must share the runtime namespace while the diagnostic recorder stays stable'
     )
+    const readySequenceBase64 = Buffer.from(
+      buildPowerShellInitializationReadySequence(runtimeToken),
+      'utf8'
+    ).toString('base64')
     assertCondition(
-      decoded.includes(buildInitializationReadyMarker(runtimeToken)),
-      'the PowerShell bootstrap completion marker must be scoped to this runtime'
+      decoded.includes(`FromBase64String('${readySequenceBase64}')`) &&
+        decoded.includes('[Console]::OpenStandardOutput()') &&
+        decoded.includes(`${privatePrefix}_ready_stdout.Write(`),
+      'the runtime-scoped PowerShell ready sequence must use raw stdout without printable marker text'
+    )
+    assertCondition(
+      decoded.includes(
+        `]1337;gyshell_${runtimeToken}_precmd;seq=`
+      ) &&
+        decoded.includes(`${privatePrefix}_prompt_stdout.Write(`),
+      'sidecar prompts should reuse the runtime-authenticated OSC lifecycle without rendering private text'
     )
     assertCondition(
       !decoded.includes('function Global:__gyshell_capture_text') &&
@@ -586,6 +672,36 @@ const run = async (): Promise<void> => {
     assertEqual(backend.commandOutputPathByPtyId.has('pty-clean'), false, 'cleanup should clear output-file tracking state')
     assertEqual(backend.commandTrackingModeByPtyId.has('pty-clean'), false, 'cleanup should clear command tracking mode')
     assertEqual(backend.promptMarkerStateByPtyId.has('pty-clean'), false, 'cleanup should clear cached marker data')
+  })
+
+  await runCase('local PowerShell commits manual input revision beside its runtime marker', async () => {
+    const backend = new NodePtyBackend() as any
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'gyshell-input-revision-test-'))
+    const markerPath = path.join(tempDir, 'prompt-marker.log')
+    const runtime = {}
+    backend.ptys.set('input-revision-pty', runtime)
+    backend.commandTrackingModeByPtyId.set(
+      'input-revision-pty',
+      'windows-powershell-sidecar'
+    )
+    backend.promptMarkerPathByPtyId.set('input-revision-pty', markerPath)
+    try {
+      await backend.commitPowerShellInputRevision(
+        'input-revision-pty',
+        11,
+        4
+      )
+      assertEqual(
+        fs.readFileSync(
+          buildWindowsPowerShellInputRevisionPath(markerPath),
+          'utf8'
+        ),
+        '11:4',
+        'the local sidecar should bind the input revision to its prompt floor'
+      )
+    } finally {
+      fs.rmSync(tempDir, { recursive: true, force: true })
+    }
   })
 
   await runCase('an old local exit cannot erase replacement state created by its callback', async () => {
