@@ -230,6 +230,53 @@ const run = (): void => {
     });
 
     runCase(
+      "zero-retention boundary inserts after the final old message and survives reload",
+      () => {
+        uiHistory.recordEvent("zero-retention", {
+          type: "user_input",
+          content: "latest unfinished request",
+          messageId: "zero-user-last",
+        } as any);
+        uiHistory.recordEvent("zero-retention", {
+          type: "compaction_boundary",
+          messageId: "zero-boundary",
+          boundaryPreviousMessageId: "zero-user-last",
+          summaryMessageId: "zero-summary",
+          protectedNormalRounds: 0,
+        } as any);
+        uiHistory.recordEvent("zero-retention", {
+          type: "sub_tool_started",
+          messageId: "zero-progress",
+          title: "Compaction...",
+        } as any);
+
+        assertDeepEqual(
+          uiHistory
+            .getMessages("zero-retention")
+            .map((message) => message.type),
+          ["text", "compaction_boundary", "compaction"],
+          "zero-retention marker should sit after all old messages and before compaction progress",
+        );
+        assertEqual(
+          uiHistory.getMessages("zero-retention")[1]?.metadata
+            ?.compactionBoundaryProtectedNormalRounds,
+          0,
+          "zero retained rounds must remain explicit in UI metadata",
+        );
+
+        uiHistory.flush("zero-retention");
+        const reloaded = new UIHistoryService({ store });
+        assertDeepEqual(
+          reloaded
+            .getMessages("zero-retention")
+            .map((message) => message.type),
+          ["text", "compaction_boundary", "compaction"],
+          "previous-only zero-retention placement should survive persistence",
+        );
+      },
+    );
+
+    runCase(
       "rollback removes a boundary whose protected tail anchor was cut",
       () => {
         uiHistory.recordEvent("session-1", {

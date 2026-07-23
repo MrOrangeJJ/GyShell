@@ -172,8 +172,21 @@ const run = async (): Promise<void> => {
       16777216,
       'new markers should carry the exact retained file length'
     )
+    const captureFailure = parseWindowsPromptMarkerLine(
+      `__GYSHELL_PROMPT__::seq=9;ec=1;output_bytes=12;retained_bytes=5;output_truncated=0;output_capture_failed=1;cwd_b64=${cwdB64};home_b64=${homeB64}`
+    )
+    assertEqual(
+      captureFailure?.outputCaptureFailed,
+      true,
+      'capture infrastructure failure must remain distinct from intentional retention truncation'
+    )
+    assertEqual(
+      captureFailure?.outputTruncated,
+      false,
+      'capture failure must not be rewritten as a retention-limit event'
+    )
     const unknownOutcome = parseWindowsPromptMarkerLine(
-      `__GYSHELL_PROMPT__::seq=9;ec=1;outcome_known=0;request_id=1123456789abcdef0123456789abcdef;output_bytes=4;retained_bytes=4;output_truncated=0;cwd_b64=${cwdB64};home_b64=${homeB64}`
+      `__GYSHELL_PROMPT__::seq=10;ec=1;outcome_known=0;request_id=1123456789abcdef0123456789abcdef;output_bytes=4;retained_bytes=4;output_truncated=0;cwd_b64=${cwdB64};home_b64=${homeB64}`
     )
     assertEqual(
       unknownOutcome?.outcomeKnown,
@@ -316,23 +329,36 @@ const run = async (): Promise<void> => {
       'local sidecar prompt must contain exactly one user-command invocation'
     )
     assertCondition(
-      decoded.includes('Out-String -Stream -Width 2147483647') &&
+      decoded.includes('$Host.UI.RawUI.BufferSize.Width') &&
+        decoded.includes('Out-String -Stream -Width $__gyshell_format_width -ErrorAction Stop') &&
+        !decoded.includes('Out-String -Stream -Width 2147483647') &&
         decoded.includes(`$global:__gyshell_output_max_bytes=[int64]${COMMAND_CAPTURE_MAX_UTF8_BYTES}`) &&
-        decoded.includes('$global:__gyshell_output_observed=[int64]$global:__gyshell_output_observed+[int64]$__gyshell_bytes.Length;if($global:__gyshell_output_truncated){return}'),
-      'local sidecar output should flow through a strict-prefix bounded streaming writer'
+        decoded.includes('$global:__gyshell_output_observed=[int64]$global:__gyshell_output_observed+[int64]$__gyshell_bytes.Length;if($global:__gyshell_output_truncated){return}') &&
+        decoded.includes('catch{$global:__gyshell_output_capture_failed=$true}'),
+      'local sidecar output should use the live bounded terminal width and distinguish capture failure from retention'
     )
     assertCondition(
       decoded.includes("Set-Variable -Scope Global -Name '__GyShell_InternalRecordOutcome'") &&
         decoded.includes(';& $global:__GyShell_InternalRecordOutcome ([bool]$?)') &&
         decoded.includes('$__GyShell_InternalUserCommandBlock=[scriptblock]::Create(') &&
+        decoded.includes('[Management.Automation.ParseException]::new(') &&
+        decoded.includes('$null=$Error.Insert(0,$__gyshell_parse_record)') &&
+        !decoded.includes('throw $__gyshell_parse_errors[0]') &&
         decoded.includes('$global:__gyshell_user_outcome_sampled=$true') &&
         !decoded.includes('if($_ -is [Management.Automation.ErrorRecord]){[string]$_}else{$_}') &&
-        decoded.includes('$global:__gyshell_user_exception | Microsoft.PowerShell.Utility\\Out-String'),
-      'the sidecar must sample status through a stable diagnostic entry while retaining structured PowerShell error details'
+        decoded.includes('$__gyshell_safe_error=[Management.Automation.ErrorRecord]::new(') &&
+        decoded.includes('$__gyshell_safe_error.ErrorDetails=$_.ErrorDetails') &&
+        decoded.includes('$global:__gyshell_user_exception | Microsoft.PowerShell.Core\\ForEach-Object {'),
+      'the sidecar must sample status while preserving safe structured error details without private invocation metadata'
     )
     const rawStartIndex = decoded.indexOf(
       "__gyshell_emit_raw_boundary 'preexec' $__gyshell_request_id"
     )
+    const historyCleanupIndex = decoded.indexOf(
+      'Microsoft.PowerShell.Core\\Get-History -ErrorAction SilentlyContinue'
+    )
+    const consoleClearIndex = decoded.indexOf('[Console]::Clear()')
+    const requestReadIndex = decoded.indexOf('[IO.File]::ReadAllText')
     const commandExecutionIndex = decoded.indexOf(
       '$global:__gyshell_output_observed=[int64]0',
       rawStartIndex
@@ -342,11 +368,22 @@ const run = async (): Promise<void> => {
       commandExecutionIndex
     )
     assertCondition(
-      rawStartIndex >= 0 &&
+      historyCleanupIndex >= 0 &&
+        !decoded.includes('Remove-History') &&
+        decoded.includes('.CommandLine -ceq $global:') &&
+        decoded.includes(
+          'Microsoft.PowerShell.Core\\Clear-History -Id ([long[]]$'
+        ) &&
+        decoded.slice(historyCleanupIndex, consoleClearIndex).includes(
+          'catch{};'
+        ) &&
+        consoleClearIndex > historyCleanupIndex &&
+        requestReadIndex > consoleClearIndex &&
+        rawStartIndex > requestReadIndex &&
         commandExecutionIndex > rawStartIndex &&
         rawFinallyIndex > commandExecutionIndex &&
         decoded.slice(rawStartIndex, commandExecutionIndex).includes(';try{'),
-      'raw output attribution must close in finally even when user control flow escapes the command block'
+      'best-effort exact history cleanup must not block screen clearing or request consumption, and raw attribution must close in finally'
     )
     assertCondition(
       decoded.includes('[Management.Automation.Language.Parser]::ParseInput($__gyshell_cmd') &&
@@ -371,7 +408,8 @@ const run = async (): Promise<void> => {
         decoded.includes("';outcome_known='") &&
         decoded.includes("';output_bytes='") &&
         decoded.includes("';retained_bytes='") &&
-        decoded.includes("';output_truncated='"),
+        decoded.includes("';output_truncated='") &&
+        decoded.includes("';output_capture_failed='"),
       'the prompt marker must publish request identity and verifiable output metadata'
     )
     assertCondition(
@@ -380,7 +418,7 @@ const run = async (): Promise<void> => {
         decoded.includes("if(-not $__gyshell_has_request -or $__gyshell_request_kind -eq 'c')") &&
         decoded.includes('$global:__gyshell_logical_user_ok=[bool]$__ok') &&
         decoded.includes("Write-Error 'GyShell status restoration sentinel' -ErrorAction Ignore"),
-      'typed probes must not replace the user-visible PowerShell status restored for the real request'
+      'typed request roles must not replace the user-visible PowerShell status restored for a command request'
     )
     assertCondition(
       !decoded.includes('__gyshell_should_native_fallback') &&
@@ -468,7 +506,13 @@ const run = async (): Promise<void> => {
           bootstrap.includes(`${privatePrefix}_input_minimum_prompt_seq`) &&
           bootstrap.includes('PSConsoleReadLine]::GetBufferState') &&
           !bootstrap.includes('Set-PSReadLineKeyHandler') &&
-          !bootstrap.includes('AddToHistoryHandler') &&
+          bootstrap.includes('Set-PSReadLineOption -AddToHistoryHandler') &&
+          bootstrap.includes(`${privatePrefix}_original_history_handler`) &&
+          bootstrap.includes('Microsoft.PowerShell.Core\\Get-History -ErrorAction SilentlyContinue') &&
+          bootstrap.includes('.CommandLine -ceq $global:') &&
+          bootstrap.includes('Microsoft.PowerShell.Core\\Clear-History -Id ([long[]]$') &&
+          !bootstrap.includes('Remove-History') &&
+          bootstrap.includes('catch{};[Console]::Clear()') &&
           bootstrap.includes(
             `$global:${privatePrefix}_bootstrap_installed=$true`
           ) &&
@@ -583,8 +627,14 @@ const run = async (): Promise<void> => {
       'tokenized sidecars must still contain exactly one user-command invocation'
     )
     assertCondition(
-      decoded.includes("Set-Variable -Scope Global -Name '__GyShell_InternalDispatch'") &&
+        decoded.includes("Set-Variable -Scope Global -Name '__GyShell_InternalDispatch'") &&
         decoded.includes("[scriptblock]::Create(@'") &&
+        decoded.includes('Set-PSReadLineOption -AddToHistoryHandler') &&
+        decoded.includes('Microsoft.PowerShell.Core\\Get-History -ErrorAction SilentlyContinue') &&
+        decoded.includes('.CommandLine -ceq $global:') &&
+        decoded.includes('Microsoft.PowerShell.Core\\Clear-History -Id ([long[]]$') &&
+        !decoded.includes('Remove-History') &&
+        decoded.includes('catch{};[Console]::Clear()') &&
         decoded.includes(
           `if($NestedPromptLevel -eq 0 -and -not $global:${privatePrefix}_completion_pending -and -not $global:${privatePrefix}_dispatch_active)`
         ) &&
@@ -1179,6 +1229,74 @@ const run = async (): Promise<void> => {
         update?.outputTruncated,
         true,
         'polling should preserve the generator truncation flag'
+      )
+    } finally {
+      fs.rmSync(tempDir, { recursive: true, force: true })
+    }
+  })
+
+  await runCase('local sidecar capture failure never attributes stale output bytes', async () => {
+    const backend = new NodePtyBackend() as any
+    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'gyshell-capture-failure-'))
+    const markerPath = path.join(tempDir, 'prompt-marker.log')
+    const outputPath = path.join(tempDir, 'command-output.txt')
+    const cwdB64 = Buffer.from('C:/Windows', 'utf8').toString('base64')
+    const homeB64 = Buffer.from('C:/Users/Administrator', 'utf8').toString('base64')
+
+    try {
+      fs.writeFileSync(outputPath, 'previous-request', 'utf8')
+      fs.writeFileSync(
+        markerPath,
+        `__GYSHELL_PROMPT__::seq=1;ec=1;output_bytes=0;retained_bytes=0;output_truncated=0;output_capture_failed=1;cwd_b64=${cwdB64};home_b64=${homeB64}\n`,
+        'utf8'
+      )
+      backend.commandTrackingModeByPtyId.set('pty-capture-failure', 'windows-powershell-sidecar')
+      backend.promptMarkerPathByPtyId.set('pty-capture-failure', markerPath)
+      backend.commandOutputPathByPtyId.set('pty-capture-failure', outputPath)
+
+      const stale = await backend.pollCommandTracking('pty-capture-failure', {
+        mode: 'windows-powershell-sidecar',
+        baselineSequence: 0,
+        commandOutputPath: outputPath,
+        expectCommandOutput: true,
+      })
+      assertEqual(stale?.output, undefined, 'a failed output-file open must not reuse the previous request transcript')
+      assertEqual(stale?.outputCaptureFailed, true, 'the completion must expose capture infrastructure failure')
+
+      fs.writeFileSync(outputPath, 'part', 'utf8')
+      fs.writeFileSync(
+        markerPath,
+        `__GYSHELL_PROMPT__::seq=2;ec=1;output_bytes=10;retained_bytes=4;output_truncated=0;output_capture_failed=1;cwd_b64=${cwdB64};home_b64=${homeB64}\n`,
+        'utf8'
+      )
+      const partial = await backend.pollCommandTracking('pty-capture-failure', {
+        mode: 'windows-powershell-sidecar',
+        baselineSequence: 1,
+        commandOutputPath: outputPath,
+        expectCommandOutput: true,
+      })
+      assertEqual(partial?.output, 'part', 'verified partial bytes should remain available as best-effort output')
+      assertEqual(partial?.outputObservedUtf8Bytes, 10, 'capture failure should preserve the generator-observed byte count')
+      assertEqual(partial?.outputTruncated, false, 'partial capture failure must not claim a retention limit')
+
+      fs.rmSync(outputPath)
+      fs.writeFileSync(
+        markerPath,
+        `__GYSHELL_PROMPT__::seq=3;ec=1;output_bytes=10;retained_bytes=4;output_truncated=0;output_capture_failed=1;cwd_b64=${cwdB64};home_b64=${homeB64}\n`,
+        'utf8'
+      )
+      const missingPartial = await Promise.allSettled([
+        backend.pollCommandTracking('pty-capture-failure', {
+          mode: 'windows-powershell-sidecar',
+          baselineSequence: 2,
+          commandOutputPath: outputPath,
+          expectCommandOutput: true,
+        })
+      ])
+      assertEqual(
+        missingPartial[0]?.status,
+        'rejected',
+        'a capture failure with known retained bytes must retry instead of discarding its partial transcript'
       )
     } finally {
       fs.rmSync(tempDir, { recursive: true, force: true })

@@ -12,12 +12,12 @@ export interface PruneLabelResult {
 export class TokenManager {
   // Conservative estimate: 4 chars per token
   private static readonly CHARS_PER_TOKEN = 4
-  
+
   // Minimum amount to prune to avoid frequent small updates (20k tokens)
   private static readonly PRUNE_MINIMUM = 20_000
   // Reserve tokens for output generation
   private static readonly OUTPUT_RESERVE = 10000
-  
+
   // Tools that should never be pruned
   private static readonly PRUNE_PROTECTED_TOOLS = ['skill']
 
@@ -27,6 +27,7 @@ export class TokenManager {
   // Keys/markers used by dynamic request-history pruning.
   static readonly PRUNE_FLAG_KEY = '_gyshellPrune'
   static readonly LAST_COMPACTION_FLAG_KEY = 'last_compaction'
+  static readonly COMPACTION_PROTECTED_ROUNDS_KEY = 'compaction_protected_normal_rounds'
   static readonly PRUNED_CONTENT_PLACEHOLDER = '[Content Pruned by TokenManager]'
 
   /**
@@ -40,12 +41,38 @@ export class TokenManager {
   static estimateMessages(messages: BaseMessage[]): number {
     let total = 0
     for (const message of messages) {
-      const content = typeof message.content === 'string'
-        ? message.content
-        : JSON.stringify(message.content)
-      total += this.estimate(content)
+      total += this.estimateMessageContent(message.content)
     }
     return total
+  }
+
+  /**
+   * Keep the legacy character estimator, but do not count encoded image URLs
+   * as text. Vision providers tokenize the image itself rather than the data
+   * URI string, so counting that string can overstate one image by hundreds of
+   * thousands of tokens.
+   */
+  static estimateMessageContent(
+    content: BaseMessage['content'] | unknown
+  ): number {
+    if (typeof content === 'string') {
+      return this.estimate(content)
+    }
+
+    const estimableContent = Array.isArray(content)
+      ? content.filter((part) => !this.isImageUrlPart(part))
+      : this.isImageUrlPart(content)
+        ? []
+        : content
+    return this.estimate(JSON.stringify(estimableContent))
+  }
+
+  private static isImageUrlPart(part: unknown): boolean {
+    return (
+      !!part &&
+      typeof part === 'object' &&
+      (part as { type?: unknown }).type === 'image_url'
+    )
   }
 
   /**
@@ -53,10 +80,10 @@ export class TokenManager {
    */
   static isOverflow(currentTokens: number, maxTokens: number): boolean {
     if (maxTokens <= 0) return false
-    
+
     // Calculate usable context window
     const usable = maxTokens - this.OUTPUT_RESERVE
-    
+
     return currentTokens > usable
   }
 
@@ -77,7 +104,7 @@ export class TokenManager {
   static applyPruneLabels(messages: BaseMessage[]): PruneLabelResult {
     const msgs = [...messages]
     const pruneWindowStartIndex = this.getPruneWindowStartIndex(msgs)
-    
+
     let estimatedPrunedTokens = 0
     const indicesToLabel: number[] = []
     let toolMessageCount = 0
@@ -85,11 +112,11 @@ export class TokenManager {
     // Traverse backwards
     for (let i = msgs.length - 1; i >= pruneWindowStartIndex; i--) {
       const msg = msgs[i]
-      
+
       // 1. Identify ToolMessages
       if (msg instanceof ToolMessage || msg.getType() === 'tool') {
         toolMessageCount++
-        
+
         // 2. Protect the most recent N tool messages
         if (toolMessageCount <= this.RECENT_TOOL_MESSAGES_TO_PROTECT) {
           continue
@@ -102,11 +129,10 @@ export class TokenManager {
         if (this.PRUNE_PROTECTED_TOOLS.includes(toolName)) continue
 
         // 4. Estimate tokens
-        const content = typeof msg.content === 'string' ? msg.content : JSON.stringify(msg.content)
         // Skip any message already tagged in additional_kwargs.
         if (this.hasPruneLabel(msg)) continue
 
-        const estimate = this.estimate(content)
+        const estimate = this.estimateMessageContent(msg.content)
         estimatedPrunedTokens += estimate
         indicesToLabel.push(i)
       }
@@ -173,5 +199,4 @@ export class TokenManager {
     }
     return Math.max(lastCompactionIndex, leadingSystemCount)
   }
-
 }

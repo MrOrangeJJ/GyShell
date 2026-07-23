@@ -113,7 +113,7 @@ export const writeStdinSchema = z
     sequence: z
       .array(z.string())
       .optional()
-      .describe('List of strings; any item that equals a C0 name is treated as that C0 control code.')
+      .describe('List of strings; CTRL_C and exact C0 names are resolved to their control characters.')
   })
   .refine((val) => !!val.sequence && val.sequence.length > 0, {
     message: 'Provide a non-empty sequence list.'
@@ -138,6 +138,10 @@ export const C0_CHAR_BY_NAME: Record<(typeof C0_NAMES)[number], string> = {
   DLE: '\x10', DC1: '\x11', DC2: '\x12', DC3: '\x13', DC4: '\x14', NAK: '\x15', SYN: '\x16', ETB: '\x17',
   CAN: '\x18', EM: '\x19', SUB: '\x1a', ESC: '\x1b', FS: '\x1c', GS: '\x1d', RS: '\x1e', US: '\x1f', DEL: '\x7f'
 }
+
+export const CONTROL_SEQUENCE_ALIASES = {
+  CTRL_C: '\x03',
+} as const
 
 const RECONNECT_READY_TIMEOUT_MS = 45 * 1000
 const RECONNECT_READY_POLL_MS = 500
@@ -1027,7 +1031,9 @@ export async function writeStdin(args: z.infer<typeof writeStdinSchema>, context
 
   const resolvedSequence: string[] = []
   for (const item of sequence ?? []) {
-    if (C0_NAMES.includes(item as (typeof C0_NAMES)[number])) {
+    if (item === 'CTRL_C') {
+      resolvedSequence.push(CONTROL_SEQUENCE_ALIASES.CTRL_C)
+    } else if (C0_NAMES.includes(item as (typeof C0_NAMES)[number])) {
       resolvedSequence.push(C0_CHAR_BY_NAME[item as (typeof C0_NAMES)[number]])
     } else {
       resolvedSequence.push(item)

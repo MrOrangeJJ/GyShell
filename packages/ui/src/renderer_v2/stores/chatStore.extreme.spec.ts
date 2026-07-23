@@ -355,6 +355,57 @@ runCase(
   },
 )
 
+runCase(
+  'INSERT_MESSAGE places a zero-retention boundary after the final old message',
+  () => {
+    const store = new ChatStore()
+    const session = getActiveSessionOrThrow(store)
+    store.handleUiUpdate({
+      type: 'ADD_MESSAGE',
+      sessionId: session.id,
+      message: createAssistantMessage('user-last', {
+        role: 'user',
+        type: 'text',
+        content: 'unfinished request',
+        backendMessageId: 'backend-user-last',
+        streaming: false,
+      }),
+    })
+    store.handleUiUpdate({
+      type: 'ADD_MESSAGE',
+      sessionId: session.id,
+      message: createAssistantMessage('progress', {
+        type: 'compaction',
+        content: 'Compaction...',
+        streaming: false,
+      }),
+    })
+    store.handleUiUpdate({
+      type: 'INSERT_MESSAGE',
+      sessionId: session.id,
+      message: createAssistantMessage('zero-boundary', {
+        role: 'system',
+        type: 'compaction_boundary',
+        content: '',
+        backendMessageId: 'ui-zero-boundary',
+        streaming: false,
+        metadata: {
+          compactionBoundaryPreviousBackendMessageId: 'backend-user-last',
+          compactionBoundaryProtectedNormalRounds: 0,
+        },
+      }),
+      anchorBackendMessageId: 'backend-user-last',
+      placement: 'after',
+    })
+
+    assertEqual(
+      session.messageIds.join(','),
+      'user-last,zero-boundary,progress',
+      'zero-retention marker should follow the complete old timeline and precede compaction progress',
+    )
+  },
+)
+
 runCase('INSERT_MESSAGE ignores missing anchors instead of appending', () => {
   const store = new ChatStore()
   const session = getActiveSessionOrThrow(store)

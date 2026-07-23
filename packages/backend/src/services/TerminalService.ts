@@ -41,9 +41,12 @@ import {
 } from './terminal/CommandStreamProtocol'
 import { CommandTranscriptCapture } from './terminal/CommandTranscriptCapture'
 import { buildWindowsPowerShellDispatchRequest } from './windowsPowerShellTracking'
+import { TerminalOutputFlowController } from './terminal/TerminalOutputFlowController'
 
 const MAX_BUFFER_SIZE = 200000 // 200KB
 const SCROLLBACK_SIZE = 5000 // Keep up to 5000 lines in virtual terminal
+const TERMINAL_OUTPUT_RETIRE_TIMEOUT_MS = 10_000
+const TERMINAL_HEADLESS_REPLAY_CHUNK_SIZE = 64 * 1024
 const PERSIST_FLUSH_DELAY_MS = 120
 const PRIVATE_UNIX_ECHO_SCAN_SIZE = 4096
 const UNIX_INTERACTIVE_SUBMISSION_BOUNDARY = '\x1b[?2004l'
@@ -328,7 +331,6 @@ export class TerminalService {
   private deferredWritesDuringCommandStartByTerminal: Map<string, string[]> = new Map()
   private deferredWritesUntilTaskFinishByTaskId: Map<string, string[]> = new Map()
   private promptFileIoTailByTerminal: Map<string, Promise<void>> = new Map()
-  private internalRawDisplaySuppressionByTerminal: Map<string, symbol> = new Map()
   private pendingUnixCommandDisplayByTerminal: Map<
     string,
     PendingUnixCommandDisplay
@@ -357,6 +359,13 @@ export class TerminalService {
   > = new Map()
   private headlessWriteSeqByTerminal: Map<string, number> = new Map()
   private headlessFlushedSeqByTerminal: Map<string, number> = new Map()
+  private outputFlowControllerByTerminal: Map<
+    string,
+    TerminalOutputFlowController
+  > = new Map()
+  private outputConsumersByTerminal: Map<string, Set<string>> = new Map()
+  private retiringOutputDrainByTerminal: Map<string, Promise<void>> = new Map()
+  private terminalOutputFailureGenerationByTerminal: Map<string, number> = new Map()
   private pendingTaskFinishByTerminal: Map<string, PendingTaskFinish> = new Map()
   private backendRuntimeGenerationByTerminal: Map<string, number> = new Map()
   private nextBackendRuntimeGeneration = 0
@@ -370,7 +379,7 @@ export class TerminalService {
     WindowsManualPromptWatcher
   > = new Map()
   /**
-   * Highest prompt sequence that any probe, agent command, or human input may
+   * Highest prompt sequence that any agent command or human input may
    * produce. Ambiguous failures retain this floor so delayed older prompts can
    * never complete newer input.
    */
@@ -393,7 +402,7 @@ export class TerminalService {
   private commandTrackingPromptSyncPollIntervalMs = 50
   private commandTrackingPromptSyncTimeoutMs = 2000
   private commandTrackingIoTimeoutMs = 5000
-  private promptFileProbeTimeoutMs = 5000
+  private promptFileRequestTimeoutMs = 5000
   private syntheticCommandQuietWindowMs = 1000
   private syntheticCommandMaxSyncWaitMs = 2000
   private commandCaptureRetentionBudgetBytes = 64 * 1024 * 1024
@@ -837,10 +846,64 @@ export class TerminalService {
           runtimeGeneration
       )
     }
+    this.outputFlowControllerByTerminal.get(terminalId)?.dispose()
+    const headless = this.headlessPtys.get(terminalId)
+    const outputFlowController = new TerminalOutputFlowController({
+      runtimeGeneration,
+      writeHeadless: headless
+        ? (data, callback) => headless.write(data, callback)
+        : undefined,
+      pauseSource: () => {
+        if (isCurrentRuntime()) backend.pauseOutput?.(ptyId)
+      },
+      resumeSource: () => {
+        if (isCurrentRuntime()) backend.resumeOutput?.(ptyId)
+      },
+      onHeadlessFailure: (error) => {
+        this.handleTerminalOutputFailure(
+          terminalId,
+          terminalType,
+          ptyId,
+          runtimeGeneration,
+          error
+        )
+      }
+    })
+    for (const consumerId of this.outputConsumersByTerminal.get(terminalId) || []) {
+      outputFlowController.attachRendererConsumer(consumerId)
+    }
+    this.outputFlowControllerByTerminal.set(terminalId, outputFlowController)
+    const failedGeneration =
+      this.terminalOutputFailureGenerationByTerminal.get(terminalId)
+    if (
+      Number.isSafeInteger(failedGeneration) &&
+      failedGeneration !== runtimeGeneration
+    ) {
+      // A replacement runtime can be silent until its first prompt. Publish a
+      // zero-byte generation boundary so a failed visible parser can rebuild
+      // immediately from the retained buffer without waiting for new output.
+      this.sendToRenderer('terminal:data', {
+        terminalId,
+        data: '',
+        offset: this.getCurrentOffset(terminalId),
+        runtimeGeneration,
+        ...this.getRenderMetadata(terminalId)
+      })
+    }
     backend.onData(ptyId, (data: string) => {
       if (!isCurrentRuntime()) return
-      this.synchronizeCommandStreamProtocol(terminalId, backend, ptyId)
-      this.handleData(terminalId, data, isCurrentRuntime)
+      try {
+        this.synchronizeCommandStreamProtocol(terminalId, backend, ptyId)
+        this.handleData(terminalId, data, isCurrentRuntime)
+      } catch (error) {
+        this.handleTerminalOutputFailure(
+          terminalId,
+          terminalType,
+          ptyId,
+          runtimeGeneration,
+          error instanceof Error ? error : new Error(String(error))
+        )
+      }
     })
     backend.onExit(ptyId, (code: number) => {
       if (!isCurrentRuntime()) return
@@ -1053,6 +1116,13 @@ export class TerminalService {
     }
 
     const backend = this.getBackend(tab.type)
+    await this.retiringOutputDrainByTerminal.get(terminalId)
+    if (
+      this.terminals.get(terminalId) !== tab ||
+      tab.runtimeState !== 'exited'
+    ) {
+      throw new Error(`Terminal ${terminalId} changed while reconnecting`)
+    }
     try {
       backend.kill(tab.ptyId)
     } catch {
@@ -1129,7 +1199,8 @@ export class TerminalService {
 
   private async restartLocalTerminalAfterExit(
     terminalId: string,
-    code: number
+    code: number,
+    outputDrain?: Promise<void>
   ): Promise<void> {
     const tab = this.terminals.get(terminalId)
     const existingConfig = this.terminalConfigs.get(terminalId)
@@ -1154,6 +1225,11 @@ export class TerminalService {
     tab.capabilities = resolveTerminalConnectionCapabilities(restartConfig)
     this.terminalConfigs.set(terminalId, restartConfig)
     this.publishTerminalTabsChanged()
+
+    await outputDrain
+    if (this.terminals.get(terminalId) !== tab) {
+      return
+    }
 
     try {
       const runtime = await this.spawnBackendRuntime(restartConfig)
@@ -1230,54 +1306,34 @@ export class TerminalService {
       }
     }
     const taskRawDisplaySuppressed = this.shouldSuppressRawTaskDisplay(terminalId)
-    const internalRawDisplaySuppressed =
-      this.internalRawDisplaySuppressionByTerminal.has(terminalId)
-    const suppressRawDisplay =
-      taskRawDisplaySuppressed || internalRawDisplaySuppressed
+    const suppressRawDisplay = taskRawDisplaySuppressed
     const headless = this.headlessPtys.get(terminalId)
     let writeSeq = 0
+    let headlessData = ''
     if (!suppressRawDisplay && headless && data) {
       writeSeq = (this.headlessWriteSeqByTerminal.get(terminalId) || 0) + 1
       this.headlessWriteSeqByTerminal.set(terminalId, writeSeq)
-      headless.write(data, () => {
-        if (!isCurrentRuntime()) {
-          return
-        }
-        const flushed = Math.max(this.headlessFlushedSeqByTerminal.get(terminalId) || 0, writeSeq)
-        this.headlessFlushedSeqByTerminal.set(terminalId, flushed)
-        this.tryFlushPendingTaskFinish(terminalId)
-      })
+      headlessData = data
     }
 
     // Process OSC markers and strip markers from visual output
     const cleanedData = this.processIncomingData(terminalId, data, writeSeq)
-    const displayFilteredTaskData =
-      taskRawDisplaySuppressed && !internalRawDisplaySuppressed
+    const displayFilteredTaskData = taskRawDisplaySuppressed
     if (displayFilteredTaskData && headless && cleanedData) {
       writeSeq = (this.headlessWriteSeqByTerminal.get(terminalId) || 0) + 1
       this.headlessWriteSeqByTerminal.set(terminalId, writeSeq)
-      headless.write(cleanedData, () => {
-        if (!isCurrentRuntime()) {
-          return
-        }
-        const flushed = Math.max(
-          this.headlessFlushedSeqByTerminal.get(terminalId) || 0,
-          writeSeq
-        )
-        this.headlessFlushedSeqByTerminal.set(terminalId, flushed)
-        this.tryFlushPendingTaskFinish(terminalId)
-      })
+      headlessData = cleanedData
     }
+    let visibleOffset = 0
     if (
       (!suppressRawDisplay || displayFilteredTaskData) &&
       cleanedData
     ) {
       const buffer = this.buffers.get(terminalId)
-      let currentOffset = 0
       if (buffer) {
         buffer.content += cleanedData
         buffer.offset += cleanedData.length
-        currentOffset = buffer.offset
+        visibleOffset = buffer.offset
 
         if (buffer.content.length > MAX_BUFFER_SIZE) {
           const trimAmount = buffer.content.length - MAX_BUFFER_SIZE
@@ -1285,11 +1341,49 @@ export class TerminalService {
         }
       }
 
-      this.sendToRenderer('terminal:data', {
-        terminalId,
-        data: cleanedData,
-        offset: currentOffset,
-        ...this.getRenderMetadata(terminalId)
+    }
+    const hasVisibleData =
+      (!suppressRawDisplay || displayFilteredTaskData) && Boolean(cleanedData)
+    if (headlessData || hasVisibleData) {
+      const runtimeGeneration =
+        this.backendRuntimeGenerationByTerminal.get(terminalId)
+      const outputController = this.outputFlowControllerByTerminal.get(terminalId)
+      outputController?.enqueue({
+        sourceCost: data.length,
+        headlessData,
+        hasVisibleData,
+        onHeadlessDrained: writeSeq > 0
+          ? () => {
+              if (!isCurrentRuntime()) return
+              const flushed = Math.max(
+                this.headlessFlushedSeqByTerminal.get(terminalId) || 0,
+                writeSeq
+              )
+              this.headlessFlushedSeqByTerminal.set(terminalId, flushed)
+              this.tryFlushPendingTaskFinish(terminalId)
+            }
+          : undefined,
+        publishVisible: hasVisibleData
+          ? (outputSequence, controllerGeneration) => {
+              if (
+                controllerGeneration !== runtimeGeneration ||
+                !isCurrentRuntime()
+              ) {
+                return
+              }
+              const published = this.sendToRenderer('terminal:data', {
+                terminalId,
+                data: cleanedData,
+                offset: visibleOffset,
+                outputSequence,
+                runtimeGeneration: controllerGeneration,
+                ...this.getRenderMetadata(terminalId)
+              })
+              if (!published) {
+                throw new Error('visible terminal output publisher unavailable')
+              }
+            }
+          : undefined
       })
     }
     const currentTerminal = this.terminals.get(terminalId)
@@ -1329,24 +1423,10 @@ export class TerminalService {
     }
 
     const headless = this.headlessPtys.get(terminalId)
+    let writeSeq = 0
     if (headless) {
-      const terminalAtWrite = this.terminals.get(terminalId)
-      const runtimeGeneration =
-        this.backendRuntimeGenerationByTerminal.get(terminalId)
-      const writeSeq = (this.headlessWriteSeqByTerminal.get(terminalId) || 0) + 1
+      writeSeq = (this.headlessWriteSeqByTerminal.get(terminalId) || 0) + 1
       this.headlessWriteSeqByTerminal.set(terminalId, writeSeq)
-      headless.write(data, () => {
-        if (
-          this.terminals.get(terminalId) !== terminalAtWrite ||
-          terminalAtWrite?.runtimeState !== 'ready' ||
-          this.backendRuntimeGenerationByTerminal.get(terminalId) !==
-            runtimeGeneration
-        ) {
-          return
-        }
-        const flushed = Math.max(this.headlessFlushedSeqByTerminal.get(terminalId) || 0, writeSeq)
-        this.headlessFlushedSeqByTerminal.set(terminalId, flushed)
-      })
     }
 
     const buffer = this.buffers.get(terminalId)
@@ -1362,11 +1442,43 @@ export class TerminalService {
       }
     }
 
-    this.sendToRenderer('terminal:data', {
-      terminalId,
-      data,
-      offset: currentOffset,
-      ...this.getRenderMetadata(terminalId)
+    const terminalAtWrite = this.terminals.get(terminalId)
+    const runtimeGeneration =
+      this.backendRuntimeGenerationByTerminal.get(terminalId)
+    this.outputFlowControllerByTerminal.get(terminalId)?.enqueue({
+      sourceCost: data.length,
+      headlessData: headless ? data : '',
+      hasVisibleData: true,
+      onHeadlessDrained: writeSeq > 0
+        ? () => {
+            if (
+              this.terminals.get(terminalId) !== terminalAtWrite ||
+              this.backendRuntimeGenerationByTerminal.get(terminalId) !==
+                runtimeGeneration
+            ) {
+              return
+            }
+            const flushed = Math.max(
+              this.headlessFlushedSeqByTerminal.get(terminalId) || 0,
+              writeSeq
+            )
+            this.headlessFlushedSeqByTerminal.set(terminalId, flushed)
+          }
+        : undefined,
+      publishVisible: (outputSequence, controllerGeneration) => {
+        if (controllerGeneration !== runtimeGeneration) return
+        const published = this.sendToRenderer('terminal:data', {
+          terminalId,
+          data,
+          offset: currentOffset,
+          outputSequence,
+          runtimeGeneration: controllerGeneration,
+          ...this.getRenderMetadata(terminalId)
+        })
+        if (!published) {
+          throw new Error('visible terminal output publisher unavailable')
+        }
+      }
     })
   }
 
@@ -2134,11 +2246,150 @@ export class TerminalService {
 
   }
 
+  private async replayIntoHeadlessTerminal(
+    terminal: TerminalType,
+    content: string
+  ): Promise<void> {
+    let offset = 0
+    while (offset < content.length) {
+      let end = Math.min(
+        content.length,
+        offset + TERMINAL_HEADLESS_REPLAY_CHUNK_SIZE
+      )
+      if (
+        end < content.length &&
+        end > offset &&
+        content.charCodeAt(end - 1) >= 0xd800 &&
+        content.charCodeAt(end - 1) <= 0xdbff &&
+        content.charCodeAt(end) >= 0xdc00 &&
+        content.charCodeAt(end) <= 0xdfff
+      ) {
+        end -= 1
+      }
+      const chunk = content.slice(offset, end)
+      await new Promise<void>((resolve, reject) => {
+        try {
+          terminal.write(chunk, resolve)
+        } catch (error) {
+          reject(error)
+        }
+      })
+      offset = end
+    }
+  }
+
+  private async rebuildHeadlessAfterOutputFailure(
+    terminalId: string,
+    failedGeneration: number | undefined,
+    retiringHeadless: TerminalType | undefined
+  ): Promise<void> {
+    if (
+      !Number.isSafeInteger(failedGeneration) ||
+      this.terminalOutputFailureGenerationByTerminal.get(terminalId) !==
+        failedGeneration
+    ) {
+      return
+    }
+
+    const expectedTab = this.terminals.get(terminalId)
+    if (!expectedTab || this.headlessPtys.get(terminalId) !== retiringHeadless) {
+      return
+    }
+
+    const createFreshHeadless = (): TerminalType =>
+      new Terminal({
+        cols: expectedTab.cols,
+        rows: expectedTab.rows,
+        scrollback: SCROLLBACK_SIZE,
+        allowProposedApi: true
+      })
+    let replacement = createFreshHeadless()
+    try {
+      const retainedDisplay = this.buffers.get(terminalId)?.content || ''
+      await this.replayIntoHeadlessTerminal(replacement, retainedDisplay)
+    } catch (error) {
+      console.error(
+        `[TerminalService] Failed to replay retained output while rebuilding headless terminal ${terminalId}; installing an empty parser instead.`,
+        error
+      )
+      replacement.dispose()
+      replacement = createFreshHeadless()
+      try {
+        await this.replayIntoHeadlessTerminal(
+          replacement,
+          '\r\nTerminal display recovery could not replay the retained buffer; future output will continue in a fresh parser.\r\n'
+        )
+      } catch {
+        replacement.dispose()
+        replacement = createFreshHeadless()
+      }
+    }
+
+    if (
+      this.terminals.get(terminalId) !== expectedTab ||
+      this.headlessPtys.get(terminalId) !== retiringHeadless ||
+      this.terminalOutputFailureGenerationByTerminal.get(terminalId) !==
+        failedGeneration
+    ) {
+      replacement.dispose()
+      return
+    }
+
+    replacement.resize(expectedTab.cols, expectedTab.rows)
+    this.headlessPtys.set(terminalId, replacement)
+    retiringHeadless?.dispose()
+  }
+
   private handleExit(terminalId: string, code: number): void {
     // A command still preparing against this runtime must not block a
     // replacement runtime that reuses the same terminal id. Its generation
     // check will prevent any late dispatch.
     this.cancelCommandStartReservation(terminalId)
+    const retiringOutputController =
+      this.outputFlowControllerByTerminal.get(terminalId)
+    const retiringRuntimeGeneration =
+      retiringOutputController?.runtimeGeneration ??
+      this.backendRuntimeGenerationByTerminal.get(terminalId)
+    const retiringHeadless = this.headlessPtys.get(terminalId)
+    const controllerDrain = retiringOutputController
+      ? retiringOutputController
+          .waitForDrain(TERMINAL_OUTPUT_RETIRE_TIMEOUT_MS)
+          .then((drained) => {
+            if (!drained) {
+              console.warn(
+                `[TerminalService] Final terminal output did not drain cleanly for ${terminalId}; continuing with bounded recovery.`
+              )
+            }
+            if (
+              this.outputFlowControllerByTerminal.get(terminalId) ===
+              retiringOutputController
+            ) {
+              retiringOutputController.dispose()
+              this.outputFlowControllerByTerminal.delete(terminalId)
+            }
+          })
+      : Promise.resolve()
+    const outputDrain = controllerDrain
+      .then(() =>
+        this.rebuildHeadlessAfterOutputFailure(
+          terminalId,
+          retiringRuntimeGeneration,
+          retiringHeadless
+        )
+      )
+      .catch((error) => {
+        // Runtime replacement must never be stranded by recovery diagnostics.
+        console.error(
+          `[TerminalService] Failed while retiring terminal output for ${terminalId}.`,
+          error
+        )
+      })
+    this.retiringOutputDrainByTerminal.set(terminalId, outputDrain)
+    void outputDrain.finally(() => {
+      if (this.retiringOutputDrainByTerminal.get(terminalId) === outputDrain) {
+        this.retiringOutputDrainByTerminal.delete(terminalId)
+      }
+    })
     const tab = this.terminals.get(terminalId)
     this.flushCommandProtocolOnRuntimeExit(terminalId)
     
@@ -2195,7 +2446,6 @@ export class TerminalService {
       this.enforceCommandCaptureRetention()
     }
     this.terminalInputSequenceTailByTerminal.delete(terminalId)
-    this.internalRawDisplaySuppressionByTerminal.delete(terminalId)
     this.pendingUnixCommandDisplayByTerminal.delete(terminalId)
     this.clearWindowsPromptRuntimeState(terminalId)
     this.pendingTaskFinishByTerminal.delete(terminalId)
@@ -2217,7 +2467,11 @@ export class TerminalService {
         tab.runtimeState !== 'exited' &&
         !this.terminalIdsBeingKilled.has(terminalId)
       ) {
-        void this.restartLocalTerminalAfterExit(terminalId, code)
+        void this.restartLocalTerminalAfterExit(
+          terminalId,
+          code,
+          outputDrain
+        )
         return
       }
       tab.isInitializing = false
@@ -2237,6 +2491,62 @@ export class TerminalService {
     this.sendToRenderer('terminal:exit', { terminalId, code })
     this.publishTerminalTabsChanged()
     this.schedulePersistTerminalState()
+  }
+
+  private handleTerminalOutputFailure(
+    terminalId: string,
+    terminalType: ConnectionType,
+    ptyId: string,
+    runtimeGeneration: number,
+    error: Error
+  ): void {
+    if (
+      this.backendRuntimeGenerationByTerminal.get(terminalId) !==
+      runtimeGeneration
+    ) {
+      return
+    }
+    if (
+      this.terminalOutputFailureGenerationByTerminal.get(terminalId) ===
+      runtimeGeneration
+    ) {
+      return
+    }
+    this.terminalOutputFailureGenerationByTerminal.set(
+      terminalId,
+      runtimeGeneration
+    )
+    console.error(
+      `[TerminalService] Terminal output flow failed for ${terminalId}; stopping runtime to preserve headless/visible consistency.`,
+      error
+    )
+    const message =
+      '\r\n\x1b[31m✘ Terminal output parser failed and this runtime was stopped to prevent data loss. Reconnect the terminal to continue.\x1b[0m\r\n'
+    const buffer = this.buffers.get(terminalId)
+    let offset = 0
+    if (buffer) {
+      buffer.content += message
+      buffer.offset += message.length
+      offset = buffer.offset
+      if (buffer.content.length > MAX_BUFFER_SIZE) {
+        buffer.content = buffer.content.slice(-MAX_BUFFER_SIZE)
+      }
+    }
+    this.sendToRenderer('terminal:data', {
+      terminalId,
+      data: message,
+      offset,
+      ...this.getRenderMetadata(terminalId)
+    })
+    try {
+      this.getBackend(terminalType).kill(ptyId)
+    } catch (killError) {
+      console.error(
+        `[TerminalService] Failed to stop output-corrupted runtime ${terminalId}:`,
+        killError
+      )
+      this.handleExit(terminalId, -1)
+    }
   }
 
   private canWriteToTerminal(terminal: TerminalTab): boolean {
@@ -2686,6 +2996,14 @@ export class TerminalService {
       } finally {
         this.terminalIdsBeingKilled.delete(terminalId)
       }
+
+      this.outputFlowControllerByTerminal.get(terminalId)?.dispose()
+      this.outputFlowControllerByTerminal.delete(terminalId)
+      // Visible consumers belong to the retained renderer runtime, not to one
+      // backend process. Renderer detach/webContents teardown removes them;
+      // keeping the registry here lets a quickly reused terminal id attach its
+      // replacement controller to the same visible xterm.
+      this.terminalOutputFailureGenerationByTerminal.delete(terminalId)
       
       const headless = this.headlessPtys.get(terminalId)
       if (headless) {
@@ -2698,7 +3016,6 @@ export class TerminalService {
       this.buffers.delete(terminalId)
       this.selectionByTerminal.delete(terminalId)
       this.commandStreamProtocolByTerminal.delete(terminalId)
-      this.internalRawDisplaySuppressionByTerminal.delete(terminalId)
       this.pendingUnixCommandDisplayByTerminal.delete(terminalId)
       this.commandProtocolTokenByTerminal.delete(terminalId)
       this.shellInputStateByTerminal.delete(terminalId)
@@ -3174,6 +3491,93 @@ export class TerminalService {
     return buffer?.offset || 0
   }
 
+  attachOutputConsumer(
+    terminalId: string,
+    consumerId: string
+  ): {
+    runtimeGeneration?: number
+    data: string
+    offset: number
+    remoteOs?: 'unix' | 'windows'
+    windowsRelease?: string
+  } {
+    if (!terminalId || !consumerId) {
+      return { data: '', offset: 0 }
+    }
+    let consumers = this.outputConsumersByTerminal.get(terminalId)
+    if (!consumers) {
+      consumers = new Set<string>()
+      this.outputConsumersByTerminal.set(terminalId, consumers)
+    }
+    consumers.add(consumerId)
+    const controller = this.outputFlowControllerByTerminal.get(terminalId)
+    controller?.attachRendererConsumer(consumerId)
+    // Registration and snapshot capture are one synchronous main-process
+    // operation. Output emitted after this point is retained as live consumer
+    // credit, so the renderer can merge it with this exact buffer baseline.
+    const buffer = this.buffers.get(terminalId)
+    return {
+      runtimeGeneration:
+        controller?.runtimeGeneration ??
+        this.backendRuntimeGenerationByTerminal.get(terminalId),
+      data: buffer?.content || '',
+      offset: buffer?.offset || 0,
+      ...this.getRenderMetadata(terminalId)
+    }
+  }
+
+  detachOutputConsumer(terminalId: string, consumerId: string): void {
+    const consumers = this.outputConsumersByTerminal.get(terminalId)
+    consumers?.delete(consumerId)
+    if (consumers?.size === 0) {
+      this.outputConsumersByTerminal.delete(terminalId)
+    }
+    this.outputFlowControllerByTerminal
+      .get(terminalId)
+      ?.detachRendererConsumer(consumerId)
+  }
+
+  acknowledgeOutput(
+    terminalId: string,
+    consumerId: string,
+    runtimeGeneration: number,
+    outputSequence: number
+  ): void {
+    const controller = this.outputFlowControllerByTerminal.get(terminalId)
+    if (!controller || controller.runtimeGeneration !== runtimeGeneration) {
+      return
+    }
+    controller.acknowledgeRenderer(consumerId, outputSequence)
+  }
+
+  reportOutputConsumerFailure(
+    terminalId: string,
+    consumerId: string,
+    runtimeGeneration: number,
+    errorMessage: string
+  ): void {
+    const controller = this.outputFlowControllerByTerminal.get(terminalId)
+    const terminal = this.terminals.get(terminalId)
+    if (
+      !controller ||
+      !terminal ||
+      controller.runtimeGeneration !== runtimeGeneration
+    ) {
+      return
+    }
+    controller.detachRendererConsumer(consumerId)
+    const normalizedMessage = String(errorMessage || 'visible xterm write failed')
+      .replace(/[\r\n]+/g, ' ')
+      .slice(0, 500)
+    this.handleTerminalOutputFailure(
+      terminalId,
+      terminal.type,
+      terminal.ptyId,
+      runtimeGeneration,
+      new Error(normalizedMessage || 'visible xterm write failed')
+    )
+  }
+
   getRenderMetadata(terminalId: string): TerminalRenderMetadata {
     const terminal = this.terminals.get(terminalId)
     const remoteOs =
@@ -3549,10 +3953,36 @@ export class TerminalService {
       return undefined
     }
     try {
-      return await this.awaitCommandTrackingIo(
+      const token = await this.awaitCommandTrackingIo(
         backend.prepareCommandTracking(terminal.ptyId),
         'command tracking preparation'
       )
+      if (token?.mode !== 'windows-powershell-sidecar') {
+        return token
+      }
+
+      const cached = this.windowsPromptBaselineByTerminal.get(terminal.id)
+      const trackingScopeMatches =
+        cached?.mode === token.mode &&
+        (!cached.trackingScopeId ||
+          !token.trackingScopeId ||
+          cached.trackingScopeId === token.trackingScopeId)
+      if (!cached || !trackingScopeMatches) {
+        return token
+      }
+
+      // Preparation bounds the append-only prompt journal by truncating it.
+      // If a prepared command is cancelled before dispatch, the next live
+      // read is legitimately empty. Keep the monotonic baseline already
+      // authenticated for this runtime instead of falling back to sequence 0.
+      return {
+        ...token,
+        baselineSequence: Math.max(
+          token.baselineSequence,
+          cached.baselineSequence,
+          this.windowsPromptSequenceFloorByTerminal.get(terminal.id) || 0
+        ),
+      }
     } catch (error) {
       if (options?.failClosed) {
         const detail = error instanceof Error ? error.message : String(error)
@@ -3645,18 +4075,6 @@ export class TerminalService {
     this.publishTerminalTabsChanged()
     this.schedulePersistTerminalState()
     return true
-  }
-
-  private advanceWindowsPromptBaseline(
-    token: TerminalCommandTrackingToken,
-    sequence: number
-  ): TerminalCommandTrackingToken {
-    return {
-      ...token,
-      baselineSequence: sequence,
-      awaitingInitialFreshMarker: false,
-      dispatchedAtMs: undefined,
-    }
   }
 
   private rememberWindowsPromptBaseline(
@@ -3795,10 +4213,19 @@ export class TerminalService {
       return
     }
     const activeTask = this.getActiveTask(terminalId)
-    if (activeTask && update.output !== undefined) {
-      activeTask.capturedOutput = update.output
-      activeTask.capturedOutputObservedUtf8Bytes = update.outputObservedUtf8Bytes
+    if (activeTask) {
+      if (update.output !== undefined) {
+        activeTask.capturedOutput = update.output
+      }
+      if (update.outputObservedUtf8Bytes !== undefined) {
+        activeTask.capturedOutputObservedUtf8Bytes = update.outputObservedUtf8Bytes
+      }
+      if (update.outputRetainedUtf8Bytes !== undefined) {
+        activeTask.capturedOutputRetainedUtf8Bytes = update.outputRetainedUtf8Bytes
+      }
       activeTask.capturedOutputTruncated = update.outputTruncated === true
+      activeTask.capturedOutputCaptureFailed =
+        update.outputCaptureFailed === true
     }
     if (activeTask?.completionTracking) {
       this.rememberWindowsPromptBaseline(
@@ -3832,8 +4259,15 @@ export class TerminalService {
     ) {
       throw new Error('Windows sidecar completion does not match its task request identity.')
     }
-    if (update.output === undefined) {
+    if (
+      update.output === undefined &&
+      (update.outputCaptureFailed !== true ||
+        update.outputRetainedUtf8Bytes !== 0)
+    ) {
       throw new Error('Windows sidecar completion arrived without its task output file.')
+    }
+    if (update.output === undefined) {
+      return
     }
     if (update.outputRetainedUtf8Bytes === undefined) {
       throw new Error('Windows sidecar completion arrived without its retained output length.')
@@ -3853,6 +4287,7 @@ export class TerminalService {
     }
     if (
       update.outputTruncated !== true &&
+      update.outputCaptureFailed !== true &&
       update.outputObservedUtf8Bytes !== undefined &&
       update.outputRetainedUtf8Bytes !== update.outputObservedUtf8Bytes
     ) {
@@ -4538,97 +4973,6 @@ export class TerminalService {
     }
   }
 
-  private async waitForPromptFileProbe(options: {
-    terminalId: string
-    runtimePtyId: string
-    backend: TerminalBackend & TerminalFileSystemBackend
-    token: TerminalCommandTrackingToken
-    requestPath: string
-    expectedOutput: string
-    runtimeIsCurrent: () => boolean
-    signal?: AbortSignal
-  }): Promise<TerminalCommandTrackingUpdate> {
-    const {
-      terminalId,
-      runtimePtyId,
-      backend,
-      token,
-      requestPath,
-      expectedOutput,
-      runtimeIsCurrent,
-      signal,
-    } = options
-    if (typeof backend.pollCommandTracking !== 'function') {
-      throw new Error('The Windows prompt-file protocol has no completion poller.')
-    }
-
-    const deadline = Date.now() + this.promptFileProbeTimeoutMs
-    let lastFailure = 'the prompt hook did not acknowledge the probe'
-    while (runtimeIsCurrent()) {
-      throwIfTerminalOperationAborted(signal)
-      try {
-        const remainingMs = Math.max(1, deadline - Date.now())
-        const update = await this.awaitCommandTrackingIo(
-          backend.pollCommandTracking(runtimePtyId, token),
-          'Windows prompt-file probe poll',
-          Math.min(this.commandTrackingIoTimeoutMs, remainingMs)
-        )
-        throwIfTerminalOperationAborted(signal)
-        if (!runtimeIsCurrent()) {
-          break
-        }
-        if (update) {
-          const requestContents = await this.awaitCommandTrackingIo(
-            backend.readFile(runtimePtyId, requestPath),
-            'Windows prompt-file probe request read',
-            Math.min(this.commandTrackingIoTimeoutMs, remainingMs)
-          )
-          throwIfTerminalOperationAborted(signal)
-          if (!runtimeIsCurrent()) {
-            break
-          }
-          const outputWithoutOneTrailingNewline = update.output?.endsWith('\r\n')
-            ? update.output.slice(0, -2)
-            : update.output?.endsWith('\n')
-              ? update.output.slice(0, -1)
-              : update.output
-          if (
-            requestContents.length === 0 &&
-            update.exitCode === 0 &&
-            update.requestId === token.expectedRequestId &&
-            update.outputTruncated !== true &&
-            outputWithoutOneTrailingNewline === expectedOutput
-          ) {
-            return update
-          }
-          lastFailure =
-            requestContents.length === 0
-              ? 'the prompt hook returned an invalid probe acknowledgement'
-              : 'the prompt hook did not consume the probe request file'
-        }
-      } catch (error) {
-        if (signal?.aborted) {
-          throwIfTerminalOperationAborted(signal)
-        }
-        if (!runtimeIsCurrent()) {
-          break
-        }
-        lastFailure = error instanceof Error ? error.message : String(error)
-      }
-
-      if (Date.now() >= deadline) {
-        throw new Error(
-          `Unable to verify the Windows prompt-file command hook for terminal ${terminalId}: ${lastFailure}.`
-        )
-      }
-      await waitForTerminalDelay(this.commandTrackingPollIntervalMs, signal)
-    }
-
-    throw new Error(
-      `Terminal ${terminalId} changed while the Windows prompt-file command hook was being verified.`
-    )
-  }
-
   private async waitForPromptFileRequestConsumption(options: {
     terminalId: string
     runtimePtyId: string
@@ -4643,7 +4987,7 @@ export class TerminalService {
       requestPath,
       runtimeIsCurrent,
     } = options
-    const deadline = Date.now() + this.promptFileProbeTimeoutMs
+    const deadline = Date.now() + this.promptFileRequestTimeoutMs
     let lastFailure = 'the request file still contains the user command'
     while (runtimeIsCurrent()) {
       try {
@@ -4727,7 +5071,6 @@ export class TerminalService {
     let promptRequestCleanup: (() => Promise<boolean>) | undefined
     const shellInputStateBeforePromptDispatch =
       this.shellInputStateByTerminal.get(terminalId)
-    let promptProbeVerified = false
     const restoreShellStateAfterPromptDispatchFailure = (): void => {
       if (!runtimeIsCurrent()) {
         return
@@ -4761,9 +5104,9 @@ export class TerminalService {
       completionTracking?.dispatchMode === 'prompt-file'
     if (
       requestsPromptFileDispatch &&
-      (!completionTracking?.commandRequestPath ||
+      (!completionTracking?.dispatchInput ||
+        !completionTracking?.commandRequestPath ||
         !completionTracking?.commandOutputPath ||
-        !completionTracking?.dispatchInput ||
         !isTerminalFileSystemBackend(backend))
     ) {
       throw new Error(
@@ -4826,118 +5169,12 @@ export class TerminalService {
         }
       }
 
-      // A runtime-private top-level dispatcher consumes the request file. It
-      // can still be damaged by a previous stateful command, while the
-      // filesystem capability remains available. Prove the full dispatch and
-      // prompt-publication path before the real user command is ever stored.
+      // Bootstrap readiness establishes the runtime-private dispatcher. The
+      // request id, one-time file consumption, completion marker, and cleanup
+      // quarantine then authenticate this exact user request. A separate
+      // preflight dispatch is not atomic with the real request and only
+      // duplicates shell input, prompts, history, and latency.
       completionTracking.expectCommandOutput = true
-      const probeRequestId = uuidv4().replace(/-/g, '')
-      completionTracking.expectedRequestId = probeRequestId
-      const probeOutput = `__GYSHELL_PROMPT_FILE_PROBE_${probeRequestId}`
-      // A previous stateful command may have defined a function or alias named
-      // Write-Output. A string expression exercises capture without invoking
-      // any user-overridable command name.
-      const probeCommand = `'${probeOutput}'`
-      const probePayload = buildWindowsPowerShellDispatchRequest({
-        requestId: probeRequestId,
-        kind: 'probe',
-        command: probeCommand,
-      })
-      promptRequestPending = true
-      try {
-        await this.awaitCommandTrackingIo(
-          backend.writeFile(
-            runtimePtyId,
-            completionTracking.commandRequestPath,
-            probePayload
-          ),
-          'Windows prompt-file probe request write'
-        )
-      } catch (writeError) {
-        await clearPendingPromptRequest()
-        if (this.isCommandTrackingIoTimeout(writeError)) {
-          quarantineCurrentPromptFileRuntime()
-        }
-        restoreShellStateAfterPromptDispatchFailure()
-        throw writeError
-      }
-      if (!runtimeIsCurrent()) {
-        await clearPendingPromptRequest()
-        throw new Error(
-          `Terminal ${terminalId} changed before the prompt-file liveness probe could be triggered.`
-        )
-      }
-      if (signal?.aborted) {
-        await clearPendingPromptRequest()
-        restoreShellStateAfterPromptDispatchFailure()
-        throwIfTerminalOperationAborted(signal)
-      }
-
-      let probeUpdate: TerminalCommandTrackingUpdate
-      const probeDisplaySuppressionLease = Symbol(terminalId)
-      this.internalRawDisplaySuppressionByTerminal.set(
-        terminalId,
-        probeDisplaySuppressionLease
-      )
-      try {
-        this.shellInputStateByTerminal.set(terminalId, 'busy')
-        try {
-          backend.write(
-            runtimePtyId,
-            `${completionTracking.dispatchInput}${eol}`
-          )
-          this.reserveWindowsPromptSequence(
-            terminalId,
-            completionTracking
-          )
-        } catch (writeError) {
-          await clearPendingPromptRequest()
-          restoreShellStateAfterPromptDispatchFailure()
-          throw writeError
-        }
-
-        try {
-          probeUpdate = await this.waitForPromptFileProbe({
-            terminalId,
-            runtimePtyId,
-            backend,
-            token: completionTracking,
-            requestPath: completionTracking.commandRequestPath,
-            expectedOutput: probeOutput,
-            runtimeIsCurrent,
-            signal,
-          })
-        } catch (probeError) {
-          await clearPendingPromptRequest()
-          if (runtimeIsCurrent()) {
-            // The probe may have reached the shell without a trustworthy
-            // acknowledgement. Do not reopen the command gate on an assumption.
-            this.shellInputStateByTerminal.set(terminalId, 'unknown')
-          }
-          throw probeError
-        }
-      } finally {
-        if (
-          this.internalRawDisplaySuppressionByTerminal.get(terminalId) ===
-          probeDisplaySuppressionLease
-        ) {
-          this.internalRawDisplaySuppressionByTerminal.delete(terminalId)
-        }
-      }
-      promptRequestPending = false
-      const advancedTracking = this.advanceWindowsPromptBaseline(
-        completionTracking,
-        probeUpdate.sequence
-      )
-      Object.assign(completionTracking, advancedTracking)
-      this.rememberWindowsPromptBaseline(
-        terminalId,
-        advancedTracking,
-        probeUpdate.sequence
-      )
-      this.applyCommandTrackingMetadata(terminalId, probeUpdate)
-      promptProbeVerified = true
-
       const commandRequestId = taskId.replace(/-/g, '')
       completionTracking.expectedRequestId = commandRequestId
       const requestPayload = buildWindowsPowerShellDispatchRequest({
@@ -5065,9 +5302,7 @@ export class TerminalService {
       const dispatchedInput = usedPromptFileDispatch
         ? `${completionTracking!.dispatchInput}${eol}`
         : `${wireCommand}${eol}`
-      const previousShellInputState = promptProbeVerified
-        ? shellInputStateBeforePromptDispatch
-        : this.shellInputStateByTerminal.get(terminalId)
+      const previousShellInputState = shellInputStateBeforePromptDispatch
       this.shellInputStateByTerminal.set(terminalId, 'busy')
       if (completionTracking) {
         completionTracking.dispatchedAtMs = Date.now()
@@ -5122,6 +5357,7 @@ export class TerminalService {
         promptRequestPending = false
       } catch (consumptionError) {
         await clearPendingPromptRequest()
+        quarantineCurrentPromptFileRuntime()
         task.terminalStatus =
           consumptionError instanceof Error
             ? consumptionError.message
@@ -5397,16 +5633,18 @@ export class TerminalService {
       const capturedOutputBytes = hasSidecarOutput
         ? Buffer.byteLength(task.capturedOutput || '', 'utf8')
         : undefined
+      const sidecarRetainedBytes =
+        task.capturedOutputRetainedUtf8Bytes ?? capturedOutputBytes
       const sidecarObservedLoss =
-        capturedOutputBytes !== undefined &&
+        sidecarRetainedBytes !== undefined &&
         task.capturedOutputObservedUtf8Bytes !== undefined &&
-        capturedOutputBytes < task.capturedOutputObservedUtf8Bytes
+        sidecarRetainedBytes < task.capturedOutputObservedUtf8Bytes
       const sidecarObservedLossBytes =
-        capturedOutputBytes !== undefined &&
+        sidecarRetainedBytes !== undefined &&
         task.capturedOutputObservedUtf8Bytes !== undefined
           ? Math.max(
               0,
-              task.capturedOutputObservedUtf8Bytes - capturedOutputBytes
+              task.capturedOutputObservedUtf8Bytes - sidecarRetainedBytes
             )
           : 0
       const pendingObservedLossBytes = pendingMetadata
@@ -5424,7 +5662,10 @@ export class TerminalService {
         capture.getMetadata().observedUtf8Bytes +
         sidecarObservedLossBytes +
         pendingObservedLossBytes
-      if (task.capturedOutputTruncated || sidecarObservedLoss) {
+      if (
+        !task.capturedOutputCaptureFailed &&
+        (task.capturedOutputTruncated || sidecarObservedLoss)
+      ) {
         if (capture.getMetadata().state === 'unknown') {
           capture.markUnknown(
             capture.getMetadata().reason || 'tracking_lost',
@@ -5436,6 +5677,9 @@ export class TerminalService {
             combinedObservedUtf8Bytes
           )
         }
+      }
+      if (task.capturedOutputCaptureFailed) {
+        capture.markUnknown('tracking_lost', combinedObservedUtf8Bytes)
       }
       if (pendingMetadata?.state === 'incomplete') {
         if (capture.getMetadata().state === 'unknown') {
@@ -5559,7 +5803,9 @@ export class TerminalService {
     delete task.completionTracking
     delete task.capturedOutput
     delete task.capturedOutputObservedUtf8Bytes
+    delete task.capturedOutputRetainedUtf8Bytes
     delete task.capturedOutputTruncated
+    delete task.capturedOutputCaptureFailed
     delete task.syntheticSidecarDisplayOutput
     delete task.syntheticRawDisplayObserved
     delete task.syntheticRawDisplayEndsWithLineBreak
@@ -5935,11 +6181,20 @@ export class TerminalService {
     return value.replace(/\s+/g, ' ').trim()
   }
 
-  private sendToRenderer(channel: string, data: unknown): void {
+  private sendToRenderer(channel: string, data: unknown): boolean {
     if (!this.rawEventPublisher) {
       console.warn(`[TerminalService] Missing rawEventPublisher, dropped event: ${channel}`)
-      return
+      return false
     }
-    this.rawEventPublisher(channel, data)
+    try {
+      this.rawEventPublisher(channel, data)
+      return true
+    } catch (error) {
+      console.warn(
+        `[TerminalService] raw event publisher failed for ${channel}:`,
+        error
+      )
+      return false
+    }
   }
 }

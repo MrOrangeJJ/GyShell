@@ -899,6 +899,21 @@ async function run(): Promise<void> {
 
   {
     const terminalService = new FakeTerminalService('ready')
+    const { context } = createContext(terminalService)
+    const result = await writeStdin(
+      { tabIdOrName: 'ssh-disconnected', sequence: ['CTRL_C', 'CAN'] },
+      context
+    )
+    assertIncludes(result, 'Sent sequence: CTRL_C, CAN', 'write_stdin should preserve readable alias reporting')
+    assertEqual(
+      JSON.stringify(terminalService.writeInputSequenceCalls),
+      JSON.stringify([['\x03', '\x18']]),
+      'CTRL_C must send ETX while the C0 CAN name must remain Ctrl+X'
+    )
+  }
+
+  {
+    const terminalService = new FakeTerminalService('ready')
     const controller = new AbortController()
     const { context, events } = createContext(terminalService)
     const registrations: any[] = []

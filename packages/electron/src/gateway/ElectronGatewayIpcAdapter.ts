@@ -6,7 +6,7 @@ import {
   app,
   nativeImage,
 } from "electron";
-import type { IpcMainInvokeEvent, NativeImage } from "electron";
+import type { IpcMainInvokeEvent, IpcMainEvent, NativeImage } from "electron";
 import type {
   StartTaskOptions,
   StartTaskInput,
@@ -89,6 +89,11 @@ const resolveDragIcon = async (filePath: string): Promise<NativeImage> => {
 
 export class ElectronGatewayIpcAdapter {
   private registeredSessionOwnerWebContentsIds = new Set<number>();
+  private outputConsumersByWebContentsId = new Map<
+    number,
+    Map<string, { terminalId: string; qualifiedConsumerId: string }>
+  >();
+  private outputConsumerCleanupRegisteredWebContentsIds = new Set<number>();
 
   constructor(
     private gateway: IGatewayRuntime,
@@ -138,6 +143,72 @@ export class ElectronGatewayIpcAdapter {
       releaseOwner();
     });
     return ownerId;
+  }
+
+  private qualifyOutputConsumerId(
+    webContentsId: number,
+    consumerId: string,
+  ): string {
+    return `electron-webcontents:${webContentsId}:${consumerId}`;
+  }
+
+  private trackOutputConsumer(
+    event: IpcMainInvokeEvent,
+    terminalId: string,
+    consumerId: string,
+  ): string {
+    const webContentsId = event.sender.id;
+    const qualifiedConsumerId = this.qualifyOutputConsumerId(
+      webContentsId,
+      consumerId,
+    );
+    let consumers = this.outputConsumersByWebContentsId.get(webContentsId);
+    if (!consumers) {
+      consumers = new Map();
+      this.outputConsumersByWebContentsId.set(webContentsId, consumers);
+    }
+    if (
+      !this.outputConsumerCleanupRegisteredWebContentsIds.has(webContentsId)
+    ) {
+      this.outputConsumerCleanupRegisteredWebContentsIds.add(webContentsId);
+      const releaseConsumers = () => {
+        const owned = this.outputConsumersByWebContentsId.get(webContentsId);
+        this.outputConsumersByWebContentsId.delete(webContentsId);
+        for (const consumer of owned?.values() || []) {
+          this.terminalService.detachOutputConsumer(
+            consumer.terminalId,
+            consumer.qualifiedConsumerId,
+          );
+        }
+      };
+      event.sender.on("did-navigate", releaseConsumers);
+      event.sender.on("render-process-gone", releaseConsumers);
+      event.sender.once("destroyed", () => {
+        this.outputConsumerCleanupRegisteredWebContentsIds.delete(
+          webContentsId,
+        );
+        releaseConsumers();
+      });
+    }
+    const previous = consumers.get(consumerId);
+    if (previous && previous.terminalId !== terminalId) {
+      this.terminalService.detachOutputConsumer(
+        previous.terminalId,
+        previous.qualifiedConsumerId,
+      );
+    }
+    consumers.set(consumerId, { terminalId, qualifiedConsumerId });
+    return qualifiedConsumerId;
+  }
+
+  private untrackOutputConsumer(
+    webContentsId: number,
+    consumerId: string,
+  ): { terminalId: string; qualifiedConsumerId: string } | undefined {
+    const consumers = this.outputConsumersByWebContentsId.get(webContentsId);
+    const tracked = consumers?.get(consumerId);
+    consumers?.delete(consumerId);
+    return tracked;
   }
 
   private updateWindowsThemeIfNeeded(): void {
@@ -857,6 +928,88 @@ export class ElectronGatewayIpcAdapter {
           offset,
           ...this.terminalService.getRenderMetadata(terminalId),
         };
+      },
+    );
+
+    ipcMain.handle(
+      "terminal:attachOutputConsumer",
+      async (
+        event: IpcMainInvokeEvent,
+        terminalId: string,
+        consumerId: string,
+      ) => {
+        const qualifiedConsumerId = this.trackOutputConsumer(
+          event,
+          terminalId,
+          consumerId,
+        );
+        return this.terminalService.attachOutputConsumer(
+          terminalId,
+          qualifiedConsumerId,
+        );
+      },
+    );
+
+    ipcMain.on(
+      "terminal:detachOutputConsumer",
+      (
+        event: IpcMainEvent,
+        _terminalId: string,
+        consumerId: string,
+      ) => {
+        const tracked = this.untrackOutputConsumer(
+          event.sender.id,
+          consumerId,
+        );
+        if (!tracked) return;
+        this.terminalService.detachOutputConsumer(
+          tracked.terminalId,
+          tracked.qualifiedConsumerId,
+        );
+      },
+    );
+
+    ipcMain.on(
+      "terminal:acknowledgeOutput",
+      (
+        event: IpcMainEvent,
+        terminalId: string,
+        consumerId: string,
+        runtimeGeneration: number,
+        outputSequence: number,
+      ) => {
+        const tracked = this.outputConsumersByWebContentsId
+          .get(event.sender.id)
+          ?.get(consumerId);
+        if (!tracked || tracked.terminalId !== terminalId) return;
+        this.terminalService.acknowledgeOutput(
+          terminalId,
+          tracked.qualifiedConsumerId,
+          runtimeGeneration,
+          outputSequence,
+        );
+      },
+    );
+
+    ipcMain.on(
+      "terminal:reportOutputFailure",
+      (
+        event: IpcMainEvent,
+        terminalId: string,
+        consumerId: string,
+        runtimeGeneration: number,
+        errorMessage: string,
+      ) => {
+        const tracked = this.outputConsumersByWebContentsId
+          .get(event.sender.id)
+          ?.get(consumerId);
+        if (!tracked || tracked.terminalId !== terminalId) return;
+        this.terminalService.reportOutputConsumerFailure(
+          terminalId,
+          tracked.qualifiedConsumerId,
+          runtimeGeneration,
+          errorMessage,
+        );
       },
     );
 

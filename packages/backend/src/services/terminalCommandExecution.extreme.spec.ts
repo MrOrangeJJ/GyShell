@@ -1,4 +1,5 @@
 import type {
+  CommandTask,
   CommandResult,
   TerminalBackend,
   TerminalCommandProtocolMetadata,
@@ -163,7 +164,7 @@ class FakeCommandBackend implements TerminalBackend {
   private commandShellFamily?: TerminalCommandShellFamily
   private initialTrackingBaselineSequence?: number
   private exposesCommandTrackingMode = false
-  private autoAcknowledgePromptFileProbe = true
+  private autoProcessPromptFileDispatch = true
   private consumePromptFileUserRequests = true
   private readonly cwdByPtyId = new Map<string, string>()
   private readonly homeDirByPtyId = new Map<string, string>()
@@ -241,7 +242,7 @@ class FakeCommandBackend implements TerminalBackend {
     if (
       data === `${FAKE_PROMPT_FILE_DISPATCH_INPUT}\r` &&
       this.promptFileDispatch &&
-      this.autoAcknowledgePromptFileProbe &&
+      this.autoProcessPromptFileDispatch &&
       this.promptFileRequestPathByPtyId.has(ptyId)
     ) {
       const files = this.filesByPtyId.get(ptyId)
@@ -654,8 +655,8 @@ class FakeCommandBackend implements TerminalBackend {
     return this.promptFileRequestPathByPtyId.get(this.getPtyId(terminalId))
   }
 
-  setAutoAcknowledgePromptFileProbe(enabled: boolean): void {
-    this.autoAcknowledgePromptFileProbe = enabled
+  setAutoProcessPromptFileDispatch(enabled: boolean): void {
+    this.autoProcessPromptFileDispatch = enabled
   }
 
   setConsumePromptFileUserRequests(enabled: boolean): void {
@@ -1806,7 +1807,7 @@ const run = async (): Promise<void> => {
     )
     backend.setTrackingState(terminalId, {
       mode: 'windows-powershell-sidecar',
-      sequence: 3,
+      sequence: 2,
       exitCode: 0,
       output: 'AGENT_OK\r\n',
       outputObservedUtf8Bytes: Buffer.byteLength('AGENT_OK\r\n', 'utf8'),
@@ -1817,7 +1818,7 @@ const run = async (): Promise<void> => {
     const cachedBaseline = service.windowsPromptBaselineByTerminal.get(terminalId)
     assertEqual(
       cachedBaseline?.baselineSequence,
-      3,
+      2,
       'the completed task should advance the shared prompt baseline'
     )
     assertEqual(
@@ -1836,11 +1837,71 @@ const run = async (): Promise<void> => {
       '\r',
     ])
     backend.setAutoEmitPromptFileRawBoundaries(false)
-    backend.emitPowerShellPrompt(terminalId, 4)
+    backend.emitPowerShellPrompt(terminalId, 3)
     await waitUntil(
       () => service.getTerminalRuntimeSnapshot(terminalId)?.canRunCommand === true,
       'manual input after a completed agent task should observe its own generic prompt'
     )
+    service.kill(terminalId)
+  })
+
+  await runCase('an empty prompt journal cannot roll a live Windows baseline back to zero', async () => {
+    const terminalId = 'sidecar-empty-journal-baseline'
+    const { backend, service, runtimeToken } =
+      await createReadyWindowsPromptFileManualFixture(terminalId)
+
+    backend.setTrackingState(terminalId, {
+      mode: 'windows-powershell-sidecar',
+      sequence: 7,
+      exitCode: 0,
+    })
+    backend.emitPowerShellPrompt(terminalId, 7)
+    await waitUntil(
+      () =>
+        service.windowsPromptBaselineByTerminal.get(terminalId)
+          ?.baselineSequence === 7,
+      'the fixture should authenticate the pre-reset prompt baseline'
+    )
+
+    const prepare = backend.prepareCommandTracking.bind(backend)
+    ;(backend as any).prepareCommandTracking = async (ptyId: string) => {
+      const token = await prepare(ptyId)
+      return token
+        ? {
+            ...token,
+            trackingScopeId: runtimeToken,
+            baselineSequence: 0,
+          }
+        : undefined
+    }
+
+    const taskId = await service.runCommandNoWait(
+      terminalId,
+      "Write-Output 'AFTER_EMPTY_JOURNAL'"
+    )
+    const activeTask = service
+      .getCommandTasks(terminalId)
+      .find((task: CommandTask) => task.id === taskId)
+    assertEqual(
+      activeTask?.completionTracking?.baselineSequence,
+      7,
+      'preparation must reconcile an empty journal with the authenticated runtime baseline'
+    )
+
+    backend.setTrackingState(terminalId, {
+      mode: 'windows-powershell-sidecar',
+      sequence: 8,
+      exitCode: 0,
+      output: 'AFTER_EMPTY_JOURNAL\r\n',
+      outputObservedUtf8Bytes: Buffer.byteLength(
+        'AFTER_EMPTY_JOURNAL\r\n',
+        'utf8'
+      ),
+      outputTruncated: false,
+    })
+    const result = await service.waitForTask(terminalId, taskId)
+    assertEqual(result.stdoutDelta.trim(), 'AFTER_EMPTY_JOURNAL', 'the next monotonic prompt must retain its request output')
+    assertEqual(result.capture?.state, 'complete', 'the reconciled raw boundary must remain authoritative')
     service.kill(terminalId)
   })
 
@@ -1903,18 +1964,18 @@ const run = async (): Promise<void> => {
     })
     assertEqual(
       service.windowsPromptSequenceFloorByTerminal.get(terminalId),
-      3,
+      2,
       'foreground stdin should reuse the active task already-reserved prompt'
     )
     backend.setTrackingState(terminalId, {
       mode: 'windows-powershell-sidecar',
-      sequence: 3,
+      sequence: 2,
       exitCode: 0,
       output: 'Ada\r\n',
       outputObservedUtf8Bytes: Buffer.byteLength('Ada\r\n'),
       outputTruncated: false,
     })
-    backend.emitPowerShellPrompt(terminalId, 3)
+    backend.emitPowerShellPrompt(terminalId, 2)
     await service.waitForTask(terminalId, taskId)
     await waitUntil(
       () => service.getTerminalRuntimeSnapshot(terminalId)?.canRunCommand === true,
@@ -1951,13 +2012,13 @@ const run = async (): Promise<void> => {
     service.kill(terminalId)
   })
 
-  await runCase('a delayed agent prompt cannot complete newer manual input', async () => {
+  await runCase('an unconsumed agent request quarantines the ambiguous runtime', async () => {
     const terminalId = 'sidecar-ambiguous-agent-then-manual'
     const { backend, service } =
       await createReadyWindowsPromptFileManualFixture(terminalId)
     backend.setConsumePromptFileUserRequests(false)
     backend.setAutoEmitPromptFileRawBoundaries(false)
-    service.promptFileProbeTimeoutMs = 25
+    service.promptFileRequestTimeoutMs = 25
 
     const taskId = await service.runCommandNoWait(
       terminalId,
@@ -1969,33 +2030,24 @@ const run = async (): Promise<void> => {
       'outcome_unknown',
       'the fixture must leave an ambiguously dispatched agent command'
     )
+    const terminal = service
+      .getDisplayTerminals()
+      .find((item: { id: string }) => item.id === terminalId)
+    assertEqual(
+      terminal?.runtimeState,
+      'exited',
+      'an unconsumed request has ambiguous ordering and must quarantine its runtime'
+    )
     assertEqual(
       service.windowsPromptSequenceFloorByTerminal.get(terminalId),
-      3,
-      'an ambiguously dispatched agent command must retain its prompt reservation'
+      undefined,
+      'quarantine must discard prompt reservations from the ambiguous runtime'
     )
 
-    await service.writeInputSequence(terminalId, [
-      'Start-Sleep -Seconds 5',
-      '\r',
-    ])
-    assertEqual(
-      service.windowsPromptSequenceFloorByTerminal.get(terminalId),
-      4,
-      'manual input must reserve beyond the possibly delayed agent prompt'
-    )
-    backend.emitPowerShellPrompt(terminalId, 3, { idle: false })
-    await new Promise((resolve) => setTimeout(resolve, 30))
     assertEqual(
       service.getTerminalRuntimeSnapshot(terminalId)?.canRunCommand,
       false,
-      'the older agent prompt must not release the newer manual command gate'
-    )
-
-    backend.emitPowerShellPrompt(terminalId, 4)
-    await waitUntil(
-      () => service.getTerminalRuntimeSnapshot(terminalId)?.canRunCommand === true,
-      'only the manual command prompt should restore idle after an ambiguous agent dispatch'
+      'the quarantined runtime must not expose an agent-ready command gate'
     )
     service.kill(terminalId)
   })
@@ -2067,7 +2119,7 @@ const run = async (): Promise<void> => {
 
     backend.setTrackingState(terminalId, {
       mode: 'windows-powershell-sidecar',
-      sequence: 3,
+      sequence: 2,
       exitCode: 0,
       output: 'POSIX_PWSH_OK\n',
       outputObservedUtf8Bytes: 14,
@@ -2813,26 +2865,16 @@ const run = async (): Promise<void> => {
       content: string
     }>
     assertEqual(fileWrites[0]?.path, requestPath, 'the delayed payload should target the request file')
-    const delayedProbeRequest = decodePromptFileRequest(fileWrites[0]?.content || '')
-    const delayedProbe = delayedProbeRequest.command
+    const delayedRequest = decodePromptFileRequest(fileWrites[0]?.content || '')
     assertEqual(
-      delayedProbeRequest.kind,
-      'probe',
-      'the preflight request must be explicitly typed as a non-user probe'
+      delayedRequest.kind,
+      'command',
+      'the single persisted request must be typed as a user command'
     )
     assertEqual(
-      /^'__GYSHELL_PROMPT_FILE_PROBE_[a-f0-9]+'$/.test(delayedProbe),
-      true,
-      'only a harmless liveness probe may be persisted before cancellation'
-    )
-    assertEqual(
-      fileWrites.some(
-        ({ content }) =>
-          decodePromptFileRequest(content || '').command ===
-          'Write-Output danger'
-      ),
-      false,
-      'the real user command must never reach the request file before the probe is acknowledged'
+      delayedRequest.command,
+      'Write-Output danger',
+      'the protocol must persist the user request only once before cancellation'
     )
     assertEqual(
       fileWrites[fileWrites.length - 1]?.content,
@@ -2892,20 +2934,23 @@ const run = async (): Promise<void> => {
     const fileWrites = (backend as any).fileWritesByPtyId.get(
       'pty-win-prompt-trigger-failure'
     ) as Array<{ path: string; content: string }>
-    const persistedCommands = fileWrites.map(
-      ({ content }) => decodePromptFileRequest(content || '').command
+    const persistedRequests = fileWrites
+      .filter(({ content }) => content.length > 0)
+      .map(({ content }) => decodePromptFileRequest(content))
+    assertEqual(
+      persistedRequests.length,
+      1,
+      'the command must be persisted exactly once before its trigger is attempted'
     )
     assertEqual(
-      persistedCommands.some((value) => value === 'Write-Output must-not-run'),
-      false,
-      'a failed liveness probe must prevent the user command from being persisted'
+      persistedRequests[0]?.command,
+      'Write-Output must-not-run',
+      'trigger failure must clean up the same user request without a probe phase'
     )
     assertEqual(
-      persistedCommands.some((value) =>
-        /^'__GYSHELL_PROMPT_FILE_PROBE_[a-f0-9]+'$/.test(value)
-      ),
-      true,
-      'the failed prompt trigger should contain only the harmless probe'
+      persistedRequests[0]?.kind,
+      'command',
+      'the single request must retain its command identity'
     )
     assertEqual(
       fileWrites[fileWrites.length - 1]?.content,
@@ -3132,11 +3177,8 @@ const run = async (): Promise<void> => {
     )
     assertEqual(
       JSON.stringify(backend.getWrites(terminalId).slice(replacementWriteBaseline)),
-      JSON.stringify([
-        `${FAKE_PROMPT_FILE_DISPATCH_INPUT}\r`,
-        `${FAKE_PROMPT_FILE_DISPATCH_INPUT}\r`,
-      ]),
-      'the probe and command triggers may dispatch, but startup-deferred input must wait for task completion'
+      JSON.stringify([`${FAKE_PROMPT_FILE_DISPATCH_INPUT}\r`]),
+      'the single command trigger may dispatch, but startup-deferred input must wait for task completion'
     )
     backend.setTrackingState(terminalId, {
       mode: 'windows-powershell-sidecar',
@@ -3153,7 +3195,6 @@ const run = async (): Promise<void> => {
     assertEqual(
       JSON.stringify(backend.getWrites(terminalId).slice(replacementWriteBaseline)),
       JSON.stringify([
-        `${FAKE_PROMPT_FILE_DISPATCH_INPUT}\r`,
         `${FAKE_PROMPT_FILE_DISPATCH_INPUT}\r`,
         'NEW_RUNTIME_INPUT',
       ]),
@@ -3422,18 +3463,16 @@ const run = async (): Promise<void> => {
     )
     const unclearedRequest = decodePromptFileRequest(
       backend.getLastFileWrite(terminalId)?.content || ''
-    ).command
-    assertEqual(
-      /^'__GYSHELL_PROMPT_FILE_PROBE_[a-f0-9]+'$/.test(
-        unclearedRequest
-      ),
-      true,
-      'even a cleanup failure may leave only the harmless liveness probe uncleared'
     )
     assertEqual(
-      unclearedRequest === 'Write-Output uncleared-stale-command',
-      false,
-      'the real stale command must never be persisted before probe acknowledgement'
+      unclearedRequest.kind,
+      'command',
+      'the abandoned runtime path must retain the identity of its single request'
+    )
+    assertEqual(
+      unclearedRequest.command,
+      'Write-Output uncleared-stale-command',
+      'a cleanup failure may leave the old command only on its abandoned runtime-scoped path'
     )
     service.kill(terminalId)
   })
@@ -4467,7 +4506,7 @@ const run = async (): Promise<void> => {
 
     backend.setTrackingState('win-local-prompt-file', {
       mode: 'windows-powershell-sidecar',
-      sequence: 2,
+      sequence: 1,
       exitCode: 0,
       cwd: 'C:/Windows',
       homeDir: 'C:/Users/SidecarHome',
@@ -4527,7 +4566,7 @@ const run = async (): Promise<void> => {
     const output = 'later failure\r\n'
     backend.setTrackingState('win-sidecar-outcome-unknown', {
       mode: 'windows-powershell-sidecar',
-      sequence: 2,
+      sequence: 1,
       outcomeKnown: false,
       cwd: 'C:/Windows',
       homeDir: 'C:/Users/SidecarHome',
@@ -4708,7 +4747,7 @@ const run = async (): Promise<void> => {
     service.kill(terminalId)
   })
 
-  await runCase('private prompt-file probe display never leaks into the visible terminal transcript', async () => {
+  await runCase('private prompt-file dispatcher redraw never leaks into the visible terminal transcript', async () => {
     const backend = new FakeCommandBackend('windows', {
       os: 'Windows',
       platform: 'win32',
@@ -4731,7 +4770,7 @@ const run = async (): Promise<void> => {
       if (data === `${FAKE_PROMPT_FILE_DISPATCH_INPUT}\r`) {
         backend.emitData(
           terminalId,
-          `${FAKE_PROMPT_FILE_DISPATCH_INPUT}\r\n__PRIVATE_PROBE_PROMPT__\r\n`
+          `${FAKE_PROMPT_FILE_DISPATCH_INPUT}\r\n__PRIVATE_DISPATCH_REDRAW__\r\n`
         )
       }
       originalWrite(ptyId, data)
@@ -4743,7 +4782,7 @@ const run = async (): Promise<void> => {
     )
     backend.setTrackingState(terminalId, {
       mode: 'windows-powershell-sidecar',
-      sequence: 2,
+      sequence: 1,
       exitCode: 0,
       output: 'visible-result\r\n',
       outputObservedUtf8Bytes: Buffer.byteLength('visible-result\r\n'),
@@ -4753,9 +4792,9 @@ const run = async (): Promise<void> => {
     const visibleBuffer = service.buffers.get(terminalId)?.content || ''
 
     assertEqual(
-      visibleBuffer.includes('__PRIVATE_PROBE_PROMPT__'),
+      visibleBuffer.includes('__PRIVATE_DISPATCH_REDRAW__'),
       false,
-      'the preflight probe should remain an internal protocol interaction'
+      'dispatcher redraw should remain an internal protocol interaction'
     )
     assertEqual(
       visibleBuffer.includes(FAKE_PROMPT_FILE_DISPATCH_INPUT),
@@ -4798,7 +4837,7 @@ const run = async (): Promise<void> => {
     )
     backend.setTrackingState(terminalId, {
       mode: 'windows-powershell-sidecar',
-      sequence: 2,
+      sequence: 1,
       exitCode: 0,
       output: 'protocol-owned-result\r\n',
       outputObservedUtf8Bytes: Buffer.byteLength('protocol-owned-result\r\n'),
@@ -4925,16 +4964,13 @@ const run = async (): Promise<void> => {
     assertEqual(sequenceSettled, false, 'the successful sequence should remain deferred while the hidden task is active')
     assertEqual(
       JSON.stringify(backend.getWrites(terminalId)),
-      JSON.stringify([
-        `${FAKE_PROMPT_FILE_DISPATCH_INPUT}\r`,
-        `${FAKE_PROMPT_FILE_DISPATCH_INPUT}\r`,
-      ]),
-      'only the probe and task triggers may reach PowerShell before request-bound completion'
+      JSON.stringify([`${FAKE_PROMPT_FILE_DISPATCH_INPUT}\r`]),
+      'only the single task trigger may reach PowerShell before request-bound completion'
     )
 
     backend.setTrackingState(terminalId, {
       mode: 'windows-powershell-sidecar',
-      sequence: 2,
+      sequence: 1,
       exitCode: 0,
       output: 'task\r\n',
       outputObservedUtf8Bytes: Buffer.byteLength('task\r\n'),
@@ -4950,7 +4986,7 @@ const run = async (): Promise<void> => {
     service.kill(terminalId)
   })
 
-  await runCase('prompt-file dispatch never persists the user command when its prompt hook is gone', async () => {
+  await runCase('a missing prompt-file dispatcher quarantines its single unconsumed request', async () => {
     const backend = new FakeCommandBackend('windows', {
       os: 'Windows',
       platform: 'win32',
@@ -4964,47 +5000,52 @@ const run = async (): Promise<void> => {
       'C:/Windows/Temp/GyShell/lost-hook-request.b64',
       'C:/Windows/Temp/GyShell/lost-hook-output.txt'
     )
-    backend.setAutoAcknowledgePromptFileProbe(false)
+    backend.setAutoProcessPromptFileDispatch(false)
     const service = createService(backend) as any
     service.commandTrackingPollIntervalMs = 5
-    service.promptFileProbeTimeoutMs = 25
+    service.promptFileRequestTimeoutMs = 25
     const terminalId = 'win-local-lost-prompt-hook'
     await createLocalTerminal(service, terminalId)
 
-    const outcome = await Promise.allSettled([
-      service.runCommandNoWait(terminalId, 'Write-Output must-never-be-latent')
-    ])
-    assertEqual(outcome[0]?.status, 'rejected', 'a missing prompt hook must fail startup')
-    assertEqual(
-      outcome[0]?.status === 'rejected' &&
-        String(outcome[0].reason).includes('Unable to verify the Windows prompt-file command hook'),
-      true,
-      'prompt-hook loss should surface a precise protocol error'
+    const taskId = await service.runCommandNoWait(
+      terminalId,
+      'Write-Output must-never-be-latent'
     )
-    const persistedCommands = ((backend as any).fileWritesByPtyId.get(
+    const result = await service.waitForTask(terminalId, taskId)
+    assertEqual(
+      result.executionState,
+      'outcome_unknown',
+      'dispatcher loss must never be reported as command completion'
+    )
+    const persistedRequests = ((backend as any).fileWritesByPtyId.get(
       `pty-${terminalId}`
-    ) as Array<{ content: string }>).map(
-      ({ content }) => decodePromptFileRequest(content || '').command
+    ) as Array<{ content: string }>)
+      .filter(({ content }) => content.length > 0)
+      .map(({ content }) => decodePromptFileRequest(content))
+    assertEqual(
+      persistedRequests.length,
+      1,
+      'dispatcher loss must leave exactly one attempted request, not a probe-plus-command pair'
     )
     assertEqual(
-      persistedCommands.includes('Write-Output must-never-be-latent'),
-      false,
-      'the real command must never be written before a nonce-bearing acknowledgement'
+      persistedRequests[0]?.command,
+      'Write-Output must-never-be-latent',
+      'the attempted request must preserve the exact user command identity'
     )
     assertEqual(
       backend.getLastFileWrite(terminalId)?.content,
       '',
-      'the harmless probe must be cleared before startup rejects'
+      'the unconsumed command must be cleared before ownership is released'
     )
     assertEqual(
-      service.getTerminalRuntimeSnapshot(terminalId)?.shellInputState,
-      'unknown',
-      'an unacknowledged probe must leave the agent command gate closed'
+      service.getTerminalRuntimeSnapshot(terminalId)?.runtimeState,
+      'exited',
+      'ambiguous dispatcher loss must quarantine the exact runtime'
     )
     assertEqual(
       service.getActiveTaskId(terminalId),
       undefined,
-      'a failed liveness probe must not create a ghost command task'
+      'dispatcher loss must not leave a running ghost task'
     )
     service.kill(terminalId)
   })
@@ -5026,7 +5067,7 @@ const run = async (): Promise<void> => {
     backend.setConsumePromptFileUserRequests(false)
     const service = createService(backend) as any
     service.commandTrackingPollIntervalMs = 5
-    service.promptFileProbeTimeoutMs = 25
+    service.promptFileRequestTimeoutMs = 25
     const terminalId = 'win-local-real-request-unconsumed'
     await createLocalTerminal(service, terminalId)
 
@@ -5039,7 +5080,11 @@ const run = async (): Promise<void> => {
     assertEqual(result.executionState, 'outcome_unknown', 'an unconsumed real request cannot be reported as executed')
     assertEqual(result.runtimeBoundary, true, 'request-consumption failure should close the command gate')
     assertEqual(result.capture?.state, 'unknown', 'the missing execution acknowledgement must be machine-readable')
-    assertEqual(result.capture?.reason, 'tracking_lost', 'the stable loss reason should identify command tracking failure')
+    assertEqual(
+      result.capture?.reason,
+      'runtime_boundary',
+      'quarantining the ambiguous runtime must expose the resulting runtime boundary'
+    )
     assertEqual(
       result.terminalStatus?.includes('did not consume the command'),
       true,
@@ -5083,7 +5128,7 @@ const run = async (): Promise<void> => {
     )
     backend.setTrackingState(terminalId, {
       mode: 'windows-powershell-sidecar',
-      sequence: 2,
+      sequence: 1,
       exitCode: 0,
       outputObservedUtf8Bytes: 27,
       outputTruncated: false,
@@ -5147,7 +5192,7 @@ const run = async (): Promise<void> => {
 
     backend.setTrackingState(terminalId, {
       mode: 'windows-powershell-sidecar',
-      sequence: 2,
+      sequence: 1,
       exitCode: 0,
       output: 'first-task\r\n',
       outputObservedUtf8Bytes: Buffer.byteLength('first-task\r\n'),
@@ -5201,7 +5246,7 @@ const run = async (): Promise<void> => {
     )
     backend.setTrackingState(terminalId, {
       mode: 'windows-powershell-sidecar',
-      sequence: 2,
+      sequence: 1,
       exitCode: 0,
       output: 'short',
       outputObservedUtf8Bytes: 32 * 1024 * 1024,
@@ -5242,7 +5287,7 @@ const run = async (): Promise<void> => {
     )
     backend.setTrackingState(terminalId, {
       mode: 'windows-powershell-sidecar',
-      sequence: 2,
+      sequence: 1,
       exitCode: 0,
       output: 'short',
       outputObservedUtf8Bytes: 100,
@@ -5288,7 +5333,7 @@ const run = async (): Promise<void> => {
     const waitPromise = service.waitForTask('win-local-sidecar-retention', taskId)
     backend.setTrackingState('win-local-sidecar-retention', {
       mode: 'windows-powershell-sidecar',
-      sequence: 2,
+      sequence: 1,
       exitCode: 0,
       output: 'retained-prefix',
       outputObservedUtf8Bytes: 32 * 1024 * 1024,
@@ -5304,6 +5349,71 @@ const run = async (): Promise<void> => {
       32 * 1024 * 1024,
       'capture metadata should expose how much output the sidecar observed'
     )
+  })
+
+  await runCase('windows sidecar capture failure is uncertainty, not a retention limit', async () => {
+    const backend = new FakeCommandBackend('windows', {
+      os: 'Windows',
+      platform: 'win32',
+      release: '10.0.14393',
+      arch: 'x64',
+      hostname: 'ws2016-capture-failure',
+      isRemote: false,
+      shell: 'powershell.exe'
+    }, 'windows-powershell-sidecar')
+    backend.setPromptFileDispatch(
+      'C:/Windows/Temp/GyShell/capture-failure-request.b64',
+      'C:/Windows/Temp/GyShell/capture-failure-output.txt'
+    )
+    const service = createService(backend)
+    const terminalId = 'win-local-sidecar-capture-failure'
+    await createLocalTerminal(service, terminalId)
+
+    const taskId = await service.runCommandNoWait(
+      terminalId,
+      'Write-Output partial-before-formatter-failure'
+    )
+    backend.setTrackingState(terminalId, {
+      mode: 'windows-powershell-sidecar',
+      sequence: 1,
+      exitCode: 0,
+      output: 'partial',
+      outputObservedUtf8Bytes: 30,
+      outputRetainedUtf8Bytes: 7,
+      outputTruncated: false,
+      outputCaptureFailed: true,
+    })
+
+    const result = await service.waitForTask(terminalId, taskId)
+    assertEqual(result.executionState, 'finished', 'capture failure must not invent command failure')
+    assertEqual(result.stdoutDelta, 'partial', 'verified best-effort bytes should remain readable')
+    assertEqual(result.capture?.state, 'unknown', 'capture infrastructure failure must be explicit uncertainty')
+    assertEqual(result.capture?.reason, 'tracking_lost', 'capture failure needs a stable non-retention reason')
+
+    const emptyTaskId = await service.runCommandNoWait(
+      terminalId,
+      'Write-Output lost-before-output-file-open'
+    )
+    backend.setTrackingState(terminalId, {
+      mode: 'windows-powershell-sidecar',
+      sequence: 2,
+      exitCode: 0,
+      outputObservedUtf8Bytes: 30,
+      outputRetainedUtf8Bytes: 0,
+      outputTruncated: false,
+      outputCaptureFailed: true,
+    })
+
+    const emptyResult = await service.waitForTask(terminalId, emptyTaskId)
+    assertEqual(emptyResult.executionState, 'finished', 'an unreadable capture must not invent command failure')
+    assertEqual(emptyResult.stdoutDelta, '', 'zero retained bytes must remain an empty best-effort transcript')
+    assertEqual(emptyResult.capture?.state, 'unknown', 'missing capture bytes must remain explicit uncertainty')
+    assertEqual(
+      emptyResult.capture?.observedUtf8Bytes,
+      30,
+      'capture failure must retain the sidecar-observed byte count even without an output file'
+    )
+    service.kill(terminalId)
   })
 
   await runCase('empty native-pipeline output never triggers a second command execution', async () => {
@@ -5336,7 +5446,7 @@ const run = async (): Promise<void> => {
 
     backend.setTrackingState(terminalId, {
       mode: 'windows-powershell-sidecar',
-      sequence: 2,
+      sequence: 1,
       exitCode: 0,
       output: '',
       outputObservedUtf8Bytes: 0,
@@ -5380,12 +5490,12 @@ const run = async (): Promise<void> => {
     // before the real request frame so that residue remains outside capture.
     backend.emitData(
       terminalId,
-      `${tokenizedUnixBoundary(runtimeToken, 'preexec', 2, '00000000000000000000000000000000')}\x1b[m`
+      `${tokenizedUnixBoundary(runtimeToken, 'preexec', 1, '00000000000000000000000000000000')}\x1b[m`
     )
     const start = tokenizedUnixBoundary(
       runtimeToken,
       'preexec',
-      2,
+      1,
       requestId
     )
     for (let offset = 0; offset < start.length; offset += 7) {
@@ -5395,14 +5505,14 @@ const run = async (): Promise<void> => {
       terminalId,
       'DIRECT_CONSOLE\r\nPS C:\\Literal> command-looking\r\n__GYSHELL_TASK_FINISH__::ec=0'
     )
-    const end = tokenizedUnixBoundary(runtimeToken, 'preend', 2, requestId)
+    const end = tokenizedUnixBoundary(runtimeToken, 'preend', 1, requestId)
     for (let offset = 0; offset < end.length; offset += 5) {
       backend.emitData(terminalId, end.slice(offset, offset + 5))
     }
     backend.emitData(terminalId, 'PS C:\\Prompt-Must-Stay-Out> ')
     backend.setTrackingState(terminalId, {
       mode: 'windows-powershell-sidecar',
-      sequence: 2,
+      sequence: 1,
       exitCode: 0,
       output: '',
       outputObservedUtf8Bytes: 0,
@@ -5452,13 +5562,13 @@ const run = async (): Promise<void> => {
     }
 
     backend.emitData(terminalId, 'DISPATCH-ECHO-MUST-STAY-OUT')
-    backend.emitPromptFileRawBoundary(terminalId, 'preexec', 2, requestId)
+    backend.emitPromptFileRawBoundary(terminalId, 'preexec', 1, requestId)
     backend.emitData(terminalId, '\x1b[31mDIRECT_B\x1b[0m')
-    backend.emitPromptFileRawBoundary(terminalId, 'preend', 2, requestId)
+    backend.emitPromptFileRawBoundary(terminalId, 'preend', 1, requestId)
     backend.emitData(terminalId, 'PROMPT-MUST-STAY-OUT')
     backend.setTrackingState(terminalId, {
       mode: 'windows-powershell-sidecar',
-      sequence: 2,
+      sequence: 1,
       exitCode: 0,
       output: 'PIPE_A\r\nPIPE_C\r\n',
       outputObservedUtf8Bytes: Buffer.byteLength('PIPE_A\r\nPIPE_C\r\n'),
@@ -5501,15 +5611,15 @@ const run = async (): Promise<void> => {
       throw new Error('Missing request identity for raw-retention fixture')
     }
 
-    backend.emitPromptFileRawBoundary(terminalId, 'preexec', 2, requestId)
+    backend.emitPromptFileRawBoundary(terminalId, 'preexec', 1, requestId)
     backend.emitData(
       terminalId,
       'R'.repeat(COMMAND_CAPTURE_MAX_UTF8_BYTES + 1024)
     )
-    backend.emitPromptFileRawBoundary(terminalId, 'preend', 2, requestId)
+    backend.emitPromptFileRawBoundary(terminalId, 'preend', 1, requestId)
     backend.setTrackingState(terminalId, {
       mode: 'windows-powershell-sidecar',
-      sequence: 2,
+      sequence: 1,
       exitCode: 0,
       output: '',
       outputObservedUtf8Bytes: 0,
@@ -5552,15 +5662,15 @@ const run = async (): Promise<void> => {
       throw new Error('Missing request identity for dual-retention fixture')
     }
 
-    backend.emitPromptFileRawBoundary(terminalId, 'preexec', 2, requestId)
+    backend.emitPromptFileRawBoundary(terminalId, 'preexec', 1, requestId)
     backend.emitData(
       terminalId,
       'R'.repeat(COMMAND_CAPTURE_MAX_UTF8_BYTES + 2048)
     )
-    backend.emitPromptFileRawBoundary(terminalId, 'preend', 2, requestId)
+    backend.emitPromptFileRawBoundary(terminalId, 'preend', 1, requestId)
     backend.setTrackingState(terminalId, {
       mode: 'windows-powershell-sidecar',
-      sequence: 2,
+      sequence: 1,
       exitCode: 0,
       output: 'S'.repeat(COMMAND_CAPTURE_MAX_UTF8_BYTES),
       outputObservedUtf8Bytes: COMMAND_CAPTURE_MAX_UTF8_BYTES + 1024,
@@ -5601,7 +5711,7 @@ const run = async (): Promise<void> => {
       throw new Error('Missing request identity for interactive prompt fixture')
     }
 
-    backend.emitPromptFileRawBoundary(terminalId, 'preexec', 2, requestId)
+    backend.emitPromptFileRawBoundary(terminalId, 'preexec', 1, requestId)
     backend.emitData(terminalId, 'NAME: ')
     await waitUntil(
       () => dumpViewport(service, terminalId, 8).includes('NAME:'),
@@ -5614,10 +5724,10 @@ const run = async (): Promise<void> => {
       'write_stdin input should reach the running sidecar command'
     )
     backend.emitData(terminalId, 'Ada\r\n')
-    backend.emitPromptFileRawBoundary(terminalId, 'preend', 2, requestId)
+    backend.emitPromptFileRawBoundary(terminalId, 'preend', 1, requestId)
     backend.setTrackingState(terminalId, {
       mode: 'windows-powershell-sidecar',
-      sequence: 2,
+      sequence: 1,
       exitCode: 0,
       output: 'ANSWER=Ada\r\n',
       outputObservedUtf8Bytes: Buffer.byteLength('ANSWER=Ada\r\n'),
@@ -5655,13 +5765,13 @@ const run = async (): Promise<void> => {
     missingEnd.backend.emitPromptFileRawBoundary(
       missingEndId,
       'preexec',
-      2,
+      1,
       missingEndRequestId
     )
     missingEnd.backend.emitData(missingEndId, 'BEST_EFFORT')
     missingEnd.backend.setTrackingState(missingEndId, {
       mode: 'windows-powershell-sidecar',
-      sequence: 2,
+      sequence: 1,
       exitCode: 0,
       output: '',
       outputObservedUtf8Bytes: 0,
@@ -5685,7 +5795,7 @@ const run = async (): Promise<void> => {
     missingStart.backend.emitData(missingStartId, 'UNATTRIBUTED-MUST-STAY-OUT')
     missingStart.backend.setTrackingState(missingStartId, {
       mode: 'windows-powershell-sidecar',
-      sequence: 2,
+      sequence: 1,
       exitCode: 0,
       output: '',
       outputObservedUtf8Bytes: 0,
@@ -5785,7 +5895,7 @@ const run = async (): Promise<void> => {
     )
     backend.setTrackingState('win-local-synthetic-display', {
       mode: 'windows-powershell-sidecar',
-      sequence: 2,
+      sequence: 1,
       exitCode: 0,
       cwd: 'C:/Users/Administrator',
       homeDir: 'C:/Users/Administrator',

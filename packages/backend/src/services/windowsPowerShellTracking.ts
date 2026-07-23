@@ -11,6 +11,9 @@ export const WINDOWS_POWERSHELL_SIDECAR_RETENTION_MS = 24 * 60 * 60 * 1000
 export const WINDOWS_POWERSHELL_COMMAND_REQUEST_FILE_PREFIX = 'gyshell-request-'
 export const WINDOWS_POWERSHELL_COMMAND_OUTPUT_FILE_PREFIX = 'gyshell-output-'
 export const WINDOWS_POWERSHELL_REQUEST_MARKER_MAX_UTF8_BYTES = 16 * 1024
+export const WINDOWS_POWERSHELL_FORMAT_WIDTH_FALLBACK = 120
+export const WINDOWS_POWERSHELL_FORMAT_WIDTH_MIN = 40
+export const WINDOWS_POWERSHELL_FORMAT_WIDTH_MAX = 4096
 
 const WINDOWS_POWERSHELL_DISPATCH_VARIABLE = '__GyShell_InternalDispatch'
 const WINDOWS_POWERSHELL_OUTCOME_RECORDER_VARIABLE = '__GyShell_InternalRecordOutcome'
@@ -29,6 +32,7 @@ export interface WindowsPromptMarkerState {
   outputObservedUtf8Bytes?: number
   outputRetainedUtf8Bytes?: number
   outputTruncated?: boolean
+  outputCaptureFailed?: boolean
   cwd?: string
   homeDir?: string
   modifiedAtMs?: number
@@ -175,36 +179,74 @@ export const buildWindowsPowerShellBootstrapScript = (options: {
     Buffer.from(value || '', 'utf8').toString('base64')
   // The footer must execute in the same dynamic script block as the user's
   // final operation: Windows PowerShell 5.1 resets `$?` when a separate block
-  // returns. Keep it to one helper call. ErrorRecord objects remain typed until
-  // PowerShell's formatter sees them; coercing them to strings here would lose
-  // invocation position, CategoryInfo, and FullyQualifiedErrorId while still
-  // claiming a complete transcript.
+  // returns. Keep it to one helper call. ErrorRecord objects remain typed; the
+  // shared formatting boundary below repairs only wrapper-attributed
+  // InvocationInfo without discarding structured error details.
   const sidecarOutcomeFooter =
     `;& $global:${WINDOWS_POWERSHELL_OUTCOME_RECORDER_VARIABLE} ([bool]$?)`
-  const sidecarUserBlockExecution =
+  const sidecarValidUserBlockExecution =
     [
-      '$__gyshell_parse_tokens=$null',
-      '$__gyshell_parse_errors=$null',
-      '$__gyshell_user_ast=[Management.Automation.Language.Parser]::ParseInput($__gyshell_cmd,[ref]$__gyshell_parse_tokens,[ref]$__gyshell_parse_errors)',
-      'if(@($__gyshell_parse_errors).Count -gt 0){throw $__gyshell_parse_errors[0]}',
       `$__gyshell_outcome_footer='${escapePowerShellSingleQuotedString(sidecarOutcomeFooter)}'`,
       '$__gyshell_instrumented_cmd=$__gyshell_cmd',
       '$__gyshell_named_block=$null',
       "foreach($__gyshell_named_name in @('DynamicParamBlock','BeginBlock','ProcessBlock','EndBlock','CleanBlock')){$__gyshell_named_property=$__gyshell_user_ast.PSObject.Properties[$__gyshell_named_name];if($null -ne $__gyshell_named_property){$__gyshell_named_candidate=$__gyshell_named_property.Value;if($null -ne $__gyshell_named_candidate -and -not [bool]$__gyshell_named_candidate.Unnamed){$__gyshell_named_block=$__gyshell_named_candidate}}}",
       "if($null -ne $__gyshell_named_block){$__gyshell_insert_offset=[int]$__gyshell_named_block.Extent.EndOffset-1;if($__gyshell_insert_offset -lt 0 -or $__gyshell_cmd[$__gyshell_insert_offset] -ne '}'){throw 'GyShell could not safely instrument the parsed PowerShell named block.'};$__gyshell_instrumented_cmd=$__gyshell_cmd.Substring(0,$__gyshell_insert_offset)+[Environment]::NewLine+$__gyshell_outcome_footer+[Environment]::NewLine+$__gyshell_cmd.Substring($__gyshell_insert_offset)}else{$__gyshell_instrumented_cmd=$__gyshell_cmd+[Environment]::NewLine+$__gyshell_outcome_footer}",
       `$${WINDOWS_POWERSHELL_USER_BLOCK_VARIABLE}=[scriptblock]::Create($__gyshell_instrumented_cmd)`,
-    ].join(';') +
-    `;if($global:__gyshell_logical_user_native_exists){$global:LASTEXITCODE=$global:__gyshell_logical_user_native}else{Microsoft.PowerShell.Utility\\Remove-Variable -Name LASTEXITCODE -Scope Global -ErrorAction SilentlyContinue};if($global:__gyshell_logical_user_ok){$null=$null}else{Microsoft.PowerShell.Utility\\Write-Error 'GyShell status restoration sentinel' -ErrorAction Ignore};\n. $${WINDOWS_POWERSHELL_USER_BLOCK_VARIABLE}\n`
+      'if($global:__gyshell_logical_user_native_exists){$global:LASTEXITCODE=$global:__gyshell_logical_user_native}else{Microsoft.PowerShell.Utility\\Remove-Variable -Name LASTEXITCODE -Scope Global -ErrorAction SilentlyContinue}',
+      "if($global:__gyshell_logical_user_ok){$null=$null}else{Microsoft.PowerShell.Utility\\Write-Error 'GyShell status restoration sentinel' -ErrorAction Ignore}",
+      `. $${WINDOWS_POWERSHELL_USER_BLOCK_VARIABLE}`,
+    ].join(';')
+  const sidecarParseFailureExecution = [
+    '$__gyshell_parse_exception=[Management.Automation.ParseException]::new([Management.Automation.Language.ParseError[]]$__gyshell_parse_errors)',
+    '$__gyshell_parse_record=[Management.Automation.ErrorRecord]::new($__gyshell_parse_exception,[string]$__gyshell_parse_errors[0].ErrorId,[Management.Automation.ErrorCategory]::ParserError,$null)',
+    '$null=$Error.Insert(0,$__gyshell_parse_record)',
+    '$global:__gyshell_user_ok=$false',
+    '$global:__gyshell_user_native=$LASTEXITCODE',
+    '$global:__gyshell_user_native_exists=[bool](Test-Path Variable:Global:LASTEXITCODE)',
+    '$global:__gyshell_user_error_count=@($Error).Count',
+    '$global:__gyshell_user_error_ref=$Error[0]',
+    '$global:__gyshell_user_exception=$__gyshell_parse_record',
+    '$global:__gyshell_user_outcome_sampled=$true',
+    '$global:__gyshell_user_outcome_set=$true',
+    '$__gyshell_parse_record',
+  ].join(';')
+  const sidecarUserBlockExecution = [
+    '$__gyshell_instrumented_cmd=$null',
+    '$__gyshell_parse_tokens=$null',
+    '$__gyshell_parse_errors=$null',
+    '$__gyshell_user_ast=[Management.Automation.Language.Parser]::ParseInput($__gyshell_cmd,[ref]$__gyshell_parse_tokens,[ref]$__gyshell_parse_errors)',
+    `if(@($__gyshell_parse_errors).Count -gt 0){${sidecarParseFailureExecution}}else{${sidecarValidUserBlockExecution}}`,
+  ].join(';')
+  // ErrorRecord.InvocationInfo is rewritten when an error crosses the dynamic
+  // dot-source boundary, so it points at GyShell's private invocation/footer
+  // instead of the user's source. Rebuild only the presentation record before
+  // formatting: the exception, category, target, fully-qualified id, and
+  // ErrorDetails remain structured while the false private call site is gone.
+  const sidecarSafeOutputProjection =
+    'Microsoft.PowerShell.Core\\ForEach-Object {' +
+    'if($_ -is [Management.Automation.ErrorRecord]){' +
+    '$__gyshell_error_definition=[string]$_.InvocationInfo.MyCommand.Definition;' +
+    '$__gyshell_error_origin=$__gyshell_error_definition+[string]$_.InvocationInfo.MyCommand.Name+[string]$_.InvocationInfo.Line+[string]$_.InvocationInfo.PositionMessage;' +
+    '$__gyshell_error_is_private=($null -ne $__gyshell_instrumented_cmd -and $__gyshell_error_definition -ceq [string]$__gyshell_instrumented_cmd)-or($__gyshell_error_origin -match \'(?i)__GyShell_Internal\');' +
+    'if($__gyshell_error_is_private){' +
+    '$__gyshell_safe_error=[Management.Automation.ErrorRecord]::new($_.Exception,[string]$_.FullyQualifiedErrorId,$_.CategoryInfo.Category,$_.TargetObject);' +
+    'if($null -ne $_.ErrorDetails){$__gyshell_safe_error.ErrorDetails=$_.ErrorDetails};' +
+    '$__gyshell_safe_error}else{$_}}else{$_}}'
   const sidecarCommandExecution =
-    `if($__gyshell_has_request){$global:__gyshell_output_observed=[int64]0;$global:__gyshell_output_retained=[int64]0;$global:__gyshell_output_truncated=$false;$global:__gyshell_user_outcome_set=$false;$global:__gyshell_user_outcome_sampled=$false;$global:__gyshell_user_exception=$null;$global:__gyshell_output_stream=$null;try{$global:__gyshell_output_stream=[IO.File]::Open($global:__gyshell_output_path,[IO.FileMode]::Create,[IO.FileAccess]::Write,[IO.FileShare]::Read);$__gyshell_cmd=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($__gyshell_request_payload));$global:__gyshell_user_error_baseline_count=@($Error).Count;$global:__gyshell_user_error_baseline_ref=if($Error.Count -gt 0){$Error[0]}else{$null};. {try{${sidecarUserBlockExecution}}catch{$global:__gyshell_user_exception=$_;$global:__gyshell_user_ok=$false;$global:__gyshell_user_native=$LASTEXITCODE;$global:__gyshell_user_native_exists=[bool](Test-Path Variable:Global:LASTEXITCODE);$global:__gyshell_user_error_count=@($Error).Count;$global:__gyshell_user_error_ref=if($Error.Count -gt 0){$Error[0]}else{$null};$global:__gyshell_user_outcome_sampled=$true;$global:__gyshell_user_outcome_set=$true;throw}finally{if(-not $global:__gyshell_user_outcome_set){$global:__gyshell_user_ok=$false;$global:__gyshell_user_native=$LASTEXITCODE;$global:__gyshell_user_native_exists=[bool](Test-Path Variable:Global:LASTEXITCODE);$global:__gyshell_user_error_count=@($Error).Count;$global:__gyshell_user_error_ref=if($Error.Count -gt 0){$Error[0]}else{$null};$global:__gyshell_user_outcome_sampled=$false;$global:__gyshell_user_outcome_set=$true}}} *>&1 | Microsoft.PowerShell.Utility\\Out-String -Stream -Width 2147483647 | Microsoft.PowerShell.Core\\ForEach-Object {__gyshell_capture_text (([string]$_)+[Environment]::NewLine)}}catch{if(-not $global:__gyshell_user_outcome_set){$global:__gyshell_user_ok=$false;$global:__gyshell_user_native=$LASTEXITCODE;$global:__gyshell_user_native_exists=[bool](Test-Path Variable:Global:LASTEXITCODE);$global:__gyshell_user_error_count=@($Error).Count;$global:__gyshell_user_error_ref=if($Error.Count -gt 0){$Error[0]}else{$null};$global:__gyshell_user_outcome_sampled=$false;$global:__gyshell_user_outcome_set=$true};if($null -ne $global:__gyshell_user_exception){$global:__gyshell_user_exception | Microsoft.PowerShell.Utility\\Out-String -Stream -Width 2147483647 | Microsoft.PowerShell.Core\\ForEach-Object {__gyshell_capture_text (([string]$_)+[Environment]::NewLine)}}else{$global:__gyshell_output_truncated=$true}}finally{if($null -ne $global:__gyshell_output_stream){$global:__gyshell_output_stream.Dispose();$global:__gyshell_output_stream=$null};$global:__gyshell_completed_request_id=$__gyshell_request_id;$global:__gyshell_completed_request_kind=$__gyshell_request_kind;$global:__gyshell_completion_pending=$true}}`
+    `if($__gyshell_has_request){$global:__gyshell_output_observed=[int64]0;$global:__gyshell_output_retained=[int64]0;$global:__gyshell_output_truncated=$false;$global:__gyshell_output_capture_failed=$false;$global:__gyshell_user_outcome_set=$false;$global:__gyshell_user_outcome_sampled=$false;$global:__gyshell_user_exception=$null;$global:__gyshell_output_stream=$null;try{$global:__gyshell_output_stream=[IO.File]::Open($global:__gyshell_output_path,[IO.FileMode]::Create,[IO.FileAccess]::Write,[IO.FileShare]::Read);$__gyshell_cmd=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($__gyshell_request_payload));$__gyshell_host_width=[int]$Host.UI.RawUI.BufferSize.Width;$__gyshell_format_width=if($__gyshell_host_width -gt 0){[Math]::Max(${WINDOWS_POWERSHELL_FORMAT_WIDTH_MIN},[Math]::Min(${WINDOWS_POWERSHELL_FORMAT_WIDTH_MAX},$__gyshell_host_width))}else{${WINDOWS_POWERSHELL_FORMAT_WIDTH_FALLBACK}};$global:__gyshell_user_error_baseline_count=@($Error).Count;$global:__gyshell_user_error_baseline_ref=if($Error.Count -gt 0){$Error[0]}else{$null};. {try{${sidecarUserBlockExecution}}catch{$global:__gyshell_user_exception=$_;$global:__gyshell_user_ok=$false;$global:__gyshell_user_native=$LASTEXITCODE;$global:__gyshell_user_native_exists=[bool](Test-Path Variable:Global:LASTEXITCODE);$global:__gyshell_user_error_count=@($Error).Count;$global:__gyshell_user_error_ref=if($Error.Count -gt 0){$Error[0]}else{$null};$global:__gyshell_user_outcome_sampled=$true;$global:__gyshell_user_outcome_set=$true;throw}finally{if(-not $global:__gyshell_user_outcome_set){$global:__gyshell_user_ok=$false;$global:__gyshell_user_native=$LASTEXITCODE;$global:__gyshell_user_native_exists=[bool](Test-Path Variable:Global:LASTEXITCODE);$global:__gyshell_user_error_count=@($Error).Count;$global:__gyshell_user_error_ref=if($Error.Count -gt 0){$Error[0]}else{$null};$global:__gyshell_user_outcome_sampled=$false;$global:__gyshell_user_outcome_set=$true}}} *>&1 | ${sidecarSafeOutputProjection} | Microsoft.PowerShell.Utility\\Out-String -Stream -Width $__gyshell_format_width -ErrorAction Stop | Microsoft.PowerShell.Core\\ForEach-Object {__gyshell_capture_text (([string]$_)+[Environment]::NewLine)}}catch{if(-not $global:__gyshell_user_outcome_set){$global:__gyshell_user_ok=$false;$global:__gyshell_user_native=$LASTEXITCODE;$global:__gyshell_user_native_exists=[bool](Test-Path Variable:Global:LASTEXITCODE);$global:__gyshell_user_error_count=@($Error).Count;$global:__gyshell_user_error_ref=if($Error.Count -gt 0){$Error[0]}else{$null};$global:__gyshell_user_outcome_sampled=$false;$global:__gyshell_user_outcome_set=$true};if($null -ne $global:__gyshell_user_exception){try{$global:__gyshell_user_exception | ${sidecarSafeOutputProjection} | Microsoft.PowerShell.Utility\\Out-String -Stream -Width $__gyshell_format_width -ErrorAction Stop | Microsoft.PowerShell.Core\\ForEach-Object {__gyshell_capture_text (([string]$_)+[Environment]::NewLine)}}catch{$global:__gyshell_output_capture_failed=$true}}else{$global:__gyshell_output_capture_failed=$true}}finally{if($null -ne $global:__gyshell_output_stream){try{$global:__gyshell_output_stream.Dispose()}catch{$global:__gyshell_output_capture_failed=$true};$global:__gyshell_output_stream=$null};$global:__gyshell_completed_request_id=$__gyshell_request_id;$global:__gyshell_completed_request_kind=$__gyshell_request_kind;$global:__gyshell_completion_pending=$true}}`
   // PowerShell's top-level break/continue can escape a dot-sourced user block.
   // Frame execution with finally so every non-process-terminating control-flow
   // path closes raw attribution before the next prompt is rendered.
   const sidecarFramedCommandExecution =
     `if($__gyshell_has_request){__gyshell_emit_raw_boundary 'preexec' $__gyshell_request_id;try{${sidecarCommandExecution}}finally{__gyshell_emit_raw_boundary 'preend' $__gyshell_request_id}}`
+  const sidecarDispatchPreparation =
+    'try{$__gyshell_dispatch_history=@(Microsoft.PowerShell.Core\\Get-History -ErrorAction SilentlyContinue|Microsoft.PowerShell.Core\\Where-Object {$_.CommandLine -ceq $global:__gyshell_dispatch_history_line});' +
+    'if($__gyshell_dispatch_history.Count -gt 0){Microsoft.PowerShell.Core\\Clear-History -Id ([long[]]$__gyshell_dispatch_history.Id) -ErrorAction SilentlyContinue}}catch{};' +
+    '[Console]::Clear()'
   const sidecarDispatchRequestBody =
     options.commandRequestPath && options.commandOutputPath
       ? [
+        sidecarDispatchPreparation,
         '$__gyshell_request_raw=[IO.File]::ReadAllText($global:__gyshell_request_path,$__gyshell_utf8)',
         '$__gyshell_request_nonempty=-not [string]::IsNullOrEmpty($__gyshell_request_raw);$__gyshell_request_separator=if($__gyshell_request_nonempty){$__gyshell_request_raw.IndexOf(\':\')}else{-1};$__gyshell_request_id_valid=$__gyshell_request_separator -eq 32 -and $__gyshell_request_raw.Substring(0,32) -match \'^[a-fA-F0-9]{32}$\';$__gyshell_request_v2=$__gyshell_request_id_valid -and $__gyshell_request_raw.Length -ge 35 -and $__gyshell_request_raw[34] -eq \':\' -and $__gyshell_request_raw.Substring(33,1) -match \'^[pc]$\';$__gyshell_request_legacy=$__gyshell_request_id_valid -and -not $__gyshell_request_v2;$__gyshell_has_request=$__gyshell_request_v2 -or $__gyshell_request_legacy;$__gyshell_request_id=if($__gyshell_has_request){$__gyshell_request_raw.Substring(0,32).ToLowerInvariant()}else{\'\'};$__gyshell_request_kind=if($__gyshell_request_v2){$__gyshell_request_raw.Substring(33,1)}elseif($__gyshell_request_legacy){\'c\'}else{\'\'};$__gyshell_request_payload=if($__gyshell_request_v2){$__gyshell_request_raw.Substring(35)}elseif($__gyshell_request_legacy){$__gyshell_request_raw.Substring(33)}else{\'\'};if($__gyshell_request_nonempty){[IO.File]::WriteAllText($global:__gyshell_request_path,\'\',$__gyshell_utf8)}',
         sidecarFramedCommandExecution,
@@ -289,13 +331,26 @@ export const buildWindowsPowerShellBootstrapScript = (options: {
       '}catch{}' +
       '}'
     : ''
+  const sidecarHistoryFilteringSetup = runtimeToken
+    ? '$global:__gyshell_dispatch_history_line=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String(\'' +
+      Buffer.from(buildWindowsPowerShellDispatchInput(), 'utf8').toString('base64') +
+      '\'));' +
+      'if(-not (Test-Path Variable:Global:__gyshell_original_history_handler)){' +
+      '$global:__gyshell_original_history_handler=(Get-PSReadLineOption -ErrorAction Stop).AddToHistoryHandler};' +
+      'Set-PSReadLineOption -AddToHistoryHandler {' +
+      'param([string]$line);' +
+      'if($line -ceq $global:__gyshell_dispatch_history_line){return $false};' +
+      'if($null -ne $global:__gyshell_original_history_handler){return $global:__gyshell_original_history_handler.Invoke($line)};' +
+      '$true' +
+      '} -ErrorAction Stop'
+    : ''
   const sidecarPromptBody = [
     '$__gyshell_prompt_ok=$?;$__gyshell_prompt_native=$LASTEXITCODE;$__gyshell_prompt_native_exists=[bool](Test-Path Variable:Global:LASTEXITCODE);$__gyshell_prompt_error_count=@($Error).Count;$__gyshell_prompt_error_ref=if($Error.Count -gt 0){$Error[0]}else{$null}',
     '$__gyshell_has_request=$global:__gyshell_completion_pending -and $global:__gyshell_completed_request_id -match \'^[a-fA-F0-9]{32}$\' -and $global:__gyshell_completed_request_kind -match \'^[pc]$\';$__gyshell_request_id=if($__gyshell_has_request){$global:__gyshell_completed_request_id}else{\'\'};$__gyshell_request_kind=if($__gyshell_has_request){$global:__gyshell_completed_request_kind}else{\'\'}',
     '$__ok=if($__gyshell_has_request){$global:__gyshell_user_ok}else{$__gyshell_prompt_ok};$__native=if($__gyshell_has_request){$global:__gyshell_user_native}else{$__gyshell_prompt_native};$__native_exists=if($__gyshell_has_request){$global:__gyshell_user_native_exists}else{$__gyshell_prompt_native_exists};$__error_count=if($__gyshell_has_request){$global:__gyshell_user_error_count}else{$__gyshell_prompt_error_count};$__error_ref=if($__gyshell_has_request){$global:__gyshell_user_error_ref}else{$__gyshell_prompt_error_ref};$__error_baseline_count=if($__gyshell_has_request){$global:__gyshell_user_error_baseline_count}else{$global:__gyshell_last_error_count};$__error_baseline_ref=if($__gyshell_has_request){$global:__gyshell_user_error_baseline_ref}else{$global:__gyshell_last_error_ref}',
     '$__has_new_error=($__error_count -gt 0) -and (($__error_count -ne [int]$__error_baseline_count) -or ($__error_ref -ne $__error_baseline_ref));$__has_native_error=$__has_new_error -and (([string]$__error_ref.FullyQualifiedErrorId) -like \'NativeCommandError*\');$__user_threw=$__gyshell_has_request -and $null -ne $global:__gyshell_user_exception;$__returned_without_sample=$__gyshell_has_request -and -not $global:__gyshell_user_outcome_sampled -and -not $__user_threw',
     '$__outcome_known=$true;$__ec=if($__returned_without_sample){$__outcome_known=$false;1}elseif($__ok){0}elseif($__user_threw){1}elseif($__has_native_error){$__outcome_known=$false;if($__native -is [int]){$__native}else{1}}elseif($__native -is [int] -and $__native -ne 0){$__outcome_known=$false;$__native}else{1}',
-    'if(-not $__gyshell_has_request -or $__gyshell_request_kind -eq \'c\'){$global:__gyshell_logical_user_ok=[bool]$__ok;$global:__gyshell_logical_user_native=$__native;$global:__gyshell_logical_user_native_exists=[bool]$__native_exists};$global:__gyshell_last_error_count=$__error_count;$global:__gyshell_last_error_ref=$__error_ref;$__output_observed=if($__gyshell_has_request){[int64]$global:__gyshell_output_observed}else{[int64]0};$__output_retained=if($__gyshell_has_request){[int64]$global:__gyshell_output_retained}else{[int64]0};$__output_truncated=if($__gyshell_has_request -and $global:__gyshell_output_truncated){1}else{0};$__outcome_known_int=if($__outcome_known){1}else{0};$global:__gyshell_prompt_seq=[int]$global:__gyshell_prompt_seq+1;$__cwd_b64=[Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($PWD.Path));$__home_b64=[Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($HOME));$__line=\'__GYSHELL_PROMPT__::seq=\'+$global:__gyshell_prompt_seq+\';ec=\'+$__ec+\';outcome_known=\'+$__outcome_known_int+\';request_id=\'+$__gyshell_request_id+\';output_bytes=\'+$__output_observed+\';retained_bytes=\'+$__output_retained+\';output_truncated=\'+$__output_truncated+\';cwd_b64=\'+$__cwd_b64+\';home_b64=\'+$__home_b64',
+    'if(-not $__gyshell_has_request -or $__gyshell_request_kind -eq \'c\'){$global:__gyshell_logical_user_ok=[bool]$__ok;$global:__gyshell_logical_user_native=$__native;$global:__gyshell_logical_user_native_exists=[bool]$__native_exists};$global:__gyshell_last_error_count=$__error_count;$global:__gyshell_last_error_ref=$__error_ref;$__output_observed=if($__gyshell_has_request){[int64]$global:__gyshell_output_observed}else{[int64]0};$__output_retained=if($__gyshell_has_request){[int64]$global:__gyshell_output_retained}else{[int64]0};$__output_truncated=if($__gyshell_has_request -and $global:__gyshell_output_truncated){1}else{0};$__output_capture_failed=if($__gyshell_has_request -and $global:__gyshell_output_capture_failed){1}else{0};$__outcome_known_int=if($__outcome_known){1}else{0};$global:__gyshell_prompt_seq=[int]$global:__gyshell_prompt_seq+1;$__cwd_b64=[Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($PWD.Path));$__home_b64=[Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($HOME));$__line=\'__GYSHELL_PROMPT__::seq=\'+$global:__gyshell_prompt_seq+\';ec=\'+$__ec+\';outcome_known=\'+$__outcome_known_int+\';request_id=\'+$__gyshell_request_id+\';output_bytes=\'+$__output_observed+\';retained_bytes=\'+$__output_retained+\';output_truncated=\'+$__output_truncated+\';output_capture_failed=\'+$__output_capture_failed+\';cwd_b64=\'+$__cwd_b64+\';home_b64=\'+$__home_b64',
     '[IO.File]::AppendAllText($global:__gyshell_marker_path,$__line+[Environment]::NewLine,$__gyshell_utf8);if($__gyshell_has_request){$__gyshell_request_marker=$global:__gyshell_marker_path+\'.\'+$__gyshell_request_id;$__gyshell_request_marker_tmp=$__gyshell_request_marker+\'.tmp\';if(Test-Path -LiteralPath $__gyshell_request_marker_tmp){Remove-Item -LiteralPath $__gyshell_request_marker_tmp -Force -ErrorAction SilentlyContinue};[IO.File]::WriteAllText($__gyshell_request_marker_tmp,$__line+[Environment]::NewLine,$__gyshell_utf8);if(Test-Path -LiteralPath $__gyshell_request_marker){Remove-Item -LiteralPath $__gyshell_request_marker -Force};[IO.File]::Move($__gyshell_request_marker_tmp,$__gyshell_request_marker);$global:__gyshell_completion_pending=$false;$global:__gyshell_completed_request_id=\'\';$global:__gyshell_completed_request_kind=\'\'}',
     sidecarPromptFrameStatement,
     sidecarReadyPromptStatement,
@@ -328,6 +383,7 @@ export const buildWindowsPowerShellBootstrapScript = (options: {
           '$global:__gyshell_output_observed=[int64]0',
           '$global:__gyshell_output_retained=[int64]0',
           '$global:__gyshell_output_truncated=$false',
+          '$global:__gyshell_output_capture_failed=$false',
           '$global:__gyshell_output_stream=$null',
           '$global:__gyshell_completed_request_id=\'\'',
           '$global:__gyshell_completed_request_kind=\'\'',
@@ -346,7 +402,8 @@ export const buildWindowsPowerShellBootstrapScript = (options: {
             ? "[IO.File]::WriteAllText($global:__gyshell_output_path,'',$__gyshell_utf8)"
             : '',
           sidecarInputIdleTrackingSetup,
-          'function Global:__gyshell_capture_text{param([AllowNull()][object]$value);try{$__gyshell_text=[string]$value;$__gyshell_bytes=$global:__gyshell_utf8.GetBytes($__gyshell_text);$global:__gyshell_output_observed=[int64]$global:__gyshell_output_observed+[int64]$__gyshell_bytes.Length;if($global:__gyshell_output_truncated){return};$__gyshell_remaining=[int64]$global:__gyshell_output_max_bytes-[int64]$global:__gyshell_output_retained;if($__gyshell_remaining -le 0){if($__gyshell_bytes.Length -gt 0){$global:__gyshell_output_truncated=$true};return};$__gyshell_take=[int][Math]::Min([int64]$__gyshell_bytes.Length,$__gyshell_remaining);if($__gyshell_take -lt $__gyshell_bytes.Length){while($__gyshell_take -gt 0 -and (($__gyshell_bytes[$__gyshell_take] -band 0xC0) -eq 0x80)){$__gyshell_take--};$global:__gyshell_output_truncated=$true};if($__gyshell_take -gt 0){$global:__gyshell_output_stream.Write($__gyshell_bytes,0,$__gyshell_take);$global:__gyshell_output_retained=[int64]$global:__gyshell_output_retained+[int64]$__gyshell_take};if($__gyshell_take -lt $__gyshell_bytes.Length){$global:__gyshell_output_truncated=$true}}catch{$global:__gyshell_output_truncated=$true}}',
+          sidecarHistoryFilteringSetup,
+          'function Global:__gyshell_capture_text{param([AllowNull()][object]$value);try{$__gyshell_text=[string]$value;$__gyshell_bytes=$global:__gyshell_utf8.GetBytes($__gyshell_text);$global:__gyshell_output_observed=[int64]$global:__gyshell_output_observed+[int64]$__gyshell_bytes.Length;if($global:__gyshell_output_truncated){return};$__gyshell_remaining=[int64]$global:__gyshell_output_max_bytes-[int64]$global:__gyshell_output_retained;if($__gyshell_remaining -le 0){if($__gyshell_bytes.Length -gt 0){$global:__gyshell_output_truncated=$true};return};$__gyshell_take=[int][Math]::Min([int64]$__gyshell_bytes.Length,$__gyshell_remaining);if($__gyshell_take -lt $__gyshell_bytes.Length){while($__gyshell_take -gt 0 -and (($__gyshell_bytes[$__gyshell_take] -band 0xC0) -eq 0x80)){$__gyshell_take--};$global:__gyshell_output_truncated=$true};if($__gyshell_take -gt 0){$global:__gyshell_output_stream.Write($__gyshell_bytes,0,$__gyshell_take);$global:__gyshell_output_retained=[int64]$global:__gyshell_output_retained+[int64]$__gyshell_take};if($__gyshell_take -lt $__gyshell_bytes.Length){$global:__gyshell_output_truncated=$true}}catch{$global:__gyshell_output_capture_failed=$true}}',
           `Set-Variable -Scope Global -Name '${WINDOWS_POWERSHELL_OUTCOME_RECORDER_VARIABLE}' -Value {param([bool]$ok);$global:__gyshell_user_ok=$ok;$global:__gyshell_user_native=$LASTEXITCODE;$global:__gyshell_user_native_exists=[bool](Test-Path Variable:Global:LASTEXITCODE);$global:__gyshell_user_error_count=@($Error).Count;$global:__gyshell_user_error_ref=if($Error.Count -gt 0){$Error[0]}else{$null};$global:__gyshell_user_outcome_sampled=$true;$global:__gyshell_user_outcome_set=$true} -Option ReadOnly -Force`,
           `function Global:__gyshell_emit_raw_boundary{param([string]$kind,[string]$nonce);try{$__gyshell_seq=[int]$global:__gyshell_prompt_seq+1;$__gyshell_stdout=[Console]::OpenStandardOutput();if($kind -eq 'preexec'){$__gyshell_sync=([string][char]27)+']1337;${commandProtocolNamespace}preexec;seq='+$__gyshell_seq+';nonce=00000000000000000000000000000000'+([string][char]7)+([string][char]27)+'[m';$__gyshell_sync_bytes=$global:__gyshell_utf8.GetBytes($__gyshell_sync);$__gyshell_stdout.Write($__gyshell_sync_bytes,0,$__gyshell_sync_bytes.Length);$__gyshell_stdout.Flush()};$__gyshell_frame=([string][char]27)+']1337;${commandProtocolNamespace}'+$kind+';seq='+$__gyshell_seq+';nonce='+$nonce+([string][char]7);$__gyshell_frame_bytes=$global:__gyshell_utf8.GetBytes($__gyshell_frame);$__gyshell_stdout.Write($__gyshell_frame_bytes,0,$__gyshell_frame_bytes.Length);$__gyshell_stdout.Flush()}catch{}}`,
           `Set-Variable -Scope Global -Name '${WINDOWS_POWERSHELL_DISPATCH_VARIABLE}' -Value ([scriptblock]::Create(@'\n${sidecarDispatchBody}\n'@\n)) -Option ReadOnly -Force`,
@@ -464,15 +521,18 @@ export const parseWindowsPromptMarkerLine = (
   const outputBytesRaw = fields.get('output_bytes')
   const outputRetainedRaw = fields.get('retained_bytes')
   const outputTruncatedRaw = fields.get('output_truncated')
+  const outputCaptureFailedRaw = fields.get('output_capture_failed')
   if (
     (outputBytesRaw === undefined) !== (outputTruncatedRaw === undefined) ||
-    (outputRetainedRaw !== undefined && outputBytesRaw === undefined)
+    (outputRetainedRaw !== undefined && outputBytesRaw === undefined) ||
+    (outputCaptureFailedRaw !== undefined && outputBytesRaw === undefined)
   ) {
     return null
   }
   let outputObservedUtf8Bytes: number | undefined
   let outputRetainedUtf8Bytes: number | undefined
   let outputTruncated: boolean | undefined
+  let outputCaptureFailed: boolean | undefined
   if (outputBytesRaw !== undefined && outputTruncatedRaw !== undefined) {
     if (!/^\d+$/.test(outputBytesRaw) || !/^[01]$/.test(outputTruncatedRaw)) {
       return null
@@ -482,6 +542,12 @@ export const parseWindowsPromptMarkerLine = (
       return null
     }
     outputTruncated = outputTruncatedRaw === '1'
+  }
+  if (outputCaptureFailedRaw !== undefined) {
+    if (!/^[01]$/.test(outputCaptureFailedRaw)) {
+      return null
+    }
+    outputCaptureFailed = outputCaptureFailedRaw === '1'
   }
   if (outputRetainedRaw !== undefined) {
     if (!/^\d+$/.test(outputRetainedRaw)) {
@@ -498,6 +564,7 @@ export const parseWindowsPromptMarkerLine = (
   }
   if (
     outputTruncated === false &&
+    outputCaptureFailed !== true &&
     outputObservedUtf8Bytes !== undefined &&
     outputRetainedUtf8Bytes !== undefined &&
     outputRetainedUtf8Bytes !== outputObservedUtf8Bytes
@@ -525,6 +592,9 @@ export const parseWindowsPromptMarkerLine = (
           outputObservedUtf8Bytes,
           outputRetainedUtf8Bytes,
           outputTruncated,
+          ...(outputCaptureFailed !== undefined
+            ? { outputCaptureFailed }
+            : {}),
         }
       : {}),
     cwd: decode(cwdRaw),

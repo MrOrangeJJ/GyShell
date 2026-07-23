@@ -7,7 +7,9 @@ export const WRITE_STDIN_TOOL_DESCRIPTION = [
   '',
   'Send a list of items in order. Each item may be either:',
   '- a normal string (any length), or',
+  '- CTRL_C (preferred interrupt alias), or',
   '- a C0 control character name (must be the whole item).',
+  'To interrupt a foreground command, send ["CTRL_C"]. ETX is the equivalent C0 name. CAN is Ctrl+X and does not interrupt a normal foreground command.',
   'If an item is a C0 name, it MUST be its own list item.',
   'Example: ["helloworld", "ESC", ":wq"]',
   'Example: ["CAN", "DC3"] sends Ctrl+X then Ctrl+S',
@@ -99,7 +101,7 @@ export const READ_FILE_DESCRIPTION =
 export const WAIT_TOOL_DESCRIPTION =
   "Pause execution for a specified number of seconds (5-120). Use this for short, fixed-duration pauses when you need to wait for an external event that doesn't affect the terminal (e.g., waiting for a web server to start up)."
 export const WAIT_TERMINAL_IDLE_DESCRIPTION =
-  "Wait until the terminal output becomes stable (no changes for a few seconds) or a timeout (120s) is reached. Use this for commands that don't emit standard OSC exit markers but eventually stop printing text (e.g., some build tools or log watchers). If the terminal is disconnected or not ready, the tool returns an explicit terminal_status instead of treating stale output as idle."
+  "Monitor a ready terminal until it reaches a verified idle prompt, its visible output remains unchanged for several seconds, or 120s elapses. This tool is specifically allowed while the shell is busy. Stable output is reported separately and never presented as proof that the command completed. If the terminal disconnects, the tool returns an explicit terminal_status instead of treating stale output as idle."
 export const RECONNECT_TERMINAL_TAB_DESCRIPTION = [
   'Attempt to reconnect an existing disconnected SSH terminal tab that has not been closed by the user.',
   'Use this when a terminal-targeting tool reports terminal_status with runtime_state=exited and reconnectable=true, or when the user asks to reconnect that tab.',

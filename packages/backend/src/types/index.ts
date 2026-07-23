@@ -388,6 +388,8 @@ export interface TerminalCommandTrackingUpdate {
   outputObservedUtf8Bytes?: number
   outputRetainedUtf8Bytes?: number
   outputTruncated?: boolean
+  /** True when formatting or persistence failed independently of retention. */
+  outputCaptureFailed?: boolean
 }
 
 export interface CommandTask {
@@ -419,7 +421,9 @@ export interface CommandTask {
   lastOutputAtMs?: number
   capturedOutput?: string
   capturedOutputObservedUtf8Bytes?: number
+  capturedOutputRetainedUtf8Bytes?: number
   capturedOutputTruncated?: boolean
+  capturedOutputCaptureFailed?: boolean
   syntheticRawDisplayObserved?: boolean
   syntheticRawDisplayEndsWithLineBreak?: boolean
   syntheticSidecarDisplayOutput?: string
@@ -779,6 +783,10 @@ export interface TerminalSessionBackend {
    * Subscribe to data events from the backend.
    */
   onData(ptyId: string, callback: (data: string) => void): void
+
+  /** Pause/resume output delivery when downstream terminal parsers are full. */
+  pauseOutput?(ptyId: string): void
+  resumeOutput?(ptyId: string): void
 
   /**
    * Subscribe to exit events.

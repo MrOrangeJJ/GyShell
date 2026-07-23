@@ -524,6 +524,156 @@ const run = async (): Promise<void> => {
       assertEqual(loaded[0].id, 'local-a', 'first valid record should be kept')
     })
 
+    await runCase('a visible output consumer can register before its terminal runtime exists', async () => {
+      const backend = new FakeTerminalBackend()
+      const service = createService(stateFilePath, backend)
+      service.attachOutputConsumer('pre-attached-terminal', 'visible-consumer')
+      await service.createTerminal({
+        type: 'local',
+        id: 'pre-attached-terminal',
+        title: 'Pre-attached',
+        cols: 80,
+        rows: 24
+      })
+
+      const controller = (service as any).outputFlowControllerByTerminal.get(
+        'pre-attached-terminal'
+      )
+      assertCondition(
+        controller?.activeRendererConsumers?.has('visible-consumer'),
+        'runtime registration must attach consumers that arrived before createTab'
+      )
+      service.kill('pre-attached-terminal')
+    })
+
+    await runCase('a retained visible output consumer follows a reused terminal id into its new runtime', async () => {
+      const backend = new FakeTerminalBackend()
+      const service = createService(stateFilePath, backend)
+      const terminalId = 'reused-output-consumer'
+      const consumerId = 'visible-consumer'
+      const visibleEvents: Array<{
+        terminalId: string
+        outputSequence: number
+        runtimeGeneration: number
+      }> = []
+      service.setRawEventPublisher((channel, payload) => {
+        if (channel === 'terminal:data') {
+          visibleEvents.push(payload as (typeof visibleEvents)[number])
+        }
+      })
+      const config: TerminalConfig = {
+        type: 'local',
+        id: terminalId,
+        title: 'Reused Output Consumer',
+        cols: 80,
+        rows: 24
+      }
+
+      service.attachOutputConsumer(terminalId, consumerId)
+      await service.createTerminal(config)
+      const firstController = (service as any).outputFlowControllerByTerminal.get(
+        terminalId
+      )
+      assertCondition(
+        firstController?.activeRendererConsumers?.has(consumerId),
+        'first runtime should attach the retained visible consumer'
+      )
+
+      service.kill(terminalId)
+      await service.createTerminal(config)
+      const replacementController = (service as any).outputFlowControllerByTerminal.get(
+        terminalId
+      )
+      assertCondition(
+        replacementController !== firstController,
+        'same-id recreation should install a new output controller'
+      )
+      assertCondition(
+        replacementController?.activeRendererConsumers?.has(consumerId),
+        'same-id recreation must preserve visible parser backpressure registration'
+      )
+
+      backend.emitDataForTerminalId(terminalId, 'replacement output')
+      const replacementEvent = visibleEvents.find(
+        (event) => event.terminalId === terminalId
+      )
+      assertCondition(
+        replacementEvent,
+        'replacement output should publish a visible parser sequence'
+      )
+      service.acknowledgeOutput(
+        terminalId,
+        consumerId,
+        replacementEvent!.runtimeGeneration,
+        replacementEvent!.outputSequence
+      )
+      assertEqual(
+        await replacementController.waitForDrain(2_000),
+        true,
+        'replacement visible acknowledgement should release source credit'
+      )
+
+      service.detachOutputConsumer(terminalId, consumerId)
+      service.kill(terminalId)
+    })
+
+    await runCase('output consumer attachment returns an atomic bounded-buffer snapshot', async () => {
+      const backend = new FakeTerminalBackend()
+      const service = createService(stateFilePath, backend)
+      const visibleEvents: Array<{
+        terminalId: string
+        data: string
+        offset: number
+        outputSequence: number
+        runtimeGeneration: number
+      }> = []
+      service.setRawEventPublisher((channel, payload) => {
+        if (channel === 'terminal:data') {
+          visibleEvents.push(payload as (typeof visibleEvents)[number])
+        }
+      })
+      await service.createTerminal({
+        type: 'local',
+        id: 'atomic-output-snapshot',
+        title: 'Atomic Output Snapshot',
+        cols: 80,
+        rows: 24
+      })
+
+      const initial = service.attachOutputConsumer(
+        'atomic-output-snapshot',
+        'visible-consumer'
+      )
+      const fullOutput = `${'a'.repeat(50_000)}${'b'.repeat(200_000)}`
+      backend.emitDataForTerminalId('atomic-output-snapshot', fullOutput)
+      const snapshot = service.attachOutputConsumer(
+        'atomic-output-snapshot',
+        'snapshot-observer'
+      )
+
+      assertEqual(initial.offset, 0, 'initial attachment should capture its exact empty baseline')
+      assertEqual(visibleEvents.length, 1, 'the registered consumer should receive one full live frame')
+      assertEqual(
+        visibleEvents[0].data,
+        fullOutput,
+        'live delivery must retain the prefix that the bounded buffer later trims'
+      )
+      assertEqual(snapshot.offset, fullOutput.length, 'snapshot offset should be absolute')
+      assertEqual(snapshot.data.length, 200_000, 'snapshot should expose the bounded retained tail')
+      assertEqual(
+        snapshot.data,
+        fullOutput.slice(-200_000),
+        'atomic snapshot and live frame must form reconstructable offset intervals'
+      )
+      service.detachOutputConsumer('atomic-output-snapshot', 'visible-consumer')
+      service.detachOutputConsumer('atomic-output-snapshot', 'snapshot-observer')
+      const drained = await (service as any).outputFlowControllerByTerminal
+        .get('atomic-output-snapshot')
+        .waitForDrain(2_000)
+      assertEqual(drained, true, 'headless parser should drain before test teardown')
+      service.kill('atomic-output-snapshot')
+    })
+
     await runCase('terminal service persists created tabs and restores them on next startup', async () => {
       const backend1 = new FakeTerminalBackend()
       const service1 = createService(stateFilePath, backend1)
@@ -1262,6 +1412,84 @@ const run = async (): Promise<void> => {
       )
     })
 
+    await runCase('local output parser failure rebuilds headless state before auto-restart', async () => {
+      const backend = new FakeTerminalBackend()
+      const service = createService(stateFilePath, backend)
+      const terminalId = 'local-headless-parser-rebuild'
+      const runtimeBoundaries: Array<{
+        terminalId: string
+        data: string
+        runtimeGeneration?: number
+      }> = []
+      service.setRawEventPublisher((channel, payload) => {
+        if (channel === 'terminal:data') {
+          const event = payload as (typeof runtimeBoundaries)[number]
+          if (event.data === '') runtimeBoundaries.push(event)
+        }
+      })
+
+      await service.createTerminal({
+        type: 'local',
+        id: terminalId,
+        title: 'Local Headless Parser Rebuild',
+        cols: 80,
+        rows: 24
+      })
+      await (service as any).outputFlowControllerByTerminal
+        .get(terminalId)
+        .waitForDrain(2_000)
+      backend.emitDataForTerminalId(terminalId, 'before-parser-failure\r\n')
+      await (service as any).outputFlowControllerByTerminal
+        .get(terminalId)
+        .waitForDrain(2_000)
+
+      const retiringHeadless = (service as any).headlessPtys.get(terminalId)
+      const originalWrite = retiringHeadless.write.bind(retiringHeadless)
+      retiringHeadless.write = (data: string, callback?: () => void): void => {
+        if (data.includes('trigger-parser-failure')) {
+          throw new Error('simulated headless parser failure')
+        }
+        originalWrite(data, callback)
+      }
+      backend.emitDataForTerminalId(terminalId, 'trigger-parser-failure\r\n')
+      await sleep(100)
+
+      const replacementHeadless = (service as any).headlessPtys.get(terminalId)
+      assertCondition(
+        replacementHeadless !== retiringHeadless,
+        'output failure must replace the poisoned headless parser before restart'
+      )
+      assertEqual(
+        backend.getSpawnConfigs().filter((config) => config.id === terminalId).length,
+        2,
+        'local restart must wait for headless reconstruction and then spawn once'
+      )
+      assertCondition(
+        runtimeBoundaries.some(
+          (event) =>
+            event.terminalId === terminalId &&
+            Number.isSafeInteger(event.runtimeGeneration)
+        ),
+        'replacement runtime must announce its generation even before producing output'
+      )
+      const rebuiltOutput = service.getRecentOutput(terminalId, 200)
+      assertCondition(
+        rebuiltOutput.includes('before-parser-failure') &&
+          rebuiltOutput.includes('trigger-parser-failure') &&
+          rebuiltOutput.includes('Terminal output parser failed'),
+        'fresh headless state must replay the same retained display tail and failure diagnostic'
+      )
+
+      backend.emitDataForTerminalId(terminalId, 'after-parser-restart\r\n')
+      await (service as any).outputFlowControllerByTerminal
+        .get(terminalId)
+        .waitForDrain(2_000)
+      assertCondition(
+        service.getRecentOutput(terminalId, 200).includes('after-parser-restart'),
+        'replacement headless parser must continue consuming the new runtime output'
+      )
+    })
+
     await runCase('local auto-restart never publishes the dead runtime as command-ready', async () => {
       const backend = new FakeTerminalBackend()
       const service = createService(stateFilePath, backend)
@@ -1479,6 +1707,75 @@ const run = async (): Promise<void> => {
         service.getRenderMetadata('ssh-reconnect-same-id').windowsRelease,
         undefined,
         'reconnect should not leak the previous Windows build into a new runtime'
+      )
+    })
+
+    await runCase('ssh reconnect waits for failed headless parser reconstruction', async () => {
+      const backend = new FakeTerminalBackend()
+      const service = createService(stateFilePath, backend)
+      const terminalId = 'ssh-headless-parser-rebuild'
+
+      await service.createTerminal({
+        type: 'ssh',
+        id: terminalId,
+        title: 'SSH Headless Parser Rebuild',
+        host: '10.0.0.9',
+        port: 22,
+        username: 'root',
+        authMethod: 'password',
+        password: 'secret',
+        cols: 80,
+        rows: 24
+      })
+      backend.setInitializationStateForTerminalId(terminalId, 'ready')
+      backend.emitDataForTerminalId(terminalId, 'ssh-before-parser-failure\r\n')
+      await (service as any).outputFlowControllerByTerminal
+        .get(terminalId)
+        .waitForDrain(2_000)
+
+      const retiringHeadless = (service as any).headlessPtys.get(terminalId)
+      const originalWrite = retiringHeadless.write.bind(retiringHeadless)
+      retiringHeadless.write = (data: string, callback?: () => void): void => {
+        if (data.includes('ssh-trigger-parser-failure')) {
+          throw new Error('simulated ssh headless parser failure')
+        }
+        originalWrite(data, callback)
+      }
+      backend.emitDataForTerminalId(
+        terminalId,
+        'ssh-trigger-parser-failure\r\n'
+      )
+      await sleep(50)
+      assertEqual(
+        service.getTerminalRuntimeSnapshot(terminalId)?.runtimeState,
+        'exited',
+        'SSH output failure must leave the tab disconnected until explicit reconnect'
+      )
+
+      await service.reconnectTerminal(terminalId)
+      const replacementHeadless = (service as any).headlessPtys.get(terminalId)
+      assertCondition(
+        replacementHeadless !== retiringHeadless,
+        'SSH reconnect must not bind a new runtime to the poisoned headless parser'
+      )
+      const rebuiltOutput = service.getRecentOutput(terminalId, 200)
+      assertCondition(
+        rebuiltOutput.includes('ssh-before-parser-failure') &&
+          rebuiltOutput.includes('ssh-trigger-parser-failure') &&
+          rebuiltOutput.includes('Terminal output parser failed'),
+        'SSH headless reconstruction must retain the display-equivalent failure tail'
+      )
+
+      backend.setInitializationStateForTerminalId(terminalId, 'ready')
+      backend.emitDataForTerminalId(terminalId, 'ssh-after-parser-reconnect\r\n')
+      await (service as any).outputFlowControllerByTerminal
+        .get(terminalId)
+        .waitForDrain(2_000)
+      assertCondition(
+        service.getRecentOutput(terminalId, 200).includes(
+          'ssh-after-parser-reconnect'
+        ),
+        'fresh SSH headless parser must continue after reconnect'
       )
     })
 

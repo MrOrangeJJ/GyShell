@@ -412,7 +412,6 @@ function isTextContentPart(part: unknown): part is { type: 'text'; text: string 
 }
 
 function buildPrunedPlaceholder(content: unknown): string {
-  const raw = typeof content === 'string' ? content : JSON.stringify(content)
-  const estimate = TokenManager.estimate(raw)
+  const estimate = TokenManager.estimateMessageContent(content)
   return `${TokenManager.PRUNED_CONTENT_PLACEHOLDER} Original length: ~${estimate} tokens.`
 }

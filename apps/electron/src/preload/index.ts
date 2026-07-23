@@ -598,6 +598,29 @@ export interface GyShellAPI {
       remoteOs?: "unix" | "windows";
       windowsRelease?: string;
     }>;
+    attachOutputConsumer: (
+      terminalId: string,
+      consumerId: string,
+    ) => Promise<{
+      runtimeGeneration?: number;
+      data: string;
+      offset: number;
+      remoteOs?: "unix" | "windows";
+      windowsRelease?: string;
+    }>;
+    detachOutputConsumer: (terminalId: string, consumerId: string) => void;
+    acknowledgeOutput: (
+      terminalId: string,
+      consumerId: string,
+      runtimeGeneration: number,
+      outputSequence: number,
+    ) => void;
+    reportOutputFailure: (
+      terminalId: string,
+      consumerId: string,
+      runtimeGeneration: number,
+      errorMessage: string,
+    ) => void;
     generateCommandDraft: (
       terminalId: string,
       prompt: string,
@@ -608,6 +631,8 @@ export interface GyShellAPI {
         terminalId: string;
         data: string;
         offset?: number;
+        outputSequence?: number;
+        runtimeGeneration?: number;
       } & TerminalRenderMetadata) => void,
     ) => () => void;
     onExit: (
@@ -1031,6 +1056,44 @@ const api: GyShellAPI = {
       ipcRenderer.invoke("terminal:setSelection", terminalId, selectionText),
     getBufferDelta: (terminalId, fromOffset) =>
       ipcRenderer.invoke("terminal:getBufferDelta", terminalId, fromOffset),
+    attachOutputConsumer: (terminalId, consumerId) =>
+      ipcRenderer.invoke(
+        "terminal:attachOutputConsumer",
+        terminalId,
+        consumerId,
+      ),
+    detachOutputConsumer: (terminalId, consumerId) =>
+      ipcRenderer.send(
+        "terminal:detachOutputConsumer",
+        terminalId,
+        consumerId,
+      ),
+    acknowledgeOutput: (
+      terminalId,
+      consumerId,
+      runtimeGeneration,
+      outputSequence,
+    ) =>
+      ipcRenderer.send(
+        "terminal:acknowledgeOutput",
+        terminalId,
+        consumerId,
+        runtimeGeneration,
+        outputSequence,
+      ),
+    reportOutputFailure: (
+      terminalId,
+      consumerId,
+      runtimeGeneration,
+      errorMessage,
+    ) =>
+      ipcRenderer.send(
+        "terminal:reportOutputFailure",
+        terminalId,
+        consumerId,
+        runtimeGeneration,
+        errorMessage,
+      ),
     generateCommandDraft: (terminalId, prompt, profileId) =>
       ipcRenderer.invoke(
         "terminal:generateCommandDraft",
@@ -1045,6 +1108,8 @@ const api: GyShellAPI = {
           terminalId: string;
           data: string;
           offset?: number;
+          outputSequence?: number;
+          runtimeGeneration?: number;
         } & TerminalRenderMetadata,
       ) => callback(data);
       ipcRenderer.on("terminal:data", handler);

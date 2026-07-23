@@ -69,8 +69,12 @@ function removeInvalidTailCompactionMarkers(
     const markerIndex = findLastCompactionMarkerIndex(currentMessages)
     if (markerIndex < 0) break
 
+    const markerProtectedRounds = getMarkerProtectedNormalRounds(
+      currentMessages[markerIndex],
+      protectedNormalRounds
+    )
     const roundsAfterMarker = countNormalUserRoundsAfterIndex(currentMessages, markerIndex)
-    if (roundsAfterMarker >= protectedNormalRounds) break
+    if (roundsAfterMarker >= markerProtectedRounds) break
 
     currentMessages = [
       ...currentMessages.slice(0, markerIndex),
@@ -80,6 +84,20 @@ function removeInvalidTailCompactionMarkers(
   }
 
   return changed ? { messages: currentMessages, changed: true } : { messages, changed: false }
+}
+
+function getMarkerProtectedNormalRounds(
+  message: BaseMessage,
+  fallback: number
+): number {
+  const additionalKwargs = (message as any)?.additional_kwargs || {}
+  const value = additionalKwargs[
+    TokenManager.COMPACTION_PROTECTED_ROUNDS_KEY
+  ]
+  if (additionalKwargs.zero_retention_compaction === true && value === 0) {
+    return 0
+  }
+  return Number.isInteger(value) && value >= 1 ? value : fallback
 }
 
 function findLastCompactionMarkerIndex(messages: BaseMessage[]): number {

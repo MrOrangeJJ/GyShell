@@ -14,11 +14,33 @@ export class ElectronWindowTransport implements IClientTransport {
    */
   send(channel: string, data: any): void {
     const windows = BrowserWindow.getAllWindows();
+    const failures: Error[] = [];
     windows.forEach(win => {
       if (!win.isDestroyed()) {
-        win.webContents.send(channel, data);
+        try {
+          win.webContents.send(channel, data);
+        } catch (error) {
+          // Finish fan-out so healthy renderers are not skipped, then report
+          // the ambiguous partial delivery to the terminal flow controller.
+          console.warn(
+            `[ElectronWindowTransport] Failed to send ${channel} to renderer ${win.webContents.id}:`,
+            error,
+          );
+          failures.push(
+            error instanceof Error ? error : new Error(String(error)),
+          );
+        }
       }
     });
+    if (failures.length > 0 && channel === 'terminal:data') {
+      const detail = failures
+        .map((failure) => failure.message)
+        .filter(Boolean)
+        .join('; ');
+      throw new Error(
+        `Failed to deliver ${channel} to ${failures.length} renderer(s)${detail ? `: ${detail}` : '.'}`,
+      );
+    }
   }
 
   /**

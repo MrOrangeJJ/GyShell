@@ -1,6 +1,7 @@
 import { z } from 'zod'
 import type { ToolExecutionContext } from '../types'
 import {
+  formatTerminalStatusHeader,
   formatTerminalUnavailableForTool,
   resolveTerminalForTool
 } from './terminal_runtime_guard'
@@ -67,10 +68,10 @@ export async function waitTerminalIdle(
     return resolved.message
   }
   const bestMatch = resolved.terminal
-  if (!resolved.snapshot.canRunCommand) {
+  if (resolved.snapshot.runtimeState !== 'ready') {
     return formatTerminalUnavailableForTool(
       resolved.snapshot,
-      'wait for this terminal to become idle'
+      'monitor this terminal'
     )
   }
 
@@ -82,16 +83,46 @@ export async function waitTerminalIdle(
     hint: ''
   })
 
-  let lastContent = ''
+  const finish = (result: string): string => {
+    sendEvent(sessionId, {
+      messageId,
+      type: 'sub_tool_delta',
+      outputDelta: result
+    })
+    sendEvent(sessionId, {
+      messageId,
+      type: 'sub_tool_finished'
+    })
+    return result
+  }
+
+  let lastContent = terminalService.getRecentOutput(bestMatch.id)
   let stableCount = 0
   const maxWaitSeconds = 120
   let elapsed = 0
 
   while (elapsed < maxWaitSeconds) {
     abortIfNeeded(context.signal)
+    const snapshot = terminalService.getTerminalRuntimeSnapshot(bestMatch.id)
+    if (!snapshot) {
+      return finish(
+        `Error: Terminal tab "${bestMatch.title || bestMatch.id}" was closed while it was being monitored.`
+      )
+    }
+    if (snapshot.runtimeState !== 'ready') {
+      return finish(
+        formatTerminalUnavailableForTool(snapshot, 'monitor this terminal')
+      )
+    }
     const currentContent = terminalService.getRecentOutput(bestMatch.id)
 
-    if (currentContent === lastContent && currentContent !== '') {
+    if (snapshot.canRunCommand) {
+      return finish(
+        `The terminal is at a verified idle prompt.\n${formatTerminalStatusHeader(snapshot)}\n<terminal_content>\n${currentContent}\n</terminal_content>`
+      )
+    }
+
+    if (currentContent === lastContent) {
       stableCount++
     } else {
       stableCount = 0
@@ -99,44 +130,41 @@ export async function waitTerminalIdle(
     }
 
     if (stableCount >= 4) {
+      const stableSnapshot = terminalService.getTerminalRuntimeSnapshot(bestMatch.id)
+      if (!stableSnapshot) {
+        return finish(
+          `Error: Terminal tab "${bestMatch.title || bestMatch.id}" was closed while it was being monitored.`
+        )
+      }
       const finalOutput = terminalService.getRecentOutput(bestMatch.id)
-      const successMsg = `The terminal has stabilized. The following is the current visible state of the terminal tab "${bestMatch.title || bestMatch.id}":
+      const successMsg = `The terminal output has remained unchanged for several seconds, but the shell is still busy. Output stability does not prove that the running command completed; do not start another command in this terminal.\n${formatTerminalStatusHeader(stableSnapshot)}\nThe following is the current visible state of the terminal tab "${bestMatch.title || bestMatch.id}":
 <terminal_content>
 ${finalOutput}
 </terminal_content>`
-      sendEvent(sessionId, {
-        messageId,
-        type: 'sub_tool_delta',
-        outputDelta: successMsg
-      })
-      sendEvent(sessionId, {
-        messageId,
-        type: 'sub_tool_finished'
-      })
-      return successMsg
+      return finish(successMsg)
     }
 
-    await waitWithSignal(1000, context.signal)
+    const waitResult = await waitWithSignalOrQueuedInsertion(
+      1000,
+      context.signal,
+      context.waitForQueuedInsertion
+    )
+    if (waitResult === 'queued_insertion') {
+      context.markWaitInterruptedByQueuedInsertion?.()
+      return finish(
+        'Terminal monitoring ended early because a queued agent notification became available.'
+      )
+    }
     elapsed++
   }
 
   const currentOutput = terminalService.getRecentOutput(bestMatch.id)
-  const timeoutMsg = `Wait timeout: The terminal has been running for over 120s and is still not idle. Please check if the task is still running correctly. If you need to continue waiting, run this tool again. If you need to stop it, use write_stdin (e.g., Ctrl+C). The following is the current visible state of the terminal tab "${bestMatch.title || bestMatch.id}":
+  const finalSnapshot = terminalService.getTerminalRuntimeSnapshot(bestMatch.id)
+  const timeoutMsg = `Wait timeout: the terminal did not reach a verified idle prompt within 120 seconds. Continue monitoring, inspect the running command, or interrupt it with write_stdin sequence ["CTRL_C"].${finalSnapshot ? `\n${formatTerminalStatusHeader(finalSnapshot)}` : ''}\nThe following is the current visible state of the terminal tab "${bestMatch.title || bestMatch.id}":
 <terminal_content>
 ${currentOutput}
 </terminal_content>`
-  sendEvent(sessionId, {
-    messageId,
-    type: 'sub_tool_delta',
-    outputDelta: timeoutMsg
-  })
-
-  sendEvent(sessionId, {
-    messageId,
-    type: 'sub_tool_finished'
-  })
-
-  return timeoutMsg
+  return finish(timeoutMsg)
 }
 
 function abortIfNeeded(signal?: AbortSignal): void {

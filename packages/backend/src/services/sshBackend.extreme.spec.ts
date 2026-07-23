@@ -277,6 +277,165 @@ const run = async (): Promise<void> => {
   );
 
   await runCase(
+    "fatal SSH errors open one no-throw circuit and notify exit once",
+    async () => {
+      class FatalClient extends EventEmitter {
+        destroys = 0;
+        connects = 0;
+
+        connect(): void {
+          this.connects += 1;
+        }
+        end(): void {}
+        destroy(): void {
+          this.destroys += 1;
+        }
+      }
+
+      const backend = new SSHBackend() as any;
+      const client = new FatalClient();
+      backend.createSshClient = () => client;
+      const terminalId = "fatal-circuit";
+      await backend.spawn({
+        type: "ssh",
+        id: terminalId,
+        title: "Fatal Circuit",
+        cols: 80,
+        rows: 24,
+        host: "fatal.example.test",
+        port: 22,
+        username: "test",
+        authMethod: "password",
+        password: "secret",
+      });
+
+      const output: string[] = [];
+      let exits = 0;
+      backend.onData(terminalId, (data: string) => {
+        output.push(data);
+        throw new Error("simulated downstream xterm failure");
+      });
+      backend.onExit(terminalId, () => {
+        exits += 1;
+      });
+
+      assertCondition(
+        client.listenerCount("error") > 0,
+        "spawn should install its fatal transport listener before connecting",
+      );
+      assertCondition(
+        (() => {
+          try {
+            client.emit("error", new Error("Invalid state for operation setAuthTag"));
+            client.emit("error", new Error("Invalid state for operation setAuthTag"));
+            return true;
+          } catch {
+            return false;
+          }
+        })(),
+        "a terminal subscriber failure must never escape the ssh2 error listener",
+      );
+      assertEqual(client.destroys, 1, "fatal transport should be destroyed once");
+      assertEqual(exits, 1, "fatal transport should emit one terminal exit");
+      assertEqual(
+        output.length,
+        1,
+        "repeated protocol errors should collapse into one visible diagnostic",
+      );
+      await new Promise((resolve) => setTimeout(resolve, 70));
+      assertEqual(
+        client.connects,
+        0,
+        "a pre-connect fatal error must cancel the delayed connection pipeline",
+      );
+    },
+  );
+
+  await runCase(
+    "fatal SSH close cancels a ready-handler pipeline and closes late setup resources",
+    async () => {
+      class ReadyClient extends EventEmitter {
+        destroys = 0;
+        shellCalls = 0;
+
+        connect(): void {
+          queueMicrotask(() => this.emit("ready"));
+        }
+        destroy(): void {
+          this.destroys += 1;
+        }
+        end(): void {}
+        shell(): void {
+          this.shellCalls += 1;
+        }
+      }
+
+      const backend = new SSHBackend() as any;
+      const client = new ReadyClient();
+      backend.createSshClient = () => client;
+      let releaseSetup: () => void = () => {};
+      const setupGate = new Promise<void>((resolve) => {
+        releaseSetup = resolve;
+      });
+      let enteredSetup: () => void = () => {};
+      const setupStarted = new Promise<void>((resolve) => {
+        enteredSetup = resolve;
+      });
+      let lateServerCloses = 0;
+      backend.setupPortForwards = async (instance: any) => {
+        enteredSetup();
+        await setupGate;
+        instance.forwardServers.push({
+          close: () => {
+            lateServerCloses += 1;
+          },
+        });
+      };
+      let osDetectionCalls = 0;
+      backend.execCollect = async () => {
+        osDetectionCalls += 1;
+        return { stdout: "Linux", stderr: "", code: 0 };
+      };
+
+      const terminalId = "fatal-ready-pipeline";
+      await backend.spawn({
+        type: "ssh",
+        id: terminalId,
+        title: "Fatal Ready Pipeline",
+        cols: 80,
+        rows: 24,
+        host: "fatal-ready.example.test",
+        port: 22,
+        username: "test",
+        authMethod: "password",
+        password: "secret",
+      });
+      await setupStarted;
+      client.emit("error", new Error("Invalid state for operation setAuthTag"));
+      releaseSetup();
+      await Promise.resolve();
+      await Promise.resolve();
+
+      assertEqual(client.destroys, 1, "fatal ready pipeline should destroy once");
+      assertEqual(
+        lateServerCloses,
+        1,
+        "a forward server created after fatal cleanup must be closed immediately",
+      );
+      assertEqual(
+        osDetectionCalls,
+        0,
+        "fatal setup must not continue into remote OS detection",
+      );
+      assertEqual(
+        client.shellCalls,
+        0,
+        "fatal setup must never open a late interactive shell",
+      );
+    },
+  );
+
+  await runCase(
     "SSH initialization retries wait for each complete write and use a fresh marker",
     async () => {
       class DelayedShellStream extends EventEmitter {
@@ -1300,8 +1459,13 @@ const run = async (): Promise<void> => {
           submissionDecoded.includes("input_revision_path") &&
           submissionDecoded.includes("PSConsoleReadLine]::GetBufferState") &&
           !submissionDecoded.includes("Set-PSReadLineKeyHandler") &&
-          !submissionDecoded.includes("AddToHistoryHandler"),
-        "the runtime-authenticated sidecar should publish revision-bound empty-input idle without replacing PSReadLine key semantics",
+          submissionDecoded.includes("Set-PSReadLineOption -AddToHistoryHandler") &&
+          submissionDecoded.includes("Microsoft.PowerShell.Core\\Get-History -ErrorAction SilentlyContinue") &&
+          submissionDecoded.includes(".CommandLine -ceq $global:") &&
+          submissionDecoded.includes("Microsoft.PowerShell.Core\\Clear-History -Id ([long[]]$") &&
+          !submissionDecoded.includes("Remove-History") &&
+          submissionDecoded.includes("catch{};[Console]::Clear()"),
+        "the runtime-authenticated sidecar should publish input-idle state while excluding its trigger from history and redraw",
       );
       assertCondition(
         decoded.includes(
@@ -1321,21 +1485,29 @@ const run = async (): Promise<void> => {
         "sidecar init must contain exactly one user-command invocation",
       );
       assertCondition(
-        decoded.includes("Out-String -Stream -Width 2147483647") &&
+        decoded.includes("$Host.UI.RawUI.BufferSize.Width") &&
+          decoded.includes("Out-String -Stream -Width $__gyshell_format_width -ErrorAction Stop") &&
+          !decoded.includes("Out-String -Stream -Width 2147483647") &&
           decoded.includes(
             `$global:__gyshell_output_max_bytes=[int64]${COMMAND_CAPTURE_MAX_UTF8_BYTES}`,
           ) &&
-          decoded.includes('$global:__gyshell_output_observed=[int64]$global:__gyshell_output_observed+[int64]$__gyshell_bytes.Length;if($global:__gyshell_output_truncated){return}'),
-        "sidecar output should flow through a strict-prefix bounded streaming writer",
+          decoded.includes('$global:__gyshell_output_observed=[int64]$global:__gyshell_output_observed+[int64]$__gyshell_bytes.Length;if($global:__gyshell_output_truncated){return}') &&
+          decoded.includes('catch{$global:__gyshell_output_capture_failed=$true}'),
+        "sidecar output should use a bounded live terminal width and separate capture failure from retention",
       );
       assertCondition(
         decoded.includes("Set-Variable -Scope Global -Name '__GyShell_InternalRecordOutcome'") &&
           decoded.includes(';& $global:__GyShell_InternalRecordOutcome ([bool]$?)') &&
           decoded.includes('$__GyShell_InternalUserCommandBlock=[scriptblock]::Create(') &&
+          decoded.includes('[Management.Automation.ParseException]::new(') &&
+          decoded.includes('$null=$Error.Insert(0,$__gyshell_parse_record)') &&
+          !decoded.includes('throw $__gyshell_parse_errors[0]') &&
           decoded.includes('$global:__gyshell_user_outcome_sampled=$true') &&
           !decoded.includes('if($_ -is [Management.Automation.ErrorRecord]){[string]$_}else{$_}') &&
-          decoded.includes('$global:__gyshell_user_exception | Microsoft.PowerShell.Utility\\Out-String'),
-        "sidecar status sampling must use a stable diagnostic entry while preserving structured PowerShell error details",
+          decoded.includes('$__gyshell_safe_error=[Management.Automation.ErrorRecord]::new(') &&
+          decoded.includes('$__gyshell_safe_error.ErrorDetails=$_.ErrorDetails') &&
+          decoded.includes('$global:__gyshell_user_exception | Microsoft.PowerShell.Core\\ForEach-Object {'),
+        "sidecar status sampling must preserve safe structured error details without private invocation metadata",
       );
       assertCondition(
         decoded.includes(
@@ -1379,7 +1551,8 @@ const run = async (): Promise<void> => {
           decoded.includes("';outcome_known='") &&
           decoded.includes("';output_bytes='") &&
           decoded.includes("';retained_bytes='") &&
-          decoded.includes("';output_truncated='"),
+          decoded.includes("';output_truncated='") &&
+          decoded.includes("';output_capture_failed='"),
         "sidecar prompt markers should publish request identity and verifiable output metadata",
       );
       assertCondition(
@@ -1388,7 +1561,7 @@ const run = async (): Promise<void> => {
           decoded.includes("if(-not $__gyshell_has_request -or $__gyshell_request_kind -eq 'c')") &&
           decoded.includes('$global:__gyshell_logical_user_ok=[bool]$__ok') &&
           decoded.includes("Write-Error 'GyShell status restoration sentinel' -ErrorAction Ignore"),
-        "a hidden probe must preserve the logical PowerShell status restored for the real user request",
+        "request roles must preserve the logical PowerShell status restored for a real user request",
       );
       assertCondition(
         !decoded.includes("__gyshell_should_native_fallback") &&
@@ -2714,6 +2887,42 @@ const run = async (): Promise<void> => {
         outcome[0]?.status,
         "rejected",
         "an unreadable owned output file must never become a successful empty capture",
+      );
+    },
+  );
+
+  await runCase(
+    "SSH sidecar capture failure retries when retained partial output is unreadable",
+    async () => {
+      const backend = new SSHBackend() as any;
+      const session = createSession();
+      session.commandTrackingMode = "windows-powershell-sidecar";
+      session.windowsCommandOutputPath =
+        "C:/Windows/Temp/GyShell/prompt-markers/missing-partial-output.txt";
+      backend.sessions.set("pty-missing-partial-output", session);
+      backend.refreshWindowsPromptMarkerState = async () => ({
+        sequence: 5,
+        exitCode: 1,
+        outputObservedUtf8Bytes: 9,
+        outputRetainedUtf8Bytes: 3,
+        outputTruncated: false,
+        outputCaptureFailed: true,
+      });
+      backend.readWindowsCommandOutputBestEffort = async () => undefined;
+
+      const outcome = await Promise.allSettled([
+        backend.pollCommandTracking("pty-missing-partial-output", {
+          mode: "windows-powershell-sidecar",
+          baselineSequence: 4,
+          commandOutputPath: session.windowsCommandOutputPath,
+          expectCommandOutput: true,
+        }),
+      ]);
+
+      assertEqual(
+        outcome[0]?.status,
+        "rejected",
+        "known retained bytes must be recovered before a capture-failed completion is consumed",
       );
     },
   );

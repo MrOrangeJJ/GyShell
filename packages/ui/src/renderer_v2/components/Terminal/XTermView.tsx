@@ -56,9 +56,14 @@ import {
   TerminalWriteCoordinator,
   type TerminalWriteTransition,
 } from "./terminalWriteCoordinator";
+import {
+  hasTerminalLiveOffsetGap,
+  mergeTerminalInitialReplay,
+} from "./terminalInitialReplay";
 
 const SCROLLBAR_HIDE_DELAY = 2000; // ms
 const RUNTIME_RELEASE_DELAY = 4000; // ms
+const TERMINAL_WRITE_RECOVERY_DRAIN_TIMEOUT_MS = 10_000;
 const COMMAND_DRAFT_SPINNER_FRAMES = ["|", "/", "-", "\\"];
 const COMMAND_DRAFT_FAILURE_VISIBILITY_MS = 1000;
 const TERMINAL_FONT_WEIGHT: FontWeight = 500;
@@ -152,6 +157,13 @@ interface TerminalRuntime {
 interface TerminalRenderMetadata {
   remoteOs?: TerminalRemoteOs;
   windowsRelease?: string;
+}
+
+interface BufferedTerminalOutputEvent extends TerminalRenderMetadata {
+  data: string;
+  offset?: number;
+  outputSequence?: number;
+  runtimeGeneration?: number;
 }
 
 const runtimePool = new Map<string, TerminalRuntime>();
@@ -360,6 +372,30 @@ const disposeRuntime = (runtime: TerminalRuntime): void => {
   runtime.term.dispose();
 };
 
+const installRuntimeWriteCoordinatorDrainHandler = (
+  runtime: TerminalRuntime,
+): void => {
+  runtime.writeCoordinator.setDrainHandler(() => {
+    if (
+      runtime.writeCoordinator.isRefitBarrierActive &&
+      runtime.refitFrame === null
+    ) {
+      scheduleRuntimeRefit(runtime);
+    }
+  });
+};
+
+const replaceRuntimeWriteCoordinator = (runtime: TerminalRuntime): void => {
+  runtime.writeCoordinator.dispose();
+  runtime.writeCoordinator = new TerminalWriteCoordinator(
+    (data, callback) => {
+      runtime.term.write(data, callback);
+    },
+    "unknown",
+  );
+  installRuntimeWriteCoordinatorDrainHandler(runtime);
+};
+
 const createRuntime = (
   config: TerminalConfig,
   theme: ITheme,
@@ -445,14 +481,7 @@ const createRuntime = (
     ),
   };
 
-  runtime.writeCoordinator.setDrainHandler(() => {
-    if (
-      runtime.writeCoordinator.isRefitBarrierActive &&
-      runtime.refitFrame === null
-    ) {
-      scheduleRuntimeRefit(runtime);
-    }
-  });
+  installRuntimeWriteCoordinatorDrainHandler(runtime);
 
   const showScrollbar = () => {
     runtime.hostEl?.classList.add("is-scrollbar-visible");
@@ -594,36 +623,129 @@ const createRuntime = (
     window.gyshell.ui.onContextMenuAction(onContextMenuAction);
 
   let lastBufferOffset = 0;
+  let lastCommittedBufferOffset = 0;
   let isSyncingInitialBuffer = true;
-  const pendingLiveEvents: Array<{
-    data: string;
-    offset?: number;
-    remoteOs?: TerminalRemoteOs;
-    windowsRelease?: string;
-  }> = [];
+  const pendingLiveEvents: BufferedTerminalOutputEvent[] = [];
+  const outputConsumerId = `${config.id}:${Date.now()}:${Math.random()
+    .toString(36)
+    .slice(2)}`;
+  let outputConsumerDisposed = false;
+  let outputConsumerAttached = false;
+  let attachedRuntimeGeneration: number | undefined;
+  let writeCoordinatorRuntimeGeneration: number | undefined;
+  let failedWriteCoordinatorGeneration: number | undefined;
+  let failedCoordinatorRecoveryInFlight = false;
+  const terminalFlowApi = window.gyshell.terminal as typeof window.gyshell.terminal & {
+    attachOutputConsumer?: (
+      terminalId: string,
+      consumerId: string,
+    ) => Promise<{
+      runtimeGeneration?: number;
+      data: string;
+      offset: number;
+      remoteOs?: TerminalRemoteOs;
+      windowsRelease?: string;
+    }>;
+    detachOutputConsumer?: (terminalId: string, consumerId: string) => void;
+    acknowledgeOutput?: (
+      terminalId: string,
+      consumerId: string,
+      runtimeGeneration: number,
+      outputSequence: number,
+    ) => void;
+    reportOutputFailure?: (
+      terminalId: string,
+      consumerId: string,
+      runtimeGeneration: number,
+      errorMessage: string,
+    ) => void;
+  };
+  const installWriteCoordinatorFailureHandler = (
+    generation?: number,
+  ): void => {
+    const coordinator = runtime.writeCoordinator;
+    coordinator.setFailureHandler((error) => {
+      const failureGeneration = Number.isSafeInteger(generation)
+        ? generation
+        : writeCoordinatorRuntimeGeneration;
+      failedWriteCoordinatorGeneration = failureGeneration;
+      isSyncingInitialBuffer = true;
+      if (Number.isSafeInteger(failureGeneration)) {
+        terminalFlowApi.reportOutputFailure?.(
+          config.id,
+          outputConsumerId,
+          failureGeneration as number,
+          error.message,
+        );
+      }
+      // Keep the logical consumer registered. The backend detaches it from
+      // the failed controller before stopping that runtime, then the next
+      // runtime generation can reuse the same consumer after we replace the
+      // failed coordinator below.
+    });
+  };
+  const prepareWriteCoordinatorForGeneration = (
+    generation: number | undefined,
+  ): boolean => {
+    if (!Number.isSafeInteger(generation)) return false;
+    const normalizedGeneration = generation as number;
+    if (
+      Number.isSafeInteger(failedWriteCoordinatorGeneration) &&
+      failedWriteCoordinatorGeneration !== normalizedGeneration
+    ) {
+      return true;
+    }
+    writeCoordinatorRuntimeGeneration = normalizedGeneration;
+    installWriteCoordinatorFailureHandler(normalizedGeneration);
+    return false;
+  };
+  installWriteCoordinatorFailureHandler();
   const writeDataWithOffset = (
     data: string,
     offset?: number,
     metadata: TerminalRenderMetadata = {},
     applyMetadataWhenDuplicate = false,
+    completion?: () => void,
+    failure?: (error: Error) => void,
   ): void => {
     const transition = createRuntimeWindowsPtyTransition(runtime, metadata);
     if (!data) {
       if (applyMetadataWhenDuplicate) {
-        runtime.writeCoordinator.write("", transition);
+        runtime.writeCoordinator.write(
+          "",
+          transition,
+          completion,
+          failure,
+        );
+      } else {
+        completion?.();
       }
       return;
     }
     if (!Number.isFinite(offset)) {
-      runtime.writeCoordinator.write(data, transition);
+      runtime.writeCoordinator.write(data, transition, completion, failure);
       return;
     }
 
     const normalizedOffset = Math.max(0, Math.floor(offset as number));
+    const completeAtOffset = (): void => {
+      lastCommittedBufferOffset = Math.max(
+        lastCommittedBufferOffset,
+        normalizedOffset,
+      );
+      completion?.();
+    };
     const chunkStart = Math.max(0, normalizedOffset - data.length);
     if (normalizedOffset <= lastBufferOffset) {
       if (applyMetadataWhenDuplicate) {
-        runtime.writeCoordinator.write("", transition);
+        runtime.writeCoordinator.write(
+          "",
+          transition,
+          completeAtOffset,
+          failure,
+        );
+      } else {
+        completion?.();
       }
       return;
     }
@@ -631,31 +753,354 @@ const createRuntime = (
       const overlap = lastBufferOffset - chunkStart;
       const nextChunk = data.slice(Math.max(0, overlap));
       if (nextChunk) {
-        runtime.writeCoordinator.write(nextChunk, transition);
+        runtime.writeCoordinator.write(
+          nextChunk,
+          transition,
+          completeAtOffset,
+          failure,
+        );
+      } else {
+        completeAtOffset();
       }
       lastBufferOffset = normalizedOffset;
       return;
     }
-    runtime.writeCoordinator.write(data, transition);
+    runtime.writeCoordinator.write(
+      data,
+      transition,
+      completeAtOffset,
+      failure,
+    );
     lastBufferOffset = normalizedOffset;
   };
 
+  const acknowledgeBufferedEvent = (
+    event: BufferedTerminalOutputEvent,
+  ): void => {
+    if (
+      Number.isSafeInteger(event.outputSequence) &&
+      Number.isSafeInteger(event.runtimeGeneration)
+    ) {
+      terminalFlowApi.acknowledgeOutput?.(
+        config.id,
+        outputConsumerId,
+        event.runtimeGeneration as number,
+        event.outputSequence as number,
+      );
+    }
+  };
+
+  const reportBufferedEventFailure = (
+    event: BufferedTerminalOutputEvent,
+    error: Error,
+  ): void => {
+    if (Number.isSafeInteger(event.runtimeGeneration)) {
+      terminalFlowApi.reportOutputFailure?.(
+        config.id,
+        outputConsumerId,
+        event.runtimeGeneration as number,
+        error.message,
+      );
+    }
+  };
+
+  const flushPendingLiveEvents = (): void => {
+    if (isSyncingInitialBuffer || pendingLiveEvents.length === 0) return;
+    const pending = pendingLiveEvents.splice(0, pendingLiveEvents.length);
+    for (let index = 0; index < pending.length; index += 1) {
+      if (isSyncingInitialBuffer) {
+        pendingLiveEvents.push(...pending.slice(index));
+        return;
+      }
+      processBufferedOutputEvent(pending[index]);
+    }
+  };
+
+  const replayBufferedOutput = (
+    initial: {
+      data: string;
+      offset: number;
+      remoteOs?: TerminalRemoteOs;
+      windowsRelease?: string;
+    },
+    replayEvents: BufferedTerminalOutputEvent[],
+    failureGeneration?: number,
+    recoveringFailedCoordinator = false,
+  ): void => {
+    const replaySegments = [
+      {
+        data: initial.data || "",
+        offset: initial.offset,
+        remoteOs: initial.remoteOs,
+        windowsRelease: initial.windowsRelease,
+      },
+      ...replayEvents,
+    ];
+    const replay = mergeTerminalInitialReplay(replaySegments);
+    const latestMetadata = [...replaySegments]
+      .reverse()
+      .find(
+        (segment) =>
+          Boolean(segment.remoteOs) || Boolean(segment.windowsRelease),
+      );
+    const replayMetadata: TerminalRenderMetadata = latestMetadata || initial;
+
+    const acknowledgeReplay = (): void => {
+      replayEvents.forEach(acknowledgeBufferedEvent);
+      if (recoveringFailedCoordinator) {
+        failedCoordinatorRecoveryInFlight = false;
+      }
+      isSyncingInitialBuffer = false;
+      flushPendingLiveEvents();
+    };
+    const reportReplayFailure = (error: Error): void => {
+      if (recoveringFailedCoordinator) {
+        failedCoordinatorRecoveryInFlight = false;
+      }
+      const latestEventGeneration = [...replayEvents]
+        .reverse()
+        .find((event) => Number.isSafeInteger(event.runtimeGeneration))
+        ?.runtimeGeneration;
+      const generation = Number.isSafeInteger(latestEventGeneration)
+        ? latestEventGeneration
+        : Number.isSafeInteger(failureGeneration)
+          ? failureGeneration
+          : attachedRuntimeGeneration;
+      if (Number.isSafeInteger(generation)) {
+        failedWriteCoordinatorGeneration = generation as number;
+        isSyncingInitialBuffer = true;
+        terminalFlowApi.reportOutputFailure?.(
+          config.id,
+          outputConsumerId,
+          generation as number,
+          error.message,
+        );
+      }
+    };
+
+    if (replay.hasGap) {
+      reportReplayFailure(
+        new Error(
+          `Visible terminal initial replay gap detected between offsets ${String(
+            replay.gapStart,
+          )} and ${String(replay.gapEnd)}.`,
+        ),
+      );
+      return;
+    }
+
+    writeDataWithOffset(
+      replay.data,
+      replay.offset,
+      replayMetadata,
+      true,
+      acknowledgeReplay,
+      reportReplayFailure,
+    );
+  };
+
+  const beginFailedCoordinatorRecovery = (
+    requestedGeneration: number,
+  ): void => {
+    if (failedCoordinatorRecoveryInFlight || outputConsumerDisposed) return;
+    failedCoordinatorRecoveryInFlight = true;
+    isSyncingInitialBuffer = true;
+    const retiringCoordinator = runtime.writeCoordinator;
+
+    void (async () => {
+      const drained = await retiringCoordinator.waitForDrain(
+        TERMINAL_WRITE_RECOVERY_DRAIN_TIMEOUT_MS,
+      );
+      if (outputConsumerDisposed) return;
+
+      const currentGeneration = Number.isSafeInteger(attachedRuntimeGeneration)
+        ? (attachedRuntimeGeneration as number)
+        : requestedGeneration;
+      if (!drained) {
+        failedCoordinatorRecoveryInFlight = false;
+        terminalFlowApi.reportOutputFailure?.(
+          config.id,
+          outputConsumerId,
+          currentGeneration,
+          "Timed out waiting for older visible xterm writes before recovery.",
+        );
+        return;
+      }
+
+      try {
+        // A parser exception can leave xterm's internal mode state suspect.
+        // Reset the parser and rebuild the visible tail from the same bounded
+        // backend buffer used to recover the headless xterm.
+        runtime.term.reset();
+        replaceRuntimeWriteCoordinator(runtime);
+        lastBufferOffset = 0;
+        lastCommittedBufferOffset = 0;
+        failedWriteCoordinatorGeneration = undefined;
+        writeCoordinatorRuntimeGeneration = currentGeneration;
+        installWriteCoordinatorFailureHandler(currentGeneration);
+
+        const initial = await window.gyshell.terminal.getBufferDelta(
+          config.id,
+          0,
+        );
+        if (outputConsumerDisposed) return;
+        const replayEvents = pendingLiveEvents.splice(
+          0,
+          pendingLiveEvents.length,
+        );
+        const latestGeneration = [...replayEvents]
+          .reverse()
+          .find((event) => Number.isSafeInteger(event.runtimeGeneration))
+          ?.runtimeGeneration;
+        const replayGeneration = Number.isSafeInteger(latestGeneration)
+          ? (latestGeneration as number)
+          : currentGeneration;
+        attachedRuntimeGeneration = replayGeneration;
+        writeCoordinatorRuntimeGeneration = replayGeneration;
+        installWriteCoordinatorFailureHandler(replayGeneration);
+        replayBufferedOutput(
+          initial,
+          replayEvents,
+          replayGeneration,
+          true,
+        );
+      } catch (error) {
+        failedCoordinatorRecoveryInFlight = false;
+        failedWriteCoordinatorGeneration = currentGeneration;
+        terminalFlowApi.reportOutputFailure?.(
+          config.id,
+          outputConsumerId,
+          currentGeneration,
+          error instanceof Error ? error.message : String(error),
+        );
+      }
+    })();
+  };
+
+  function processBufferedOutputEvent(
+    event: BufferedTerminalOutputEvent,
+  ): void {
+    if (Number.isSafeInteger(event.runtimeGeneration)) {
+      const eventGeneration = event.runtimeGeneration as number;
+      attachedRuntimeGeneration = Number.isSafeInteger(
+        attachedRuntimeGeneration,
+      )
+        ? Math.max(attachedRuntimeGeneration as number, eventGeneration)
+        : eventGeneration;
+    }
+
+    if (Number.isSafeInteger(failedWriteCoordinatorGeneration)) {
+      isSyncingInitialBuffer = true;
+      pendingLiveEvents.push(event);
+      if (
+        Number.isSafeInteger(event.runtimeGeneration) &&
+        event.runtimeGeneration !== failedWriteCoordinatorGeneration
+      ) {
+        beginFailedCoordinatorRecovery(event.runtimeGeneration as number);
+      }
+      return;
+    }
+
+    if (
+      !isSyncingInitialBuffer &&
+      Number.isSafeInteger(event.runtimeGeneration) &&
+      hasTerminalLiveOffsetGap(lastBufferOffset, event)
+    ) {
+      const eventGeneration = event.runtimeGeneration as number;
+      isSyncingInitialBuffer = true;
+      pendingLiveEvents.push(event);
+      failedWriteCoordinatorGeneration = eventGeneration;
+      terminalFlowApi.reportOutputFailure?.(
+        config.id,
+        outputConsumerId,
+        eventGeneration,
+        `Visible terminal output gap detected before offset ${String(event.offset)}.`,
+      );
+      return;
+    }
+
+    prepareWriteCoordinatorForGeneration(event.runtimeGeneration);
+    if (isSyncingInitialBuffer) {
+      pendingLiveEvents.push(event);
+      return;
+    }
+    writeDataWithOffset(
+      event.data,
+      event.offset,
+      event,
+      false,
+      () => acknowledgeBufferedEvent(event),
+      (error) => reportBufferedEventFailure(event, error),
+    );
+  }
+
   const cleanup = window.gyshell.terminal.onData(
-    ({ terminalId, data, offset, remoteOs, windowsRelease }) => {
+    ({
+      terminalId,
+      data,
+      offset,
+      remoteOs,
+      windowsRelease,
+      outputSequence,
+      runtimeGeneration,
+    }) => {
       if (terminalId === config.id) {
-        if (isSyncingInitialBuffer) {
-          pendingLiveEvents.push({
-            data,
-            offset,
-            remoteOs,
-            windowsRelease,
-          });
-          return;
-        }
-        writeDataWithOffset(data, offset, { remoteOs, windowsRelease });
+        processBufferedOutputEvent({
+          data,
+          offset,
+          remoteOs,
+          windowsRelease,
+          outputSequence,
+          runtimeGeneration,
+        });
       }
     },
   );
+  let outputAttachmentPromise: Promise<{
+    runtimeGeneration?: number;
+    data: string;
+    offset: number;
+    remoteOs?: TerminalRemoteOs;
+    windowsRelease?: string;
+  } | undefined> = Promise.resolve(undefined);
+  if (typeof terminalFlowApi.attachOutputConsumer === "function") {
+    outputAttachmentPromise = (async () => {
+      let attempt = 0;
+      while (!outputConsumerDisposed) {
+        try {
+          const result = await terminalFlowApi.attachOutputConsumer!(
+            config.id,
+            outputConsumerId,
+          );
+          if (outputConsumerDisposed) {
+            terminalFlowApi.detachOutputConsumer?.(
+              config.id,
+              outputConsumerId,
+            );
+            return undefined;
+          }
+          if (Number.isSafeInteger(result?.runtimeGeneration)) {
+            attachedRuntimeGeneration = result.runtimeGeneration;
+            prepareWriteCoordinatorForGeneration(result.runtimeGeneration);
+          }
+          outputConsumerAttached = true;
+          return result;
+        } catch (error) {
+          attempt += 1;
+          if (attempt === 1 || attempt % 5 === 0) {
+            console.warn(
+              `[XTermView] Failed to attach output consumer for ${config.id}; retrying (attempt ${attempt}).`,
+              error,
+            );
+          }
+          await new Promise<void>((resolve) => {
+            window.setTimeout(resolve, Math.min(1000, 50 * 2 ** attempt));
+          });
+        }
+      }
+      return undefined;
+    })();
+  }
 
   const plainConfig = toPlainConfig(config);
   const dims = fit.proposeDimensions();
@@ -672,37 +1117,66 @@ const createRuntime = (
 
   const syncBufferedOutput = async (): Promise<void> => {
     try {
-      const initial = await window.gyshell.terminal.getBufferDelta(
-        config.id,
+      const attachment = await outputAttachmentPromise;
+      if (outputConsumerDisposed) return;
+      const initial =
+        attachment ||
+        (await window.gyshell.terminal.getBufferDelta(config.id, 0));
+      const replayEvents = pendingLiveEvents.splice(
         0,
+        pendingLiveEvents.length,
       );
-      writeDataWithOffset(initial.data || "", initial.offset, initial, true);
-
-      const normalizedOffset = Math.max(
-        lastBufferOffset,
-        Number.isFinite(initial.offset) ? Math.floor(initial.offset) : 0,
+      const latestGeneration = [...replayEvents]
+        .reverse()
+        .find((event) => Number.isSafeInteger(event.runtimeGeneration))
+        ?.runtimeGeneration;
+      replayBufferedOutput(
+        initial,
+        replayEvents,
+        Number.isSafeInteger(latestGeneration)
+          ? latestGeneration
+          : attachedRuntimeGeneration,
       );
-      lastBufferOffset = normalizedOffset;
-      const tail = await window.gyshell.terminal.getBufferDelta(
-        config.id,
-        normalizedOffset,
-      );
-      writeDataWithOffset(tail.data || "", tail.offset, tail, true);
-    } catch {
-      // ignore: runtime output sync is best-effort
-    } finally {
-      isSyncingInitialBuffer = false;
-      if (pendingLiveEvents.length > 0) {
-        const pending = pendingLiveEvents.splice(0, pendingLiveEvents.length);
-        pending.forEach((event) => {
-          writeDataWithOffset(event.data, event.offset, event);
-        });
+    } catch (error) {
+      const failureGeneration = Number.isSafeInteger(
+        attachedRuntimeGeneration,
+      )
+        ? (attachedRuntimeGeneration as number)
+        : [...pendingLiveEvents]
+            .reverse()
+            .find((event) => Number.isSafeInteger(event.runtimeGeneration))
+            ?.runtimeGeneration;
+      if (Number.isSafeInteger(failureGeneration)) {
+        failedWriteCoordinatorGeneration = failureGeneration;
+        terminalFlowApi.reportOutputFailure?.(
+          config.id,
+          outputConsumerId,
+          failureGeneration as number,
+          error instanceof Error ? error.message : String(error),
+        );
+      } else {
+        console.warn(
+          `[XTermView] Initial terminal buffer replay failed for ${config.id}.`,
+          error,
+        );
+        isSyncingInitialBuffer = false;
+        flushPendingLiveEvents();
       }
     }
   };
   void syncBufferedOutput();
 
-  runtime.cleanupBackendData = cleanup;
+  runtime.cleanupBackendData = () => {
+    cleanup();
+    outputConsumerDisposed = true;
+    if (outputConsumerAttached) {
+      terminalFlowApi.detachOutputConsumer?.(
+        config.id,
+        outputConsumerId,
+      );
+      outputConsumerAttached = false;
+    }
+  };
   runtime.cleanupContextMenuListener = removeContextMenuListener;
   runtime.inputDispose = () => inputDisposable.dispose();
   runtime.selectionDispose = () => selectionDisposable.dispose();

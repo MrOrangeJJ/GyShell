@@ -1,4 +1,4 @@
-import { waitSchema } from './wait_tools'
+import { waitSchema, waitTerminalIdle } from './wait_tools'
 
 const assertEqual = <T>(actual: T, expected: T, message: string): void => {
   if (actual !== expected) {
@@ -80,7 +80,108 @@ async function run(): Promise<void> {
     assertEqual(result.success, false, 'missing seconds field should be rejected')
   }
 
-  console.log('PASS wait_tools.extreme.spec: all 9 cases passed')
+  const terminal = {
+    id: 'win-busy',
+    title: 'Windows Busy',
+    type: 'ssh',
+  }
+  const createContext = (options: {
+    snapshots: Array<Record<string, unknown> | null>
+    output?: string
+    waitForQueuedInsertion?: () => Promise<boolean>
+    markQueuedInsertion?: () => void
+  }) => {
+    const events: Array<Record<string, unknown>> = []
+    let snapshotIndex = 0
+    const terminalService = {
+      resolveTerminal: () => ({ found: [terminal], bestMatch: terminal }),
+      getTerminalRuntimeSnapshot: () => {
+        const index = Math.min(snapshotIndex, options.snapshots.length - 1)
+        snapshotIndex += 1
+        return options.snapshots[index]
+      },
+      getRecentOutput: () => options.output || '',
+    }
+    return {
+      events,
+      context: {
+        sessionId: 'wait-session',
+        messageId: 'wait-message',
+        terminalService,
+        sendEvent: (_sessionId: string, event: Record<string, unknown>) => {
+          events.push(event)
+        },
+        waitForQueuedInsertion: options.waitForQueuedInsertion,
+        markWaitInterruptedByQueuedInsertion: options.markQueuedInsertion,
+      } as any,
+    }
+  }
+  const readySnapshot = {
+    ...terminal,
+    runtimeState: 'ready',
+    isInitializing: false,
+    reconnectable: false,
+    canRunCommand: true,
+    canWrite: true,
+    canUseFilesystem: true,
+    shellInputState: 'idle',
+  }
+  const busySnapshot = {
+    ...readySnapshot,
+    canRunCommand: false,
+    shellInputState: 'busy',
+  }
+
+  {
+    const { context, events } = createContext({
+      snapshots: [readySnapshot, readySnapshot],
+      output: 'PS C:\\Users\\Tester>',
+    })
+    const result = await waitTerminalIdle({ tabIdOrName: terminal.id }, context)
+    assertEqual(result.includes('verified idle prompt'), true, 'verified prompt state should finish immediately')
+    assertEqual(events.at(-1)?.type, 'sub_tool_finished', 'successful monitoring must finish its tool event')
+  }
+
+  {
+    const { context } = createContext({
+      snapshots: [busySnapshot],
+      output: 'long-running command has no new output',
+    })
+    const result = await waitTerminalIdle({ tabIdOrName: terminal.id }, context)
+    assertEqual(result.includes('shell is still busy'), true, 'stable output must not be described as command completion')
+    assertEqual(result.includes('do not start another command'), true, 'busy stability must give the agent an explicit interaction constraint')
+  }
+
+  {
+    let marked = false
+    const { context } = createContext({
+      snapshots: [busySnapshot],
+      waitForQueuedInsertion: async () => true,
+      markQueuedInsertion: () => {
+        marked = true
+      },
+    })
+    const result = await waitTerminalIdle({ tabIdOrName: terminal.id }, context)
+    assertEqual(result.includes('queued agent notification'), true, 'queued work should interrupt terminal monitoring promptly')
+    assertEqual(marked, true, 'queued interruption must be recorded in the agent context')
+  }
+
+  {
+    const exitedSnapshot = {
+      ...busySnapshot,
+      runtimeState: 'exited',
+      reconnectable: true,
+      canWrite: false,
+      canUseFilesystem: false,
+    }
+    const { context } = createContext({
+      snapshots: [busySnapshot, busySnapshot, exitedSnapshot],
+    })
+    const result = await waitTerminalIdle({ tabIdOrName: terminal.id }, context)
+    assertEqual(result.includes('disconnected'), true, 'runtime exit during monitoring must be rechecked and reported')
+  }
+
+  console.log('PASS wait_tools.extreme.spec: all schema and runtime cases passed')
 }
 
 void run().catch((error) => {

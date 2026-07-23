@@ -144,4 +144,115 @@ runCase('dispose ignores later output and drain notifications', () => {
   assertEqual(writes.length, 0, 'disposed runtimes should not receive queued output')
 })
 
+runCase('a failed xterm write reports failure without acknowledging dropped data', () => {
+  let completions = 0
+  let failures = 0
+  let terminalFailures = 0
+  const coordinator = new TerminalWriteCoordinator(() => {
+    throw new Error('write data discarded, use flow control')
+  })
+  coordinator.setFailureHandler(() => {
+    terminalFailures += 1
+  })
+
+  coordinator.write(
+    'unsafe',
+    undefined,
+    () => {
+      completions += 1
+    },
+    () => {
+      failures += 1
+    }
+  )
+
+  assertEqual(completions, 0, 'dropped data must never receive a parser ACK')
+  assertEqual(failures, 1, 'the failed logical event should report once')
+  assertEqual(terminalFailures, 1, 'the terminal failure handler should run once')
+})
+
+await (async () => {
+  const callbacks: Array<() => void> = []
+  let writes = 0
+  const coordinator = new TerminalWriteCoordinator((_data, callback) => {
+    writes += 1
+    if (writes === 2) {
+      throw new Error('write data discarded, use flow control')
+    }
+    callbacks.push(callback)
+  })
+
+  coordinator.write('older-pending')
+  coordinator.write('failed')
+  let settled = false
+  const drained = coordinator.waitForDrain(1_000).then((result) => {
+    settled = true
+    return result
+  })
+  await Promise.resolve()
+  assertEqual(
+    settled,
+    false,
+    'failure recovery must wait for older accepted xterm writes'
+  )
+  callbacks.shift()?.()
+  assertEqual(
+    await drained,
+    true,
+    'the failed coordinator should report drained after older writes settle'
+  )
+  console.log('PASS waits for older accepted writes after a later write fails')
+})()
+
+runCase('splits a giant logical event and acknowledges only after every chunk drains', () => {
+  const writes: string[] = []
+  const callbacks: Array<() => void> = []
+  let completions = 0
+  let tailCompletions = 0
+  const coordinator = new TerminalWriteCoordinator((data, callback) => {
+    writes.push(data)
+    callbacks.push(callback)
+  })
+  const source = `${'x'.repeat(64 * 1024 - 1)}😀${'y'.repeat(70 * 1024)}`
+
+  coordinator.write(source, undefined, () => {
+    completions += 1
+  })
+  coordinator.write('tail', undefined, () => {
+    tailCompletions += 1
+  })
+  assertEqual(writes.length, 1, 'only the first bounded chunk should enter xterm')
+  assertEqual(completions, 0, 'logical ACK must wait for all chunks')
+  callbacks.shift()?.()
+  assertEqual(writes.length, 2, 'the second chunk should follow the first drain')
+  assertEqual(completions, 0, 'intermediate chunk drain must not ACK the event')
+  callbacks.shift()?.()
+  assertEqual(writes.length, 3, 'the final bounded chunk should be emitted')
+  callbacks.shift()?.()
+
+  assertEqual(
+    writes.slice(0, 3).join(''),
+    source,
+    'chunking must preserve exact data order'
+  )
+  assertEqual(completions, 1, 'the visible parser should ACK the event once')
+  assertEqual(
+    writes[3],
+    'tail',
+    'a later logical event must not interleave between chunks of a giant event'
+  )
+  assertEqual(
+    tailCompletions,
+    0,
+    'the later event must retain its own parser-drain ACK'
+  )
+  callbacks.shift()?.()
+  assertEqual(tailCompletions, 1, 'the later event should ACK after its drain')
+  assertEqual(
+    writes.every((chunk) => chunk.length <= 64 * 1024),
+    true,
+    'no xterm write should exceed the fixed chunk limit'
+  )
+})
+
 console.log('All terminal write coordinator extreme tests passed.')

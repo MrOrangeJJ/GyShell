@@ -17,11 +17,18 @@ import { UIHistoryService } from "./UIHistoryService";
 import { TokenManager } from "./AgentHelper/TokenManager";
 import {
   PASS_CHAT_HISTORY_TAG,
+  USER_INSERTED_INPUT_TAG,
   USER_INPUT_TAG,
   WHAT_HAVE_DONE_IN_THE_PAST_TAG,
 } from "./AgentHelper/prompts";
 import { buildDynamicRequestHistory } from "./AgentHelper/utils/model_messages";
 import { buildDeterministicCompactionDigest } from "./AgentHelper/utils/deterministic_compaction_digest";
+import { sanitizeCompressionAfterRollback } from "./AgentHelper/utils/history_compression_maintenance";
+import {
+  invokeWithRetry,
+  isContextWindowExceededError,
+} from "./AgentHelper/utils/runtime";
+import { MAX_LINE_LENGTH, readTextFile } from "./AgentHelper/tools/read_tools";
 import { HistorySqliteStore } from "./history/HistorySqliteStore";
 
 const runCase = async (
@@ -33,13 +40,16 @@ const runCase = async (
 };
 
 class FakeTerminalService {
-  constructor(private readonly hasLocalTerminal: boolean = true) {}
+  createdLocalTerminals = 0;
+  private localTerminalId = "local-main";
+
+  constructor(private hasLocalTerminal: boolean = true) {}
 
   getDisplayTerminals(): any[] {
     if (!this.hasLocalTerminal) return [];
     return [
       {
-        id: "local-main",
+        id: this.localTerminalId,
         title: "Local",
         type: "local",
         capabilities: { supportsFilesystem: true },
@@ -49,6 +59,17 @@ class FakeTerminalService {
 
   getTerminalRuntimeSnapshot(): any {
     return this.hasLocalTerminal ? { canUseFilesystem: true } : null;
+  }
+
+  async createTerminal(config: any): Promise<any> {
+    this.hasLocalTerminal = true;
+    this.createdLocalTerminals += 1;
+    this.localTerminalId = String(config.id);
+    return {
+      ...config,
+      type: "local",
+      capabilities: { supportsFilesystem: true },
+    };
   }
 }
 
@@ -86,6 +107,50 @@ const makePrunedTool = (id: string, content: string): ToolMessage =>
       [TokenManager.PRUNE_FLAG_KEY]: true,
     },
   } as any);
+
+const unwrapZeroRetentionExport = (wrapped: string): string => {
+  const logicalLines: string[] = [];
+  let pendingLogicalLine: string[] = [];
+  let expectedPart = 0;
+  let expectedParts = 0;
+
+  const flushPending = (): void => {
+    if (pendingLogicalLine.length === 0) return;
+    assert.equal(expectedPart, expectedParts);
+    logicalLines.push(pendingLogicalLine.join(""));
+    pendingLogicalLine = [];
+    expectedPart = 0;
+    expectedParts = 0;
+  };
+
+  for (const line of wrapped.split("\n")) {
+    const chunk = line.match(
+      /^\[\[GYSHELL-WRAPPED-LINE-V1 logical=(\d+) part=(\d+)\/(\d+)\]\] (.*)$/,
+    );
+    if (!chunk) {
+      flushPending();
+      logicalLines.push(
+        line.startsWith("[[GYSHELL-LITERAL-LINE-V1]]")
+          ? line.slice("[[GYSHELL-LITERAL-LINE-V1]]".length)
+          : line,
+      );
+      continue;
+    }
+
+    const part = Number(chunk[2]);
+    const parts = Number(chunk[3]);
+    if (part === 1) {
+      flushPending();
+      expectedParts = parts;
+    }
+    assert.equal(part, expectedPart + 1);
+    assert.equal(parts, expectedParts);
+    expectedPart = part;
+    pendingLogicalLine.push(chunk[4]);
+  }
+  flushPending();
+  return logicalLines.join("\n");
+};
 
 const makeMessages = (): BaseMessage[] => [
   new SystemMessage({
@@ -170,6 +235,8 @@ const createAgentHarness = (options?: {
   omitProtectedAnchor?: boolean;
 }): {
   agent: AgentService_v2;
+  terminalService: FakeTerminalService;
+  chatHistory: ChatHistoryService;
   tempDir: string;
   events: any[];
   cleanup: () => void;
@@ -186,8 +253,12 @@ const createAgentHarness = (options?: {
     omitProtectedAnchor: options?.omitProtectedAnchor,
   });
 
+  const terminalService = new FakeTerminalService(
+    options?.hasLocalTerminal !== false,
+  );
+
   const agent = new AgentService_v2(
-    new FakeTerminalService(options?.hasLocalTerminal !== false) as any,
+    terminalService as any,
     {} as any,
     { getActiveTools: () => [] } as any,
     { getEnabledSkills: async () => [] } as any,
@@ -212,6 +283,8 @@ const createAgentHarness = (options?: {
 
   return {
     agent,
+    terminalService,
+    chatHistory,
     tempDir,
     events,
     cleanup: () => {
@@ -236,6 +309,439 @@ const runFallbackCompaction = async (
     undefined,
   );
 };
+
+const forceOrdinaryCompactionFailure = (agent: AgentService_v2): void => {
+  (agent as any).getCompactionModelDecision = async () => {
+    throw new Error("ordinary compaction unavailable");
+  };
+  (agent as any).buildDeterministicFallbackSummary = async () => {
+    throw new Error("deterministic emergency unavailable");
+  };
+};
+
+await runCase("legacy token estimation contract remains exact", () => {
+  const toolCall = new AIMessage({
+    content: "",
+    tool_calls: [
+      {
+        id: "large-command",
+        name: "exec_command",
+        args: { cmd: `printf %s ${"A".repeat(120_000)}` },
+      },
+    ],
+  });
+  assert.equal(TokenManager.estimate("x".repeat(40_003)), 10_001);
+  assert.equal(TokenManager.estimate("界".repeat(16_000)), 4_000);
+  assert.equal(TokenManager.estimateMessages([toolCall]), 0);
+  assert.equal(TokenManager.isOverflow(70_000, 80_000), false);
+  assert.equal(TokenManager.isOverflow(70_001, 80_000), true);
+});
+
+await runCase(
+  "token estimation excludes typed image_url parts without changing text estimation",
+  () => {
+    const textPart = { type: "text" as const, text: "x".repeat(4_000) };
+    const textOnly = new HumanMessage({ content: [textPart] as any });
+    const withLargeImage = new HumanMessage({
+      content: [
+        textPart,
+        {
+          type: "image_url",
+          image_url: {
+            url: `data:image/png;base64,${"A".repeat(1_000_000)}`,
+          },
+        },
+      ] as any,
+    });
+
+    assert.equal(
+      TokenManager.estimateMessages([withLargeImage]),
+      TokenManager.estimateMessages([textOnly]),
+    );
+    assert.equal(
+      TokenManager.estimateMessages([
+        new HumanMessage("data:image/png;base64," + "A".repeat(4_000)),
+      ]),
+      TokenManager.estimate("data:image/png;base64," + "A".repeat(4_000)),
+      "plain text that happens to contain a data URI must keep the legacy estimator",
+    );
+  },
+);
+
+await runCase(
+  "context overflow classification is high-confidence and skips generic retry",
+  async () => {
+    const positives = [
+      { status: 400, error: { code: "context_length_exceeded" } },
+      {
+        error: {
+          metadata: {
+            raw: JSON.stringify({
+              error: { type: "context_window_exceeded" },
+            }),
+          },
+        },
+      },
+      { errors: [{ code: "input_too_long" }] },
+      new Error(
+        "This endpoint's maximum context length is 262144 tokens. However, you requested about 1536517 tokens.",
+      ),
+      { message: "Your input exceeds the context window of this model." },
+      { response: { data: { message: "Prompt is too long: 9001 tokens" } } },
+    ];
+    const negatives = [
+      { status: 400 },
+      { status: 413, type: "invalid_request_error" },
+      { status: 400, error: { message: "Invalid tool schema" } },
+      { status: 400, message: "max_tokens must be at least 1" },
+      { status: 429, message: "Too many requests" },
+      { response_metadata: { finish_reason: "length" } },
+    ];
+
+    positives.forEach((error) =>
+      assert.equal(isContextWindowExceededError(error), true),
+    );
+    negatives.forEach((error) =>
+      assert.equal(isContextWindowExceededError(error), false),
+    );
+
+    let attempts = 0;
+    await assert.rejects(
+      () =>
+        invokeWithRetry(
+          async () => {
+            attempts += 1;
+            throw positives[0];
+          },
+          4,
+          [0, 0, 0, 0],
+        ),
+      (error) => error === positives[0],
+    );
+    assert.equal(attempts, 1);
+  },
+);
+
+await runCase(
+  "main-request limits ignore the compaction model and switch after first-turn thinking",
+  () => {
+    const { agent, cleanup } = createAgentHarness();
+    try {
+      const binding = {
+        globalMaxTokens: 240_000,
+        thinkingMaxTokens: 80_000,
+        compactionMaxTokens: 16_000,
+      };
+      assert.equal(
+        (agent as any).getNextMainRequestMaxTokens(binding, {
+          firstTurnThinkingModelEnabled: false,
+          modelRequestPassCount: 0,
+        }),
+        240_000,
+      );
+      assert.equal(
+        (agent as any).getNextMainRequestMaxTokens(binding, {
+          firstTurnThinkingModelEnabled: true,
+          modelRequestPassCount: 0,
+        }),
+        80_000,
+      );
+      assert.equal(
+        (agent as any).getNextMainRequestMaxTokens(binding, {
+          firstTurnThinkingModelEnabled: true,
+          modelRequestPassCount: 1,
+        }),
+        240_000,
+      );
+    } finally {
+      cleanup();
+    }
+  },
+);
+
+await runCase(
+  "provider context overflow compacts once and retries the main request once",
+  async () => {
+    const { agent, cleanup } = createAgentHarness();
+    try {
+      const trace: string[] = [];
+      const contextError = {
+        status: 400,
+        error: { code: "context_length_exceeded" },
+      };
+      const compactedMarker = new HumanMessage({
+        content: `${WHAT_HAVE_DONE_IN_THE_PAST_TAG}provider recovery`,
+        additional_kwargs: {
+          _gyshellMessageId: "provider-recovery-marker",
+          [TokenManager.LAST_COMPACTION_FLAG_KEY]: true,
+        },
+      });
+      (agent as any).tryCompactHistory = async (
+        _sessionId: string,
+        messages: BaseMessage[],
+      ) => {
+        trace.push("compact");
+        return { changed: true, messages: [...messages, compactedMarker] };
+      };
+
+      let requests = 0;
+      const result = await (agent as any).invokeMainModelWithContextRecovery({
+        sessionId: "session-1",
+        historyMessages: makeMessages(),
+        modelSupportsImage: true,
+        maxTokens: 80_000,
+        canRecover: () => true,
+        request: async (messages: BaseMessage[]) => {
+          requests += 1;
+          trace.push(
+            messages.some((message) =>
+              TokenManager.hasLastCompactionFlag(message),
+            )
+              ? "request-compacted"
+              : "request-original",
+          );
+          if (requests === 1) throw contextError;
+          return "accepted";
+        },
+      });
+
+      assert.deepEqual(trace, [
+        "request-original",
+        "compact",
+        "request-compacted",
+      ]);
+      assert.equal(result.response, "accepted");
+      assert.ok(result.historyMessages.includes(compactedMarker));
+    } finally {
+      cleanup();
+    }
+  },
+);
+
+await runCase(
+  "main-request context recovery is bounded and ignores unrelated 400 errors",
+  async () => {
+    const { agent, cleanup } = createAgentHarness();
+    try {
+      const contextError = {
+        status: 400,
+        error: { code: "context_length_exceeded" },
+      };
+      const secondContextError = {
+        status: 400,
+        message: "Your input exceeds the context window of this model.",
+      };
+      let compactions = 0;
+      (agent as any).tryCompactHistory = async (
+        _sessionId: string,
+        messages: BaseMessage[],
+      ) => {
+        compactions += 1;
+        const marker = new HumanMessage({
+          content: `${WHAT_HAVE_DONE_IN_THE_PAST_TAG}bounded recovery`,
+          additional_kwargs: {
+            [TokenManager.LAST_COMPACTION_FLAG_KEY]: true,
+          },
+        });
+        return { changed: true, messages: [...messages, marker] };
+      };
+
+      let requests = 0;
+      await assert.rejects(
+        () =>
+          (agent as any).invokeMainModelWithContextRecovery({
+            sessionId: "session-1",
+            historyMessages: makeMessages(),
+            modelSupportsImage: true,
+            maxTokens: 80_000,
+            canRecover: () => true,
+            request: async () => {
+              requests += 1;
+              throw requests === 1 ? contextError : secondContextError;
+            },
+          }),
+        (error) => error === secondContextError,
+      );
+      assert.equal(requests, 2);
+      assert.equal(compactions, 1);
+
+      const unrelatedError = {
+        status: 400,
+        error: { message: "Invalid tool schema" },
+      };
+      await assert.rejects(
+        () =>
+          (agent as any).invokeMainModelWithContextRecovery({
+            sessionId: "session-1",
+            historyMessages: makeMessages(),
+            modelSupportsImage: true,
+            maxTokens: 80_000,
+            canRecover: () => true,
+            request: async () => {
+              throw unrelatedError;
+            },
+          }),
+        (error) => error === unrelatedError,
+      );
+      assert.equal(compactions, 1);
+
+      await assert.rejects(
+        () =>
+          (agent as any).invokeMainModelWithContextRecovery({
+            sessionId: "session-1",
+            historyMessages: makeMessages(),
+            modelSupportsImage: true,
+            maxTokens: 80_000,
+            canRecover: () => false,
+            request: async () => {
+              throw contextError;
+            },
+          }),
+        (error) => error === contextError,
+      );
+      assert.equal(
+        compactions,
+        1,
+        "a context error after any streamed chunk must fail closed",
+      );
+    } finally {
+      cleanup();
+    }
+  },
+);
+
+await runCase(
+  "an encoded image does not trigger compaction far below an 80k window",
+  async () => {
+    const { agent, cleanup } = createAgentHarness();
+    try {
+      let compactionCalls = 0;
+      (agent as any).tryCompactHistory = async () => {
+        compactionCalls += 1;
+        return { changed: false, messages: [] };
+      };
+
+      const node = (agent as any).createTokenManagerNode();
+      await node.invoke({
+        sessionId: "session-1",
+        messages: [
+          new HumanMessage({
+            content: [
+              { type: "text", text: `${USER_INPUT_TAG}continue` },
+              {
+                type: "image_url",
+                image_url: {
+                  url: `data:image/png;base64,${"A".repeat(1_000_000)}`,
+                },
+              },
+            ] as any,
+          }),
+        ],
+        token_state: { current_tokens: 47_463, max_tokens: 80_000 },
+        pendingToolCalls: [],
+        pendingToolSupplementMessages: [],
+      });
+      assert.equal(compactionCalls, 0);
+    } finally {
+      cleanup();
+    }
+  },
+);
+
+await runCase(
+  "ordinary model compaction succeeds before deterministic or zero-retention fallback",
+  async () => {
+    const { agent, events, cleanup } = createAgentHarness();
+    try {
+      const trace: string[] = [];
+      (agent as any).getCompactionModelDecision = async () => {
+        trace.push("ordinary-model");
+        return { summary: "ordinary model summary" };
+      };
+      (agent as any).buildDeterministicFallbackSummary = async () => {
+        trace.push("deterministic-emergency");
+        throw new Error("deterministic fallback must not run");
+      };
+      (agent as any).buildZeroRetentionCompactionCandidate = async () => {
+        trace.push("zero-retention");
+        throw new Error("zero-retention must not run");
+      };
+
+      const result = await (agent as any).tryCompactHistory(
+        "session-1",
+        makeMessages(),
+        undefined,
+        { maxTokens: 80_000 },
+      );
+      const marker = result.messages.find((message: BaseMessage) =>
+        TokenManager.hasLastCompactionFlag(message),
+      ) as any;
+      assert.deepEqual(trace, ["ordinary-model"]);
+      assert.equal(
+        marker.additional_kwargs?.zero_retention_compaction,
+        undefined,
+      );
+      assert.equal(
+        marker.additional_kwargs?.[
+          TokenManager.COMPACTION_PROTECTED_ROUNDS_KEY
+        ],
+        undefined,
+      );
+      assert.equal(
+        events.find((event) => event.type === "compaction_boundary")
+          ?.protectedNormalRounds,
+        2,
+      );
+    } finally {
+      cleanup();
+    }
+  },
+);
+
+await runCase(
+  "deterministic emergency succeeds before zero-retention fallback",
+  async () => {
+    const { agent, events, cleanup } = createAgentHarness();
+    try {
+      const trace: string[] = [];
+      (agent as any).getCompactionModelDecision = async () => {
+        trace.push("ordinary-model");
+        throw new Error("ordinary model unavailable");
+      };
+      (agent as any).buildDeterministicFallbackSummary = async () => {
+        trace.push("deterministic-emergency");
+        return "deterministic emergency summary";
+      };
+      (agent as any).buildZeroRetentionCompactionCandidate = async () => {
+        trace.push("zero-retention");
+        throw new Error("zero-retention must not run");
+      };
+
+      const result = await (agent as any).tryCompactHistory(
+        "session-1",
+        makeMessages(),
+        undefined,
+        { maxTokens: 80_000 },
+      );
+      const marker = result.messages.find((message: BaseMessage) =>
+        TokenManager.hasLastCompactionFlag(message),
+      ) as any;
+      assert.deepEqual(trace, ["ordinary-model", "deterministic-emergency"]);
+      assert.equal(marker.additional_kwargs?.fallback_compaction, true);
+      assert.equal(
+        marker.additional_kwargs?.zero_retention_compaction,
+        undefined,
+      );
+      assert.equal(
+        events.find((event) => event.type === "compaction_boundary")
+          ?.protectedNormalRounds,
+        2,
+      );
+    } finally {
+      cleanup();
+    }
+  },
+);
 
 await runCase(
   "deterministic digest stays inside a hard character budget",
@@ -673,6 +1179,103 @@ await runCase(
 );
 
 await runCase(
+  "emergency fallback cannot bypass the ordinary minimum-round guard",
+  async () => {
+    const { agent, events, cleanup } = createAgentHarness();
+    try {
+      const trace: string[] = [];
+      (agent as any).getCompactionModelDecision = async () => {
+        trace.push("ordinary-model");
+        throw new Error("must not run");
+      };
+      (agent as any).buildDeterministicFallbackSummary = async () => {
+        trace.push("deterministic-emergency");
+        throw new Error("must not run");
+      };
+      (agent as any).buildZeroRetentionCompactionCandidate = async () => {
+        trace.push("zero-retention");
+        throw new Error("must not run");
+      };
+
+      const messages = [
+        new SystemMessage("system"),
+        makeUser("guard-user-1", "round one"),
+        makeAssistant("guard-assistant-1", "answer one"),
+        makeUser("guard-user-2", "round two"),
+      ];
+      const result = await (agent as any).tryCompactHistory(
+        "session-1",
+        messages,
+        undefined,
+        { maxTokens: 15_000 },
+      );
+
+      assert.equal(result.changed, false);
+      assert.equal(result.messages, messages);
+      assert.deepEqual(trace, []);
+      assert.ok(
+        !events.some(
+          (event) =>
+            event.type === "sub_tool_started" &&
+            event.title === "Compaction...",
+        ),
+      );
+      assert.ok(!events.some((event) => event.type === "compaction_boundary"));
+    } finally {
+      cleanup();
+    }
+  },
+);
+
+await runCase(
+  "emergency fallback cannot bypass an ordinary marker collision",
+  async () => {
+    const { agent, events, cleanup } = createAgentHarness();
+    try {
+      const trace: string[] = [];
+      (agent as any).getCompactionModelDecision = async () => {
+        trace.push("ordinary-model");
+        throw new Error("must not run");
+      };
+      (agent as any).buildDeterministicFallbackSummary = async () => {
+        trace.push("deterministic-emergency");
+        throw new Error("must not run");
+      };
+      (agent as any).buildZeroRetentionCompactionCandidate = async () => {
+        trace.push("zero-retention");
+        throw new Error("must not run");
+      };
+
+      const messages = makeMessages();
+      (messages[5] as any).additional_kwargs = {
+        ...((messages[5] as any).additional_kwargs || {}),
+        [TokenManager.LAST_COMPACTION_FLAG_KEY]: true,
+      };
+      const result = await (agent as any).tryCompactHistory(
+        "session-1",
+        messages,
+        undefined,
+        { maxTokens: 15_000 },
+      );
+
+      assert.equal(result.changed, false);
+      assert.equal(result.messages, messages);
+      assert.deepEqual(trace, []);
+      assert.ok(
+        !events.some(
+          (event) =>
+            event.type === "sub_tool_started" &&
+            event.title === "Compaction...",
+        ),
+      );
+      assert.ok(!events.some((event) => event.type === "compaction_boundary"));
+    } finally {
+      cleanup();
+    }
+  },
+);
+
+await runCase(
   "abort errors do not trigger deterministic fallback",
   async () => {
     const { agent, events, cleanup } = createAgentHarness();
@@ -800,6 +1403,895 @@ await runCase(
       view.some((message) =>
         String(message.content).includes("third protected request"),
       ),
+    );
+  },
+);
+
+await runCase(
+  "token node sends a newly pruned view normally before any compaction",
+  async () => {
+    const { agent, cleanup } = createAgentHarness();
+    try {
+      const oldLargeTool = makeTool("old-large", "x".repeat(120_000));
+      const recentTools = Array.from({ length: 10 }, (_, index) =>
+        makeTool(`recent-${index}`, "ok"),
+      );
+      const messages = [
+        makeUser("large-user", "y".repeat(100_000)),
+        oldLargeTool,
+        ...recentTools,
+      ];
+      let compactionCalls = 0;
+      (agent as any).tryCompactHistory = async (
+        _sessionId: string,
+        nextMessages: BaseMessage[],
+      ) => {
+        compactionCalls += 1;
+        assert.equal(
+          TokenManager.hasPruneLabel(nextMessages[1]),
+          true,
+          "compaction must receive the newly pruned history",
+        );
+        return { changed: false, messages: nextMessages };
+      };
+
+      const node = (agent as any).createTokenManagerNode();
+      const prunedResult = await node.invoke({
+        sessionId: "session-1",
+        messages,
+        token_state: { current_tokens: 100_000, max_tokens: 30_000 },
+        pendingToolCalls: [],
+        pendingToolSupplementMessages: [],
+      });
+      assert.equal(
+        compactionCalls,
+        0,
+        "a local post-prune estimate must not trigger compaction",
+      );
+      assert.equal(
+        TokenManager.hasPruneLabel(prunedResult.messages[1]),
+        true,
+        "the labeled history must continue to the normal model request",
+      );
+
+      compactionCalls = 0;
+      await node.invoke({
+        sessionId: "session-1",
+        messages: [
+          makeUser("small-user", "continue"),
+          oldLargeTool,
+          ...recentTools,
+        ],
+        token_state: { current_tokens: 100_000, max_tokens: 40_000 },
+        pendingToolCalls: [],
+        pendingToolSupplementMessages: [],
+      });
+      assert.equal(
+        compactionCalls,
+        0,
+        "the stale pre-prune usage count must not force compaction after the materialized request fits",
+      );
+
+      compactionCalls = 0;
+      await node.invoke({
+        sessionId: "session-1",
+        messages: [
+          makeUser("usage-only-user", "继续"),
+          makePrunedTool("already-pruned", "old output"),
+        ],
+        token_state: { current_tokens: 100_000, max_tokens: 40_000 },
+        pendingToolCalls: [],
+        pendingToolSupplementMessages: [],
+      });
+      assert.equal(
+        compactionCalls,
+        1,
+        "an overflow reported by the provider must remain authoritative when prune changed nothing",
+      );
+    } finally {
+      cleanup();
+    }
+  },
+);
+
+await runCase(
+  "zero-retention runs only after ordinary and deterministic compaction fail",
+  async () => {
+    const { agent, tempDir, events, cleanup } = createAgentHarness();
+    try {
+      const messages = makeMessages().map((message, index) => {
+        if (index === 6) {
+          return makeUser(
+            "backend-user-3",
+            `third protected request ${"p".repeat(40_000)}`,
+          );
+        }
+        if (index === 8) {
+          return makeUser(
+            "backend-user-4",
+            `fourth protected request ${"q".repeat(40_000)}`,
+          );
+        }
+        return message;
+      });
+      forceOrdinaryCompactionFailure(agent);
+
+      const result = await (agent as any).tryCompactHistory(
+        "session-1",
+        messages,
+        undefined,
+        { maxTokens: 15_000 },
+      );
+      assert.equal(result.changed, true);
+      const summary = result.messages[result.messages.length - 1] as any;
+      assert.equal(summary.additional_kwargs?.zero_retention_compaction, true);
+      assert.equal(
+        summary.additional_kwargs?.[
+          TokenManager.COMPACTION_PROTECTED_ROUNDS_KEY
+        ],
+        0,
+      );
+
+      const view = buildDynamicRequestHistory(result.messages);
+      assert.equal(
+        view.includes(messages[1]),
+        false,
+        "no original historical turn may remain in the active request view",
+      );
+      assert.equal(
+        view.some((message) =>
+          String(message.content).includes(
+            "Zero-retention emergency context recovery is active",
+          ),
+        ),
+        true,
+      );
+
+      const pathMatch = String(summary.content).match(
+        /Markdown Export Path: (.+)/,
+      );
+      assert.ok(pathMatch?.[1]);
+      const exported = fs.readFileSync(pathMatch![1].trim(), "utf8");
+      assert.ok(exported.includes("first historical request"));
+      assert.ok(exported.includes("fourth protected request"));
+      assert.ok(exported.includes("BEGIN_GYSHELL_BACKEND_HISTORY_JSON"));
+      assert.ok(exported.includes("backend-user-4"));
+      assert.ok(
+        exported.includes("[[GYSHELL-WRAPPED-LINE-V1"),
+        "oversized stored-message fields must use reversible physical-line chunks",
+      );
+      assert.ok(
+        exported.split("\n").every((line) => line.length <= MAX_LINE_LENGTH),
+        "every physical export line must stay below read_file's irreversible clipping limit",
+      );
+      const unwrapped = unwrapZeroRetentionExport(exported);
+      assert.ok(
+        unwrapped.includes(`third protected request ${"p".repeat(40_000)}`),
+        "the reversible export must retain the complete oversized request",
+      );
+      assert.ok(
+        unwrapped.includes(`fourth protected request ${"q".repeat(40_000)}`),
+      );
+      const firstReadPage = readTextFile({
+        filePath: pathMatch![1].trim(),
+        bytes: fs.readFileSync(pathMatch![1].trim()),
+        offset: 0,
+        limit: 5,
+      });
+      assert.match(firstReadPage, /File has more lines/);
+      assert.ok(!firstReadPage.includes(`${"x".repeat(MAX_LINE_LENGTH)}...`));
+      assert.equal(
+        fs
+          .readdirSync(path.join(tempDir, "fallback-compaction-history"))
+          .filter((name) => name.endsWith(".md")).length,
+        1,
+        "zero-retention recovery should create exactly one managed export",
+      );
+
+      const boundary = events.find(
+        (event) =>
+          event.type === "compaction_boundary" &&
+          event.protectedNormalRounds === 0,
+      );
+      assert.ok(boundary);
+      assert.equal(boundary.boundaryTargetMessageId, undefined);
+      assert.equal(boundary.boundaryPreviousMessageId, "backend-user-4");
+    } finally {
+      cleanup();
+    }
+  },
+);
+
+await runCase(
+  "zero-retention capsule fits the legacy estimate without truncating its export",
+  async () => {
+    const { agent, cleanup } = createAgentHarness();
+    try {
+      const messages = makeMessages().map((message, index) =>
+        index === 8
+          ? makeUser("backend-user-4", `继续未完成任务 ${"界".repeat(40_000)}`)
+          : message,
+      );
+      forceOrdinaryCompactionFailure(agent);
+
+      const result = await (agent as any).tryCompactHistory(
+        "session-1",
+        messages,
+        undefined,
+        { maxTokens: 15_000 },
+      );
+      const marker = result.messages[result.messages.length - 1] as any;
+      const requestView = buildDynamicRequestHistory(result.messages);
+      assert.equal(marker.additional_kwargs?.zero_retention_compaction, true);
+      assert.equal(
+        TokenManager.isOverflow(
+          TokenManager.estimateMessages(requestView),
+          15_000,
+        ),
+        false,
+      );
+      const pathMatch = String(marker.content).match(
+        /Markdown Export Path: (.+)/,
+      );
+      assert.ok(pathMatch?.[1]);
+      const exported = unwrapZeroRetentionExport(
+        fs.readFileSync(pathMatch![1].trim(), "utf8"),
+      );
+      assert.ok(
+        exported.includes("界".repeat(4_000)),
+        "adaptive prompt shrinking must not truncate the complete exported history",
+      );
+    } finally {
+      cleanup();
+    }
+  },
+);
+
+await runCase(
+  "a committed zero-retention boundary recovers its exact marker after node failure",
+  async () => {
+    const { agent, chatHistory, events, cleanup } = createAgentHarness();
+    try {
+      const physicalRunId = "failed-model-run";
+      const oldMarker = makeUser("old-compaction-marker", "old summary");
+      (oldMarker as any).additional_kwargs = {
+        ...(oldMarker as any).additional_kwargs,
+        [TokenManager.LAST_COMPACTION_FLAG_KEY]: true,
+      };
+      const checkpointMessages = [...makeMessages(), oldMarker];
+      const candidate = (agent as any).buildCompactionCandidate({
+        messages: checkpointMessages,
+        insertionIndex: checkpointMessages.length,
+        summaryText: "zero-retention recovery bridge",
+        logLabel: "test zero-retention compaction",
+        protectedNormalRounds: 0,
+        additionalKwargs: {
+          fallback_compaction: true,
+          zero_retention_compaction: true,
+        },
+      });
+      (agent as any).activePhysicalRunIds.add(physicalRunId);
+      (agent as any).commitCompactionCandidate(
+        "session-1",
+        candidate,
+        "test-progress",
+        physicalRunId,
+      );
+      (agent as any).graph = {
+        getState: async () => ({
+          values: {
+            messages: checkpointMessages,
+            pendingToolSupplementMessages: [],
+          },
+        }),
+      };
+
+      await (agent as any).trySaveSessionFromCheckpoint(
+        "session-1",
+        physicalRunId,
+      );
+      const boundary = events.find(
+        (event) => event.type === "compaction_boundary",
+      );
+      const saved = chatHistory.loadSession("session-1");
+      const savedIds = new Set(
+        Array.from(saved?.messages.values() || []).map(
+          (message: any) => message?.data?.additional_kwargs?._gyshellMessageId,
+        ),
+      );
+      assert.equal(
+        boundary.summaryMessageId,
+        candidate.summaryMessageBackendId,
+      );
+      assert.equal(savedIds.has(candidate.summaryMessageBackendId), true);
+      assert.equal(savedIds.has("old-compaction-marker"), true);
+    } finally {
+      cleanup();
+    }
+  },
+);
+
+await runCase(
+  "checkpoint state newer than the exact zero-retention marker is never overwritten",
+  async () => {
+    const { agent, chatHistory, cleanup } = createAgentHarness();
+    try {
+      const physicalRunId = "completed-model-node-run";
+      const candidate = (agent as any).buildCompactionCandidate({
+        messages: makeMessages(),
+        insertionIndex: makeMessages().length,
+        summaryText: "zero-retention recovery bridge",
+        logLabel: "test zero-retention compaction",
+        protectedNormalRounds: 0,
+        additionalKwargs: {
+          fallback_compaction: true,
+          zero_retention_compaction: true,
+        },
+      });
+      const newerAssistant = makeAssistant(
+        "assistant-after-compaction",
+        "newer checkpoint content",
+      );
+      (agent as any).activePhysicalRunIds.add(physicalRunId);
+      (agent as any).commitCompactionCandidate(
+        "session-1",
+        candidate,
+        "test-progress",
+        physicalRunId,
+      );
+      (agent as any).graph = {
+        getState: async () => ({
+          values: {
+            messages: [...candidate.messages, newerAssistant],
+            pendingToolSupplementMessages: [],
+          },
+        }),
+      };
+
+      await (agent as any).trySaveSessionFromCheckpoint(
+        "session-1",
+        physicalRunId,
+      );
+      const saved = chatHistory.loadSession("session-1");
+      const savedIds = new Set(
+        Array.from(saved?.messages.values() || []).map(
+          (message: any) => message?.data?.additional_kwargs?._gyshellMessageId,
+        ),
+      );
+      assert.equal(savedIds.has(candidate.summaryMessageBackendId), true);
+      assert.equal(savedIds.has("assistant-after-compaction"), true);
+    } finally {
+      cleanup();
+    }
+  },
+);
+
+await runCase(
+  "zero-retention recovery creates a local reader when only SSH tabs exist",
+  async () => {
+    const { agent, terminalService, cleanup } = createAgentHarness({
+      hasLocalTerminal: false,
+    });
+    try {
+      const messages = makeMessages().map((message, index) =>
+        index === 8
+          ? makeUser(
+              "backend-user-4",
+              `fourth protected request ${"q".repeat(80_000)}`,
+            )
+          : message,
+      );
+      forceOrdinaryCompactionFailure(agent);
+
+      const result = await (agent as any).tryCompactHistory(
+        "session-1",
+        messages,
+        undefined,
+        { maxTokens: 15_000 },
+      );
+      const marker = result.messages[result.messages.length - 1] as any;
+      assert.equal(marker.additional_kwargs?.zero_retention_compaction, true);
+      assert.equal(terminalService.createdLocalTerminals, 1);
+      assert.match(
+        String(
+          marker.additional_kwargs?.zero_retention_local_terminal_id || "",
+        ),
+        /^local-/,
+      );
+    } finally {
+      cleanup();
+    }
+  },
+);
+
+await runCase(
+  "ordinary compaction model is attempted without a local summary-request gate",
+  async () => {
+    const { agent, cleanup } = createAgentHarness();
+    try {
+      const messages = makeMessages().map((message, index) =>
+        index === 1
+          ? makeUser(
+              "backend-user-1",
+              `first historical request ${"x".repeat(120_000)}`,
+            )
+          : message,
+      );
+      let modelCalls = 0;
+      (agent as any).getCompactionModelDecision = async () => {
+        modelCalls += 1;
+        return { summary: "ordinary summary" };
+      };
+
+      const result = await (agent as any).tryCompactHistory(
+        "session-1",
+        messages,
+        undefined,
+        { maxTokens: 30_000 },
+      );
+      assert.equal(result.changed, true);
+      assert.equal(modelCalls, 1);
+      const marker = result.messages.find((message: BaseMessage) =>
+        TokenManager.hasLastCompactionFlag(message),
+      ) as any;
+      assert.equal(
+        marker.additional_kwargs?.zero_retention_compaction,
+        undefined,
+      );
+    } finally {
+      cleanup();
+    }
+  },
+);
+
+await runCase(
+  "zero-retention recovery rolls over the same export and only advances through model-consumed pages",
+  async () => {
+    const { agent, tempDir, cleanup } = createAgentHarness();
+    try {
+      const messages = makeMessages().map((message, index) => {
+        if (index === 6) {
+          return makeUser(
+            "backend-user-3",
+            `third protected request ${"p".repeat(40_000)}`,
+          );
+        }
+        if (index === 8) {
+          return makeUser(
+            "backend-user-4",
+            `fourth protected request ${"q".repeat(40_000)}`,
+          );
+        }
+        return message;
+      });
+      forceOrdinaryCompactionFailure(agent);
+
+      const initial = await (agent as any).tryCompactHistory(
+        "session-1",
+        messages,
+        undefined,
+        { maxTokens: 15_000 },
+      );
+      const initialMarker = initial.messages[
+        initial.messages.length - 1
+      ] as any;
+      const filePath = String(initialMarker.content)
+        .match(/Markdown Export Path: (.+)/)?.[1]
+        ?.trim();
+      assert.ok(filePath);
+      const bytes = fs.readFileSync(filePath!);
+
+      const makeReadCall = (
+        id: string,
+        offset: number,
+        limit: number,
+        recoveryReasoning?: string,
+      ): AIMessage =>
+        new AIMessage({
+          content: recoveryReasoning
+            ? ""
+            : `Recovery page request at offset ${offset}`,
+          tool_calls: [
+            {
+              id,
+              name: "read_file",
+              args: {
+                tabIdOrName: "local-main",
+                filePath,
+                offset,
+                limit,
+              },
+            },
+          ],
+          additional_kwargs: {
+            ...makeId(`assistant-${id}`),
+            ...(recoveryReasoning
+              ? { reasoning_content: recoveryReasoning }
+              : {}),
+          },
+        });
+      const makeReadResult = (
+        id: string,
+        offset: number,
+        limit: number,
+      ): ToolMessage =>
+        new ToolMessage({
+          content: readTextFile({ filePath: filePath!, bytes, offset, limit }),
+          name: "read_file",
+          tool_call_id: id,
+          additional_kwargs: makeId(`tool-${id}`),
+        } as any);
+
+      const firstPageCall = makeReadCall("recovery-page-1", 0, 5);
+      const firstPageResult = makeReadResult("recovery-page-1", 0, 5);
+      const secondPageCall = makeReadCall(
+        "recovery-page-2",
+        5,
+        5,
+        "DURABLE_REASONING_ONLY_RECOVERY reconstructed the header and first page",
+      );
+      const secondPageResult = makeReadResult("recovery-page-2", 5, 5);
+      const firstRollover = await (agent as any).tryCompactHistory(
+        "session-1",
+        [
+          ...initial.messages,
+          firstPageCall,
+          firstPageResult,
+          secondPageCall,
+          secondPageResult,
+        ],
+        undefined,
+        { maxTokens: 15_000 },
+      );
+      const firstRolloverMarker = firstRollover.messages[
+        firstRollover.messages.length - 1
+      ] as any;
+      assert.equal(
+        firstRolloverMarker.additional_kwargs?.zero_retention_rollover,
+        true,
+      );
+      assert.equal(
+        firstRolloverMarker.additional_kwargs?.zero_retention_history_path,
+        filePath,
+      );
+      assert.equal(
+        firstRolloverMarker.additional_kwargs?.zero_retention_resume_after_line,
+        5,
+        "only page 1 had a later AI pass proving it was consumed",
+      );
+      assert.equal(
+        firstRolloverMarker.additional_kwargs?.zero_retention_read_limit,
+        2,
+      );
+      assert.ok(String(firstRolloverMarker.content).includes("offset=5"));
+      assert.ok(
+        String(firstRolloverMarker.content).includes(
+          "DURABLE_REASONING_ONLY_RECOVERY",
+        ),
+        "reasoning-only recovery state must be copied into the next durable capsule before advancing the frontier",
+      );
+      assert.ok(
+        String(firstRolloverMarker.content).includes(
+          "before any model pass could consume it",
+        ),
+      );
+
+      const retriedSecondPageCall = makeReadCall("recovery-page-2-retry", 5, 2);
+      const retriedSecondPageResult = makeReadResult(
+        "recovery-page-2-retry",
+        5,
+        2,
+      );
+      const thirdPageCall = makeReadCall("recovery-page-3", 7, 2);
+      const thirdPageResult = makeReadResult("recovery-page-3", 7, 2);
+      const secondRollover = await (agent as any).tryCompactHistory(
+        "session-1",
+        [
+          ...firstRollover.messages,
+          retriedSecondPageCall,
+          retriedSecondPageResult,
+          thirdPageCall,
+          thirdPageResult,
+        ],
+        undefined,
+        { maxTokens: 15_000 },
+      );
+      const secondRolloverMarker = secondRollover.messages[
+        secondRollover.messages.length - 1
+      ] as any;
+      assert.equal(
+        secondRolloverMarker.additional_kwargs
+          ?.zero_retention_resume_after_line,
+        7,
+      );
+      assert.equal(
+        secondRolloverMarker.additional_kwargs?.zero_retention_read_limit,
+        1,
+        "an unconsumed retry must eventually back off to one physical line",
+      );
+      assert.equal(
+        secondRolloverMarker.additional_kwargs?.zero_retention_history_path,
+        filePath,
+      );
+      assert.equal(
+        fs
+          .readdirSync(path.join(tempDir, "fallback-compaction-history"))
+          .filter((name) => name.endsWith(".md")).length,
+        1,
+        "rolling recovery must reuse the exact verified export",
+      );
+      assert.equal(
+        buildDynamicRequestHistory(secondRollover.messages).some(
+          (message) => message === thirdPageResult,
+        ),
+        false,
+        "the unconsumed oversized page must be rolled out before the next model call",
+      );
+    } finally {
+      cleanup();
+    }
+  },
+);
+
+await runCase(
+  "an inactive zero-retention marker restores ordinary compaction for new rounds",
+  async () => {
+    const { agent, cleanup } = createAgentHarness();
+    try {
+      forceOrdinaryCompactionFailure(agent);
+      const initial = await (agent as any).tryCompactHistory(
+        "session-1",
+        makeMessages(),
+        undefined,
+        { maxTokens: 15_000 },
+      );
+      const continuedMessages = [
+        ...initial.messages,
+        makeUser("post-zero-user-1", "new task round one"),
+        makeAssistant("post-zero-assistant-1", "round one result"),
+        makeUser("post-zero-user-2", "new task round two"),
+        makeAssistant("post-zero-assistant-2", "round two result"),
+        makeUser("post-zero-user-3", "new task round three"),
+      ];
+      const trace: string[] = [];
+      (agent as any).getCompactionModelDecision = async () => {
+        trace.push("ordinary-model");
+        return { summary: "new rounds ordinary summary" };
+      };
+      (agent as any).buildZeroRetentionCompactionCandidate = async () => {
+        trace.push("zero-retention");
+        throw new Error("zero-retention must not replace new ordinary rounds");
+      };
+
+      const result = await (agent as any).tryCompactHistory(
+        "session-1",
+        continuedMessages,
+        undefined,
+        { maxTokens: 80_000 },
+      );
+      const latestMarker = [...result.messages]
+        .reverse()
+        .find((message) => TokenManager.hasLastCompactionFlag(message)) as any;
+      assert.deepEqual(trace, ["ordinary-model"]);
+      assert.equal(
+        latestMarker.additional_kwargs?.zero_retention_compaction,
+        undefined,
+      );
+    } finally {
+      cleanup();
+    }
+  },
+);
+
+await runCase(
+  "zero-retention frontier accepts only a verified opaque wrapped-line jump",
+  () => {
+    const { agent, cleanup } = createAgentHarness();
+    try {
+      const filePath = "/tmp/managed-zero-retention.md";
+      const readCall = (id: string, offset: number): AIMessage =>
+        new AIMessage({
+          content: "",
+          tool_calls: [
+            {
+              id,
+              name: "read_file",
+              args: {
+                tabIdOrName: "local-main",
+                filePath,
+                offset,
+                limit: 1,
+              },
+            },
+          ],
+          additional_kwargs: makeId(`assistant-${id}`),
+        });
+      const firstResult = new ToolMessage({
+        content: [
+          "<file>",
+          `00001| [[GYSHELL-WRAPPED-LINE-V1 logical=1 part=1/4]] {\"image\":\"data:image/png;base64,${"Ab9+".repeat(80)}`,
+          "",
+          "(File has more lines. Use 'offset' parameter to read beyond line 1)",
+          "</file>",
+        ].join("\n"),
+        name: "read_file",
+        tool_call_id: "opaque-first",
+      } as any);
+      const durableReasoning = new AIMessage({
+        content: "",
+        additional_kwargs: {
+          reasoning_content:
+            "Recorded that logical line 1 is an opaque PNG data URI.",
+        },
+      });
+      const finalResult = new ToolMessage({
+        content: [
+          "<file>",
+          "00005| semantic history resumes here",
+          "",
+          "(End of file - total 5 lines)",
+          "</file>",
+        ].join("\n"),
+        name: "read_file",
+        tool_call_id: "opaque-after",
+      } as any);
+      const durableCompletion = new AIMessage("Recovered unfinished task");
+      const progress = (agent as any).resolveZeroRetentionReadProgress(
+        [
+          new HumanMessage("zero marker"),
+          readCall("opaque-first", 0),
+          firstResult,
+          durableReasoning,
+          readCall("opaque-after", 4),
+          finalResult,
+          durableCompletion,
+        ],
+        {
+          markerIndex: 0,
+          filePath,
+          localTerminalId: "local-main",
+          physicalLineCount: 5,
+          progressDigest: "",
+          resumeAfterLine: 0,
+          recommendedReadLimit: 1,
+          historyReadComplete: false,
+        },
+      );
+      assert.equal(progress.resumeAfterLine, 5);
+      assert.equal(progress.historyReadComplete, true);
+      assert.equal(progress.safeSkipAfterLine, undefined);
+    } finally {
+      cleanup();
+    }
+  },
+);
+
+await runCase(
+  "zero-retention capsule prioritizes the latest real user request over large system history",
+  () => {
+    const { agent, cleanup } = createAgentHarness();
+    try {
+      const latestRequest =
+        "LATEST_AUTHORITATIVE_REQUEST preserve this exact unfinished constraint";
+      const capsule = (agent as any).buildZeroRetentionRecoveryCapsule(
+        [
+          new SystemMessage("system-a " + "a".repeat(20_000)),
+          new SystemMessage("system-b " + "b".repeat(20_000)),
+          new SystemMessage("system-c " + "c".repeat(20_000)),
+          makeUser("old-user", "old request " + "d".repeat(20_000)),
+          makeAssistant("old-assistant", "old answer"),
+          makeUser("latest-user", latestRequest),
+          makeAssistant("latest-assistant", "unfinished current state"),
+        ],
+        8_000,
+      );
+      assert.ok(capsule.includes(latestRequest));
+      assert.ok(capsule.includes("Authoritative latest real user request"));
+      assert.ok(capsule.length <= 8_000);
+    } finally {
+      cleanup();
+    }
+  },
+);
+
+await runCase(
+  "zero-retention export reuse stops after inserted user input or a substantive tool call",
+  async () => {
+    const { agent, cleanup } = createAgentHarness();
+    try {
+      const exportService = (agent as any)
+        .fallbackCompactionHistoryExportService as PassChatTempExportService;
+      const filePath = await exportService.exportMarkdown({
+        sessionId: "session-1",
+        title: "recovery baseline",
+        markdown: "baseline\n",
+      });
+      const marker = new HumanMessage({
+        content: `${WHAT_HAVE_DONE_IN_THE_PAST_TAG}${PASS_CHAT_HISTORY_TAG}Markdown Export Path: ${filePath}`,
+        additional_kwargs: {
+          _gyshellMessageId: "zero-baseline",
+          [TokenManager.LAST_COMPACTION_FLAG_KEY]: true,
+          [TokenManager.COMPACTION_PROTECTED_ROUNDS_KEY]: 0,
+          fallback_compaction: true,
+          zero_retention_compaction: true,
+          zero_retention_history_path: filePath,
+          zero_retention_progress_digest: "baseline capsule",
+          zero_retention_resume_after_line: 0,
+          zero_retention_history_read_complete: false,
+          zero_retention_physical_line_count: 2,
+          zero_retention_local_terminal_id: "local-main",
+          zero_retention_read_limit: 5,
+        },
+      });
+      const insertedUser = new HumanMessage(
+        `${USER_INSERTED_INPUT_TAG}change the active task`,
+      );
+      assert.equal(
+        (agent as any).findActiveZeroRetentionRecovery("session-1", [
+          marker,
+          insertedUser,
+        ]),
+        null,
+      );
+
+      const mutationCall = new AIMessage({
+        content: "",
+        tool_calls: [
+          {
+            id: "mutation-call",
+            name: "exec_command",
+            args: { cmd: "touch changed-after-baseline" },
+          },
+        ],
+      });
+      const mutationResult = new ToolMessage({
+        content: "exit code 0",
+        name: "exec_command",
+        tool_call_id: "mutation-call",
+      } as any);
+      assert.equal(
+        (agent as any).findActiveZeroRetentionRecovery("session-1", [
+          marker,
+          mutationCall,
+          mutationResult,
+        ]),
+        null,
+        "a reused baseline must never omit exact post-baseline side effects",
+      );
+    } finally {
+      cleanup();
+    }
+  },
+);
+
+await runCase(
+  "rollback maintenance preserves a zero-retention marker with no later user round",
+  () => {
+    const zeroMarker = new HumanMessage({
+      content: `${WHAT_HAVE_DONE_IN_THE_PAST_TAG}recovery bridge`,
+      additional_kwargs: {
+        _gyshellMessageId: "zero-marker",
+        [TokenManager.LAST_COMPACTION_FLAG_KEY]: true,
+        [TokenManager.COMPACTION_PROTECTED_ROUNDS_KEY]: 0,
+        zero_retention_compaction: true,
+      },
+    });
+    const messages = [...makeMessages(), zeroMarker];
+    const sanitized = sanitizeCompressionAfterRollback(messages, {
+      pruneToolWindow: 10,
+      protectedNormalRounds: 2,
+    });
+    assert.equal(
+      sanitized.messages.includes(zeroMarker),
+      true,
+      "marker-specific zero protection must override the legacy two-round default",
+    );
+    assert.equal(
+      buildDynamicRequestHistory(sanitized.messages).some((message) =>
+        String(message.content).includes("first historical request"),
+      ),
+      false,
+      "old history must stay hidden after rollback maintenance",
     );
   },
 );

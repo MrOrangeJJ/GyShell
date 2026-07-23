@@ -284,7 +284,7 @@ export class NodePtyBackend implements TerminalBackend {
     if (token.awaitingInitialFreshMarker) {
       token.awaitingInitialFreshMarker = false
     }
-    const output = await this.readCommandOutputFile(
+    let output = await this.readCommandOutputFile(
       token.commandOutputPath || this.commandOutputPathByPtyId.get(ptyId)
     )
     if (
@@ -293,7 +293,24 @@ export class NodePtyBackend implements TerminalBackend {
     ) {
       return undefined
     }
-    if (token.expectCommandOutput && token.commandOutputPath && !output) {
+    if (
+      snapshot.outputCaptureFailed === true &&
+      output &&
+      snapshot.outputRetainedUtf8Bytes !== output.observedUtf8Bytes
+    ) {
+      // A failed open can leave the previous request's file in place. Never
+      // attach stale bytes to the completed request.
+      output = undefined
+    }
+    if (
+      token.expectCommandOutput &&
+      token.commandOutputPath &&
+      !output &&
+      !(
+        snapshot.outputCaptureFailed === true &&
+        snapshot.outputRetainedUtf8Bytes === 0
+      )
+    ) {
       throw new Error('Windows sidecar output file is not readable yet.')
     }
     if (token.expectCommandOutput && output) {
@@ -333,6 +350,7 @@ export class NodePtyBackend implements TerminalBackend {
       outputRetainedUtf8Bytes:
         snapshot.outputRetainedUtf8Bytes ?? output?.observedUtf8Bytes,
       outputTruncated: snapshot.outputTruncated ?? output?.truncated,
+      outputCaptureFailed: snapshot.outputCaptureFailed,
     }
   }
 
@@ -463,6 +481,7 @@ export class NodePtyBackend implements TerminalBackend {
           outputObservedUtf8Bytes: parsed.outputObservedUtf8Bytes,
           outputRetainedUtf8Bytes: parsed.outputRetainedUtf8Bytes,
           outputTruncated: parsed.outputTruncated,
+          outputCaptureFailed: parsed.outputCaptureFailed,
           cwd: parsed.cwd ? this.normalizeDecodedLocalPath(parsed.cwd) || undefined : undefined,
           homeDir: parsed.homeDir ? this.normalizeDecodedLocalPath(parsed.homeDir) || undefined : undefined,
           modifiedAtMs: Number.isFinite(stats.mtimeMs) ? stats.mtimeMs : undefined,
@@ -1270,6 +1289,14 @@ export class NodePtyBackend implements TerminalBackend {
         callback(pendingData)
       }
     }
+  }
+
+  pauseOutput(ptyId: string): void {
+    this.ptys.get(ptyId)?.pty.pause()
+  }
+
+  resumeOutput(ptyId: string): void {
+    this.ptys.get(ptyId)?.pty.resume()
   }
 
   private emitPtyData(instance: PtyInstance, data: string): void {

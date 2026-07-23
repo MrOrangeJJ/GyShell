@@ -130,8 +130,11 @@ interface SSHInstance {
   initializationGate: PrivateShellInitializationGate;
   initializationAbortController: AbortController;
   transportShutdownStarted?: boolean;
+  fatalCloseStarted?: boolean;
+  fatalErrorMessage?: string;
   exitEmitted?: boolean;
   streamDecoder: StringDecoder;
+  streamDataHandler?: (data: Buffer) => void;
   commandProtocolAvailable?: boolean;
 }
 
@@ -662,7 +665,7 @@ export class SSHBackend implements TerminalBackend {
     if (token.awaitingInitialFreshMarker) {
       token.awaitingInitialFreshMarker = false;
     }
-    const output = await this.readWindowsCommandOutputBestEffort(
+    let output = await this.readWindowsCommandOutputBestEffort(
       instance,
       token.commandOutputPath || instance.windowsCommandOutputPath,
       { preferExec: preferExecOutputRead },
@@ -674,7 +677,24 @@ export class SSHBackend implements TerminalBackend {
     ) {
       return undefined;
     }
-    if (token.expectCommandOutput && token.commandOutputPath && !output) {
+    if (
+      snapshot.outputCaptureFailed === true &&
+      output &&
+      snapshot.outputRetainedUtf8Bytes !== output.observedUtf8Bytes
+    ) {
+      // A failed open can leave the previous request's file in place. Never
+      // attach stale bytes to the completed request.
+      output = undefined;
+    }
+    if (
+      token.expectCommandOutput &&
+      token.commandOutputPath &&
+      !output &&
+      !(
+        snapshot.outputCaptureFailed === true &&
+        snapshot.outputRetainedUtf8Bytes === 0
+      )
+    ) {
       throw new Error("Windows sidecar output file is not readable yet");
     }
     if (token.expectCommandOutput && output) {
@@ -725,6 +745,7 @@ export class SSHBackend implements TerminalBackend {
       outputRetainedUtf8Bytes:
         snapshot.outputRetainedUtf8Bytes ?? output?.observedUtf8Bytes,
       outputTruncated: snapshot.outputTruncated ?? output?.truncated,
+      outputCaptureFailed: snapshot.outputCaptureFailed,
     };
   }
 
@@ -1338,6 +1359,7 @@ export class SSHBackend implements TerminalBackend {
             outputObservedUtf8Bytes: parsed.outputObservedUtf8Bytes,
             outputRetainedUtf8Bytes: parsed.outputRetainedUtf8Bytes,
             outputTruncated: parsed.outputTruncated,
+            outputCaptureFailed: parsed.outputCaptureFailed,
             cwd: parsed.cwd
               ? this.normalizeDecodedRemotePath(parsed.cwd) || undefined
               : undefined,
@@ -1500,6 +1522,7 @@ export class SSHBackend implements TerminalBackend {
             outputObservedUtf8Bytes: parsed.outputObservedUtf8Bytes,
             outputRetainedUtf8Bytes: parsed.outputRetainedUtf8Bytes,
             outputTruncated: parsed.outputTruncated,
+            outputCaptureFailed: parsed.outputCaptureFailed,
             cwd: parsed.cwd
               ? this.normalizeDecodedRemotePath(parsed.cwd) || undefined
               : undefined,
@@ -2060,14 +2083,49 @@ export class SSHBackend implements TerminalBackend {
   private async setupPortForwards(
     instance: SSHInstance,
     sshConfig: SSHConnectionConfig,
+    signal: AbortSignal,
   ): Promise<void> {
+    if (signal.aborted) throw createRouteAbortError();
     const tunnels = sshConfig.tunnels ?? [];
     if (!tunnels.length) return;
+
+    const bindAcceptedSocketLifetime = (sock: net.Socket): boolean => {
+      if (signal.aborted) {
+        sock.destroy();
+        return false;
+      }
+      let cleaned = false;
+      const cleanup = (): void => {
+        if (cleaned) return;
+        cleaned = true;
+        signal.removeEventListener("abort", onAbort);
+        sock.removeListener("error", onError);
+        sock.removeListener("close", cleanup);
+      };
+      const onAbort = (): void => {
+        sock.destroy();
+      };
+      const onError = (): void => {
+        sock.destroy();
+      };
+      sock.on("error", onError);
+      sock.once("close", cleanup);
+      signal.addEventListener("abort", onAbort, { once: true });
+      if (signal.aborted) {
+        onAbort();
+        return false;
+      }
+      return true;
+    };
 
     const remoteTunnels = tunnels.filter((t) => t.type === "Remote");
     if (remoteTunnels.length && !instance.remoteForwardHandlerInstalled) {
       instance.remoteForwardHandlerInstalled = true;
       instance.client.on("tcp connection", (info: any, accept, reject) => {
+        if (signal.aborted) {
+          reject?.();
+          return;
+        }
         const match = remoteTunnels.find(
           (t) => t.host === info.destIP && t.port === info.destPort,
         );
@@ -2094,8 +2152,10 @@ export class SSHBackend implements TerminalBackend {
     }
 
     for (const t of tunnels) {
+      if (signal.aborted) throw createRouteAbortError();
       if (t.type === "Local") {
         const server = net.createServer((sock) => {
+          if (!bindAcceptedSocketLifetime(sock)) return;
           const srcAddr = sock.remoteAddress ?? "127.0.0.1";
           const srcPort = sock.remotePort ?? 0;
           const dstAddr = t.targetAddress ?? "127.0.0.1";
@@ -2106,6 +2166,13 @@ export class SSHBackend implements TerminalBackend {
             dstAddr,
             dstPort,
             (err, stream) => {
+              if (signal.aborted || sock.destroyed) {
+                try {
+                  stream?.destroy();
+                } catch {}
+                sock.destroy();
+                return;
+              }
               if (err || !stream) {
                 sock.destroy();
                 return;
@@ -2121,27 +2188,54 @@ export class SSHBackend implements TerminalBackend {
             },
           );
         });
-        await new Promise<void>((resolve, reject) => {
-          server.once("error", reject);
-          server.listen(t.port, t.host, resolve);
-        });
+        await this.listenForwardServer(server, t.host, t.port, signal);
+        if (signal.aborted) {
+          server.close();
+          throw createRouteAbortError();
+        }
         instance.forwardServers.push(server);
       } else if (t.type === "Dynamic") {
         const server = net.createServer((sock) => {
+          if (!bindAcceptedSocketLifetime(sock)) return;
           let buf = Buffer.alloc(0);
           const need = async (n: number): Promise<Buffer> => {
             while (buf.length < n) {
+              if (signal.aborted) throw createRouteAbortError();
+              if (sock.destroyed) {
+                throw new Error("SOCKS client socket closed during handshake.");
+              }
               const chunk = await new Promise<Buffer>((resolve, reject) => {
-                const onData = (d: Buffer) => {
-                  sock.off("error", onErr);
-                  resolve(d);
+                let settled = false;
+                const cleanup = (): void => {
+                  sock.removeListener("data", onData);
+                  sock.removeListener("error", onError);
+                  sock.removeListener("close", onClose);
+                  sock.removeListener("end", onClose);
+                  signal.removeEventListener("abort", onAbort);
                 };
-                const onErr = (e: Error) => {
-                  sock.off("data", onData);
-                  reject(e);
+                const finish = (data?: Buffer, error?: Error): void => {
+                  if (settled) return;
+                  settled = true;
+                  cleanup();
+                  if (error) reject(error);
+                  else resolve(data ?? Buffer.alloc(0));
                 };
+                const onData = (data: Buffer): void => finish(data);
+                const onError = (error: Error): void =>
+                  finish(undefined, error);
+                const onClose = (): void =>
+                  finish(
+                    undefined,
+                    new Error("SOCKS client socket closed during handshake."),
+                  );
+                const onAbort = (): void =>
+                  finish(undefined, createRouteAbortError());
                 sock.once("data", onData);
-                sock.once("error", onErr);
+                sock.once("error", onError);
+                sock.once("close", onClose);
+                sock.once("end", onClose);
+                signal.addEventListener("abort", onAbort, { once: true });
+                if (signal.aborted) onAbort();
               });
               buf = Buffer.concat([buf, chunk]);
             }
@@ -2152,6 +2246,7 @@ export class SSHBackend implements TerminalBackend {
 
           (async () => {
             try {
+              if (signal.aborted) throw createRouteAbortError();
               const hello = await need(2);
               if (hello[0] !== 0x05) throw new Error("SOCKS version mismatch");
               const nMethods = hello[1];
@@ -2199,12 +2294,21 @@ export class SSHBackend implements TerminalBackend {
               const p = await need(2);
               const dstPort = (p[0] << 8) | p[1];
 
+              if (signal.aborted) throw createRouteAbortError();
+
               instance.client.forwardOut(
                 sock.remoteAddress ?? "127.0.0.1",
                 sock.remotePort ?? 0,
                 dstAddr,
                 dstPort,
                 (err, stream) => {
+                  if (signal.aborted || sock.destroyed) {
+                    try {
+                      stream?.destroy();
+                    } catch {}
+                    sock.destroy();
+                    return;
+                  }
                   if (err || !stream) {
                     sock.write(
                       Buffer.from([0x05, 0x05, 0x00, 0x01, 0, 0, 0, 0, 0, 0]),
@@ -2234,21 +2338,111 @@ export class SSHBackend implements TerminalBackend {
             }
           })();
         });
-        await new Promise<void>((resolve, reject) => {
-          server.once("error", reject);
-          server.listen(t.port, t.host, resolve);
-        });
+        await this.listenForwardServer(server, t.host, t.port, signal);
+        if (signal.aborted) {
+          server.close();
+          throw createRouteAbortError();
+        }
         instance.forwardServers.push(server);
       } else if (t.type === "Remote") {
-        await new Promise<void>((resolve, reject) => {
-          instance.client.forwardIn(t.host, t.port, (err) => {
-            if (err) reject(err);
-            else resolve();
-          });
-        });
+        await this.requestRemoteForward(
+          instance,
+          t.host,
+          t.port,
+          signal,
+        );
+        if (signal.aborted) throw createRouteAbortError();
         instance.remoteForwards.push({ host: t.host, port: t.port });
       }
     }
+  }
+
+  private listenForwardServer(
+    server: net.Server,
+    host: string,
+    port: number,
+    signal: AbortSignal,
+  ): Promise<void> {
+    if (signal.aborted) return Promise.reject(createRouteAbortError());
+    return new Promise<void>((resolve, reject) => {
+      let settled = false;
+      const onRuntimeError = (error: Error): void => {
+        console.error("[SSH] Port forward server error after listen:", error);
+      };
+      const removeRuntimeErrorHandler = (): void => {
+        server.removeListener("error", onRuntimeError);
+      };
+      const finish = (error?: Error): void => {
+        if (settled) return;
+        settled = true;
+        server.removeListener("error", onError);
+        signal.removeEventListener("abort", onAbort);
+        if (error) reject(error);
+        else resolve();
+      };
+      const onError = (error: Error): void => finish(error);
+      const onAbort = (): void => {
+        try {
+          server.close();
+        } catch {}
+        finish(createRouteAbortError());
+      };
+      server.once("error", onError);
+      server.once("close", removeRuntimeErrorHandler);
+      signal.addEventListener("abort", onAbort, { once: true });
+      if (signal.aborted) {
+        onAbort();
+        return;
+      }
+      try {
+        server.listen(port, host, () => {
+          server.on("error", onRuntimeError);
+          finish();
+        });
+      } catch (error) {
+        finish(error instanceof Error ? error : new Error(String(error)));
+      }
+    });
+  }
+
+  private requestRemoteForward(
+    instance: SSHInstance,
+    host: string,
+    port: number,
+    signal: AbortSignal,
+  ): Promise<void> {
+    if (signal.aborted) return Promise.reject(createRouteAbortError());
+    return new Promise<void>((resolve, reject) => {
+      let settled = false;
+      const finish = (error?: Error): void => {
+        if (settled) return;
+        settled = true;
+        signal.removeEventListener("abort", onAbort);
+        if (error) reject(error);
+        else resolve();
+      };
+      const onAbort = (): void => finish(createRouteAbortError());
+      signal.addEventListener("abort", onAbort, { once: true });
+      if (signal.aborted) {
+        onAbort();
+        return;
+      }
+      try {
+        instance.client.forwardIn(host, port, (error) => {
+          if (settled) {
+            if (!error) {
+              try {
+                instance.client.unforwardIn(host, port);
+              } catch {}
+            }
+            return;
+          }
+          finish(error || undefined);
+        });
+      } catch (error) {
+        finish(error instanceof Error ? error : new Error(String(error)));
+      }
+    });
   }
 
   private waitForShellInitializationDelay(
@@ -2511,6 +2705,25 @@ export class SSHBackend implements TerminalBackend {
     if (instance.transportShutdownStarted) return;
     instance.transportShutdownStarted = true;
 
+    if (instance.fatalCloseStarted) {
+      if (instance.stream && instance.streamDataHandler) {
+        instance.stream.removeListener("data", instance.streamDataHandler);
+      }
+      try {
+        instance.stream?.pause();
+      } catch {}
+      try {
+        instance.stream?.destroy();
+      } catch {}
+      try {
+        instance.sftp?.end?.();
+      } catch {}
+      try {
+        instance.client.destroy();
+      } catch {}
+      return;
+    }
+
     try {
       instance.stream?.end();
     } catch {}
@@ -2540,6 +2753,48 @@ export class SSHBackend implements TerminalBackend {
     };
     const timer = setTimeout(finish, SSH_TRANSPORT_CLEANUP_GRACE_MS);
     void this.cleanupUnixShellBootstrap(instance).then(finish, finish);
+  }
+
+  private emitDataSafely(instance: SSHInstance, data: string): void {
+    if (!data || instance.exitEmitted) return;
+    instance.dataCallbacks.forEach((callback) => {
+      try {
+        callback(data);
+      } catch (error) {
+        console.error(
+          "[SSH] Terminal data subscriber failed; output exception was isolated from the SSH parser.",
+          error,
+        );
+      }
+    });
+  }
+
+  private beginFatalSshClose(
+    ptyId: string,
+    instance: SSHInstance,
+    error: unknown,
+  ): void {
+    if (instance.fatalCloseStarted || instance.exitEmitted) return;
+    instance.fatalCloseStarted = true;
+    const message = error instanceof Error ? error.message : String(error);
+    instance.fatalErrorMessage = message;
+    instance.initializationGate.fail();
+    instance.initializationAbortController.abort();
+    if (instance.initializationState === "initializing") {
+      instance.initializationState = "failed";
+    }
+
+    if (instance.stream && instance.streamDataHandler) {
+      instance.stream.removeListener("data", instance.streamDataHandler);
+    }
+    try {
+      instance.stream?.pause();
+    } catch {}
+    this.emitDataSafely(
+      instance,
+      `\x1b[31m✘ SSH connection closed after a fatal transport error: ${message}\x1b[0m\r\n`,
+    );
+    this.emitExitOnce(ptyId, instance, -1);
   }
 
   private emitExitOnce(
@@ -2582,13 +2837,49 @@ export class SSHBackend implements TerminalBackend {
     });
   }
 
+  private isSshInstanceActive(
+    ptyId: string,
+    instance: SSHInstance,
+  ): boolean {
+    return (
+      this.sessions.get(ptyId) === instance &&
+      !instance.fatalCloseStarted &&
+      !instance.exitEmitted &&
+      !instance.initializationAbortController.signal.aborted
+    );
+  }
+
+  private closeLateSshSetupResources(instance: SSHInstance): void {
+    for (const server of instance.forwardServers.splice(0)) {
+      try {
+        server.close();
+      } catch {}
+    }
+    for (const remoteForward of instance.remoteForwards.splice(0)) {
+      try {
+        instance.client.unforwardIn(
+          remoteForward.host,
+          remoteForward.port,
+        );
+      } catch {}
+    }
+    if (instance.fatalCloseStarted || instance.exitEmitted) {
+      try {
+        instance.stream?.destroy();
+      } catch {}
+      try {
+        instance.sftp?.end?.();
+      } catch {}
+    }
+  }
+
   async spawn(config: TerminalConfig): Promise<string> {
     if (!isSshConnectionConfig(config)) {
       throw new Error("SSHBackend only supports ssh connections");
     }
     const sshConfig: SSHConnectionConfig = config;
 
-    const client = new ssh2.Client();
+    const client = this.createSshClient();
 
     const instance: SSHInstance = {
       client,
@@ -2613,39 +2904,54 @@ export class SSHBackend implements TerminalBackend {
     // and allow TerminalService to register data listeners.
     (async () => {
       const emit = (data: string) => {
-        instance.dataCallbacks.forEach((cb) => cb(data));
+        this.emitDataSafely(instance, data);
       };
       const emitExit = (code: number) => {
         this.emitExitOnce(config.id, instance, code);
       };
+      const signal = instance.initializationAbortController.signal;
+      const stopIfInactive = (): boolean => {
+        if (this.isSshInstanceActive(config.id, instance)) return false;
+        this.closeLateSshSetupResources(instance);
+        return true;
+      };
 
       client.on("ready", async () => {
+        if (stopIfInactive()) return;
         emit("\x1b[2J\x1b[H\x1b[32m✔ Connection established.\x1b[0m\r\n");
+        if (stopIfInactive()) return;
         console.log(
           `[SSH] Connection ready for ${sshConfig.host}:${sshConfig.port}`,
         );
         try {
           emit("\x1b[36m▹ Setting up port forwards...\x1b[0m\r\n");
+          if (stopIfInactive()) return;
           console.log(`[SSH] Setting up port forwards...`);
-          await this.setupPortForwards(instance, sshConfig);
+          await this.setupPortForwards(instance, sshConfig, signal);
         } catch (e: any) {
+          if (stopIfInactive()) return;
           console.error(`[SSH] Port forward setup failed:`, e);
           emit(`\x1b[31m✘ Port forward failed: ${e.message}\x1b[0m\r\n`);
           // We continue anyway to allow shell access
         }
+        if (stopIfInactive()) return;
 
         try {
           emit("\x1b[36m▹ Detecting remote OS...\x1b[0m\r\n");
+          if (stopIfInactive()) return;
           console.log(`[SSH] Detecting remote OS...`);
           const ver = await this.execCollect(client, "cmd.exe /c ver");
+          if (stopIfInactive()) return;
           const v = (ver.stdout || ver.stderr || "").toLowerCase();
           if (v.includes("windows")) instance.remoteOs = "windows";
         } catch {
           // ignore
         }
+        if (stopIfInactive()) return;
         if (!instance.remoteOs) {
           try {
             const uname = await this.execCollect(client, "uname -s");
+            if (stopIfInactive()) return;
             const u = (uname.stdout || uname.stderr || "").toLowerCase();
             if (u.includes("linux") || u.includes("darwin")) {
               instance.remoteOs = "unix";
@@ -2654,21 +2960,26 @@ export class SSHBackend implements TerminalBackend {
             // ignore
           }
         }
+        if (stopIfInactive()) return;
         if (!instance.remoteOs) instance.remoteOs = "unix";
         console.log(`[SSH] Remote OS detected: ${instance.remoteOs}`);
 
         instance.commandShellFamily = await this.detectCommandShellFamily(
           instance,
         );
+        if (stopIfInactive()) return;
         console.log(
           `[SSH] Command shell family detected: ${instance.commandShellFamily}`,
         );
 
         try {
           emit("\x1b[36m▹ Initializing SFTP channel...\x1b[0m\r\n");
+          if (stopIfInactive()) return;
           await this.initializeSftp(instance);
+          if (stopIfInactive()) return;
           emit("\x1b[32m✔ SFTP channel ready.\x1b[0m\r\n");
         } catch (error: any) {
+          if (stopIfInactive()) return;
           const message =
             error instanceof Error ? error.message : String(error);
           instance.sftpInitError = message;
@@ -2677,11 +2988,14 @@ export class SSHBackend implements TerminalBackend {
             `\x1b[33m⚠ SFTP unavailable: ${message}. File panel features may be limited.\x1b[0m\r\n`,
           );
         }
+        if (stopIfInactive()) return;
 
         if (instance.commandShellFamily === "unix") {
           try {
             await this.stageUnixShellBootstrap(instance);
+            if (stopIfInactive()) return;
           } catch (error) {
+            if (stopIfInactive()) return;
             console.warn(
               "[SSH] Could not stage the Unix shell bootstrap; using the inline compatibility path:",
               error,
@@ -2692,12 +3006,16 @@ export class SSHBackend implements TerminalBackend {
         if (instance.commandShellFamily === "powershell") {
           try {
             await this.bootstrapWindowsSession(instance);
+            if (stopIfInactive()) return;
           } catch {
+            if (stopIfInactive()) return;
             instance.commandTrackingMode = "shell-integration";
           }
         }
 
+        if (stopIfInactive()) return;
         emit("\x1b[36m▹ Opening interactive shell...\x1b[0m\r\n");
+        if (stopIfInactive()) return;
         console.log(`[SSH] Opening interactive shell...`);
         const initialWindowSize = this.resolveRequestedWindowSize(instance, {
           cols: config.cols,
@@ -2718,6 +3036,12 @@ export class SSHBackend implements TerminalBackend {
             },
           },
           (err, stream) => {
+            if (stopIfInactive()) {
+              try {
+                stream?.destroy();
+              } catch {}
+              return;
+            }
             if (err) {
               console.error(`[SSH] Failed to open shell:`, err);
               instance.initializationState = "failed";
@@ -2744,12 +3068,21 @@ export class SSHBackend implements TerminalBackend {
               );
             };
 
-            stream.on("data", (data: Buffer) => {
+            const streamDataHandler = (data: Buffer): void => {
+              if (instance.fatalCloseStarted || instance.exitEmitted) return;
               handleShellData(instance.streamDecoder.write(data));
+            };
+            instance.streamDataHandler = streamDataHandler;
+            stream.on("data", streamDataHandler);
+
+            stream.on("error", (error: Error) => {
+              this.beginFatalSshClose(config.id, instance, error);
             });
 
             stream.on("close", (code: number) => {
-              const remaining = instance.streamDecoder.end();
+              const remaining = instance.fatalCloseStarted
+                ? ""
+                : instance.streamDecoder.end();
               if (remaining) handleShellData(remaining);
               emitExit(typeof code === "number" ? code : 0);
             });
@@ -2761,6 +3094,7 @@ export class SSHBackend implements TerminalBackend {
               emit,
               emitExit,
             ).catch((error) => {
+              if (stopIfInactive()) return;
               this.failShellInitialization(
                 config.id,
                 instance,
@@ -2774,9 +3108,19 @@ export class SSHBackend implements TerminalBackend {
       });
 
       client.on("error", (err) => {
-        console.error(`[SSH] Client error:`, err);
-        emit(`\x1b[31m✘ SSH Error: ${err.message}\x1b[0m\r\n`);
-        emitExit(-1);
+        try {
+          if (instance.fatalCloseStarted || instance.exitEmitted) return;
+          console.error(`[SSH] Client error:`, err);
+          this.beginFatalSshClose(config.id, instance, err);
+        } catch (handlerError) {
+          // ssh2 emits this event before its own socket shutdown. Never let an
+          // application listener throw back through the protocol parser.
+          console.error("[SSH] Fatal error handler failed:", handlerError);
+          try {
+            client.destroy();
+          } catch {}
+          this.emitExitOnce(config.id, instance, -1);
+        }
       });
 
       client.on("end", () => {
@@ -2817,14 +3161,24 @@ export class SSHBackend implements TerminalBackend {
       try {
         // Give TerminalService a tiny bit of time to register the listener
         await new Promise((r) => setTimeout(r, 50));
+        if (stopIfInactive()) return;
 
         emit(
           `\x1b[36m▹ Connecting to ${sshConfig.host}:${sshConfig.port}...\x1b[0m\r\n`,
         );
+        if (stopIfInactive()) return;
         console.log(
           `[SSH] Attempting to connect to ${sshConfig.host}:${sshConfig.port}...`,
         );
-        const sock = await this.buildConnectSocketIfNeeded(sshConfig, emit);
+        const sock = await this.buildConnectSocketIfNeeded(sshConfig, emit, {
+          signal,
+        });
+        if (stopIfInactive()) {
+          try {
+            sock?.destroy();
+          } catch {}
+          return;
+        }
         if (sock) {
           console.log(
             `[SSH] SUCCESS: Connection to ${sshConfig.host} will be tunneled through sock (Jump Host/Proxy).`,
@@ -2838,8 +3192,10 @@ export class SSHBackend implements TerminalBackend {
             `[SSH] DIRECT: No jump host or proxy, connecting directly to ${sshConfig.host}.`,
           );
         }
+        if (stopIfInactive()) return;
         client.connect(connectConfig);
       } catch (e: any) {
+        if (stopIfInactive()) return;
         const errMsg = e instanceof Error ? e.message : String(e);
         emit(`\x1b[31m✘ Connection failed: ${errMsg}\x1b[0m\r\n`);
         emitExit(-1);
@@ -2968,6 +3324,14 @@ export class SSHBackend implements TerminalBackend {
     if (instance) {
       instance.dataCallbacks.add(callback);
     }
+  }
+
+  pauseOutput(ptyId: string): void {
+    this.sessions.get(ptyId)?.stream?.pause();
+  }
+
+  resumeOutput(ptyId: string): void {
+    this.sessions.get(ptyId)?.stream?.resume();
   }
 
   onExit(ptyId: string, callback: (code: number) => void): void {

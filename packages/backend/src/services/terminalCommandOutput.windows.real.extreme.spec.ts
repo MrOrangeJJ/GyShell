@@ -14,8 +14,42 @@ const RUN_FLAG = '--run-real-windows-ssh'
 const FORCE_FIRST_INIT_RETRY_FLAG = '--force-first-init-retry'
 const CONNECTION_NAME = process.env.GYSHELL_REAL_WINDOWS_CONNECTION || 'WIN'
 
+const PRIVATE_WINDOWS_PROTOCOL_FRAGMENTS = [
+  '__GyShell_InternalDispatch',
+  '__GyShell_InternalRecordOutcome',
+  '__GyShell_InternalUserCommandBlock',
+  '__GYSHELL_PROMPT__',
+  '__gyshell_',
+  'GYSHELL_READY',
+  'GYSHELL_COMMAND_PROTOCOL',
+] as const
+
 function assert(condition: unknown, message: string): asserts condition {
   if (!condition) throw new Error(message)
+}
+
+const assertNoPrivateWindowsProtocolLeak = (
+  label: string,
+  ...surfaces: string[]
+): void => {
+  for (const fragment of PRIVATE_WINDOWS_PROTOCOL_FRAGMENTS) {
+    const leakingSurfaceIndex = surfaces.findIndex((surface) =>
+      surface.includes(fragment)
+    )
+    const leakingSurface =
+      leakingSurfaceIndex >= 0 ? surfaces[leakingSurfaceIndex] : ''
+    const fragmentOffset = leakingSurface.indexOf(fragment)
+    const context = fragmentOffset >= 0
+      ? leakingSurface.slice(
+          Math.max(0, fragmentOffset - 240),
+          fragmentOffset + fragment.length + 240,
+        )
+      : ''
+    assert(
+      leakingSurfaceIndex < 0,
+      `${label} exposed private Windows protocol data on surface ${leakingSurfaceIndex}: ${fragment}; context=${JSON.stringify(context)}`,
+    )
+  }
 }
 
 const waitUntil = async (
@@ -174,13 +208,12 @@ const run = async (): Promise<void> => {
     service.resize(config.id, 120, 40)
     await new Promise((resolve) => setTimeout(resolve, 1200))
     const startupOutput = service.getBufferDelta(config.id, 0)
-    for (const privateBootstrapFragment of [
-      '__GYSHELL_',
-      '__gyshell_',
-      '__GyShell_Internal',
-      '-EncodedCommand',
-      'gyshell-init-ready',
-    ]) {
+    assertNoPrivateWindowsProtocolLeak(
+      'Windows SSH startup or resize',
+      startupOutput,
+      liveTerminalData,
+    )
+    for (const privateBootstrapFragment of ['-EncodedCommand', 'gyshell-init-ready']) {
       assert(
         !startupOutput.includes(privateBootstrapFragment) &&
           !liveTerminalData.includes(privateBootstrapFragment),
@@ -276,6 +309,21 @@ const run = async (): Promise<void> => {
       Number(prepareCommandTrackingCalls) === 0,
       'PowerShell startup and manual input performed destructive prompt-journal preparation.',
     )
+    const historyBaseline = await runTracked(
+      service,
+      config.id,
+      `$__target='. $global:'+'__GyShell_'+'InternalDispatch';$__history_path=(Get-PSReadLineOption).HistorySavePath;$__disk=if(Test-Path -LiteralPath $__history_path){@(Get-Content -LiteralPath $__history_path | Where-Object { $_ -ceq $__target }).Count}else{0};Write-Output $__disk`,
+    )
+    const psReadLineDispatcherHistoryBaseline = Number.parseInt(
+      historyBaseline.snapshot.output.trim(),
+      10,
+    )
+    assert(
+      Number.isSafeInteger(psReadLineDispatcherHistoryBaseline) &&
+        psReadLineDispatcherHistoryBaseline >= 0,
+      `Could not establish the legacy PSReadLine dispatcher-history baseline: ${JSON.stringify(historyBaseline.snapshot.output)}`,
+    )
+    const prepareCallsBeforeAgentReadHost = prepareCommandTrackingCalls
     const agentReadHostPrompt = `GYSHELL_AGENT_READHOST_${process.pid}`
     const agentReadHostTaskId = await service.runCommandNoWait(
       config.id,
@@ -401,7 +449,7 @@ const run = async (): Promise<void> => {
       15_000,
     )
     assert(
-      prepareCommandTrackingCalls === 1,
+      prepareCommandTrackingCalls === prepareCallsBeforeAgentReadHost + 1,
       'Only the explicit agent task should prepare command tracking.',
     )
 
@@ -412,6 +460,217 @@ const run = async (): Promise<void> => {
     )
     assert(unicode.snapshot.output === '汉字🙂é\n', 'PowerShell Unicode output changed')
     assert(unicode.snapshot.capture.state === 'complete', 'Unicode capture must be complete')
+
+    const progressRawOffset = liveTerminalData.length
+    const progressDisplayOffset = service.getCurrentOffset(config.id)
+    const computerInfoTaskId = await service.runCommandNoWait(
+      config.id,
+      'Get-ComputerInfo',
+    )
+    let resizeToggle = false
+    const resizeDuringProgress = setInterval(() => {
+      resizeToggle = !resizeToggle
+      service.resize(
+        config.id,
+        resizeToggle ? 119 : 121,
+        resizeToggle ? 39 : 41,
+      )
+    }, 100)
+    let computerInfoResult: CommandResult
+    try {
+      await waitUntil(
+        () =>
+          service.getCommandOutputSnapshot(config.id, computerInfoTaskId)
+            ?.executionState !== 'running',
+        'Get-ComputerInfo did not finish during resize coverage.',
+        120_000,
+      )
+      computerInfoResult = await service.waitForTask(
+        config.id,
+        computerInfoTaskId,
+      )
+    } finally {
+      clearInterval(resizeDuringProgress)
+      service.resize(config.id, 120, 40)
+    }
+    const computerInfoSnapshot = service.getCommandOutputSnapshot(
+      config.id,
+      computerInfoTaskId,
+    )
+    assert(computerInfoSnapshot, 'Missing Get-ComputerInfo command snapshot.')
+    assert(
+      computerInfoResult.executionState === 'finished' &&
+        computerInfoSnapshot.output.length > 1000,
+      `Get-ComputerInfo did not complete with substantive output: ${JSON.stringify({
+        result: computerInfoResult,
+        rawTail: liveTerminalData.slice(progressRawOffset).slice(-4000),
+        displayTail: service
+          .getBufferDelta(config.id, progressDisplayOffset)
+          .slice(-4000),
+      })}`,
+    )
+    assertNoPrivateWindowsProtocolLeak(
+      'Get-ComputerInfo progress redraw and resize',
+      liveTerminalData.slice(progressRawOffset),
+      service.getBufferDelta(config.id, progressDisplayOffset),
+      computerInfoSnapshot.output,
+    )
+
+    const directorySentinel = `GYSHELL_DIRECTORY_AFTER_${process.pid}`
+    const directoryStartedAt = Date.now()
+    const directoryInfo = await runTracked(
+      service,
+      config.id,
+      `Get-Item -LiteralPath $env:TEMP; Write-Output '${directorySentinel}'`,
+    )
+    const directoryDurationMs = Date.now() - directoryStartedAt
+    assert(
+      directoryInfo.snapshot.output.includes(directorySentinel),
+      'DirectoryInfo formatting swallowed the following pipeline output.',
+    )
+    assert(
+      Buffer.byteLength(directoryInfo.snapshot.output, 'utf8') < 128 * 1024,
+      `DirectoryInfo formatting produced pathological padding: ${Buffer.byteLength(directoryInfo.snapshot.output, 'utf8')} bytes`,
+    )
+    assert(
+      directoryDurationMs < 15_000,
+      `DirectoryInfo formatting took an unreasonable ${directoryDurationMs}ms.`,
+    )
+
+    const parseFailure = await runTracked(
+      service,
+      config.id,
+      'Write-Output )',
+    )
+    assert(
+      parseFailure.result.exitCode !== 0 &&
+        parseFailure.snapshot.output.includes('Write-Output )') &&
+        parseFailure.snapshot.output.includes('ParserError') &&
+        parseFailure.snapshot.output.includes('FullyQualifiedErrorId'),
+      `PowerShell parse failure lost user-source diagnostics: ${JSON.stringify(parseFailure.snapshot.output)}`,
+    )
+    assertNoPrivateWindowsProtocolLeak(
+      'PowerShell parse failure',
+      parseFailure.snapshot.output,
+    )
+    const parseRecovery = await runTracked(
+      service,
+      config.id,
+      `Write-Output 'GYSHELL_PARSE_RECOVERY_${process.pid}'`,
+    )
+    assert(
+      parseRecovery.snapshot.output.trim() ===
+        `GYSHELL_PARSE_RECOVERY_${process.pid}`,
+      'A parser error poisoned the next top-level PowerShell command.',
+    )
+
+    const scopeVariable = `GYSHELL_SCOPE_${process.pid}`
+    const scopeFunction = `GYSHELL_SCOPE_FN_${process.pid}`
+    await runTracked(
+      service,
+      config.id,
+      `$global:${scopeVariable}='VARIABLE_OK'; function global:${scopeFunction} { 'FUNCTION_OK' }`,
+    )
+    const scopePersistence = await runTracked(
+      service,
+      config.id,
+      `Write-Output ($global:${scopeVariable}+';'+(${scopeFunction}))`,
+    )
+    assert(
+      scopePersistence.snapshot.output.trim() === 'VARIABLE_OK;FUNCTION_OK',
+      `Agent commands lost top-level PowerShell scope: ${JSON.stringify(scopePersistence.snapshot.output)}`,
+    )
+
+    const seededEngineHistory = await runTracked(
+      service,
+      config.id,
+      `$__target='. $global:'+'__GyShell_'+'InternalDispatch';$__now=Get-Date;1..3|ForEach-Object {[pscustomobject]@{CommandLine=$__target;ExecutionStatus='Completed';StartExecutionTime=$__now;EndExecutionTime=$__now}|Add-History};Write-Output ('SEEDED='+@(Get-History|Where-Object {$_.CommandLine -ceq $__target}).Count)`,
+    )
+    const seededEngineHistoryMatch = seededEngineHistory.snapshot.output
+      .trim()
+      .match(/^SEEDED=(\d+)$/)
+    assert(
+      seededEngineHistoryMatch !== null &&
+        Number.parseInt(seededEngineHistoryMatch[1], 10) >= 3,
+      `The real history fixture could not seed repeated exact dispatcher entries: ${JSON.stringify(seededEngineHistory.snapshot.output)}`,
+    )
+
+    const historyAudit = await runTracked(
+      service,
+      config.id,
+      `$__target='. $global:'+'__GyShell_'+'InternalDispatch';$__engine=@(Get-History | Where-Object { $_.CommandLine -ceq $__target }).Count;$__history_path=(Get-PSReadLineOption).HistorySavePath;$__disk=if(Test-Path -LiteralPath $__history_path){@(Get-Content -LiteralPath $__history_path | Where-Object { $_ -ceq $__target }).Count}else{0};Write-Output ('ENGINE='+$__engine+';PSREADLINE='+$__disk)`,
+    )
+    const historyAuditMatch = historyAudit.snapshot.output.trim().match(
+      /^ENGINE=(\d+);PSREADLINE=(\d+)$/,
+    )
+    assert(
+      historyAuditMatch !== null &&
+        historyAuditMatch[1] === '0' &&
+        Number.parseInt(historyAuditMatch[2], 10) ===
+          psReadLineDispatcherHistoryBaseline,
+      `The private dispatcher entered PowerShell history: ${JSON.stringify(historyAudit.snapshot.output)}`,
+    )
+
+    const cancellationRawOffset = liveTerminalData.length
+    const cancellationStartedAt = Date.now()
+    const cancellationTaskId = await service.runCommandNoWait(
+      config.id,
+      `Start-Sleep -Seconds 30; Write-Output 'GYSHELL_CANCEL_MUST_NOT_FINISH_${process.pid}'`,
+    )
+    await new Promise((resolve) => setTimeout(resolve, 300))
+    await service.writeInputSequence(
+      config.id,
+      ['\x03'],
+      { inputOwner: 'active-task' },
+    )
+    await waitUntil(
+      () =>
+        service.getCommandOutputSnapshot(config.id, cancellationTaskId)
+          ?.executionState !== 'running',
+      'Ctrl-C did not settle the tracked PowerShell command.',
+      15_000,
+    )
+    const cancellationResult = await service.waitForTask(
+      config.id,
+      cancellationTaskId,
+    )
+    assert(
+      Date.now() - cancellationStartedAt < 15_000 &&
+        !cancellationResult.stdoutDelta.includes('GYSHELL_CANCEL_MUST_NOT_FINISH'),
+      `Ctrl-C did not stop the tracked command promptly: ${JSON.stringify(cancellationResult)}`,
+    )
+    await waitUntil(
+      () => service.getTerminalRuntimeSnapshot(config.id)?.canRunCommand === true,
+      'Tracked Ctrl-C did not restore a verified PowerShell prompt.',
+      15_000,
+    )
+    assertNoPrivateWindowsProtocolLeak(
+      'tracked Ctrl-C recovery',
+      liveTerminalData.slice(cancellationRawOffset),
+    )
+
+    const repeatedPrepareBaseline = prepareCommandTrackingCalls
+    const repeatedStartedAt = Date.now()
+    for (let index = 0; index < 5; index += 1) {
+      const repeated = await runTracked(
+        service,
+        config.id,
+        `Write-Output 'GYSHELL_REPEAT_${process.pid}_${index}'`,
+      )
+      assert(
+        repeated.snapshot.output.trim() ===
+          `GYSHELL_REPEAT_${process.pid}_${index}`,
+        `Repeated PowerShell command ${index} returned the wrong output.`,
+      )
+    }
+    assert(
+      prepareCommandTrackingCalls - repeatedPrepareBaseline === 5,
+      'Each repeated agent command must perform exactly one tracking preparation.',
+    )
+    assert(
+      Date.now() - repeatedStartedAt < 20_000,
+      'Five trivial PowerShell commands incurred pathological dispatcher latency.',
+    )
 
     const delayedStartedAt = Date.now()
     const delayedTaskId = await service.runCommandNoWait(
@@ -532,7 +791,7 @@ const run = async (): Promise<void> => {
     assert(
       absentNativeStatus.snapshot.output.trim() ===
         'PRIOR_OK=True;NATIVE_EXISTS=False',
-      `Hidden probe invented a missing native status variable: ${JSON.stringify(absentNativeStatus.snapshot.output)}`,
+      `Hidden dispatch invented a missing native status variable: ${JSON.stringify(absentNativeStatus.snapshot.output)}`,
     )
 
     const dotSourcedStatus = await runTracked(
@@ -571,6 +830,10 @@ const run = async (): Promise<void> => {
         `PowerShell structured error lost ${detail}: ${JSON.stringify(structuredError.snapshot.output)}`,
       )
     }
+    assertNoPrivateWindowsProtocolLeak(
+      'PowerShell nonterminating structured error',
+      structuredError.snapshot.output,
+    )
 
     const priorStatus = await runTracked(
       service,
@@ -580,7 +843,36 @@ const run = async (): Promise<void> => {
     assert(
       priorStatus.snapshot.output.trim() ===
         'PRIOR_OK=False;PRIOR_NATIVE=37;TOP_ERROR=STRUCTURED_ERROR_SENTINEL',
-      `Hidden probe changed the previous PowerShell status: ${JSON.stringify(priorStatus.snapshot.output)}`,
+      `Hidden dispatch changed the previous PowerShell status: ${JSON.stringify(priorStatus.snapshot.output)}`,
+    )
+
+    const terminatingError = await runTracked(
+      service,
+      config.id,
+      `throw 'TERMINATING_ERROR_SENTINEL'`,
+    )
+    assert(
+      terminatingError.result.exitCode !== 0 &&
+        terminatingError.snapshot.output.includes(
+          'TERMINATING_ERROR_SENTINEL',
+        ) &&
+        terminatingError.snapshot.output.includes('CategoryInfo') &&
+        terminatingError.snapshot.output.includes('FullyQualifiedErrorId'),
+      `PowerShell terminating error lost structured details: ${JSON.stringify(terminatingError.snapshot.output)}`,
+    )
+    assertNoPrivateWindowsProtocolLeak(
+      'PowerShell terminating structured error',
+      terminatingError.snapshot.output,
+    )
+    const priorTerminatingStatus = await runTracked(
+      service,
+      config.id,
+      `Write-Output ('PRIOR_OK=' + $? + ';PRIOR_NATIVE=' + $LASTEXITCODE + ';TOP_ERROR=' + $Error[0].Exception.Message)`,
+    )
+    assert(
+      priorTerminatingStatus.snapshot.output.trim() ===
+        'PRIOR_OK=False;PRIOR_NATIVE=37;TOP_ERROR=TERMINATING_ERROR_SENTINEL',
+      `Hidden dispatch changed the terminating-error status: ${JSON.stringify(priorTerminatingStatus.snapshot.output)}`,
     )
 
     const nativeFailure = await runTracked(
@@ -601,7 +893,7 @@ const run = async (): Promise<void> => {
     assert(
       priorNativeFailure.snapshot.output.trim() ===
         'PRIOR_OK=False;PRIOR_NATIVE=29',
-      `Hidden probe changed the previous native status: ${JSON.stringify(priorNativeFailure.snapshot.output)}`,
+      `Hidden dispatch changed the previous native status: ${JSON.stringify(priorNativeFailure.snapshot.output)}`,
     )
     const priorSuccessfulPowerShell = await runTracked(
       service,
@@ -611,7 +903,13 @@ const run = async (): Promise<void> => {
     assert(
       priorSuccessfulPowerShell.snapshot.output.trim() ===
         'PRIOR_OK=True;PRIOR_NATIVE=29',
-      `Successful PowerShell status did not survive the hidden probe: ${JSON.stringify(priorSuccessfulPowerShell.snapshot.output)}`,
+      `Successful PowerShell status did not survive hidden dispatch: ${JSON.stringify(priorSuccessfulPowerShell.snapshot.output)}`,
+    )
+
+    assertNoPrivateWindowsProtocolLeak(
+      'complete Windows SSH interaction matrix',
+      liveTerminalData,
+      service.getBufferDelta(config.id, 0),
     )
 
     console.log(`PASS real Windows SSH command-output matrix: ${CONNECTION_NAME}`)
