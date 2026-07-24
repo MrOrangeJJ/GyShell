@@ -2926,7 +2926,9 @@ export class AppStore {
       const panelIdsByHiddenKind = new Map<WindowScopedTabKind, string[]>();
       this.getVisibilityLinkedKindsForTab("terminal", id).forEach(
         (linkedKind) => {
-          if (linkedKind === "terminal") {
+          // Background creation may preserve filesystem context, but monitor
+          // panels track terminal runtimes independently of terminal hosting.
+          if (linkedKind !== "filesystem") {
             return;
           }
           const panelIds = this.layout.getPanelIdsByKind(linkedKind);

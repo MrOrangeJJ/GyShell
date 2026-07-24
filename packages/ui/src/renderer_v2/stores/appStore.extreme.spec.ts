@@ -1258,7 +1258,7 @@ const run = async (): Promise<void> => {
   );
 
   await runCase(
-    "background SSH tab stays hidden from existing linked non-terminal panels",
+    "background SSH tab binds to an existing monitor without a terminal panel",
     async () => {
       const store = new AppStore();
       store.settings = {
@@ -1281,28 +1281,32 @@ const run = async (): Promise<void> => {
       (store.layout as any).saveLayoutDebounced = () => {};
       store.layout.setViewport(1400, 900);
 
+      const listPanelId = store.layout.ensurePrimaryPanelForKind("listPanel");
+      assertCondition(
+        Boolean(listPanelId),
+        "test setup should create a list panel",
+      );
       const initialTerminalPanelId = store.layout.getPrimaryPanelId("terminal");
       assertCondition(
         Boolean(initialTerminalPanelId),
         "default main layout should start with a terminal panel",
       );
       store.layout.removePanel(initialTerminalPanelId!);
+      const initialChatPanelId = store.layout.getPrimaryPanelId("chat");
+      if (initialChatPanelId) {
+        store.layout.removePanel(initialChatPanelId);
+      }
       assertEqual(
         store.layout.getPrimaryPanelId("terminal"),
         null,
         "test setup should remove terminal panels before background creation",
       );
-      const initialChatPanelId = store.layout.getPrimaryPanelId("chat");
-      if (initialChatPanelId) {
-        store.layout.removePanel(initialChatPanelId);
-      }
-      const filesystemPanelId =
-        store.layout.ensurePrimaryPanelForKind("filesystem");
-      const monitorPanelId = store.layout.ensurePrimaryPanelForKind("monitor");
-      assertCondition(
-        Boolean(filesystemPanelId),
-        "test setup should create a filesystem panel",
+      assertEqual(
+        store.layout.getPrimaryPanelId("chat"),
+        null,
+        "test setup should leave only the list panel before adding monitor",
       );
+      const monitorPanelId = store.layout.ensurePrimaryPanelForKind("monitor");
       assertCondition(
         Boolean(monitorPanelId),
         "test setup should create a monitor panel",
@@ -1320,39 +1324,46 @@ const run = async (): Promise<void> => {
       );
       assertCondition(
         !store.getLayoutBindableTabIds("filesystem").includes(tabId!),
-        "background SSH tab should stay out of existing filesystem panels",
+        "background SSH tab should remain hidden from filesystem panels",
       );
       assertCondition(
-        !store.getLayoutBindableTabIds("monitor").includes(tabId!),
-        "background SSH tab should stay out of existing monitor panels",
-      );
-      assertEqual(
-        JSON.stringify(store.layout.getPanelTabIds(filesystemPanelId!)),
-        JSON.stringify([]),
-        "existing filesystem panel should not receive a background SSH tab",
+        store.getLayoutBindableTabIds("monitor").includes(tabId!),
+        "background SSH tab should stay bindable to the existing monitor panel",
       );
       assertEqual(
         JSON.stringify(store.layout.getPanelTabIds(monitorPanelId!)),
-        JSON.stringify([]),
-        "existing monitor panel should not receive a background SSH tab",
-      );
-
-      const restoredTerminalPanelId =
-        store.layout.ensurePrimaryPanelForKind("terminal");
-      assertCondition(
-        Boolean(restoredTerminalPanelId),
-        "terminal panel should still be restorable",
+        JSON.stringify([tabId]),
+        "existing monitor panel should receive the background SSH tab",
       );
       assertEqual(
-        JSON.stringify(store.layout.getPanelTabIds(restoredTerminalPanelId!)),
+        store.layout.getPanelActiveTabId(monitorPanelId!),
+        tabId,
+        "existing monitor panel should activate the background SSH tab",
+      );
+
+      store.reconcileTerminalTabs({
+        terminals: [
+          {
+            id: tabId,
+            title: "Deploy Host",
+            type: "ssh",
+            cols: 80,
+            rows: 24,
+            runtimeState: "ready",
+            monitorIdentity: "ssh://deploy@deploy.example.test:22",
+          },
+        ],
+      } as any);
+      assertEqual(
+        JSON.stringify(store.layout.getPanelTabIds(monitorPanelId!)),
         JSON.stringify([tabId]),
-        "future terminal panel should automatically host the background SSH tab",
+        "backend reconciliation should preserve the monitor panel binding",
       );
     },
   );
 
   await runCase(
-    "background SSH tab stays hidden from future linked non-terminal panels",
+    "background SSH tab binds to a future monitor but not a future filesystem panel",
     async () => {
       const store = new AppStore();
       store.settings = {
@@ -1375,6 +1386,11 @@ const run = async (): Promise<void> => {
       (store.layout as any).saveLayoutDebounced = () => {};
       store.layout.setViewport(1400, 900);
 
+      const listPanelId = store.layout.ensurePrimaryPanelForKind("listPanel");
+      assertCondition(
+        Boolean(listPanelId),
+        "test setup should create a list panel",
+      );
       const initialTerminalPanelId = store.layout.getPrimaryPanelId("terminal");
       assertCondition(
         Boolean(initialTerminalPanelId),
@@ -1416,8 +1432,8 @@ const run = async (): Promise<void> => {
         "background SSH tab should be hidden from future filesystem panels",
       );
       assertCondition(
-        !store.getLayoutBindableTabIds("monitor").includes(tabId!),
-        "background SSH tab should be hidden from future monitor panels",
+        store.getLayoutBindableTabIds("monitor").includes(tabId!),
+        "background SSH tab should remain bindable to future monitor panels",
       );
 
       const filesystemPanelId =
@@ -1438,8 +1454,13 @@ const run = async (): Promise<void> => {
       );
       assertEqual(
         JSON.stringify(store.layout.getPanelTabIds(monitorPanelId!)),
-        JSON.stringify([]),
-        "future monitor panel should not auto-host a background SSH tab",
+        JSON.stringify([tabId]),
+        "future monitor panel should automatically host the background SSH tab",
+      );
+      assertEqual(
+        store.layout.getPanelActiveTabId(monitorPanelId!),
+        tabId,
+        "future monitor panel should activate the background SSH tab",
       );
     },
   );
