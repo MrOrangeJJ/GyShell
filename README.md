@@ -79,9 +79,12 @@ GyShell is built for **persistent execution in your real terminal runtime**:
 - **Live session rename**: rename a chat from the desktop Tab List or `gyll` and see the saved title update across connected clients.
 - **Agent-managed terminal tabs**: opt-in experimental tools let the Agent create Local/SSH tabs and close existing tabs.
 - **Direct SSH transfers**: large single files can move directly between compatible Unix SSH hosts, with automatic relay fallback.
+- **Per-model request parameters**: add validated OpenAI-compatible request-body overrides without exposing runtime-owned fields.
+- **Reliable command-output semantics**: complete, partial, and display-truncated output are explicit, with continuation for retained long results.
+- **Cleaner Seamless activity**: inspect tool work through compact, multi-level disclosure with accurate warning and failure states.
 - **Auto-saved Agent Settings**: edits made while a profile is active are written back automatically.
 - **Clearer tools and Skills**: tool descriptions are shorter, and Skill discovery is limited to GyShell's managed folder plus `~/.agents/skills`.
-- **Reliability fixes**: Windows terminal resizing keeps cursor output synchronized, and chat panels preserve their selected session.
+- **Reliability fixes**: streamed multi-tool calls stay intact, terminal and SSH recovery is more defensive, background SSH tabs remain monitorable, Windows terminal resizing stays synchronized, and chat panels preserve their selected session.
 
 ---
 
@@ -94,16 +97,18 @@ GyShell is built for **persistent execution in your real terminal runtime**:
 - Supported, compatible tool calls—including read-only tools and commands targeting different machines—can execute safely in parallel to significantly accelerate Agent tasks.
 - Per-profile model routing for `Global`, `Thinking`, `Action`, and `Compaction` roles.
 - Reusable Agent Setting profiles for model profile, security policy, tools, skills, memory, recursion, and experimental workflow flags, with automatic write-back while a profile is active.
-- Long-session context quality with dedicated compaction models, dynamic summaries, visible `[CTX COMPACTED]` boundary markers, and deterministic fallback recovery when model compaction is unavailable.
+- Long-session context quality with dedicated compaction models, dynamic summaries, visible `[CTX COMPACTED]` boundary markers, efficient exit-only checkpoint serialization, and durable-frontier recovery for histories that still exceed the emergency context budget.
 - SQLite-backed conversation history with automatic one-time migration from legacy JSON storage.
 - AI-assisted terminal command drafting from recent tab context, with paste-before-run control.
 - Background (nowait) commands automatically notify the agent on completion, so the agent can close the loop without polling.
 - Terminal-targeting agent tools report runtime status and refuse stale operations on disconnected tabs until reconnect succeeds.
 - Reference previous conversations with `Pass Chat` mentions; GyShell exports the selected chat as private local Markdown and tells the agent how to read it only when needed.
-- Classic or Seamless chat activity display, depending on how much inline tool detail you want.
+- Classic or Seamless chat activity display, with compact multi-level tool disclosure and accurate warning/failure severity in Seamless mode.
 - Persistent memory injection via `memory.md`, scoped to the active Agent Setting profile when one is applied.
 - Multimodal user input pipeline (text + images) for compatible models.
-- OpenAI-compatible model endpoint support, with automatic recovery from malformed empty tool-call stream finishes.
+- OpenAI-compatible model endpoint support, including validated per-model text, number, boolean, and JSON request-body overrides while runtime-owned fields remain protected.
+- Streamed multi-tool calls are reconciled from raw response identities before planning so call IDs, indices, arguments, and results remain intact across execution and recovery, including automatic fallback for malformed empty tool-call finishes.
+- Command tools expose explicit execution, capture, and presentation states, allowing the Agent to distinguish complete output from incomplete capture or a bounded display excerpt and continue reading retained results.
 - Optional experimental agent tools, including asynchronous cross-machine file transfer between terminal tabs with progress polling.
 - Optional experimental terminal lifecycle tools let the agent create tabs from saved Local/SSH connections and close tabs after explicit opt-in.
 
@@ -120,6 +125,7 @@ GyShell is built for **persistent execution in your real terminal runtime**:
 - Draft a command for the current terminal tab from recent visible output, then paste it back without auto-running it.
 - Search within the active terminal buffer without leaving the panel.
 - Terminal tab restoration after backend restart, plus lossless output catch-up for renderer remount/reconnect within the same backend runtime.
+- Private shell initialization and Unix dispatcher traffic remain hidden, with stricter startup retries, prompt-bound input gating, and terminal output flow control across local and SSH sessions.
 - Local terminal tabs auto-respawn their shell if it exits, so a local tab stays usable instead of going dead.
 - Disconnected SSH tabs can be reconnected in place from the tab right-click menu using their saved connection config.
 - **Integrated file browser panel**: browse, create, rename, delete, preview, sort, filter, and search files across local and SSH sessions.
@@ -140,6 +146,7 @@ GyShell is built for **persistent execution in your real terminal runtime**:
 - Open a resource monitor panel for local and SSH terminals from the workspace rail.
 - Monitor panel surfaces CPU, memory, disk, network, process, socket, and GPU telemetry when available.
 - Monitor collection is shared across tabs that point at the same local or SSH target, with failover if the original source tab exits.
+- Background SSH tabs remain available to existing or future monitor panels even when no terminal panel is hosting them.
 - Monitor polling can be paused or resumed per local/SSH source, with the preference kept across restarts.
 - Compact monitor layouts now give GPU telemetry its own card with clearer VRAM usage details.
 
