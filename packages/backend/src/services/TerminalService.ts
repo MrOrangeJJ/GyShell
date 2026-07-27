@@ -42,6 +42,10 @@ import {
 import { CommandTranscriptCapture } from './terminal/CommandTranscriptCapture'
 import { buildWindowsPowerShellDispatchRequest } from './windowsPowerShellTracking'
 import { TerminalOutputFlowController } from './terminal/TerminalOutputFlowController'
+import {
+  isolateUnixAgentCommand,
+  shouldIsolateUnixAgentCommand,
+} from './terminal/UnixCommandIsolation'
 
 const MAX_BUFFER_SIZE = 200000 // 200KB
 const SCROLLBACK_SIZE = 5000 // Keep up to 5000 lines in virtual terminal
@@ -3925,7 +3929,8 @@ export class TerminalService {
   private buildDispatchedCommand(
     terminal: TerminalTab,
     command: string,
-    taskId: string
+    taskId: string,
+    isolateUnixCommand: boolean
   ): string {
     if (
       this.getCommandShellFamily(terminal) !== 'unix'
@@ -3940,7 +3945,7 @@ export class TerminalService {
       runtimeToken,
       expectedSequence,
       fallbackNonce,
-      command
+      isolateUnixCommand ? isolateUnixAgentCommand(command) : command
     )
   }
 
@@ -5062,7 +5067,17 @@ export class TerminalService {
       throw error
     }
     throwIfTerminalOperationAborted(signal)
-    const wireCommand = this.buildDispatchedCommand(terminal, command, taskId)
+    const isolateUnixCommand =
+      terminal.type === 'ssh' &&
+      this.getCommandShellFamily(terminal) === 'unix' &&
+      await shouldIsolateUnixAgentCommand(command)
+    throwIfTerminalOperationAborted(signal)
+    const wireCommand = this.buildDispatchedCommand(
+      terminal,
+      command,
+      taskId,
+      isolateUnixCommand
+    )
 
     const backend = this.getBackend(terminal.type)
     const eol = this.usesPowerShellCommandLifecycle(terminal) ? '\r' : '\n'
