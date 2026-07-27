@@ -20,12 +20,8 @@ const resolveOwnedTabIds = (
   fallback: () => string[],
 ): string[] => {
   const runtime = appStore as AppStore & {
-    getLayoutBindableTabIds?: (panelKind: PanelKind) => string[];
     getOwnedTabIds?: (panelKind: PanelKind) => string[];
   };
-  if (typeof runtime.getLayoutBindableTabIds === "function") {
-    return runtime.getLayoutBindableTabIds(kind);
-  }
   if (typeof runtime.getOwnedTabIds === "function") {
     return runtime.getOwnedTabIds(kind);
   }

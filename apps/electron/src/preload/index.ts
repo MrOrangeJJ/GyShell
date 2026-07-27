@@ -512,6 +512,20 @@ export interface FileTransferTaskSnapshot {
   toolMessageId?: string;
 }
 
+type WindowingTabKind = "chat" | "terminal" | "filesystem" | "monitor";
+
+interface WindowingTabTarget {
+  kind: WindowingTabKind;
+  tabId: string;
+}
+
+type WindowingTabOwnership = Partial<Record<WindowingTabKind, string[]>>;
+
+interface OpenDetachedWindowOptions {
+  tabOwnership?: WindowingTabOwnership;
+  focusTarget?: WindowingTabTarget;
+}
+
 export interface GyShellAPI {
   system: {
     platform: NodeJS.Platform;
@@ -536,8 +550,20 @@ export interface GyShellAPI {
     openDetached: (
       detachedStateToken: string,
       sourceClientId: string,
-    ) => Promise<{ ok: boolean }>;
-    onMainWindowClosing: (callback: () => void) => () => void;
+      options?: OpenDetachedWindowOptions,
+    ) => Promise<{ ok: boolean; reused?: boolean }>;
+    updateTabOwnership: (
+      ownership: WindowingTabOwnership,
+    ) => Promise<{ ok: boolean; registered: boolean }>;
+    closeDetachedWindows: () => Promise<{
+      ok: boolean;
+      closed: number;
+      tabsByKind: WindowingTabOwnership;
+    }>;
+    onActivateTab: (
+      callback: (target: WindowingTabTarget) => void,
+    ) => () => void;
+    onDetachedWindowCascadeClosing: (callback: () => void) => () => void;
   };
   // Settings
   settings: {
@@ -976,16 +1002,28 @@ const api: GyShellAPI = {
     },
   },
   windowing: {
-    openDetached: (detachedStateToken, sourceClientId) =>
+    openDetached: (detachedStateToken, sourceClientId, options) =>
       ipcRenderer.invoke(
         "windowing:openDetached",
         detachedStateToken,
         sourceClientId,
+        options,
       ),
-    onMainWindowClosing: (callback) => {
+    updateTabOwnership: (ownership) =>
+      ipcRenderer.invoke("windowing:updateTabOwnership", ownership),
+    closeDetachedWindows: () =>
+      ipcRenderer.invoke("windowing:closeDetachedWindows"),
+    onActivateTab: (callback) => {
+      const handler = (_: IpcRendererEvent, target: WindowingTabTarget) =>
+        callback(target);
+      ipcRenderer.on("windowing:activateTab", handler);
+      return () => ipcRenderer.off("windowing:activateTab", handler);
+    },
+    onDetachedWindowCascadeClosing: (callback) => {
       const handler = () => callback();
-      ipcRenderer.on("windowing:mainWindowClosing", handler);
-      return () => ipcRenderer.off("windowing:mainWindowClosing", handler);
+      ipcRenderer.on("windowing:detachedWindowCascadeClosing", handler);
+      return () =>
+        ipcRenderer.off("windowing:detachedWindowCascadeClosing", handler);
     },
   },
   windowControls: {

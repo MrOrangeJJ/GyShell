@@ -287,6 +287,17 @@ export class LayoutStore {
     if (!this.canApplyRestoredTree(nextTree)) {
       return false;
     }
+    const prepareForLayoutSwitch = (
+      this.appStore as AppStore & {
+        prepareForLayoutSwitch?: () => Promise<boolean>;
+      }
+    ).prepareForLayoutSwitch;
+    if (
+      typeof prepareForLayoutSwitch === "function" &&
+      !(await prepareForLayoutSwitch.call(this.appStore))
+    ) {
+      return false;
+    }
 
     this.pinnedEmptyPanelIds.clear();
     this.tree = nextTree;
@@ -987,8 +998,6 @@ export class LayoutStore {
     if (!this.canAcceptTabDrop(payload, targetPanelId, direction)) {
       return;
     }
-    this.showTabsInLayout(payload.kind, [payload.tabId]);
-
     if (direction === "center") {
       this.moveTabBinding(
         payload.kind,
@@ -1238,6 +1247,9 @@ export class LayoutStore {
         return;
       }
 
+      // A hydrated kind with at least one panel must bind its complete owned
+      // inventory exactly once across those panels. Per-feature visibility
+      // filters must be resolved before this boundary, never inside bindings.
       const ownerTabIds = adapter.getOwnerTabIds(this.appStore);
       const ownerSet = new Set(ownerTabIds);
       const consumed = new Set<string>();
@@ -1342,7 +1354,6 @@ export class LayoutStore {
     if (!getPanelKindAdapter(kind).supportsTabs) {
       return;
     }
-    this.showTabsInLayout(kind, [tabId]);
     const nextTree = this.createTreeWithMovedTab(
       this.tree,
       kind,
@@ -1355,13 +1366,6 @@ export class LayoutStore {
     this.syncGlobalActiveFromPanel(kind, tabId);
     this.syncPanelBindings({ persist: false });
     this.saveLayoutDebounced();
-  }
-
-  private showTabsInLayout(kind: PanelKind, tabIds: string[]): void {
-    const runtime = this.appStore as AppStore & {
-      showTabsInLayout?: (panelKind: PanelKind, tabIds: string[]) => void;
-    };
-    runtime.showTabsInLayout?.(kind, tabIds);
   }
 
   private createTreeWithoutTabs(

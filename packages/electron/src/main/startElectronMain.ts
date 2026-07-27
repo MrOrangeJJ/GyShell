@@ -53,6 +53,11 @@ import { MobileWebServerService } from "../services/MobileWebServerService";
 import { ResourceMonitorService } from "../../../backend/src/services/ResourceMonitorService";
 import { MonitorWindowRegistry } from "./MonitorWindowRegistry";
 import {
+  DetachedWindowRegistry,
+  type DetachedWindowTabOwnership,
+  type DetachedWindowTabTarget,
+} from "./DetachedWindowRegistry";
+import {
   broadcastTerminalRecoveryHint,
   isDisplayMetricsRecoveryRelevant,
 } from "./terminalRecovery";
@@ -88,6 +93,7 @@ let webSocketGatewayControlService: WebSocketGatewayControlService | null =
 let mobileWebServerService: MobileWebServerService | null = null;
 let resourceMonitorService: ResourceMonitorService;
 let monitorWindowRegistry: MonitorWindowRegistry;
+const detachedWindowRegistry = new DetachedWindowRegistry<BrowserWindow>();
 let historyStore: HistorySqliteStore | null = null;
 let sleepBlockerService: SleepBlockerService | null = null;
 let agentSettingProfileService: AgentSettingProfileService;
@@ -98,6 +104,7 @@ interface CreateWindowOptions {
   role?: AppWindowRole;
   detachedStateToken?: string;
   sourceClientId?: string;
+  tabOwnership?: DetachedWindowTabOwnership;
 }
 
 const DETACHED_WINDOW_DEFAULT_WIDTH_SCALE = 0.5;
@@ -177,6 +184,11 @@ function createWindow(options?: CreateWindowOptions): BrowserWindow {
   });
   if (isMainWindow) {
     mainWindow = windowInstance;
+  } else {
+    detachedWindowRegistry.register(
+      windowInstance,
+      options?.tabOwnership,
+    );
   }
 
   const query = new URLSearchParams();
@@ -239,7 +251,7 @@ function createWindow(options?: CreateWindowOptions): BrowserWindow {
       // detached-closing rollback broadcasts back into the main workspace.
       detachedWindows.forEach((win) => {
         if (!win.webContents.isDestroyed()) {
-          win.webContents.send("windowing:mainWindowClosing");
+          win.webContents.send("windowing:detachedWindowCascadeClosing");
         }
       });
       detachedWindows.forEach((win) => {
@@ -255,6 +267,8 @@ function createWindow(options?: CreateWindowOptions): BrowserWindow {
   windowInstance.on("closed", () => {
     if (isMainWindow) {
       mainWindow = null;
+    } else {
+      detachedWindowRegistry.unregister(windowInstance);
     }
   });
 
@@ -1033,6 +1047,10 @@ export async function startElectronMain(): Promise<void> {
             event: any,
             detachedStateToken: string,
             sourceClientId: string,
+            options?: {
+              tabOwnership?: DetachedWindowTabOwnership;
+              focusTarget?: DetachedWindowTabTarget;
+            },
           ) => {
             const token = String(detachedStateToken || "").trim();
             if (!token) {
@@ -1042,12 +1060,113 @@ export async function startElectronMain(): Promise<void> {
             if (!senderWindow || senderWindow.isDestroyed()) {
               throw new Error("Failed to resolve source window.");
             }
+            const focusTarget = options?.focusTarget
+              ? {
+                  kind: options.focusTarget.kind,
+                  tabId: String(options.focusTarget.tabId || "").trim(),
+                }
+              : null;
+            if (focusTarget?.tabId) {
+              const existingWindow =
+                detachedWindowRegistry.focusWindowHostingTab(
+                  focusTarget,
+                );
+              if (existingWindow) {
+                if (!existingWindow.webContents.isDestroyed()) {
+                  existingWindow.webContents.send(
+                    "windowing:activateTab",
+                    focusTarget,
+                  );
+                }
+                return { ok: true, reused: true };
+              }
+            }
             createWindow({
               role: "detached",
               detachedStateToken: token,
               sourceClientId: String(sourceClientId || "").trim(),
+              tabOwnership: options?.tabOwnership,
             });
-            return { ok: true };
+            return { ok: true, reused: false };
+          },
+        );
+
+        ipcMain.handle(
+          "windowing:updateTabOwnership",
+          async (
+            event: any,
+            ownership?: DetachedWindowTabOwnership,
+          ) => {
+            const senderWindow = BrowserWindow.fromWebContents(event.sender);
+            if (!senderWindow || senderWindow.isDestroyed()) {
+              throw new Error("Failed to resolve source window.");
+            }
+            return {
+              ok: true,
+              registered: detachedWindowRegistry.updateOwnership(
+                senderWindow,
+                ownership,
+              ),
+            };
+          },
+        );
+
+        ipcMain.handle(
+          "windowing:closeDetachedWindows",
+          async (event: any) => {
+            const senderWindow = BrowserWindow.fromWebContents(event.sender);
+            if (
+              !senderWindow ||
+              senderWindow.isDestroyed() ||
+              senderWindow !== mainWindow
+            ) {
+              throw new Error(
+                "Only the main window can close detached workspaces.",
+              );
+            }
+
+            const detachedWindows = detachedWindowRegistry.getWindows();
+            const tabsByKind = detachedWindowRegistry.collectOwnership();
+            detachedWindows.forEach((window) => {
+              if (!window.webContents.isDestroyed()) {
+                window.webContents.send(
+                  "windowing:detachedWindowCascadeClosing",
+                );
+              }
+            });
+            await Promise.all(
+              detachedWindows.map(
+                (window) =>
+                  new Promise<void>((resolveClose) => {
+                    if (window.isDestroyed()) {
+                      resolveClose();
+                      return;
+                    }
+                    let settled = false;
+                    const finish = () => {
+                      if (settled) return;
+                      settled = true;
+                      clearTimeout(timeout);
+                      resolveClose();
+                    };
+                    const timeout = setTimeout(finish, 1500);
+                    window.once("closed", finish);
+                    setTimeout(() => {
+                      if (!window.isDestroyed()) {
+                        window.close();
+                      }
+                    }, 0);
+                }),
+              ),
+            );
+            const remainingDetachedWindows =
+              detachedWindowRegistry.getWindows();
+            return {
+              ok: remainingDetachedWindows.length === 0,
+              closed:
+                detachedWindows.length - remainingDetachedWindows.length,
+              tabsByKind,
+            };
           },
         );
 

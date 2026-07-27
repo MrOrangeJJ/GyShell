@@ -898,7 +898,7 @@ const run = async (): Promise<void> => {
         "list-panel local creation should not recreate a terminal panel by itself",
       );
       assertCondition(
-        store.getLayoutBindableTabIds("terminal").includes(tabId),
+        store.getOwnedTabIds("terminal").includes(tabId),
         "unhosted local tab should remain eligible for a future terminal panel",
       );
 
@@ -999,7 +999,7 @@ const run = async (): Promise<void> => {
           "backend local runtime creation should keep the tab unhosted when no terminal panel exists",
         );
         assertCondition(
-          store.getLayoutBindableTabIds("terminal").includes(tabId),
+          store.getOwnedTabIds("terminal").includes(tabId),
           "background local runtime should stay eligible for future terminal panels after reconciliation",
         );
         assertEqual(
@@ -1113,7 +1113,7 @@ const run = async (): Promise<void> => {
           "background SSH creation should keep the tab visible in global terminal inventory",
         );
         assertEqual(
-          JSON.stringify(store.getLayoutBindableTabIds("terminal")),
+          JSON.stringify(store.getOwnedTabIds("terminal")),
           JSON.stringify([tabId]),
           "background SSH creation should remain bindable when a terminal panel appears later",
         );
@@ -1175,7 +1175,7 @@ const run = async (): Promise<void> => {
         "background SSH creation should not recreate a terminal panel by itself",
       );
       assertCondition(
-        store.getLayoutBindableTabIds("terminal").includes(tabId!),
+        store.getOwnedTabIds("terminal").includes(tabId!),
         "background SSH tab should stay eligible for future terminal panels",
       );
 
@@ -1240,7 +1240,7 @@ const run = async (): Promise<void> => {
         "background SSH tab should stay visible in global terminal inventory",
       );
       assertEqual(
-        JSON.stringify(store.getLayoutBindableTabIds("terminal")),
+        JSON.stringify(store.getOwnedTabIds("terminal")),
         JSON.stringify([tabId]),
         "background SSH tab should stay layout-bindable when a terminal panel exists",
       );
@@ -1319,15 +1319,15 @@ const run = async (): Promise<void> => {
       });
       assertCondition(Boolean(tabId), "background SSH tab should be created");
       assertCondition(
-        store.getLayoutBindableTabIds("terminal").includes(tabId!),
+        store.getOwnedTabIds("terminal").includes(tabId!),
         "background SSH tab should remain eligible for a future terminal panel",
       );
       assertCondition(
-        !store.getLayoutBindableTabIds("filesystem").includes(tabId!),
-        "background SSH tab should remain hidden from filesystem panels",
+        store.getOwnedTabIds("filesystem").includes(tabId!),
+        "background SSH tab should remain eligible for filesystem panels",
       );
       assertCondition(
-        store.getLayoutBindableTabIds("monitor").includes(tabId!),
+        store.getOwnedTabIds("monitor").includes(tabId!),
         "background SSH tab should stay bindable to the existing monitor panel",
       );
       assertEqual(
@@ -1363,7 +1363,7 @@ const run = async (): Promise<void> => {
   );
 
   await runCase(
-    "background SSH tab binds to a future monitor but not a future filesystem panel",
+    "background SSH tab binds to future filesystem and monitor panels",
     async () => {
       const store = new AppStore();
       store.settings = {
@@ -1424,15 +1424,15 @@ const run = async (): Promise<void> => {
       });
       assertCondition(Boolean(tabId), "background SSH tab should be created");
       assertCondition(
-        store.getLayoutBindableTabIds("terminal").includes(tabId!),
+        store.getOwnedTabIds("terminal").includes(tabId!),
         "background SSH tab should remain eligible for a future terminal panel",
       );
       assertCondition(
-        !store.getLayoutBindableTabIds("filesystem").includes(tabId!),
-        "background SSH tab should be hidden from future filesystem panels",
+        store.getOwnedTabIds("filesystem").includes(tabId!),
+        "background SSH tab should remain bindable to future filesystem panels",
       );
       assertCondition(
-        store.getLayoutBindableTabIds("monitor").includes(tabId!),
+        store.getOwnedTabIds("monitor").includes(tabId!),
         "background SSH tab should remain bindable to future monitor panels",
       );
 
@@ -1449,8 +1449,8 @@ const run = async (): Promise<void> => {
       );
       assertEqual(
         JSON.stringify(store.layout.getPanelTabIds(filesystemPanelId!)),
-        JSON.stringify([]),
-        "future filesystem panel should not auto-host a background SSH tab",
+        JSON.stringify([tabId]),
+        "future filesystem panel should automatically host the background SSH tab",
       );
       assertEqual(
         JSON.stringify(store.layout.getPanelTabIds(monitorPanelId!)),
@@ -1458,9 +1458,131 @@ const run = async (): Promise<void> => {
         "future monitor panel should automatically host the background SSH tab",
       );
       assertEqual(
+        store.layout.getPanelActiveTabId(filesystemPanelId!),
+        tabId,
+        "future filesystem panel should activate the background SSH tab",
+      );
+      assertEqual(
         store.layout.getPanelActiveTabId(monitorPanelId!),
         tabId,
         "future monitor panel should activate the background SSH tab",
+      );
+    },
+  );
+
+  await runCase(
+    "filesystem and monitor panels retain every terminal-derived tab exactly once including exited tabs",
+    () => {
+      const store = new AppStore();
+      (store.layout as any).saveLayoutDebounced = () => {};
+      store.layout.setViewport(1800, 1000);
+      (store as any).terminalTabs = [
+        {
+          id: "term-ready",
+          title: "Ready Host",
+          config: {
+            type: "ssh",
+            id: "term-ready",
+            title: "Ready Host",
+            cols: 80,
+            rows: 24,
+          },
+          capabilities: { supportsFilesystem: true, supportsMonitor: true },
+          runtimeState: "ready",
+        },
+        {
+          id: "term-exited",
+          title: "Exited Host",
+          config: {
+            type: "ssh",
+            id: "term-exited",
+            title: "Exited Host",
+            cols: 80,
+            rows: 24,
+          },
+          capabilities: { supportsFilesystem: true, supportsMonitor: true },
+          runtimeState: "exited",
+          lastExitCode: 255,
+        },
+      ];
+      store.terminalTabsHydrated = true;
+      const filesystemPanelIds = ["panel-filesystem-a", "panel-filesystem-b"];
+      const monitorPanelId = "panel-monitor";
+      (store.layout as any).tree = {
+        schemaVersion: 2,
+        root: {
+          type: "split",
+          id: "root-derived-tab-ownership",
+          direction: "horizontal",
+          children: [
+            {
+              type: "panel",
+              id: "node-filesystem-a",
+              panel: {
+                id: filesystemPanelIds[0],
+                kind: "filesystem",
+              },
+            },
+            {
+              type: "panel",
+              id: "node-filesystem-b",
+              panel: {
+                id: filesystemPanelIds[1],
+                kind: "filesystem",
+              },
+            },
+            {
+              type: "panel",
+              id: "node-monitor",
+              panel: { id: monitorPanelId, kind: "monitor" },
+            },
+          ],
+          sizes: [34, 33, 33],
+        },
+        focusedPanelId: filesystemPanelIds[0],
+        panelTabs: {
+          [filesystemPanelIds[0]!]: {
+            tabIds: ["term-ready", "term-exited"],
+            activeTabId: "term-ready",
+          },
+          [filesystemPanelIds[1]!]: {
+            tabIds: ["term-exited"],
+            activeTabId: "term-exited",
+          },
+          [monitorPanelId]: {
+            tabIds: ["term-ready"],
+            activeTabId: "term-ready",
+          },
+        },
+      };
+      store.layout.syncPanelBindings({ persist: false });
+
+      const assignedFilesystemIds = filesystemPanelIds.flatMap((panelId) =>
+        store.layout.getPanelTabIds(panelId),
+      );
+      assertEqual(
+        JSON.stringify(assignedFilesystemIds),
+        JSON.stringify(["term-ready", "term-exited"]),
+        "duplicate persisted filesystem bindings should normalize to one owner per tab",
+      );
+      assertEqual(
+        JSON.stringify(store.layout.getPanelTabIds(monitorPanelId)),
+        JSON.stringify(["term-ready", "term-exited"]),
+        "the only monitor panel should hold the complete terminal-derived inventory",
+      );
+      assertCondition(
+        store.fileSystemTabs.some(
+          (tab) =>
+            tab.id === "term-exited" && tab.runtimeState === "exited",
+        ),
+        "an exited terminal should remain available to render as a disconnected filesystem tab",
+      );
+      assertCondition(
+        store.monitorTabs.some(
+          (tab) =>
+            tab.id === "term-exited" && tab.runtimeState === "exited",
+        ),
+        "an exited terminal should remain available to render as a disconnected monitor tab",
       );
     },
   );
@@ -3095,6 +3217,85 @@ const run = async (): Promise<void> => {
         JSON.stringify(["term-a"]),
         "terminal suppression should not hide filesystem owner tab",
       );
+    },
+  );
+
+  await runCase(
+    "layout switching closes detached windows before releasing suppressed ownership",
+    async () => {
+      const originalWindow = (globalThis as any).window;
+      let closeCalls = 0;
+      try {
+        (globalThis as any).window = {
+          gyshell: {
+            windowing: {
+              closeDetachedWindows: async () => {
+                closeCalls += 1;
+                return {
+                  ok: true,
+                  closed: 2,
+                  tabsByKind: {
+                    terminal: ["term-detached"],
+                  },
+                };
+              },
+            },
+          },
+        };
+        const store = new AppStore();
+        store.terminalTabs = [
+          {
+            id: "term-detached",
+            title: "Detached",
+            config: {
+              type: "local",
+              id: "term-detached",
+              title: "Detached",
+              cols: 80,
+              rows: 24,
+            },
+            capabilities: { supportsFilesystem: true, supportsMonitor: true },
+            connectionRef: { type: "local" },
+            runtimeState: "ready",
+          },
+        ];
+        store.terminalTabsHydrated = true;
+        (store.layout as any).syncPanelBindings = () => {};
+        store.suppressTabs("terminal", ["term-detached"]);
+        store.suppressTabs("filesystem", ["term-detached"]);
+        store.suppressTabs("monitor", ["term-detached"]);
+        assertEqual(
+          store.getOwnedTabIds("terminal").length,
+          0,
+          "detached ownership should suppress the source terminal before switching",
+        );
+
+        const prepared = await store.prepareForLayoutSwitch();
+
+        assertEqual(prepared, true, "successful detached cleanup should allow the switch");
+        assertEqual(
+          closeCalls,
+          1,
+          "layout switching should request one detached-window cascade close",
+        );
+        assertEqual(
+          JSON.stringify(store.getOwnedTabIds("terminal")),
+          JSON.stringify(["term-detached"]),
+          "closing child windows should release source ownership for rebinding",
+        );
+        assertEqual(
+          JSON.stringify(store.getOwnedTabIds("filesystem")),
+          JSON.stringify(["term-detached"]),
+          "filesystem ownership should return before the saved layout is bound",
+        );
+        assertEqual(
+          JSON.stringify(store.getOwnedTabIds("monitor")),
+          JSON.stringify(["term-detached"]),
+          "monitor ownership should return before the saved layout is bound",
+        );
+      } finally {
+        (globalThis as any).window = originalWindow;
+      }
     },
   );
 

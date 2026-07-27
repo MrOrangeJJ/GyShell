@@ -380,12 +380,6 @@ export class AppStore {
     filesystem: new Set<string>(),
     monitor: new Set<string>(),
   };
-  private layoutHiddenTabIdsByKind: Record<WindowScopedTabKind, Set<string>> = {
-    chat: new Set<string>(),
-    terminal: new Set<string>(),
-    filesystem: new Set<string>(),
-    monitor: new Set<string>(),
-  };
   private monitorRetainedTabIds = new Set<string>();
   private monitorSubscribedTabIds = new Set<string>();
   private monitorSnapshotUnsubscribe: (() => void) | null = null;
@@ -527,6 +521,7 @@ export class AppStore {
       onPanelRemoved: action,
       suppressTabs: action,
       unsuppressTabs: action,
+      prepareForLayoutSwitch: action,
       getUniqueTitle: action,
       loadVersionState: action,
       checkVersion: action,
@@ -930,68 +925,6 @@ export class AppStore {
     return [];
   }
 
-  getLayoutBindableTabIds(kind: PanelKind): string[] {
-    const tabIds = this.getOwnedTabIds(kind);
-    const scopedKind =
-      kind === "chat" ||
-      kind === "terminal" ||
-      kind === "filesystem" ||
-      kind === "monitor"
-        ? kind
-        : null;
-    if (!scopedKind) {
-      return tabIds;
-    }
-    const hidden = this.layoutHiddenTabIdsByKind[scopedKind];
-    return tabIds.filter((tabId) => !hidden.has(tabId));
-  }
-
-  hideTabsFromLayout(kind: PanelKind, tabIds: string[]): void {
-    const normalizedIds = tabIds
-      .map((tabId) => String(tabId || "").trim())
-      .filter((tabId) => tabId.length > 0);
-    if (normalizedIds.length === 0) {
-      return;
-    }
-    normalizedIds.forEach((tabId) => {
-      this.getVisibilityLinkedKindsForTab(kind, tabId).forEach((targetKind) => {
-        this.layoutHiddenTabIdsByKind[targetKind].add(tabId);
-      });
-    });
-  }
-
-  private hideTabsFromLayoutKinds(
-    kinds: Iterable<WindowScopedTabKind>,
-    tabIds: string[],
-  ): void {
-    const normalizedIds = tabIds
-      .map((tabId) => String(tabId || "").trim())
-      .filter((tabId) => tabId.length > 0);
-    const targetKinds = Array.from(new Set(kinds));
-    if (normalizedIds.length === 0 || targetKinds.length === 0) {
-      return;
-    }
-    normalizedIds.forEach((tabId) => {
-      targetKinds.forEach((targetKind) => {
-        this.layoutHiddenTabIdsByKind[targetKind].add(tabId);
-      });
-    });
-  }
-
-  showTabsInLayout(kind: PanelKind, tabIds: string[]): void {
-    const normalizedIds = tabIds
-      .map((tabId) => String(tabId || "").trim())
-      .filter((tabId) => tabId.length > 0);
-    if (normalizedIds.length === 0) {
-      return;
-    }
-    normalizedIds.forEach((tabId) => {
-      this.getVisibilityLinkedKindsForTab(kind, tabId).forEach((targetKind) => {
-        this.layoutHiddenTabIdsByKind[targetKind].delete(tabId);
-      });
-    });
-  }
-
   private collectDetachedVisibleTabIdsByKind(
     layoutTree: LayoutTree | null | undefined,
   ): Record<WindowScopedTabKind, Set<string>> | null {
@@ -1337,6 +1270,60 @@ export class AppStore {
       filesystem: collectForKind("filesystem"),
       monitor: collectForKind("monitor"),
     };
+  }
+
+  async prepareForLayoutSwitch(): Promise<boolean> {
+    let shouldRefreshTerminalInventory = false;
+    const closeDetachedWindows =
+      typeof window !== "undefined"
+        ? window.gyshell?.windowing?.closeDetachedWindows
+        : undefined;
+    if (typeof closeDetachedWindows === "function") {
+      try {
+        const result = await closeDetachedWindows();
+        if (!result?.ok) {
+          return false;
+        }
+        const chatTabIds = this.materializeTransferredTabs(
+          "chat",
+          result.tabsByKind?.chat || [],
+        );
+        this.hydrateTransferredTabs("chat", chatTabIds);
+        shouldRefreshTerminalInventory = [
+          ...(result.tabsByKind?.terminal || []),
+          ...(result.tabsByKind?.filesystem || []),
+          ...(result.tabsByKind?.monitor || []),
+        ].length > 0;
+      } catch (error) {
+        console.error(
+          "Failed to close detached windows before switching layout",
+          error,
+        );
+        return false;
+      }
+    }
+
+    const listTerminalTabs =
+      shouldRefreshTerminalInventory && typeof window !== "undefined"
+        ? window.gyshell?.terminal?.list
+        : undefined;
+    if (typeof listTerminalTabs === "function") {
+      try {
+        const snapshot = await listTerminalTabs();
+        this.reconcileTerminalTabs(snapshot);
+      } catch {
+        // Existing renderer inventory remains sufficient for tabs detached from it.
+      }
+    }
+
+    (
+      ["chat", "terminal", "filesystem", "monitor"] as WindowScopedTabKind[]
+    ).forEach((kind) => {
+      this.unsuppressTabs(kind, Array.from(this.suppressedTabIdsByKind[kind]), {
+        syncLayout: false,
+      });
+    });
+    return true;
   }
 
   get isSettings(): boolean {
@@ -2920,26 +2907,6 @@ export class AppStore {
     this.activeTerminalId = id;
     this.unsuppressTabs("terminal", [id], { syncLayout: false });
     const shouldAttachToPanel = options?.attachToPanel !== false;
-    if (shouldAttachToPanel) {
-      this.showTabsInLayout("terminal", [id]);
-    } else {
-      const panelIdsByHiddenKind = new Map<WindowScopedTabKind, string[]>();
-      this.getVisibilityLinkedKindsForTab("terminal", id).forEach(
-        (linkedKind) => {
-          // Background creation may preserve filesystem context, but monitor
-          // panels track terminal runtimes independently of terminal hosting.
-          if (linkedKind !== "filesystem") {
-            return;
-          }
-          const panelIds = this.layout.getPanelIdsByKind(linkedKind);
-          panelIdsByHiddenKind.set(linkedKind, panelIds);
-        },
-      );
-      this.hideTabsFromLayoutKinds(panelIdsByHiddenKind.keys(), [id]);
-      this.layout.pinPanelsAsRestorePlaceholder(
-        Array.from(panelIdsByHiddenKind.values()).flat(),
-      );
-    }
     if (options?.startRuntime === true) {
       void this.startTerminalRuntime(tab);
     }
@@ -3280,7 +3247,6 @@ export class AppStore {
       nextActive = nextTabs[idx]?.id ?? nextTabs[idx - 1]?.id ?? null;
     }
 
-    this.showTabsInLayout("terminal", [tabId]);
     runInAction(() => {
       this.terminalTabs = nextTabs;
       this.activeTerminalId = nextActive;

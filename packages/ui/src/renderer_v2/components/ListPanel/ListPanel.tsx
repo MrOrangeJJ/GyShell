@@ -159,7 +159,7 @@ export const ListPanel: React.FC<ListPanelProps> = observer(
 
     const terminalRows = buildListPanelRows({
       sources: buildTerminalSources(store),
-      visibleTabIds: store.getOwnedTabIds("terminal"),
+      visibleTabIds: store.terminalTabs.map((tab) => tab.id),
       panelIds: store.layout.getPanelIdsByKind("terminal"),
       getPanelTabIds: (targetPanelId) =>
         store.layout.getPanelTabIds(targetPanelId),
@@ -174,7 +174,7 @@ export const ListPanel: React.FC<ListPanelProps> = observer(
         running: t.layout.listPanelChatRunning,
         ready: t.layout.listPanelChatReady,
       }),
-      visibleTabIds: store.getOwnedTabIds("chat"),
+      visibleTabIds: store.chat.sessions.map((session) => session.id),
       panelIds: store.layout.getPanelIdsByKind("chat"),
       getPanelTabIds: (targetPanelId) =>
         store.layout.getPanelTabIds(targetPanelId),

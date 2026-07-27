@@ -1,5 +1,6 @@
 import type { TerminalConfig } from './ipcTypes'
 import {
+  listPanels,
   makeLayoutId,
   type LayoutPanelTabBinding,
   type LayoutTree,
@@ -12,6 +13,21 @@ import {
 import type { TerminalConnectionRef } from './terminalConnectionModel'
 
 export type RendererWindowRole = 'main' | 'detached'
+export type WindowingTabKind = Extract<
+  PanelKind,
+  'chat' | 'terminal' | 'filesystem' | 'monitor'
+>
+
+export interface WindowingTabTarget {
+  kind: WindowingTabKind
+  tabId: string
+}
+
+export type WindowingTabOwnership = Partial<Record<WindowingTabKind, string[]>>
+
+export interface OpenDetachedWindowOptions {
+  focusTarget?: WindowingTabTarget
+}
 
 const DETACHED_STATE_KEY_PREFIX = 'gyshell.detachedState.'
 const DETACHED_STATE_SESSION_KEY_PREFIX = 'gyshell.detachedStateSession.'
@@ -215,6 +231,43 @@ export const buildDetachedLayoutTree = (
   }
 }
 
+export const collectLayoutTabOwnership = (
+  layoutTree: LayoutTree
+): WindowingTabOwnership => {
+  const tabsByKind: Record<WindowingTabKind, Set<string>> = {
+    chat: new Set<string>(),
+    terminal: new Set<string>(),
+    filesystem: new Set<string>(),
+    monitor: new Set<string>()
+  }
+
+  listPanels(layoutTree).forEach((node) => {
+    const kind = node.panel.kind
+    if (
+      kind !== 'chat' &&
+      kind !== 'terminal' &&
+      kind !== 'filesystem' &&
+      kind !== 'monitor'
+    ) {
+      return
+    }
+    const tabIds = layoutTree.panelTabs?.[node.panel.id]?.tabIds || []
+    tabIds.forEach((tabId) => {
+      const normalized = String(tabId || '').trim()
+      if (normalized) {
+        tabsByKind[kind].add(normalized)
+      }
+    })
+  })
+
+  return {
+    chat: Array.from(tabsByKind.chat),
+    terminal: Array.from(tabsByKind.terminal),
+    filesystem: Array.from(tabsByKind.filesystem),
+    monitor: Array.from(tabsByKind.monitor)
+  }
+}
+
 export const stashDetachedWindowState = (token: string, state: DetachedWindowState): boolean => {
   const localKey = getDetachedStateLocalKey(token)
   if (!localKey) return false
@@ -318,7 +371,10 @@ export const readDetachedWindowState = (token: string): DetachedWindowState | nu
   }
 }
 
-export const openDetachedWindowState = async (state: DetachedWindowState): Promise<boolean> => {
+export const openDetachedWindowState = async (
+  state: DetachedWindowState,
+  options?: OpenDetachedWindowOptions
+): Promise<boolean> => {
   const sourceClientId = String(state.sourceClientId || '').trim()
   if (!sourceClientId) {
     return false
@@ -331,8 +387,18 @@ export const openDetachedWindowState = async (state: DetachedWindowState): Promi
   }
 
   try {
-    const result = await window.gyshell.windowing.openDetached(token, sourceClientId)
+    const result = await window.gyshell.windowing.openDetached(
+      token,
+      sourceClientId,
+      {
+        tabOwnership: collectLayoutTabOwnership(state.layoutTree),
+        ...(options?.focusTarget ? { focusTarget: options.focusTarget } : {})
+      }
+    )
     if (result?.ok) {
+      if (result.reused) {
+        clearDetachedWindowState(token)
+      }
       return true
     }
   } catch {

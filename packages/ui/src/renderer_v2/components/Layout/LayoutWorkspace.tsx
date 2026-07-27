@@ -1049,19 +1049,51 @@ export const LayoutWorkspace: React.FC<LayoutWorkspaceProps> = observer(
     ]);
 
     React.useEffect(() => {
-      const onMainWindowClosing = window.gyshell.windowing.onMainWindowClosing;
-      if (typeof onMainWindowClosing !== "function") {
+      const onDetachedWindowCascadeClosing =
+        window.gyshell.windowing.onDetachedWindowCascadeClosing;
+      if (typeof onDetachedWindowCascadeClosing !== "function") {
         return;
       }
-      const unsubscribe = onMainWindowClosing(() => {
-        // Main-window shutdown cascades close detached windows. Those windows must
-        // skip detached-closing rollback broadcasts during that cascade.
+      const unsubscribe = onDetachedWindowCascadeClosing(() => {
+        // Main-controlled cascades reclaim ownership centrally, so detached
+        // renderers must skip their normal per-window rollback broadcast.
         skipDetachedClosingRef.current = true;
       });
       return () => {
         unsubscribe();
       };
     }, []);
+
+    React.useEffect(() => {
+      if (!store.isDetachedWindow) {
+        return;
+      }
+      void window.gyshell.windowing
+        .updateTabOwnership(store.collectAssignedTabsByKind())
+        .catch(() => {});
+    }, [store, store.isDetachedWindow, store.layout.tree]);
+
+    React.useEffect(() => {
+      const onActivateTab = window.gyshell.windowing.onActivateTab;
+      if (typeof onActivateTab !== "function") {
+        return;
+      }
+      return onActivateTab((target) => {
+        const panelId =
+          store.layout
+            .getPanelIdsByKind(target.kind)
+            .find((candidatePanelId) =>
+              store.layout
+                .getPanelTabIds(candidatePanelId)
+                .includes(target.tabId),
+            ) || null;
+        if (!panelId) {
+          return;
+        }
+        store.layout.setPanelActiveTab(panelId, target.tabId);
+        store.layout.setFocusedPanel(panelId);
+      });
+    }, [store.layout]);
 
     const syncDetachedWindowSnapshot = React.useCallback(() => {
       if (!store.isDetachedWindow) {
@@ -1213,6 +1245,14 @@ export const LayoutWorkspace: React.FC<LayoutWorkspaceProps> = observer(
     const detachTabToWindow = React.useCallback(
       async (payload: TabDragPayload) => {
         if (!getPanelKindAdapter(payload.kind).supportsTabs) return;
+        if (
+          payload.kind !== "chat" &&
+          payload.kind !== "terminal" &&
+          payload.kind !== "filesystem" &&
+          payload.kind !== "monitor"
+        ) {
+          return;
+        }
         const tabId = String(payload.tabId || "").trim();
         if (!tabId) return;
 
@@ -1223,12 +1263,20 @@ export const LayoutWorkspace: React.FC<LayoutWorkspaceProps> = observer(
         const terminalTabs = isTerminalBackedPanelKind(payload.kind)
           ? collectWindowingTerminalTabSnapshots(store, [tabId])
           : undefined;
-        const opened = await openDetachedWindowState({
-          sourceClientId: store.windowClientId,
-          layoutTree: detachedTree,
-          createdAt: Date.now(),
-          ...(terminalTabs ? { terminalTabs } : {}),
-        });
+        const opened = await openDetachedWindowState(
+          {
+            sourceClientId: store.windowClientId,
+            layoutTree: detachedTree,
+            createdAt: Date.now(),
+            ...(terminalTabs ? { terminalTabs } : {}),
+          },
+          {
+            focusTarget: {
+              kind: payload.kind,
+              tabId,
+            },
+          },
+        );
         if (!opened) {
           return;
         }

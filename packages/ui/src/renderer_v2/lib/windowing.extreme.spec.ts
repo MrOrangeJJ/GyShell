@@ -7,9 +7,11 @@ import type {
 } from './windowing'
 import {
   buildDetachedLayoutTree,
+  collectLayoutTabOwnership,
   clearTabDragState,
   clearPanelDragState,
   createWindowingChannel,
+  openDetachedWindowState,
   readPanelDragState,
   readTabDragState,
   readDetachedWindowState,
@@ -510,6 +512,129 @@ runCase('panel-moved message is valid WindowingMessage', () => {
   assertEqual(msg.sourcePanelId, 'panel-terminal-1', 'panel-moved sourcePanelId should match')
   assertEqual(msg.tabIds.length, 2, 'panel-moved tabIds should be preserved')
 })
+
+runCase('detached ownership is derived from exact panel-kind bindings', () => {
+  const tree: LayoutTree = {
+    schemaVersion: 2,
+    root: {
+      type: 'split',
+      id: 'root-ownership',
+      direction: 'horizontal',
+      children: [
+        {
+          type: 'panel',
+          id: 'node-terminal',
+          panel: { id: 'panel-terminal', kind: 'terminal' }
+        },
+        {
+          type: 'panel',
+          id: 'node-filesystem',
+          panel: { id: 'panel-filesystem', kind: 'filesystem' }
+        }
+      ],
+      sizes: [50, 50]
+    },
+    panelTabs: {
+      'panel-terminal': {
+        tabIds: ['term-a', 'term-a', 'term-b'],
+        activeTabId: 'term-a'
+      },
+      'panel-filesystem': {
+        tabIds: ['term-b'],
+        activeTabId: 'term-b'
+      }
+    }
+  }
+
+  assertDeepEqual(
+    collectLayoutTabOwnership(tree),
+    {
+      chat: [],
+      terminal: ['term-a', 'term-b'],
+      filesystem: ['term-b'],
+      monitor: []
+    },
+    'main-process ownership should track exact hosted kinds and normalize duplicates'
+  )
+})
+
+await (async () => {
+  const originalWindow = (globalThis as any).window
+  const localStorageState = new Map<string, string>()
+  let receivedOptions: unknown = null
+  const storage = {
+    getItem(key: string) {
+      return localStorageState.get(key) ?? null
+    },
+    setItem(key: string, value: string) {
+      localStorageState.set(key, value)
+    },
+    removeItem(key: string) {
+      localStorageState.delete(key)
+    }
+  }
+  ;(globalThis as any).window = {
+    localStorage: storage,
+    sessionStorage: storage,
+    gyshell: {
+      windowing: {
+        openDetached: async (
+          _token: string,
+          _sourceClientId: string,
+          options: unknown
+        ) => {
+          receivedOptions = options
+          return { ok: true, reused: true }
+        }
+      }
+    }
+  }
+
+  try {
+    const opened = await openDetachedWindowState(
+      {
+        sourceClientId: 'win-main',
+        layoutTree: buildDetachedLayoutTree('terminal', {
+          tabIds: ['term-a'],
+          activeTabId: 'term-a'
+        }),
+        createdAt: 123
+      },
+      {
+        focusTarget: {
+          kind: 'terminal',
+          tabId: 'term-a'
+        }
+      }
+    )
+
+    assertEqual(opened, true, 'reusing a detached window should count as a successful open')
+    assertDeepEqual(
+      receivedOptions,
+      {
+        tabOwnership: {
+          chat: [],
+          terminal: ['term-a'],
+          filesystem: [],
+          monitor: []
+        },
+        focusTarget: {
+          kind: 'terminal',
+          tabId: 'term-a'
+        }
+      },
+      'open request should atomically register ownership and the tab to activate'
+    )
+    assertEqual(
+      localStorageState.size,
+      0,
+      'a reused window should discard the unused detached bootstrap payload'
+    )
+    console.log('PASS repeated detached open reuses ownership and clears unused state')
+  } finally {
+    ;(globalThis as any).window = originalWindow
+  }
+})()
 
 // ---------------------------------------------------------------------------
 // Drag-end clears only matching source

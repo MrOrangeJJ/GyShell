@@ -868,6 +868,16 @@ const run = async (): Promise<void> => {
     })
     store.bootstrap()
     store.setViewport(1440, 900)
+    let detachedCleanupCalls = 0
+    ;(store as any).appStore.prepareForLayoutSwitch = async () => {
+      detachedCleanupCalls += 1
+      assertEqual(
+        store.getPrimaryPanelId('terminal'),
+        null,
+        'detached windows should be closed before the saved tree replaces the current layout'
+      )
+      return true
+    }
 
     assertEqual(store.getPrimaryPanelId('terminal'), null, 'current layout should start without terminal panel')
     assertEqual(
@@ -878,6 +888,11 @@ const run = async (): Promise<void> => {
 
     const applied = await store.applySavedLayoutSlot(getSavedLayoutSlotId(1))
     assertEqual(applied, true, 'saved layout containing a terminal panel should apply')
+    assertEqual(
+      detachedCleanupCalls,
+      1,
+      'applying a saved layout should close all detached windows exactly once'
+    )
 
     const terminalPanelId = store.getPrimaryPanelId('terminal')
     assertCondition(Boolean(terminalPanelId), 'applied saved layout should restore a terminal panel')
