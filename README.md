@@ -1,5 +1,8 @@
 # <img src="./demo_imgs/icon.png" width="40" height="40" align="center" style="margin-right: 10px;"> GyShell
 
+> [!WARNING]
+> **Recommendation for newer, more capable models:** For current smarter models (for example, `gpt-5.6-sol`, `claude opus 5`, and `kimi-k3`), we recommend going to **Settings → Workflow** and disabling every switch except **First-Turn Thinking Model**. Testing shows that newer models no longer need these mechanisms as auxiliary constraints; leaving them enabled may slow task completion and can even reduce result quality.
+
 > **The AI-Native Terminal that thinks, executes, and collaborates with you.**
 
 [![License](https://img.shields.io/badge/License-CC%20BY--NC%204.0-lightgrey.svg)](https://creativecommons.org/licenses/by-nc/4.0/)
