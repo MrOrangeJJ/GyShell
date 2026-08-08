@@ -45,6 +45,19 @@ const writeFlatSkill = async (root: string, fileName: string, name: string): Pro
   )
 }
 
+const writeDirectorySkill = async (skillDir: string, name: string): Promise<void> => {
+  await fs.mkdir(skillDir, { recursive: true })
+  await fs.writeFile(
+    path.join(skillDir, 'SKILL.md'),
+    ['---', `name: ${name}`, `description: ${name} description`, '---', '', '# Instructions'].join('\n'),
+    'utf8'
+  )
+}
+
+const linkDirectory = async (targetPath: string, linkPath: string): Promise<void> => {
+  await fs.symlink(targetPath, linkPath, process.platform === 'win32' ? 'junction' : 'dir')
+}
+
 const run = async (): Promise<void> => {
   await runCase('default scan roots load only GyShell and ~/.agents skills', async () => {
     await withTempDir(async (tempDir) => {
@@ -112,6 +125,76 @@ const run = async (): Promise<void> => {
       assertEqual(skills.length, 0, 'reload should not synthesize skills for empty roots')
       assert(await exists(primaryRoot), 'reload should create the primary skills root')
       assert(!(await exists(missingAgentsRoot)), 'reload must not create missing agents compatibility roots')
+    })
+  })
+
+  await runCase('reload follows chained directory links while preserving the installed skill path', async () => {
+    await withTempDir(async (tempDir) => {
+      const primaryRoot = path.join(tempDir, 'gyshell-data', 'skills')
+      const agentsRoot = path.join(tempDir, 'home', '.agents', 'skills')
+      const versionedSkillDir = path.join(tempDir, 'ego', 'versions', '1.2.3', 'ego-browser')
+      const stableSkillLink = path.join(tempDir, 'ego', 'ego-skills')
+      const installedSkillLink = path.join(agentsRoot, 'ego-browser')
+
+      await writeDirectorySkill(versionedSkillDir, 'ego-browser')
+      await fs.mkdir(path.join(versionedSkillDir, 'references'), { recursive: true })
+      await fs.writeFile(path.join(versionedSkillDir, 'references', 'install.md'), '# Install', 'utf8')
+      await fs.mkdir(path.dirname(stableSkillLink), { recursive: true })
+      await linkDirectory(versionedSkillDir, stableSkillLink)
+      await fs.mkdir(agentsRoot, { recursive: true })
+      await linkDirectory(stableSkillLink, installedSkillLink)
+
+      const store = new FileSkillStore({
+        getPrimaryRoot: () => primaryRoot,
+        getScanRoots: () => [primaryRoot, agentsRoot]
+      })
+      const skills = await store.reload()
+
+      assertEqual(skills.length, 1, 'the linked skill directory should load')
+      assertEqual(skills[0]?.name, 'ego-browser', 'the linked skill name should come from SKILL.md')
+      assertEqual(skills[0]?.baseDir, installedSkillLink, 'skill metadata should preserve the installed link path')
+      assertEqual(
+        skills[0]?.filePath,
+        path.join(installedSkillLink, 'SKILL.md'),
+        'the linked SKILL.md path should remain stable across target updates'
+      )
+      assertEqual(
+        skills[0]?.supportingFiles?.join(','),
+        path.join('references', 'install.md'),
+        'supporting files should be discovered through the directory link'
+      )
+
+      const loaded = await store.readSkillContentByName('ego-browser')
+      assert(loaded.content.includes('# Instructions'), 'linked skill content should be readable')
+      assert(loaded.content.includes('references'), 'linked supporting files should be included in loaded content')
+    })
+  })
+
+  await runCase('reload skips broken directory links and other invalid links', async () => {
+    await withTempDir(async (tempDir) => {
+      const primaryRoot = path.join(tempDir, 'gyshell-data', 'skills')
+      const agentsRoot = path.join(tempDir, 'home', '.agents', 'skills')
+      const removedTarget = path.join(tempDir, 'removed-skill')
+      const fileTarget = path.join(tempDir, 'not-a-skill-directory.md')
+
+      await fs.mkdir(agentsRoot, { recursive: true })
+      await fs.mkdir(removedTarget, { recursive: true })
+      await linkDirectory(removedTarget, path.join(agentsRoot, 'broken-skill'))
+      await fs.rm(removedTarget, { recursive: true })
+      await fs.writeFile(fileTarget, '# Not a directory skill', 'utf8')
+      if (process.platform !== 'win32') {
+        await fs.symlink(fileTarget, path.join(agentsRoot, 'file-link.md'))
+        const cyclicLink = path.join(agentsRoot, 'cyclic-skill')
+        await fs.symlink(cyclicLink, cyclicLink)
+      }
+
+      const store = new FileSkillStore({
+        getPrimaryRoot: () => primaryRoot,
+        getScanRoots: () => [primaryRoot, agentsRoot]
+      })
+      const skills = await store.reload()
+
+      assertEqual(skills.length, 0, 'invalid links should not be treated as skills')
     })
   })
 

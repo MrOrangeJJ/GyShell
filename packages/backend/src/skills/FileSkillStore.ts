@@ -105,6 +105,14 @@ async function listSupportingFiles(dir: string, skillFilePath: string): Promise<
   return files.sort((a, b) => a.localeCompare(b))
 }
 
+async function resolvesToDirectory(entry: Dirent, entryPath: string): Promise<boolean> {
+  if (entry.isDirectory()) return true
+  if (!entry.isSymbolicLink()) return false
+
+  const targetStat = await fs.stat(entryPath).catch(() => null)
+  return targetStat?.isDirectory() === true
+}
+
 function toSafeSkillFileName(name: string): string {
   const slug = name
     .toLowerCase()
@@ -282,9 +290,10 @@ export class FileSkillStore {
       for (const entry of entries) {
         if (entry.name.startsWith('.')) continue
 
+        const entryPath = path.join(rootDir, entry.name)
+
         if (entry.isFile() && entry.name.toLowerCase().endsWith('.md')) {
-          const filePath = path.join(rootDir, entry.name)
-          const info = await this.tryBuildFlatSkillInfo(rootDir, entry.name, filePath, seenNames)
+          const info = await this.tryBuildFlatSkillInfo(rootDir, entry.name, entryPath, seenNames)
           if (info) {
             result.push(info)
             seenNames.add(info.name)
@@ -292,8 +301,8 @@ export class FileSkillStore {
           continue
         }
 
-        if (entry.isDirectory()) {
-          const skillDir = path.join(rootDir, entry.name)
+        if (await resolvesToDirectory(entry, entryPath)) {
+          const skillDir = entryPath
           const skillFilePath = path.join(skillDir, 'SKILL.md')
           const info = await this.tryBuildNestedSkillInfo(rootDir, skillDir, skillFilePath, seenNames)
           if (info) {
