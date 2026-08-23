@@ -807,9 +807,10 @@ await runCase(
       assert.ok(!exported.includes("third protected request"));
       assert.ok(!exported.includes("fourth protected request"));
 
-      const insertionIndex = (agent as any).findCompactionInsertionIndex(
+      const insertionIndex = (agent as any).resolveCompactionPlan(
         messages,
-      );
+        undefined,
+      ).plan.cutIndex;
       assert.equal(
         result.messages[insertionIndex + 1],
         messages[insertionIndex],

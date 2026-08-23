@@ -137,6 +137,7 @@ import {
   COMPACTION_SUMMARY_SCHEMA,
   createCommandPolicyUserPrompt,
   createCompactionSummaryUserPrompt,
+  createCompactionTurnPrefixSummaryUserPrompt,
   createZeroRetentionCompactionRecoveryText,
   createSelfCorrectionAuditDecisionUserPrompt,
   createSelfCorrectionInstructionUserPrompt,
@@ -263,6 +264,15 @@ const StateAnnotation = Ann.Root({
 const MODEL_RETRY_MAX = 4;
 const MODEL_RETRY_DELAYS_MS = [1000, 2000, 4000, 6000];
 const COMPACTION_PROTECTED_NORMAL_USER_ROUNDS = 2;
+// Recent request-view tokens kept verbatim after an ordinary compaction. The
+// cut point is chosen by token budget rather than by normal user rounds so that
+// a single long autonomous run still compacts repeatedly.
+const COMPACTION_KEEP_RECENT_TOKENS = 60_000;
+// The retained tail must stay well under the usable window, otherwise a small
+// context model could "keep" the entire overflowing history and never shrink.
+const COMPACTION_KEEP_RECENT_USABLE_RATIO = 0.5;
+// Space held back for the generated summary when checking whether a cut fits.
+const COMPACTION_SUMMARY_RESERVE_USABLE_RATIO = 0.25;
 const FALLBACK_COMPACTION_SUMMARY_MAX_CHARS = 60_000;
 const FALLBACK_COMPACTION_DIGEST_MIN_CHARS = 8_000;
 const FALLBACK_COMPACTION_FAILURE_REASON_MAX_CHARS = 2_000;
@@ -294,6 +304,63 @@ interface CompactionCandidate {
   boundaryPreviousMessageId?: string;
   logLabel: string;
   protectedNormalRounds: number;
+}
+
+/**
+ * Where an ordinary compaction may cut the history.
+ *
+ * `cutIndex` never points at a tool message, so the retained tail can never
+ * begin with an orphaned tool result. When the cut lands inside a turn rather
+ * than on a user input, `turnStartIndex` marks that turn's user input and an
+ * extra prefix summary preserves the original request.
+ */
+interface CompactionPlan {
+  cutIndex: number;
+  turnStartIndex: number;
+  isSplitTurn: boolean;
+  /** Normal user rounds this cut actually keeps verbatim after the summary. */
+  protectedNormalRounds: number;
+}
+
+/**
+ * Outcome of planning an ordinary compaction.
+ *
+ * `no_compactable_history` means the history is already at or below its
+ * protected shape, so no layer can shrink it and the caller must leave it
+ * untouched. `tail_still_overflows` means a cut exists but its retained tail
+ * would still not fit, which only zero-retention recovery can resolve.
+ */
+type CompactionPlanResult =
+  | { kind: "plan"; plan: CompactionPlan }
+  | { kind: "no_compactable_history" }
+  | { kind: "tail_still_overflows" };
+
+function countLeadingSystemMessages(messages: BaseMessage[]): number {
+  let count = 0;
+  while (count < messages.length && messages[count]?.type === "system") {
+    count += 1;
+  }
+  return count;
+}
+
+/** Messages that may begin a retained compaction tail. */
+function isCompactionCutCandidate(message: BaseMessage): boolean {
+  const type = message.getType();
+  return type !== "tool" && type !== "system";
+}
+
+function resolveCompactionKeepRecentTokens(
+  maxTokens: number | undefined,
+): number {
+  if (maxTokens === undefined) return COMPACTION_KEEP_RECENT_TOKENS;
+  const usableTokens = TokenManager.getUsableTokenBudget(maxTokens);
+  return Math.max(
+    1,
+    Math.min(
+      COMPACTION_KEEP_RECENT_TOKENS,
+      Math.floor(usableTokens * COMPACTION_KEEP_RECENT_USABLE_RATIO),
+    ),
+  );
 }
 
 interface EmergencyCompactionOptions {
@@ -3815,25 +3882,33 @@ export class AgentService_v2 {
     const resumesAfterInactiveZeroRetention =
       emergency !== undefined &&
       this.hasLatestZeroRetentionCompactionMarker(messages);
-    const insertionIndex = resumesAfterInactiveZeroRetention
-      ? this.findCompactionInsertionIndexAfterLatestMarker(messages)
-      : this.findCompactionInsertionIndex(messages);
-    if (insertionIndex < 0) {
+    const budgetForPlan =
+      emergency?.maxTokens ??
+      this.getPrimaryModelMaxTokensForSession(sessionId);
+    // A resumed zero-retention session must keep cutting after its own marker
+    // so recovery pages are never re-summarized into the next tail.
+    const planResult = resumesAfterInactiveZeroRetention
+      ? this.resolveZeroRetentionResumePlan(messages, budgetForPlan)
+      : this.resolveCompactionPlan(messages, budgetForPlan);
+
+    // Nothing older than the protected shape exists, so no layer can shrink
+    // this history. Escalating to zero retention here would discard context
+    // that compaction was never able to summarize in the first place.
+    if (planResult.kind === "no_compactable_history") {
       console.log(
-        `[TokenManager] Overflow remains but compaction skipped: fewer than ${COMPACTION_PROTECTED_NORMAL_USER_ROUNDS + 1} normal user rounds (sessionId=${sessionId}).`,
+        `[TokenManager] Overflow remains but compaction skipped: no compactable history before the protected tail (sessionId=${sessionId}).`,
       );
       return { changed: false, messages };
     }
-    if (this.hasCompactionMarkerAtInsertion(messages, insertionIndex)) {
+    const plan = planResult.kind === "plan" ? planResult.plan : null;
+    if (!plan) {
       console.log(
-        `[TokenManager] Overflow remains but compaction skipped: insertion index=${insertionIndex} already compacted once (sessionId=${sessionId}).`,
+        `[TokenManager] Ordinary compaction tail still overflows; deferring to zero-retention recovery (sessionId=${sessionId}).`,
       );
-      return { changed: false, messages };
     }
 
-    // Freeze only after the stable ordinary-compaction guards pass, but before
-    // the progress event can mutate UI history. Zero-retention exports must be
-    // a complete pre-compaction snapshot.
+    // Freeze before the progress event can mutate UI history. Zero-retention
+    // exports must be a complete pre-compaction snapshot.
     const uiSnapshot = emergency
       ? this.freezeCompactionUiSnapshot(sessionId)
       : null;
@@ -3846,12 +3921,14 @@ export class AgentService_v2 {
     });
 
     try {
-      const ordinaryCandidate = await this.tryBuildOrdinaryCompactionCandidate(
-        sessionId,
-        messages,
-        insertionIndex,
-        signal,
-      );
+      const ordinaryCandidate = plan
+        ? await this.tryBuildOrdinaryCompactionCandidate(
+            sessionId,
+            messages,
+            plan,
+            signal,
+          )
+        : null;
 
       this.throwIfAborted(signal);
 
@@ -3963,12 +4040,14 @@ export class AgentService_v2 {
   private async tryBuildOrdinaryCompactionCandidate(
     sessionId: string,
     messages: BaseMessage[],
-    insertionIndex: number,
+    plan: CompactionPlan,
     signal: AbortSignal | undefined,
   ): Promise<CompactionCandidate | null> {
-    const historyBeforeProtectedRounds = messages.slice(0, insertionIndex);
+    // A split turn summarizes history up to the turn start, then summarizes the
+    // turn prefix separately so the original request survives the cut.
+    const historyEnd = plan.isSplitTurn ? plan.turnStartIndex : plan.cutIndex;
     const summaryRequestMessages = [
-      ...historyBeforeProtectedRounds,
+      ...messages.slice(0, historyEnd),
       createCompactionSummaryUserPrompt({
         protectedRounds: COMPACTION_PROTECTED_NORMAL_USER_ROUNDS,
       }),
@@ -3988,10 +4067,16 @@ export class AgentService_v2 {
       if (summaryText) {
         return this.buildCompactionCandidate({
           messages,
-          insertionIndex,
-          summaryText,
-          logLabel: "Compaction",
-          protectedNormalRounds: COMPACTION_PROTECTED_NORMAL_USER_ROUNDS,
+          insertionIndex: plan.cutIndex,
+          summaryText: await this.appendCompactionTurnPrefixSummary(
+            sessionId,
+            messages,
+            plan,
+            summaryText,
+            signal,
+          ),
+          logLabel: plan.isSplitTurn ? "Split-turn compaction" : "Compaction",
+          protectedNormalRounds: plan.protectedNormalRounds,
         });
       }
     } catch (error) {
@@ -4009,7 +4094,7 @@ export class AgentService_v2 {
         await this.buildDeterministicFallbackSummary(
           sessionId,
           messages,
-          insertionIndex,
+          plan.cutIndex,
           fallbackCause,
           signal,
         ),
@@ -4018,10 +4103,10 @@ export class AgentService_v2 {
 
       return this.buildCompactionCandidate({
         messages,
-        insertionIndex,
+        insertionIndex: plan.cutIndex,
         summaryText,
         logLabel: "Deterministic fallback compaction",
-        protectedNormalRounds: COMPACTION_PROTECTED_NORMAL_USER_ROUNDS,
+        protectedNormalRounds: plan.protectedNormalRounds,
         additionalKwargs: {
           fallback_compaction: true,
         },
@@ -4036,6 +4121,48 @@ export class AgentService_v2 {
       );
     }
     return null;
+  }
+
+  /**
+   * Add a prefix summary when the cut splits a turn. The prefix carries the
+   * original user request that the retained tail no longer contains. A failure
+   * here degrades to the history summary alone rather than losing the whole
+   * compaction.
+   */
+  private async appendCompactionTurnPrefixSummary(
+    sessionId: string,
+    messages: BaseMessage[],
+    plan: CompactionPlan,
+    historySummaryText: string,
+    signal: AbortSignal | undefined,
+  ): Promise<string> {
+    if (!plan.isSplitTurn) return historySummaryText;
+
+    try {
+      const prefixDecision: z.infer<typeof COMPACTION_SUMMARY_SCHEMA> =
+        await this.getCompactionModelDecision(
+          sessionId,
+          [
+            ...messages.slice(plan.turnStartIndex, plan.cutIndex),
+            createCompactionTurnPrefixSummaryUserPrompt(),
+          ],
+          COMPACTION_SUMMARY_SCHEMA,
+          signal,
+          "history_compaction",
+        );
+      const prefixText = String(prefixDecision.summary || "").trim();
+      if (!prefixText) return historySummaryText;
+      return `${historySummaryText}\n\nTurn context (split turn):\n${prefixText}`;
+    } catch (error) {
+      if (this.helpers.isAbortError(error) || signal?.aborted) {
+        throw error;
+      }
+      console.warn(
+        "[AgentService_v2][history_compaction_guard] Turn prefix summary failed; keeping history summary only.",
+        error,
+      );
+      return historySummaryText;
+    }
   }
 
   private freezeCompactionUiSnapshot(
@@ -5088,13 +5215,129 @@ export class AgentService_v2 {
     }
   }
 
-  private findCompactionInsertionIndex(messages: BaseMessage[]): number {
+  /**
+   * Choose where an ordinary compaction should cut, or null when no cut can
+   * help. Returning null skips the model and deterministic summaries only; the
+   * zero-retention layer keeps its own coordinate and stays reachable.
+   */
+  private resolveCompactionPlan(
+    messages: BaseMessage[],
+    maxTokens: number | undefined,
+  ): CompactionPlanResult {
+    const floor = Math.max(
+      this.findLastCompactionMarkerIndex(messages) + 1,
+      countLeadingSystemMessages(messages),
+    );
+
+    // A tool message can never start the retained tail, otherwise its result
+    // would be sent without the assistant call that produced it.
+    const cutCandidates: number[] = [];
+    for (let index = floor; index < messages.length; index += 1) {
+      if (isCompactionCutCandidate(messages[index])) {
+        cutCandidates.push(index);
+      }
+    }
+    if (cutCandidates.length === 0) {
+      return { kind: "no_compactable_history" };
+    }
+
+    const keepRecentTokens = resolveCompactionKeepRecentTokens(maxTokens);
+    let accumulatedTokens = 0;
+    let cutIndex = -1;
+    for (let index = messages.length - 1; index >= floor; index -= 1) {
+      // Measure the request view: pruned tool output is materialized as a short
+      // placeholder, so the raw message length would overstate the tail.
+      accumulatedTokens += TokenManager.estimateMessages(
+        buildDynamicRequestHistory([messages[index]]),
+      );
+      if (accumulatedTokens < keepRecentTokens) continue;
+      // Prefer the oldest cut that still fits the tail budget. When the budget
+      // is already exhausted past the last candidate, the newest candidate is
+      // the smallest tail available.
+      cutIndex = cutCandidates[cutCandidates.length - 1];
+      for (const candidate of cutCandidates) {
+        if (candidate >= index) {
+          cutIndex = candidate;
+          break;
+        }
+      }
+      break;
+    }
+
+    // A history smaller than the retained tail cannot be split by token budget.
+    // Fall back to the conversation-shaped cut, which keeps the most recent
+    // normal user rounds verbatim.
+    let protectedNormalRounds = 0;
+    if (cutIndex <= floor) {
+      cutIndex = this.findProtectedNormalRoundCutIndex(messages, floor);
+      protectedNormalRounds = COMPACTION_PROTECTED_NORMAL_USER_ROUNDS;
+    }
+    if (cutIndex <= floor) {
+      return { kind: "no_compactable_history" };
+    }
+
+    if (!this.isCompactionPlanWithinBudget(messages, cutIndex, maxTokens)) {
+      return { kind: "tail_still_overflows" };
+    }
+
+    const cutsAtUserInput =
+      messages[cutIndex].type === "human" &&
+      hasAnyUserInputTag(messages[cutIndex].content);
+    const turnStartIndex = cutsAtUserInput
+      ? -1
+      : this.findCompactionTurnStartIndex(messages, cutIndex, floor);
+
+    return {
+      kind: "plan",
+      plan: {
+        cutIndex,
+        turnStartIndex,
+        isSplitTurn: !cutsAtUserInput && turnStartIndex >= 0,
+        protectedNormalRounds,
+      },
+    };
+  }
+
+  /**
+   * Reject a cut whose retained tail would still overflow. Such a history can
+   * only be rescued by pruning or zero-retention recovery. Without a known
+   * budget the cut cannot be disproved, so it is accepted.
+   */
+  private isCompactionPlanWithinBudget(
+    messages: BaseMessage[],
+    cutIndex: number,
+    maxTokens: number | undefined,
+  ): boolean {
+    if (maxTokens === undefined) return true;
+    const usableTokens = TokenManager.getUsableTokenBudget(maxTokens);
+    const summaryReserve = Math.min(
+      Math.ceil(FALLBACK_COMPACTION_SUMMARY_MAX_CHARS / 4),
+      Math.floor(usableTokens * COMPACTION_SUMMARY_RESERVE_USABLE_RATIO),
+    );
+    const retained = [
+      ...messages.slice(0, countLeadingSystemMessages(messages)),
+      ...messages.slice(cutIndex),
+    ];
+    const retainedTokens = TokenManager.estimateMessages(
+      buildDynamicRequestHistory(retained),
+    );
+    return retainedTokens + summaryReserve <= usableTokens;
+  }
+
+  /**
+   * Cut before the most recent protected normal user rounds. Used when the
+   * history is too small for the token budget to select a cut.
+   */
+  private findProtectedNormalRoundCutIndex(
+    messages: BaseMessage[],
+    floor: number,
+  ): number {
     const normalUserRoundIndices: number[] = [];
-    for (let i = 0; i < messages.length; i++) {
-      const message = messages[i];
+    for (let index = floor; index < messages.length; index += 1) {
+      const message = messages[index];
       if (message.type !== "human") continue;
       if (hasAnyNormalUserInputTag(message.content)) {
-        normalUserRoundIndices.push(i);
+        normalUserRoundIndices.push(index);
       }
     }
     if (
@@ -5102,11 +5345,58 @@ export class AgentService_v2 {
     ) {
       return -1;
     }
-
-    // Insert before the earliest message of the protected tail rounds.
     return normalUserRoundIndices[
       normalUserRoundIndices.length - COMPACTION_PROTECTED_NORMAL_USER_ROUNDS
     ];
+  }
+
+  /** Index of the user input that started the turn containing `fromIndex`. */
+  private findCompactionTurnStartIndex(
+    messages: BaseMessage[],
+    fromIndex: number,
+    floor: number,
+  ): number {
+    for (let index = fromIndex; index >= floor; index -= 1) {
+      const message = messages[index];
+      if (message.type !== "human") continue;
+      if (hasAnyUserInputTag(message.content)) return index;
+    }
+    return -1;
+  }
+
+  private findLastCompactionMarkerIndex(messages: BaseMessage[]): number {
+    for (let index = messages.length - 1; index >= 0; index -= 1) {
+      if (TokenManager.hasLastCompactionFlag(messages[index])) return index;
+    }
+    return -1;
+  }
+
+  /**
+   * Plan for a session resuming after an inactive zero-retention marker. The
+   * cut must stay strictly after that marker so recovery pages already read
+   * back into context are not summarized away again.
+   */
+  private resolveZeroRetentionResumePlan(
+    messages: BaseMessage[],
+    maxTokens: number | undefined,
+  ): CompactionPlanResult {
+    const insertionIndex =
+      this.findCompactionInsertionIndexAfterLatestMarker(messages);
+    if (insertionIndex < 0) {
+      return { kind: "no_compactable_history" };
+    }
+    if (!this.isCompactionPlanWithinBudget(messages, insertionIndex, maxTokens)) {
+      return { kind: "tail_still_overflows" };
+    }
+    return {
+      kind: "plan",
+      plan: {
+        cutIndex: insertionIndex,
+        turnStartIndex: -1,
+        isSplitTurn: false,
+        protectedNormalRounds: COMPACTION_PROTECTED_NORMAL_USER_ROUNDS,
+      },
+    };
   }
 
   private findCompactionInsertionIndexAfterLatestMarker(
@@ -5136,24 +5426,6 @@ export class AgentService_v2 {
     return normalUserRoundIndices[
       normalUserRoundIndices.length - COMPACTION_PROTECTED_NORMAL_USER_ROUNDS
     ];
-  }
-
-  private hasCompactionMarkerAtInsertion(
-    messages: BaseMessage[],
-    insertionIndex: number,
-  ): boolean {
-    if (insertionIndex < 0 || insertionIndex > messages.length) {
-      return false;
-    }
-
-    const markerAtInsertion =
-      insertionIndex < messages.length &&
-      TokenManager.hasLastCompactionFlag(messages[insertionIndex]);
-    const markerBeforeInsertion =
-      insertionIndex > 0 &&
-      TokenManager.hasLastCompactionFlag(messages[insertionIndex - 1]);
-
-    return markerAtInsertion || markerBeforeInsertion;
   }
 
   private getBaseMessageBackendId(

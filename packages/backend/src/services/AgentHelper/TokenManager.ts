@@ -78,13 +78,15 @@ export class TokenManager {
   /**
    * Check if current usage exceeds safe limits
    */
+  /** Context tokens available for history once output reserve is withheld. */
+  static getUsableTokenBudget(maxTokens: number): number {
+    return maxTokens - this.OUTPUT_RESERVE
+  }
+
   static isOverflow(currentTokens: number, maxTokens: number): boolean {
     if (maxTokens <= 0) return false
 
-    // Calculate usable context window
-    const usable = maxTokens - this.OUTPUT_RESERVE
-
-    return currentTokens > usable
+    return currentTokens > this.getUsableTokenBudget(maxTokens)
   }
 
   static hasPruneLabel(message: BaseMessage): boolean {

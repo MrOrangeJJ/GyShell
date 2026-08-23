@@ -226,6 +226,26 @@ export function createCompactionSummaryUserPrompt(params: {
   );
 }
 
+export function createCompactionTurnPrefixSummaryUserPrompt(): HumanMessage {
+  return new HumanMessage(
+    [
+      "Summarize the PREFIX of the current turn for long-context compaction.",
+      "The suffix of this turn (the most recent work) is retained verbatim after your summary, so this prefix must explain what the retained suffix is continuing.",
+      "",
+      "Required structure:",
+      "1) The exact original user request that started this turn, preserved word-for-word wherever possible, including every explicit constraint, preference, and prohibition.",
+      "2) Key decisions already made and work already completed in this prefix.",
+      "3) Context required to understand the retained suffix, with concrete paths/commands/ids when available.",
+      "",
+      "Output rule:",
+      "- Return one concise but complete paragraph-style summary in plain text.",
+      "- Do not add markdown headings, bullets, JSON, or code fences.",
+      "- Never paraphrase away an explicit user instruction; reproduce its wording.",
+      "- Do not mention this instruction.",
+    ].join("\n"),
+  );
+}
+
 export function createZeroRetentionCompactionRecoveryText(params: {
   historyDetailBlock: string;
   recoveryCapsule: string;

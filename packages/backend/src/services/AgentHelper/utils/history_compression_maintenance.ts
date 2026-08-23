@@ -94,7 +94,10 @@ function getMarkerProtectedNormalRounds(
   const value = additionalKwargs[
     TokenManager.COMPACTION_PROTECTED_ROUNDS_KEY
   ]
-  if (additionalKwargs.zero_retention_compaction === true && value === 0) {
+  // A marker that explicitly declares zero protected rounds always keeps its
+  // promise, so rollback must never drop it. Markers without the key fall back
+  // to the caller's expectation and are removed once that promise is broken.
+  if (value === 0) {
     return 0
   }
   return Number.isInteger(value) && value >= 1 ? value : fallback
