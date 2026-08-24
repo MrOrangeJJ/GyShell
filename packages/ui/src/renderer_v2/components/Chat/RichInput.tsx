@@ -618,7 +618,10 @@ export const RichInput = observer(
         selection.addRange(range);
       };
 
-      const insertMention = (item: RichMentionItem) => {
+      const insertMention = (
+        item: RichMentionItem,
+        options?: { replaceExisting?: boolean },
+      ) => {
         const editor = editorRef.current;
         if (!editor) return;
 
@@ -631,11 +634,15 @@ export const RichInput = observer(
           ? editor.contains(activeRange.commonAncestorContainer)
           : false;
 
+        // A caret resting right after a mention means the user wants to replace
+        // that mention. Batch insertions leave the caret in exactly that spot,
+        // so they must opt out or each file would overwrite the previous one.
+        const allowReplaceExisting = options?.replaceExisting !== false;
         const info = activeRangeInEditor ? (getMentionInfo() as any) : null;
         const replacementRange = document.createRange();
 
         // 1. Handle the re-select case where we have a direct targetTag
-        if (info?.isReSelect && info.targetTag) {
+        if (allowReplaceExisting && info?.isReSelect && info.targetTag) {
           replacementRange.setStartBefore(info.targetTag);
           const nextSibling = info.targetTag.nextSibling;
           if (nextSibling?.nodeType === Node.TEXT_NODE) {
@@ -1200,11 +1207,14 @@ export const RichInput = observer(
             payload.sourceTerminalId,
             entry.path,
           );
-          insertMention({
-            type: "file",
-            name: mentionPath,
-            preview: entry.name || getFileMentionDisplayName(entry.path),
-          });
+          insertMention(
+            {
+              type: "file",
+              name: mentionPath,
+              preview: entry.name || getFileMentionDisplayName(entry.path),
+            },
+            { replaceExisting: false },
+          );
         }
         if (createdImages.length > 0) {
           updateImageAttachments((current) => [...current, ...createdImages]);
@@ -1248,11 +1258,14 @@ export const RichInput = observer(
               const mentionPath = localTerminalId
                 ? encodeTerminalScopedFilePath(localTerminalId, path)
                 : path;
-              insertMention({
-                type: "file",
-                name: mentionPath,
-                preview: getFileMentionDisplayName(path),
-              });
+              insertMention(
+                {
+                  type: "file",
+                  name: mentionPath,
+                  preview: getFileMentionDisplayName(path),
+                },
+                { replaceExisting: false },
+              );
             }
           });
         }
