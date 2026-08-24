@@ -574,6 +574,235 @@ const runAsyncCases = async (): Promise<void> => {
       'rename should run only after the latest backend ownership is established',
     )
     console.log('PASS rename waits for stable ownership registration')
+
+    const revisionSessionId = 'revision-race-session'
+    let resolveInitialPage: ((value: any) => void) | null = null
+    let resolveAroundPage: ((value: any) => void) | null = null
+    let resolveFullMessages: ((value: any) => void) | null = null
+    let notifyInitialPageRequested: (() => void) | null = null
+    let notifyAroundPageRequested: (() => void) | null = null
+    let notifyFullMessagesRequested: (() => void) | null = null
+    const initialPageRequested = new Promise<void>((resolve) => {
+      notifyInitialPageRequested = resolve
+    })
+    const aroundPageRequested = new Promise<void>((resolve) => {
+      notifyAroundPageRequested = resolve
+    })
+    const fullMessagesRequested = new Promise<void>((resolve) => {
+      notifyFullMessagesRequested = resolve
+    })
+    let pageRequestCount = 0
+    const raceAgent = (globalThis as any).window.gyshell.agent
+    raceAgent.listSessionSummaries = async () => [
+      {
+        id: revisionSessionId,
+        title: 'Old snapshot title',
+        updatedAt: 1,
+        messagesCount: 1,
+        isBusy: false,
+        lockedProfileId: null,
+        uiRevision: 5,
+      },
+    ]
+    raceAgent.getSessionMetadata = async () => ({
+      id: revisionSessionId,
+      title: 'Old snapshot title',
+      updatedAt: 1,
+      messagesCount: 1,
+      isBusy: false,
+      lockedProfileId: null,
+      uiRevision: 5,
+    })
+    raceAgent.getUiMessagePage = async () => {
+      pageRequestCount += 1
+      if (pageRequestCount === 1) {
+        notifyInitialPageRequested?.()
+        return await new Promise<any>((resolve) => {
+          resolveInitialPage = resolve
+        })
+      }
+      notifyAroundPageRequested?.()
+      return await new Promise<any>((resolve) => {
+        resolveAroundPage = resolve
+      })
+    }
+    raceAgent.getFullUiMessages = async () => {
+      notifyFullMessagesRequested?.()
+      return await new Promise<any>((resolve) => {
+        resolveFullMessages = resolve
+      })
+    }
+    raceAgent.loadChatRuntimeSession = async () => null
+
+    const raceStore = new ChatStore()
+    raceStore.hydrateSessionInventoryFromLayout(
+      [revisionSessionId],
+      revisionSessionId,
+    )
+    const initialHydration = raceStore.hydrateSessionsFromBackend(
+      [revisionSessionId],
+      revisionSessionId,
+    )
+    await initialPageRequested
+    raceStore.handleUiUpdate({
+      type: 'SESSION_RENAMED',
+      sessionId: revisionSessionId,
+      title: 'Newest title',
+      uiRevision: 6,
+    })
+    raceStore.handleUiUpdate({
+      type: 'APPEND_CONTENT',
+      sessionId: revisionSessionId,
+      messageId: 'revision-message',
+      content: '-through-7',
+      uiRevision: 7,
+    })
+    ;(resolveInitialPage as ((value: any) => void) | null)?.({
+      sessionId: revisionSessionId,
+      entries: [
+        {
+          position: 0,
+          message: createAssistantMessage('revision-message', {
+            content: 'baseline',
+            streaming: true,
+          }),
+        },
+      ],
+      totalCount: 1,
+      startPosition: 0,
+      endPosition: 0,
+      hasOlder: false,
+      hasNewer: false,
+      uiRevision: 5,
+      metadata: {
+        id: revisionSessionId,
+        title: 'Old snapshot title',
+        updatedAt: 1,
+        messagesCount: 1,
+        isBusy: false,
+        lockedProfileId: null,
+        uiRevision: 5,
+      },
+    })
+    await initialHydration
+    const raceSession = raceStore.getSessionById(revisionSessionId)!
+    raceSession.messagesById.get('revision-message')!.deferredPayload = {
+      fields: ['content'],
+    }
+    assertEqual(
+      raceSession.title,
+      'Newest title',
+      'a stale metadata/page snapshot must not overwrite a newer rename event',
+    )
+    assertEqual(
+      raceSession.messagesById.get('revision-message')?.content,
+      'baseline-through-7',
+      'events already represented by neither snapshot nor page must replay exactly once',
+    )
+    assertEqual(
+      raceSession.uiRevision,
+      7,
+      'hydration should finish at the newest replayed session revision',
+    )
+
+    const aroundLoad = raceStore.loadMessagesAroundPosition(
+      revisionSessionId,
+      0,
+      300,
+    )
+    await aroundPageRequested
+    raceStore.handleUiUpdate({
+      type: 'APPEND_CONTENT',
+      sessionId: revisionSessionId,
+      messageId: 'revision-message',
+      content: '-through-8',
+      uiRevision: 8,
+    })
+    ;(resolveAroundPage as ((value: any) => void) | null)?.({
+      sessionId: revisionSessionId,
+      entries: [
+        {
+          position: 0,
+          message: createAssistantMessage('revision-message', {
+            content: 'projected-through-7',
+            streaming: true,
+            deferredPayload: { fields: ['content'] },
+          }),
+        },
+      ],
+      totalCount: 1,
+      startPosition: 0,
+      endPosition: 0,
+      hasOlder: false,
+      hasNewer: false,
+      uiRevision: 7,
+      metadata: {
+        id: revisionSessionId,
+        title: 'Old snapshot title',
+        updatedAt: 1,
+        messagesCount: 1,
+        isBusy: false,
+        lockedProfileId: null,
+        uiRevision: 7,
+      },
+    })
+    const aroundApplied = await aroundLoad
+    assertEqual(
+      aroundApplied,
+      false,
+      'a stale around-position page must be discarded instead of replacing newer state',
+    )
+    assertEqual(
+      raceSession.title,
+      'Newest title',
+      'around-position navigation must not roll a newer title backward',
+    )
+    assertEqual(
+      raceSession.messagesById.get('revision-message')?.content,
+      'baseline-through-7-through-8',
+      'a stale around-position page must not overwrite newer transcript updates',
+    )
+
+    const fullLoad = raceStore.loadFullMessages(revisionSessionId, [
+      'revision-message',
+    ])
+    await fullMessagesRequested
+    raceStore.handleUiUpdate({
+      type: 'APPEND_CONTENT',
+      sessionId: revisionSessionId,
+      messageId: 'revision-message',
+      content: '-through-9',
+      uiRevision: 9,
+    })
+    ;(resolveFullMessages as ((value: any) => void) | null)?.({
+      sessionId: revisionSessionId,
+      messages: [
+        createAssistantMessage('revision-message', {
+          content: 'complete-through-8',
+          streaming: true,
+        }),
+      ],
+      uiRevision: 8,
+    })
+    await fullLoad
+    assertEqual(
+      raceSession.messagesById.get('revision-message')?.content,
+      'complete-through-8-through-9',
+      'a slow full-payload response must preserve newer streaming deltas',
+    )
+    raceStore.handleUiUpdate({
+      type: 'APPEND_CONTENT',
+      sessionId: revisionSessionId,
+      messageId: 'revision-message',
+      content: '-duplicate',
+      uiRevision: 9,
+    })
+    assertEqual(
+      raceSession.messagesById.get('revision-message')?.content,
+      'complete-through-8-through-9',
+      'duplicate or replayed revisions must be ignored',
+    )
+    console.log('PASS revision races cannot overwrite newer renderer state')
   } finally {
     ;(globalThis as any).window = previousWindow
   }

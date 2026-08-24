@@ -15,6 +15,17 @@ export type MessageType =
   | 'ask'
   | 'tokens_count'
 
+export type DeferredUiMessageField =
+  | 'content'
+  | 'output'
+  | 'diff'
+  | 'details'
+  | 'inputImages'
+
+export interface DeferredUiMessagePayload {
+  fields: DeferredUiMessageField[]
+}
+
 export interface ChatMessage {
   id: string
   backendMessageId?: string
@@ -52,6 +63,7 @@ export interface ChatMessage {
   }
   timestamp: number
   streaming?: boolean
+  deferredPayload?: DeferredUiMessagePayload
 }
 
 export interface UIChatSession {
@@ -59,6 +71,7 @@ export interface UIChatSession {
   title: string
   messages: ChatMessage[]
   updatedAt: number
+  uiRevision?: number
 }
 
 export type UIUpdateAction = (

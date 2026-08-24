@@ -804,8 +804,37 @@ export interface GyShellAPI {
     ) => Promise<void>;
     stopTask: (sessionId: string) => Promise<void>;
     getAllChatHistory: () => Promise<any[]>;
+    listSessionSummaries: () => Promise<any[]>;
+    getSessionMetadata: (sessionId: string) => Promise<{
+      id: string;
+      title: string;
+      updatedAt: number;
+      messagesCount: number;
+      isBusy: boolean;
+      lockedProfileId: string | null;
+      uiRevision: number;
+    } | null>;
     loadChatSession: (sessionId: string) => Promise<any>;
+    loadChatRuntimeSession: (sessionId: string) => Promise<any>;
     getUiMessages: (sessionId: string) => Promise<any[]>;
+    getUiMessagePage: (
+      sessionId: string,
+      request?: {
+        limit?: number;
+        beforePosition?: number;
+        afterPosition?: number;
+        aroundPosition?: number;
+      },
+    ) => Promise<any>;
+    getFullUiMessages: (
+      sessionId: string,
+      messageIds: string[],
+    ) => Promise<any>;
+    searchUiMessages: (
+      sessionId: string,
+      query: string,
+      limit?: number,
+    ) => Promise<any>;
     getSessionSnapshot: (sessionId: string) => Promise<{
       id: string;
       title: string;
@@ -1334,10 +1363,26 @@ const api: GyShellAPI = {
       ipcRenderer.invoke("agent:startTask", sessionId, userInput, options),
     stopTask: (sessionId) => ipcRenderer.invoke("agent:stopTask", sessionId),
     getAllChatHistory: () => ipcRenderer.invoke("agent:getAllChatHistory"),
+    listSessionSummaries: async () => {
+      const payload = await ipcRenderer.invoke("session:list");
+      return Array.isArray(payload?.sessions) ? payload.sessions : [];
+    },
+    getSessionMetadata: async (sessionId) => {
+      const payload = await ipcRenderer.invoke("session:metadata", sessionId);
+      return payload?.metadata ?? null;
+    },
     loadChatSession: (sessionId) =>
       ipcRenderer.invoke("agent:loadChatSession", sessionId),
+    loadChatRuntimeSession: (sessionId) =>
+      ipcRenderer.invoke("agent:loadChatRuntimeSession", sessionId),
     getUiMessages: (sessionId) =>
       ipcRenderer.invoke("agent:getUiMessages", sessionId),
+    getUiMessagePage: (sessionId, request) =>
+      ipcRenderer.invoke("agent:getUiMessagePage", sessionId, request),
+    getFullUiMessages: (sessionId, messageIds) =>
+      ipcRenderer.invoke("agent:getFullUiMessages", sessionId, messageIds),
+    searchUiMessages: (sessionId, query, limit) =>
+      ipcRenderer.invoke("agent:searchUiMessages", sessionId, query, limit),
     getSessionSnapshot: async (sessionId) => {
       const payload = await ipcRenderer.invoke("session:get", sessionId);
       return payload?.session ?? null;

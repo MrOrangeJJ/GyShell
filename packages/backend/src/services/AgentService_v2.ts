@@ -580,6 +580,63 @@ export class AgentService_v2 {
       : undefined;
   };
 
+  private loadRuntimeChatSession(sessionId: string): ChatSession | null {
+    const loadRuntimeSession = (this.chatHistoryService as any)
+      ?.loadRuntimeSession;
+    if (typeof loadRuntimeSession === "function") {
+      return loadRuntimeSession.call(this.chatHistoryService, sessionId);
+    }
+    const loadSession = (this.chatHistoryService as any)?.loadSession;
+    return typeof loadSession === "function"
+      ? loadSession.call(this.chatHistoryService, sessionId)
+      : null;
+  }
+
+  private saveRuntimeChatSession(
+    session: ChatSession,
+    rawSession?: ChatSession,
+  ): void {
+    const saveRuntimeSession = (this.chatHistoryService as any)
+      ?.saveRuntimeSession;
+    if (typeof saveRuntimeSession === "function") {
+      saveRuntimeSession.call(this.chatHistoryService, session, rawSession);
+      return;
+    }
+    const saveSession = (this.chatHistoryService as any)?.saveSession;
+    if (typeof saveSession === "function") {
+      saveSession.call(this.chatHistoryService, session);
+    }
+  }
+
+  private buildRawChatSessionFromMessages(
+    session: ChatSession,
+    messages: BaseMessage[],
+    lastProfileMaxTokens?: number,
+  ): ChatSession {
+    const storedMessages = mapChatMessagesToStoredMessages(
+      messages.filter((message) => !this.helpers.isEphemeral(message)),
+    ) as any[];
+    // Preserve monotonic command lifecycle state even when the raw checkpoint
+    // arrives after a newer terminal settlement was already persisted.
+    this.preferDurableExecCommandSettlements(session.id, storedMessages);
+    const messageMap = new Map<string, any>();
+    for (const storedMessage of storedMessages) {
+      const id =
+        storedMessage?.data?.additional_kwargs?._gyshellMessageId ||
+        storedMessage?.additional_kwargs?._gyshellMessageId ||
+        uuidv4();
+      messageMap.set(String(id), storedMessage);
+    }
+    return {
+      id: session.id,
+      title: session.title,
+      messages: messageMap,
+      lastCheckpointOffset: session.lastCheckpointOffset,
+      lastProfileMaxTokens:
+        lastProfileMaxTokens ?? session.lastProfileMaxTokens,
+    };
+  }
+
   private getStoredMessageId(message: any): string | undefined {
     const messageId = message?.data?.additional_kwargs?._gyshellMessageId;
     return typeof messageId === "string" && messageId.length > 0
@@ -616,12 +673,7 @@ export class AgentService_v2 {
     sessionId: string,
     incomingMessages: any[],
   ): void {
-    const loadSession = (this.chatHistoryService as any).loadSession;
-    if (typeof loadSession !== "function") return;
-    const durableSession = loadSession.call(
-      this.chatHistoryService,
-      sessionId,
-    ) as ChatSession | null;
+    const durableSession = this.loadRuntimeChatSession(sessionId);
     if (!durableSession) return;
 
     const durableByMessageId = new Map<string, any>();
@@ -668,18 +720,7 @@ export class AgentService_v2 {
     }
 
     try {
-      const loadSession = (this.chatHistoryService as any).loadSession;
-      const saveSession = (this.chatHistoryService as any).saveSession;
-      if (
-        typeof loadSession !== "function" ||
-        typeof saveSession !== "function"
-      ) {
-        return false;
-      }
-      const session = loadSession.call(
-        this.chatHistoryService,
-        params.sessionId,
-      ) as ChatSession | null;
+      const session = this.loadRuntimeChatSession(params.sessionId);
       if (!session) return false;
       const entry = Array.from(session.messages.entries()).find(
         ([key, message]) =>
@@ -714,7 +755,7 @@ export class AgentService_v2 {
           content: params.content,
         },
       });
-      saveSession.call(this.chatHistoryService, session);
+      this.saveRuntimeChatSession(session);
       return true;
     } catch (error) {
       console.warn(
@@ -4262,8 +4303,35 @@ export class AgentService_v2 {
     compactionMessageId: string,
     physicalRunId?: string,
   ): { changed: boolean; messages: BaseMessage[] } {
+    const runtimeMessages = this.materializeBoundedCompactionRuntime(
+      candidate.messages,
+      candidate.summaryMessageBackendId,
+    );
+    const session = this.loadRuntimeChatSession(sessionId) || {
+      id: sessionId,
+      title: "New Session",
+      messages: new Map(),
+      lastCheckpointOffset: 0,
+      lastProfileMaxTokens: this.getPrimaryModelMaxTokensForSession(sessionId),
+    };
+    const rawSession = this.buildRawChatSessionFromMessages(
+      session,
+      candidate.messages,
+      this.getPrimaryModelMaxTokensForSession(sessionId),
+    );
+    this.updateSessionFromMessages(
+      session,
+      candidate.messages,
+      this.getPrimaryModelMaxTokensForSession(sessionId),
+    );
+    // Persist every message produced before the cut before physically dropping
+    // it from graph state. The append-preserving transcript remains available
+    // for export/rollback while subsequent graph nodes retain only the latest
+    // summary marker and tail.
+    this.saveRuntimeChatSession(session, rawSession);
+
     console.log(
-      `[TokenManager] ${candidate.logLabel} inserted summary at index=${candidate.insertionIndex} (sessionId=${sessionId}).`,
+      `[TokenManager] ${candidate.logLabel} inserted summary at index=${candidate.insertionIndex} and bounded runtime history to ${runtimeMessages.length} messages (sessionId=${sessionId}).`,
     );
     this.helpers.sendEvent(sessionId, {
       messageId: uuidv4(),
@@ -4277,11 +4345,32 @@ export class AgentService_v2 {
       this.committedCompactionByPhysicalRunId.set(physicalRunId, {
         sessionId,
         summaryMessageBackendId: candidate.summaryMessageBackendId,
-        messages: [...candidate.messages],
+        messages: [...runtimeMessages],
       });
     }
     this.finishCompactionProgress(sessionId, compactionMessageId);
-    return { changed: true, messages: candidate.messages };
+    return { changed: true, messages: runtimeMessages };
+  }
+
+  private materializeBoundedCompactionRuntime(
+    messages: BaseMessage[],
+    summaryMessageBackendId: string,
+  ): BaseMessage[] {
+    const leadingSystemCount = countLeadingSystemMessages(messages);
+    const markerIndex = messages.findIndex(
+      (message) =>
+        TokenManager.hasLastCompactionFlag(message) &&
+        this.getBaseMessageBackendId(message) === summaryMessageBackendId,
+    );
+    if (markerIndex < 0) {
+      throw new Error(
+        `Committed compaction marker is missing from the candidate (summaryMessageId=${summaryMessageBackendId}).`,
+      );
+    }
+    return [
+      ...messages.slice(0, leadingSystemCount),
+      ...messages.slice(Math.max(markerIndex, leadingSystemCount)),
+    ];
   }
 
   private async buildZeroRetentionCompactionCandidate(
@@ -6083,7 +6172,7 @@ export class AgentService_v2 {
     );
     const currentRunMaxTokens = sessionBinding.globalMaxTokens;
     const recursionLimit = this.settings?.recursionLimit ?? 200;
-    const loadedSession = this.chatHistoryService.loadSession(sessionId);
+    const loadedSession = this.loadRuntimeChatSession(sessionId);
     let baseMessages: BaseMessage[] = [];
     if (loadedSession) {
       const storedMessages = Array.from(loadedSession.messages.values());
@@ -6145,12 +6234,17 @@ export class AgentService_v2 {
           lastCheckpointOffset: 0,
           lastProfileMaxTokens: currentRunMaxTokens,
         };
+        const rawSession = this.buildRawChatSessionFromMessages(
+          sessionToSave,
+          finalMessages as BaseMessage[],
+          currentRunMaxTokens,
+        );
         this.updateSessionFromMessages(
           sessionToSave,
           finalMessages as BaseMessage[],
           currentRunMaxTokens,
         );
-        this.chatHistoryService.saveSession(sessionToSave);
+        this.saveRuntimeChatSession(sessionToSave, rawSession);
       }
     } catch (err: any) {
       const isAbort = this.helpers.isAbortError(err);
@@ -6263,7 +6357,7 @@ export class AgentService_v2 {
       }
       if (messages.length === 0) return;
 
-      const session = this.chatHistoryService.loadSession(sessionId) || {
+      const session = this.loadRuntimeChatSession(sessionId) || {
         id: sessionId,
         title: "New Session",
         messages: new Map(),
@@ -6271,12 +6365,17 @@ export class AgentService_v2 {
         lastProfileMaxTokens:
           this.getPrimaryModelMaxTokensForSession(sessionId),
       };
+      const rawSession = this.buildRawChatSessionFromMessages(
+        session,
+        messages,
+        this.getPrimaryModelMaxTokensForSession(sessionId),
+      );
       this.updateSessionFromMessages(
         session,
         messages,
         this.getPrimaryModelMaxTokensForSession(sessionId),
       );
-      this.chatHistoryService.saveSession(session);
+      this.saveRuntimeChatSession(session, rawSession);
       this.abortedMessagesByRunId.delete(physicalRunId);
       this.committedCompactionByPhysicalRunId.delete(physicalRunId);
     } catch (error) {
@@ -6404,6 +6503,15 @@ export class AgentService_v2 {
 
   loadChatSession(sessionId: string): ChatSession | null {
     return this.chatHistoryService.loadSession(sessionId);
+  }
+
+  /**
+   * Desktop-only runtime hydration. Unlike loadChatSession(), this never
+   * materializes the authoritative transcript and returns only the bounded
+   * post-compaction context needed to resume an agent run.
+   */
+  loadChatRuntimeSession(sessionId: string): ChatSession | null {
+    return this.loadRuntimeChatSession(sessionId);
   }
 
   listStoredChatSessions(): StoredChatSession[] {

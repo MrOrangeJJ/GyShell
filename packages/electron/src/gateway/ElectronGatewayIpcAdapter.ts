@@ -38,6 +38,7 @@ import {
   assertSettingsPatchDoesNotEnableExperimentalTools,
   isExperimentalToolConfirmationRequired,
 } from "../../../backend/src/services/settings/experimentalToolConsent";
+import { RendererSessionRegistrationGate } from "./rendererSessionRegistrationGate";
 import type { WsGatewayAccess } from "../../../backend/src/types";
 import {
   buildBuiltInToolStatusSummary,
@@ -123,6 +124,7 @@ export class ElectronGatewayIpcAdapter {
     private fileSystemService?: FileSystemService,
     private fileTransferService?: FileTransferService,
     private mobileWebServerService?: import("../services/MobileWebServerService").MobileWebServerService,
+    private rendererSessionRegistrationGate?: RendererSessionRegistrationGate<IpcMainInvokeEvent>,
   ) {}
 
   private getRendererSessionOwner(event: IpcMainInvokeEvent): string {
@@ -255,27 +257,53 @@ export class ElectronGatewayIpcAdapter {
     this.gateway.broadcastRaw("memory:updated", result.memory);
   }
 
-  registerHandlers(): void {
-    // Agent runtime
+  private registerSessionHandlers(): void {
+    const handleSessionRegistration = async (
+      event: IpcMainInvokeEvent,
+      operation: "register" | "unregister",
+      sessionId: string,
+    ): Promise<void> => {
+      // A renderer can die while its startup request is waiting behind history
+      // migration. Do not create a stale backend owner for that renderer.
+      if (
+        typeof event.sender?.isDestroyed === "function" &&
+        event.sender.isDestroyed()
+      ) {
+        return;
+      }
+      const ownerId = this.getRendererSessionOwner(event);
+      if (operation === "register") {
+        this.gateway.registerSession(sessionId, ownerId);
+      } else {
+        this.gateway.unregisterSession(sessionId, ownerId);
+      }
+    };
+
+    if (this.rendererSessionRegistrationGate) {
+      this.rendererSessionRegistrationGate.setHandler(
+        async (event, operation, sessionId) =>
+          handleSessionRegistration(event, operation, sessionId),
+      );
+      return;
+    }
+
+    // Keep the direct registration path for non-Electron harnesses that build
+    // the adapter without the startup gate.
     ipcMain.handle(
       "agent:registerSession",
-      async (event: IpcMainInvokeEvent, sessionId: string) => {
-        this.gateway.registerSession(
-          sessionId,
-          this.getRendererSessionOwner(event),
-        );
-      },
+      async (event: IpcMainInvokeEvent, sessionId: string) =>
+        handleSessionRegistration(event, "register", sessionId),
     );
-
     ipcMain.handle(
       "agent:unregisterSession",
-      async (event: IpcMainInvokeEvent, sessionId: string) => {
-        this.gateway.unregisterSession(
-          sessionId,
-          this.getRendererSessionOwner(event),
-        );
-      },
+      async (event: IpcMainInvokeEvent, sessionId: string) =>
+        handleSessionRegistration(event, "unregister", sessionId),
     );
+  }
+
+  registerHandlers(): void {
+    // Agent runtime
+    this.registerSessionHandlers();
 
     ipcMain.handle(
       "agent:startTask",
@@ -422,8 +450,32 @@ export class ElectronGatewayIpcAdapter {
     ipcMain.handle("agent:loadChatSession", (_: any, id: string) =>
       this.agentService.loadChatSession(id),
     );
+    ipcMain.handle("agent:loadChatRuntimeSession", (_: any, id: string) =>
+      this.agentService.loadChatRuntimeSession(id),
+    );
     ipcMain.handle("agent:getUiMessages", (_: any, id: string) =>
       this.uiHistoryService.getMessages(id),
+    );
+    ipcMain.handle(
+      "agent:getUiMessagePage",
+      (_: any, sessionId: string, request?: any) => {
+        const page = this.uiHistoryService.getMessagePage(sessionId, request);
+        if (!page) return null;
+        return {
+          ...page,
+          metadata: this.gateway.getSessionMetadata(sessionId),
+        };
+      },
+    );
+    ipcMain.handle(
+      "agent:getFullUiMessages",
+      (_: any, sessionId: string, messageIds: string[]) =>
+        this.uiHistoryService.getFullMessagesByIds(sessionId, messageIds),
+    );
+    ipcMain.handle(
+      "agent:searchUiMessages",
+      (_: any, sessionId: string, query: string, limit?: number) =>
+        this.uiHistoryService.searchMessages(sessionId, query, limit),
     );
     ipcMain.handle(
       "agent:formatMessagesMarkdown",
@@ -440,6 +492,13 @@ export class ElectronGatewayIpcAdapter {
         sessions,
         uiRevision: sessions[0]?.uiRevision ?? this.gateway.getUiRevision(),
       };
+    });
+    ipcMain.handle("session:metadata", (_: any, sessionId: string) => {
+      const metadata = this.gateway.getSessionMetadata(sessionId);
+      if (!metadata) {
+        throw new Error(`Session not found: ${sessionId}`);
+      }
+      return { metadata };
     });
     ipcMain.handle("session:get", (_: any, sessionId: string) => {
       const session = this.gateway.getSessionSnapshot(sessionId);

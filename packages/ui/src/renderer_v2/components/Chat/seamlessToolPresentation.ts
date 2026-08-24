@@ -379,31 +379,61 @@ export const getCommandOutputUiPresentation = (
   }
 }
 
-const getToolActivityTone = (message: ChatMessage): SeamlessStepTone => {
-  const explicitLevel = message.metadata?.subToolLevel
-  if (explicitLevel === 'error') return 'error'
-  if (explicitLevel === 'warning') return 'warning'
-  const output = String(message.metadata?.output ?? '').trimStart()
-  if (TOOL_FAILURE_OUTPUT_PATTERN.test(output)) return 'error'
-  if (output.length > SEAMLESS_DETAIL_PREVIEW_LIMIT) return 'neutral'
-
-  try {
-    const structured = JSON.parse(output) as unknown
-    if (!structured || Array.isArray(structured) || typeof structured !== 'object') {
-      return 'neutral'
-    }
-    const result = structured as Record<string, unknown>
-    const status = compactWhitespace(result.status).toLowerCase()
-    if (
-      ['error', 'failed', 'failure', 'denied', 'blocked'].includes(status) ||
-      result.ok === false ||
-      result.success === false
-    ) {
-      return 'error'
-    }
-  } catch {
-    // Plain-text tool output is expected; the prefix check above handles it.
+export const getSeamlessStepTone = (
+  message: ChatMessage,
+): SeamlessStepTone => {
+  if (message.type === 'command') {
+    const commandOutputPresentation = getCommandOutputUiPresentation(message)
+    if (commandOutputPresentation) return commandOutputPresentation.tone
+    const exitCode = message.metadata?.exitCode
+    const isBackgroundTransition =
+      message.metadata?.isNowait === true && exitCode === -3
+    return typeof exitCode === 'number' &&
+      exitCode !== 0 &&
+      !isBackgroundTransition
+      ? 'error'
+      : 'neutral'
   }
+  if (message.type === 'file_edit') {
+    return message.metadata?.action === 'error' ? 'error' : 'neutral'
+  }
+
+  let tone: SeamlessStepTone = 'neutral'
+  const explicitLevel = message.metadata?.subToolLevel
+  if (explicitLevel === 'error') {
+    tone = 'error'
+  } else if (explicitLevel === 'warning') {
+    tone = 'warning'
+  } else {
+    const output = String(message.metadata?.output ?? '').trimStart()
+    if (TOOL_FAILURE_OUTPUT_PATTERN.test(output)) {
+      tone = 'error'
+    } else if (output.length <= SEAMLESS_DETAIL_PREVIEW_LIMIT) {
+      try {
+        const structured = JSON.parse(output) as unknown
+        if (structured && !Array.isArray(structured) && typeof structured === 'object') {
+          const result = structured as Record<string, unknown>
+          const status = compactWhitespace(result.status).toLowerCase()
+          if (
+            ['error', 'failed', 'failure', 'denied', 'blocked'].includes(status) ||
+            result.ok === false ||
+            result.success === false
+          ) {
+            tone = 'error'
+          }
+        }
+      } catch {
+        // Plain-text tool output is expected; the prefix check above handles it.
+      }
+    }
+  }
+
+  const commandOutputTone =
+    message.type === 'tool_call'
+      ? getCommandOutputUiPresentation(message)?.tone
+      : undefined
+  if (tone === 'error' || commandOutputTone === 'error') return 'error'
+  if (tone === 'warning' || commandOutputTone === 'warning') return 'warning'
   return 'neutral'
 }
 
@@ -490,7 +520,7 @@ export const buildSeamlessStepPresentation = (
     )
     const fullSummary = joinSummary(title, subtitle)
     const commandOutputPresentation = getCommandOutputUiPresentation(message)
-    const toolTone = getToolActivityTone(message)
+    const toolTone = getSeamlessStepTone(message)
     return {
       kindLabel: 'Tool',
       title,
@@ -570,7 +600,7 @@ export const buildSeamlessStepPresentation = (
     subtitle,
     summary: truncate(fullSummary, MAX_SUMMARY_LENGTH),
     fullSummary,
-    tone: getToolActivityTone(message),
+    tone: getSeamlessStepTone(message),
     details,
   }
 }

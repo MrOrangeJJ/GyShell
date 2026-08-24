@@ -36,7 +36,12 @@ export interface ISettingsRuntime {
 
 export interface IChatHistoryRuntime {
   saveSession(session: ChatSession): void;
+  saveRuntimeSession(
+    session: ChatSession,
+    rawSession?: ChatSession,
+  ): void;
   loadSession(sessionId: string): ChatSession | null;
+  loadRuntimeSession(sessionId: string): ChatSession | null;
   getAllSessions(): StoredChatSession[];
   getAllSessionSummaries(): ChatSessionSummaryRecord[];
   deleteSession(sessionId: string): void;

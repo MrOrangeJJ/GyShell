@@ -84,6 +84,20 @@ export interface GatewaySessionSnapshot {
 }
 
 /**
+ * Lightweight session state used by desktop startup and tab inventory.
+ * It intentionally contains no transcript payload.
+ */
+export interface GatewaySessionMetadata {
+  id: string;
+  title: string;
+  updatedAt: number;
+  messagesCount: number;
+  isBusy: boolean;
+  lockedProfileId: string | null;
+  uiRevision: number;
+}
+
+/**
  * Gateway interface definition
  */
 export interface IGateway {
@@ -121,6 +135,7 @@ export interface IGatewayRuntime extends IGateway {
   unregisterSessionOwner(ownerId: string): void;
   getUiRevision(): number;
   listSessionSummaries(): GatewaySessionSummary[];
+  getSessionMetadata(sessionId: string): GatewaySessionMetadata | null;
   getSessionSnapshot(sessionId: string): GatewaySessionSnapshot | null;
   waitForRunCompletion(sessionId: string): Promise<void>;
   submitFeedback(messageId: string, payload: any): { ok: true };

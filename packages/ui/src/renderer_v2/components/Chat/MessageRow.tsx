@@ -123,6 +123,29 @@ export const MessageRow: React.FC<MessageRowProps> = observer(
       showAssistantGroupCopy &&
       normalizedAssistantGroupMessageIds.length > 0 &&
       !assistantGroupIsRunning;
+    const deferredAutoLoadIds = (() => {
+      if (!session) return [];
+      if (seamlessGroupMessageIds && seamlessGroupMessageIds.length > 0) {
+        const tailId = seamlessGroupMessageIds[seamlessGroupMessageIds.length - 1];
+        const tail = tailId ? session.messagesById.get(tailId) : undefined;
+        return tail?.deferredPayload?.fields.length ? [tail.id] : [];
+      }
+      return msg?.deferredPayload?.fields.length ? [msg.id] : [];
+    })();
+    const deferredAutoLoadKey = deferredAutoLoadIds.join(":");
+    const requestFullMessages = React.useCallback(
+      (messageIds: string[]) =>
+        store.chat.loadFullMessages(sessionId, messageIds),
+      [sessionId, store.chat],
+    );
+
+    React.useEffect(() => {
+      if (!deferredAutoLoadKey) return;
+      void requestFullMessages(deferredAutoLoadIds)
+        .catch((error) => {
+          console.warn("Failed to load deferred chat payload:", error);
+        });
+    }, [deferredAutoLoadKey, requestFullMessages]);
 
     const copyConnectedAssistantRun = React.useCallback(async () => {
       if (!shouldShowGroupCopy) return;
@@ -154,6 +177,11 @@ export const MessageRow: React.FC<MessageRowProps> = observer(
     );
 
     if (!session) return null;
+    // Historical list pages carry bounded projections for unusually large
+    // fields. Keep the original row UI offscreen for this brief local fetch so
+    // users never see a truncation control or alternate presentation.
+    if (deferredAutoLoadKey) return null;
+
     const assistantGroupBranchMessage = assistantGroupBranchMessageId
       ? session.messagesById.get(assistantGroupBranchMessageId)
       : null;
@@ -228,6 +256,7 @@ export const MessageRow: React.FC<MessageRowProps> = observer(
             onExpandedDetailIdsChange={(expandedDetailIds) =>
               onBannerUiStateChange?.({ expandedDetailIds })
             }
+            onRequestFullMessages={requestFullMessages}
           />
           {assistantGroupActions}
         </div>

@@ -69,6 +69,13 @@ import { AgentSettingProfileService } from "../../../backend/src/services/AgentS
 import {
   isExperimentalToolConfirmationRequired,
 } from "../../../backend/src/services/settings/experimentalToolConsent";
+import {
+  decideRendererRecovery,
+  shouldRecoverWindowsForChildProcess,
+  type RendererRecoveryReason,
+} from "./rendererRecovery";
+import { RendererSessionRegistrationGate } from "../gateway/rendererSessionRegistrationGate";
+import type { IpcMainInvokeEvent } from "electron";
 
 let mainWindow: BrowserWindow | null = null;
 let settingsService: SettingsService;
@@ -105,10 +112,171 @@ interface CreateWindowOptions {
   detachedStateToken?: string;
   sourceClientId?: string;
   tabOwnership?: DetachedWindowTabOwnership;
+  safeMode?: boolean;
 }
 
 const DETACHED_WINDOW_DEFAULT_WIDTH_SCALE = 0.5;
 const DETACHED_WINDOW_DEFAULT_HEIGHT_SCALE = 0.75;
+
+interface RendererRecoveryInstallOptions {
+  role: AppWindowRole;
+  detachedStateToken?: string;
+  sourceClientId?: string;
+  tabOwnership?: DetachedWindowTabOwnership;
+}
+
+interface RendererRecoveryRuntimeState {
+  attempts: number;
+  lastFailureAt?: number;
+  safeMode: boolean;
+  handlingFailure: boolean;
+  stableResetTimer?: ReturnType<typeof setTimeout>;
+  unresponsiveTimer?: ReturnType<typeof setTimeout>;
+}
+
+const rendererRecoveryStateByWindow = new WeakMap<
+  BrowserWindow,
+  RendererRecoveryRuntimeState
+>();
+const rendererRecoveryRequestByWindow = new WeakMap<
+  BrowserWindow,
+  (reason: RendererRecoveryReason) => void
+>();
+
+const loadRendererDocumentForRecovery = (
+  windowInstance: BrowserWindow,
+  options: RendererRecoveryInstallOptions,
+  safeMode: boolean,
+): void => {
+  if (windowInstance.isDestroyed()) return;
+  const query = new URLSearchParams();
+  if (safeMode) query.set("safeMode", "1");
+  if (options.role === "detached") {
+    query.set("windowRole", "detached");
+    if (options.detachedStateToken?.trim()) {
+      query.set("detachedStateToken", options.detachedStateToken.trim());
+    }
+    if (options.sourceClientId?.trim()) {
+      query.set("sourceClientId", options.sourceClientId.trim());
+    }
+  }
+  const queryString = query.toString();
+  const suffix = queryString ? `?${queryString}` : "";
+  if (!app.isPackaged) {
+    const devUrl = process.env.ELECTRON_RENDERER_URL;
+    if (!devUrl) return;
+    void windowInstance
+      .loadURL(`${devUrl}/index.html${suffix}`)
+      .catch(() => undefined);
+    return;
+  }
+  const queryPayload: Record<string, string> = {};
+  query.forEach((value, key) => {
+    queryPayload[key] = value;
+  });
+  void windowInstance
+    .loadFile(join(__dirname, "../renderer/index.html"), {
+      ...(Object.keys(queryPayload).length > 0 ? { query: queryPayload } : {}),
+    })
+    .catch(() => undefined);
+};
+
+const installRendererRecoveryHandlers = (
+  windowInstance: BrowserWindow,
+  options: RendererRecoveryInstallOptions,
+): void => {
+  if (rendererRecoveryStateByWindow.has(windowInstance)) return;
+  const state: RendererRecoveryRuntimeState = {
+    attempts: 0,
+    safeMode: false,
+    handlingFailure: false,
+  };
+  rendererRecoveryStateByWindow.set(windowInstance, state);
+
+  const clearTimers = (): void => {
+    if (state.stableResetTimer) clearTimeout(state.stableResetTimer);
+    if (state.unresponsiveTimer) clearTimeout(state.unresponsiveTimer);
+    state.stableResetTimer = undefined;
+    state.unresponsiveTimer = undefined;
+  };
+
+  const noteStableLoad = (): void => {
+    state.handlingFailure = false;
+    if (state.stableResetTimer) clearTimeout(state.stableResetTimer);
+    state.stableResetTimer = setTimeout(() => {
+      state.attempts = 0;
+      state.lastFailureAt = undefined;
+      state.safeMode = false;
+      state.stableResetTimer = undefined;
+    }, 15_000);
+  };
+
+  const recover = (reason: RendererRecoveryReason): void => {
+    if (windowInstance.isDestroyed() || state.handlingFailure) return;
+    state.handlingFailure = true;
+    const decision = decideRendererRecovery(reason, {
+      attempts: state.attempts,
+      lastFailureAt: state.lastFailureAt,
+    });
+    state.attempts = decision.attempt;
+    state.lastFailureAt = Date.now();
+    state.safeMode = decision.safeMode || state.safeMode;
+    console.error(
+      `[RendererRecovery] renderer failure reason=${reason} action=${decision.action} attempt=${decision.attempt}`,
+    );
+
+    if (decision.action === "reload" && !state.safeMode) {
+      windowInstance.webContents.reload();
+      return;
+    }
+
+    // Safe mode keeps the same BrowserWindow, settings, and backend ownership.
+    // Only internal hydration limits are reduced, so recovery does not alter
+    // the workspace's visible mode or interaction contract.
+    loadRendererDocumentForRecovery(windowInstance, options, true);
+  };
+
+  rendererRecoveryRequestByWindow.set(windowInstance, recover);
+  windowInstance.webContents.on("did-finish-load", noteStableLoad);
+  windowInstance.webContents.on("render-process-gone", (_event, details) => {
+    const rawReason = String((details as any)?.reason || "crashed").toLowerCase();
+    recover(
+      rawReason === "killed"
+        ? "killed"
+        : rawReason === "oom"
+          ? "oom"
+          : rawReason === "launch-failed"
+            ? "child-process-gone"
+            : "crashed",
+    );
+  });
+  windowInstance.on("unresponsive", () => {
+    if (state.unresponsiveTimer) return;
+    state.unresponsiveTimer = setTimeout(() => {
+      state.unresponsiveTimer = undefined;
+      recover("unresponsive");
+    }, 3_000);
+  });
+  windowInstance.on("responsive", () => {
+    if (state.unresponsiveTimer) clearTimeout(state.unresponsiveTimer);
+    state.unresponsiveTimer = undefined;
+  });
+  windowInstance.webContents.on(
+    "did-fail-load",
+    (_event, errorCode, _errorDescription, _validatedURL, isMainFrame) => {
+      if (!isMainFrame || errorCode === -3) return;
+      // A failed reload does not emit did-finish-load, so clear the in-flight
+      // guard before attempting the next bounded recovery step.
+      state.handlingFailure = false;
+      recover("load-failure");
+    },
+  );
+  windowInstance.once("closed", () => {
+    clearTimers();
+    rendererRecoveryStateByWindow.delete(windowInstance);
+    rendererRecoveryRequestByWindow.delete(windowInstance);
+  });
+};
 
 function createWindow(options?: CreateWindowOptions): BrowserWindow {
   const role: AppWindowRole =
@@ -192,6 +360,9 @@ function createWindow(options?: CreateWindowOptions): BrowserWindow {
   }
 
   const query = new URLSearchParams();
+  if (options?.safeMode === true) {
+    query.set("safeMode", "1");
+  }
   if (!isMainWindow) {
     query.set("windowRole", "detached");
     if (
@@ -209,6 +380,13 @@ function createWindow(options?: CreateWindowOptions): BrowserWindow {
   }
   const queryString = query.toString();
   const urlSuffix = queryString.length > 0 ? `?${queryString}` : "";
+
+  installRendererRecoveryHandlers(windowInstance, {
+    role,
+    detachedStateToken: options?.detachedStateToken,
+    sourceClientId: options?.sourceClientId,
+    tabOwnership: options?.tabOwnership,
+  });
 
   // Load the app
   if (!app.isPackaged) {
@@ -330,6 +508,23 @@ export async function startElectronMain(): Promise<void> {
   }
   const historyMigrationCoordinator = new HistoryMigrationCoordinator();
   historyMigrationCoordinator.registerHandlers();
+
+  // Install the session ownership IPC contract before creating the renderer.
+  // The backend gateway is intentionally initialized later, after history
+  // migration and terminal restore; requests are queued by this gate instead
+  // of surfacing a transient "No handler registered" error to the renderer.
+  const rendererSessionRegistrationGate =
+    new RendererSessionRegistrationGate<IpcMainInvokeEvent>();
+  ipcMain.handle(
+    "agent:registerSession",
+    (event: IpcMainInvokeEvent, sessionId: string) =>
+      rendererSessionRegistrationGate.dispatch(event, "register", sessionId),
+  );
+  ipcMain.handle(
+    "agent:unregisterSession",
+    (event: IpcMainInvokeEvent, sessionId: string) =>
+      rendererSessionRegistrationGate.dispatch(event, "unregister", sessionId),
+  );
 
   // Run Electron-only data migrations before services consume persisted state.
   const settingsMigration = new ElectronAppSettingsMigration();
@@ -963,6 +1158,7 @@ export async function startElectronMain(): Promise<void> {
           fileSystemService,
           fileTransferService,
           mobileWebServerService,
+          rendererSessionRegistrationGate,
         );
         ipcAdapter.registerHandlers();
 
@@ -1205,6 +1401,7 @@ export async function startElectronMain(): Promise<void> {
 
         historyMigrationCoordinator.markReady();
       } catch (error) {
+        rendererSessionRegistrationGate.fail(error);
         if (historyMigrationCoordinator.getState().status !== "error") {
           historyMigrationCoordinator.markError(error, {
             title: "Application startup failed",
@@ -1256,6 +1453,17 @@ export async function startElectronMain(): Promise<void> {
     }
   });
 }
+
+app.on("child-process-gone", (_event, details) => {
+  if (!shouldRecoverWindowsForChildProcess(details)) return;
+  console.error(
+    `[RendererRecovery] GPU child process failure reason=${details.reason}`,
+  );
+  BrowserWindow.getAllWindows().forEach((windowInstance) => {
+    rendererRecoveryRequestByWindow
+      .get(windowInstance)?.("child-process-gone");
+  });
+});
 
 app.on("window-all-closed", async () => {
   if (terminalService) {

@@ -10,8 +10,17 @@ import type {
   UIChatSession,
   UIUpdateAction,
 } from "../types/ui-chat";
-import type { UISessionSummaryRecord } from "./history/historyTypes";
-import { HistorySqliteStore } from "./history/HistorySqliteStore";
+import type {
+  UiFullMessagesResult,
+  UiMessagePage,
+  UiMessagePageRequest,
+  UiMessageSearchResult,
+  UISessionSummaryRecord,
+} from "./history/historyTypes";
+import {
+  HistorySqliteStore,
+  projectUiMessageForList,
+} from "./history/HistorySqliteStore";
 import {
   buildAutoSessionTitle,
   buildUiSessionSummary,
@@ -26,17 +35,34 @@ interface UIHistoryServiceOptions {
   store?: HistorySqliteStore;
 }
 
+interface CachedUiSession {
+  session: UIChatSession;
+  startPosition: number;
+  totalCount: number;
+  lastAccessedAt: number;
+  dirtyMessageIds: Set<string>;
+  requiresFullRewrite: boolean;
+}
+
+const UI_HISTORY_LIVE_TAIL_LIMIT = 500;
+const UI_HISTORY_MAX_CACHED_SESSIONS = 4;
+
 export class UIHistoryService {
   private readonly store: HistorySqliteStore;
-  private sessionsCache: Record<string, UIChatSession> = {};
+  private sessionsCache: Record<string, CachedUiSession> = {};
   private sessionSummaryCache: Record<string, UISessionSummary> = {};
   private dirtySessions: Set<string> = new Set();
+  private revisionDirtySessions: Set<string> = new Set();
+  private sessionUiRevisionById: Map<string, number> = new Map();
 
   constructor(options?: UIHistoryServiceOptions) {
     this.store = options?.store || new HistorySqliteStore();
     this.sessionSummaryCache = this.buildSessionSummaryCache(
       this.store.listUiSessionSummaries(),
     );
+    Object.values(this.sessionSummaryCache).forEach((summary) => {
+      this.sessionUiRevisionById.set(summary.id, summary.uiRevision);
+    });
   }
 
   private buildSessionSummaryCache(
@@ -46,6 +72,7 @@ export class UIHistoryService {
     for (const summary of summaries) {
       cache[summary.id] = {
         ...summary,
+        uiRevision: Math.max(0, Math.floor(summary.uiRevision || 0)),
         lastMessagePreview: extractCommandOutputDisplayText(
           summary.lastMessagePreview || "",
         ),
@@ -57,25 +84,223 @@ export class UIHistoryService {
   private getOrLoadSession(sessionId: string): UIChatSession | null {
     const cached = this.sessionsCache[sessionId];
     if (cached) {
-      return cached;
+      cached.lastAccessedAt = Date.now();
+      return cached.session;
     }
-    const loaded = this.store.loadUiSession(sessionId);
+    const loadTail = (this.store as any).loadUiSessionTail;
+    const loaded =
+      typeof loadTail === "function"
+        ? loadTail.call(this.store, sessionId, UI_HISTORY_LIVE_TAIL_LIMIT)
+        : (() => {
+            const session = this.store.loadUiSession(sessionId);
+            return session
+              ? {
+                  session,
+                  startPosition: 0,
+                  totalCount: session.messages.length,
+                }
+              : null;
+          })();
     if (!loaded) {
       return null;
     }
-    const sanitized = sanitizeUiSession(loaded);
-    this.sessionsCache[sessionId] = sanitized;
+    const sanitized = sanitizeUiSession(loaded.session, {
+      normalizeCompactionBoundaries: loaded.startPosition === 0,
+    });
+    sanitized.uiRevision = Math.max(
+      sanitized.uiRevision || 0,
+      this.getUiRevision(sessionId),
+    );
+    const entry: CachedUiSession = {
+      session: sanitized,
+      startPosition: loaded.startPosition,
+      totalCount: loaded.totalCount,
+      lastAccessedAt: Date.now(),
+      dirtyMessageIds: new Set(),
+      requiresFullRewrite: false,
+    };
+    this.sessionsCache[sessionId] = entry;
     this.syncSessionSummary(sessionId);
-    return sanitized;
+    this.evictInactiveSessionCaches(sessionId);
+    return entry.session;
+  }
+
+  private getCachedSessionEntry(sessionId: string): CachedUiSession | null {
+    return this.sessionsCache[sessionId] || null;
+  }
+
+  private evictInactiveSessionCaches(protectedSessionId?: string): void {
+    const entries = Object.entries(this.sessionsCache);
+    if (entries.length <= UI_HISTORY_MAX_CACHED_SESSIONS) return;
+    entries
+      .filter(([sessionId]) => sessionId !== protectedSessionId)
+      .sort(([, left], [, right]) => left.lastAccessedAt - right.lastAccessedAt)
+      .forEach(([sessionId]) => {
+        if (
+          Object.keys(this.sessionsCache).length <=
+          UI_HISTORY_MAX_CACHED_SESSIONS
+        ) {
+          return;
+        }
+        if (this.dirtySessions.has(sessionId)) {
+          this.flush(sessionId);
+        }
+        delete this.sessionsCache[sessionId];
+      });
+  }
+
+  private trimCachedSession(sessionId: string): void {
+    const entry = this.getCachedSessionEntry(sessionId);
+    if (!entry || entry.session.messages.length <= UI_HISTORY_LIVE_TAIL_LIMIT) {
+      return;
+    }
+    const removeCount = entry.session.messages.length - UI_HISTORY_LIVE_TAIL_LIMIT;
+    entry.session.messages = entry.session.messages.slice(removeCount);
+    entry.startPosition += removeCount;
   }
 
   private syncSessionSummary(sessionId: string): void {
-    const session = this.sessionsCache[sessionId];
-    if (!session) {
-      delete this.sessionSummaryCache[sessionId];
+    const entry = this.sessionsCache[sessionId];
+    if (!entry) {
       return;
     }
-    this.sessionSummaryCache[sessionId] = buildUiSessionSummary(session);
+    const uiRevision = this.getUiRevision(sessionId);
+    entry.session.uiRevision = uiRevision;
+    const tailSummary = buildUiSessionSummary(entry.session);
+    this.sessionSummaryCache[sessionId] = {
+      ...tailSummary,
+      messagesCount: entry.totalCount,
+      uiRevision,
+    };
+  }
+
+  getMaxUiRevision(): number {
+    const storedMaximum =
+      typeof (this.store as any).getMaxUiRevision === "function"
+        ? Number((this.store as any).getMaxUiRevision())
+        : 0;
+    let maximum = Number.isFinite(storedMaximum) ? storedMaximum : 0;
+    this.sessionUiRevisionById.forEach((revision) => {
+      maximum = Math.max(maximum, revision);
+    });
+    return Math.max(0, Math.floor(maximum));
+  }
+
+  getUiRevision(sessionId: string): number {
+    return Math.max(
+      0,
+      Math.floor(
+        this.sessionUiRevisionById.get(sessionId) ||
+          this.sessionsCache[sessionId]?.session.uiRevision ||
+          this.sessionSummaryCache[sessionId]?.uiRevision ||
+          0,
+      ),
+    );
+  }
+
+  noteUiRevision(sessionId: string, uiRevision: number): void {
+    const normalizedSessionId = String(sessionId || "").trim();
+    const normalizedRevision = Math.max(0, Math.floor(uiRevision));
+    if (
+      !normalizedSessionId ||
+      !Number.isSafeInteger(normalizedRevision) ||
+      normalizedRevision <= this.getUiRevision(normalizedSessionId)
+    ) {
+      return;
+    }
+    this.sessionUiRevisionById.set(normalizedSessionId, normalizedRevision);
+    const entry = this.sessionsCache[normalizedSessionId];
+    if (entry) entry.session.uiRevision = normalizedRevision;
+    const summary = this.sessionSummaryCache[normalizedSessionId];
+    if (summary) {
+      this.sessionSummaryCache[normalizedSessionId] = {
+        ...summary,
+        uiRevision: normalizedRevision,
+      };
+    }
+
+    // A summary-only session may not have a live tail cache. Persist its
+    // revision immediately so a restart cannot replay an older snapshot before
+    // that session is opened again. Cached live sessions stay batched with the
+    // normal durability flush to avoid a synchronous SQLite write per stream
+    // delta.
+    const updateRevision = (this.store as any).updateUiSessionRevision;
+    if (
+      !entry &&
+      typeof updateRevision === "function" &&
+      updateRevision.call(this.store, normalizedSessionId, normalizedRevision)
+    ) {
+      this.revisionDirtySessions.delete(normalizedSessionId);
+      return;
+    }
+    this.revisionDirtySessions.add(normalizedSessionId);
+  }
+
+  private hydrateProjectedMessagesForEvent(
+    sessionId: string,
+    session: UIChatSession,
+    event: AgentEvent,
+  ): void {
+    const loadMessages = (this.store as any).loadUiMessagesByIds;
+    if (typeof loadMessages !== "function") return;
+    const candidateIds = new Set<string>();
+    const addMessage = (message: ChatMessage | undefined): void => {
+      if (!message || !message.deferredPayload?.fields.length) return;
+      candidateIds.add(message.id);
+    };
+
+    if (event.type === "say") {
+      addMessage(
+        [...session.messages]
+          .reverse()
+          .find(
+            (message) =>
+              message.role === "assistant" &&
+              message.type === "text" &&
+              message.streaming,
+          ),
+      );
+    } else if (event.type === "command_finished") {
+      addMessage(
+        session.messages.find(
+          (message) => message.metadata?.commandId === event.commandId,
+        ),
+      );
+    } else if (
+      event.type === "sub_tool_delta" ||
+      event.type === "sub_tool_finished"
+    ) {
+      addMessage(
+        event.messageId
+          ? session.messages.find(
+              (message) => message.backendMessageId === event.messageId,
+            )
+          : [...session.messages]
+              .reverse()
+              .find(
+                (message) =>
+                  (message.type === "sub_tool" ||
+                    message.type === "reasoning" ||
+                    message.type === "compaction") &&
+                  message.streaming,
+              ),
+      );
+    } else if (event.type === "done") {
+      session.messages.filter((message) => message.streaming).forEach(addMessage);
+    }
+
+    if (candidateIds.size === 0) return;
+    const fullMessages = loadMessages.call(
+      this.store,
+      sessionId,
+      [...candidateIds],
+    ) as ChatMessage[];
+    for (const fullMessage of fullMessages || []) {
+      const index = session.messages.findIndex(
+        (message) => message.id === fullMessage.id,
+      );
+      if (index >= 0) session.messages[index] = fullMessage;
+    }
   }
 
   recordEvent(sessionId: string, event: AgentEvent): UIUpdateAction[] {
@@ -87,53 +312,286 @@ export class UIHistoryService {
         messages: [],
         updatedAt: Date.now(),
       };
-      this.sessionsCache[sessionId] = session;
+      this.sessionsCache[sessionId] = {
+        session,
+        startPosition: 0,
+        totalCount: 0,
+        lastAccessedAt: Date.now(),
+        dirtyMessageIds: new Set(),
+        requiresFullRewrite: false,
+      };
     }
+    const cacheEntry = this.sessionsCache[sessionId];
+    cacheEntry.lastAccessedAt = Date.now();
     session.updatedAt = Date.now();
 
+    this.hydrateProjectedMessagesForEvent(sessionId, session, event);
+    const previousMessageIds = new Set(
+      session.messages.map((message) => message.id),
+    );
+    const streamingMessageIdsBeforeEvent =
+      event.type === "done"
+        ? session.messages
+            .filter((message) => message.streaming)
+            .map((message) => message.id)
+        : [];
+    const previousDurableCount = session.messages.filter(
+      (message) => message.type !== "ask",
+    ).length;
     const actions = this.processEvent(session, event, sessionId);
+    const nextDurableCount = session.messages.filter(
+      (message) => message.type !== "ask",
+    ).length;
+    cacheEntry.totalCount += nextDurableCount - previousDurableCount;
+
+    for (const action of actions) {
+      if (
+        action.type === "ADD_MESSAGE" ||
+        action.type === "INSERT_MESSAGE"
+      ) {
+        cacheEntry.dirtyMessageIds.add(action.message.id);
+      } else if (
+        action.type === "UPDATE_MESSAGE" ||
+        action.type === "APPEND_CONTENT" ||
+        action.type === "APPEND_OUTPUT"
+      ) {
+        cacheEntry.dirtyMessageIds.add(action.messageId);
+      } else if (
+        action.type === "REMOVE_MESSAGE" ||
+        action.type === "ROLLBACK"
+      ) {
+        cacheEntry.requiresFullRewrite = true;
+      }
+    }
+    const nextMessageIds = new Set(session.messages.map((message) => message.id));
+    if ([...previousMessageIds].some((id) => !nextMessageIds.has(id))) {
+      cacheEntry.requiresFullRewrite = true;
+    }
+    if (event.type === "compaction_boundary") {
+      cacheEntry.requiresFullRewrite = true;
+    }
+    if (event.type === "done") {
+      // DONE settles every streaming row, not just the last row returned by
+      // stopLatestStreaming. Only those rows need an incremental write.
+      streamingMessageIdsBeforeEvent.forEach((messageId) =>
+        cacheEntry.dirtyMessageIds.add(messageId),
+      );
+    }
     this.syncSessionSummary(sessionId);
     this.dirtySessions.add(sessionId);
-    return actions;
+    if (
+      session.messages.length >= UI_HISTORY_LIVE_TAIL_LIMIT + 250 &&
+      !session.messages.some((message) => message.type === "ask")
+    ) {
+      this.flush(sessionId, { preserveLiveTransientState: true });
+      this.trimCachedSession(sessionId);
+    }
+    return actions.map((action) => this.projectUiUpdateForTransport(action));
   }
 
   flush(
     sessionId?: string,
     options?: { preserveLiveTransientState?: boolean },
   ): void {
+    const pendingSessionIds = new Set([
+      ...this.dirtySessions,
+      ...this.revisionDirtySessions,
+    ]);
     const sessionIds = sessionId
-      ? this.dirtySessions.has(sessionId)
+      ? pendingSessionIds.has(sessionId)
         ? [sessionId]
         : []
-      : Array.from(this.dirtySessions);
+      : Array.from(pendingSessionIds);
     if (sessionIds.length === 0) {
       return;
     }
 
-    const entries: Array<{
-      session: UIChatSession;
-      summary: UISessionSummary;
-    }> = [];
     sessionIds.forEach((id) => {
-      const session = this.sessionsCache[id];
-      if (!session) {
+      const entry = this.sessionsCache[id];
+      if (!entry) {
+        const updateRevision = (this.store as any).updateUiSessionRevision;
+        if (typeof updateRevision === "function") {
+          updateRevision.call(this.store, id, this.getUiRevision(id));
+        }
         this.dirtySessions.delete(id);
+        this.revisionDirtySessions.delete(id);
         return;
       }
-      const sanitized = sanitizeUiSession(session, {
-        recoverInterruptedCommands: false,
-      });
-      if (options?.preserveLiveTransientState !== true) {
-        this.sessionsCache[id] = sanitized;
+      if (!this.dirtySessions.has(id)) {
+        const updateRevision = (this.store as any).updateUiSessionRevision;
+        if (typeof updateRevision === "function") {
+          updateRevision.call(this.store, id, this.getUiRevision(id));
+        }
+        this.revisionDirtySessions.delete(id);
+        return;
       }
-      const summary = buildUiSessionSummary(sanitized);
+      this.hydrateDirtyMessagesForPersistence(id, entry);
+      const sanitized = sanitizeUiSession(entry.session, {
+        recoverInterruptedCommands: false,
+        normalizeCompactionBoundaries: entry.startPosition === 0,
+      });
+      const persistedTotalCount = entry.startPosition + sanitized.messages.length;
+      const summary: UISessionSummary = {
+        ...buildUiSessionSummary(sanitized),
+        messagesCount: persistedTotalCount,
+      };
       this.sessionSummaryCache[id] = summary;
-      entries.push({ session: sanitized, summary });
+
+      let persisted = false;
+      const incrementalStore = (this.store as any).upsertUiMessagesIncremental;
+      if (
+        !entry.requiresFullRewrite &&
+        typeof incrementalStore === "function"
+      ) {
+        persisted = incrementalStore.call(
+          this.store,
+          sanitized,
+          summary,
+          entry.startPosition,
+          entry.dirtyMessageIds,
+        ) === true;
+      }
+
+      if (!persisted) {
+        let rewriteSession = sanitized;
+        let rewriteStartPosition = entry.startPosition;
+        if (entry.requiresFullRewrite && entry.startPosition > 0) {
+          const durable = this.store.loadUiSession(id);
+          if (durable) {
+            const durableById = new Map(
+              durable.messages.map((message) => [message.id, message] as const),
+            );
+            rewriteSession = {
+              ...durable,
+              messages: [
+                ...durable.messages.slice(0, entry.startPosition),
+                ...sanitized.messages.map((message) =>
+                  this.mergeProjectedMessageWithDurable(
+                    message,
+                    durableById.get(message.id),
+                  ),
+                ),
+              ],
+            };
+            rewriteStartPosition = 0;
+          }
+        }
+        if (typeof (this.store as any).saveUiSessionWindow === "function") {
+          this.store.saveUiSessionWindow(
+            rewriteSession,
+            summary,
+            rewriteStartPosition,
+          );
+        } else {
+          this.store.saveUiSessions([{ session: rewriteSession, summary }]);
+        }
+      }
+
+      entry.dirtyMessageIds.clear();
+      entry.requiresFullRewrite = false;
+      entry.totalCount = persistedTotalCount;
+      if (options?.preserveLiveTransientState === true) {
+        entry.session = {
+          ...entry.session,
+          messages: entry.session.messages.map((message) =>
+            message.type === "ask" || message.streaming === true
+              ? message
+              : projectUiMessageForList(message),
+          ),
+        };
+      } else {
+        entry.session = sanitized;
+        this.trimCachedSession(id);
+      }
+      this.dirtySessions.delete(id);
+      this.revisionDirtySessions.delete(id);
     });
-    if (entries.length > 0) {
-      this.store.saveUiSessions(entries);
+  }
+
+  private hydrateDirtyMessagesForPersistence(
+    sessionId: string,
+    entry: CachedUiSession,
+  ): void {
+    if (entry.dirtyMessageIds.size === 0) return;
+    const loadFullMessages = (this.store as any).loadUiMessagesByIds;
+    if (typeof loadFullMessages !== "function") return;
+    const fullMessages = loadFullMessages.call(
+      this.store,
+      sessionId,
+      [...entry.dirtyMessageIds],
+    ) as ChatMessage[];
+    if (fullMessages.length === 0) return;
+    const fullById = new Map(fullMessages.map((message) => [message.id, message]));
+    entry.session.messages = entry.session.messages.map((message) => {
+      const durable = fullById.get(message.id);
+      return durable && message.deferredPayload?.fields.length
+        ? this.mergeProjectedMessageWithDurable(message, durable)
+        : message;
+    });
+  }
+
+  private mergeProjectedMessageWithDurable(
+    projected: ChatMessage,
+    durable: ChatMessage | undefined,
+  ): ChatMessage {
+    if (!durable || !projected.deferredPayload?.fields.length) {
+      return projected;
     }
-    sessionIds.forEach((id) => this.dirtySessions.delete(id));
+    const deferredFields = new Set(projected.deferredPayload.fields);
+    const metadata = {
+      ...(durable.metadata || {}),
+      ...(projected.metadata || {}),
+    };
+    for (const field of deferredFields) {
+      const durableValue = durable.metadata?.[field as keyof NonNullable<ChatMessage["metadata"]>];
+      if (field === "content") continue;
+      if (durableValue === undefined) {
+        delete metadata[field as keyof typeof metadata];
+      } else {
+        metadata[field as keyof typeof metadata] = durableValue as never;
+      }
+    }
+    return {
+      ...projected,
+      content: deferredFields.has("content") ? durable.content : projected.content,
+      metadata: Object.keys(metadata).length > 0 ? metadata : undefined,
+      deferredPayload: undefined,
+    };
+  }
+
+  private projectUiUpdateForTransport(action: UIUpdateAction): UIUpdateAction {
+    if (action.type === "ADD_MESSAGE" || action.type === "INSERT_MESSAGE") {
+      return {
+        ...action,
+        message: projectUiMessageForList(action.message),
+      };
+    }
+    if (action.type !== "UPDATE_MESSAGE") return action;
+    const patchMessage: ChatMessage = {
+      id: action.messageId,
+      role: action.patch.role || "assistant",
+      type: action.patch.type || "text",
+      content: action.patch.content || "",
+      metadata: action.patch.metadata,
+      timestamp: action.patch.timestamp || Date.now(),
+      streaming: action.patch.streaming,
+    };
+    const projected = projectUiMessageForList(patchMessage);
+    return {
+      ...action,
+      patch: {
+        ...action.patch,
+        ...(action.patch.content !== undefined
+          ? { content: projected.content }
+          : {}),
+        ...(action.patch.metadata !== undefined
+          ? { metadata: projected.metadata }
+          : {}),
+        ...(projected.deferredPayload
+          ? { deferredPayload: projected.deferredPayload }
+          : {}),
+      },
+    };
   }
 
   private processEvent(
@@ -771,12 +1229,172 @@ export class UIHistoryService {
     }
   }
 
+  getMessagePage(
+    sessionId: string,
+    request?: UiMessagePageRequest,
+  ): UiMessagePage | null {
+    // Initialize the bounded live tail before reading a page. This applies the
+    // same interrupted-command recovery that the legacy full-session path used,
+    // while later live events can still replace recovered rows in the cache.
+    this.getOrLoadSession(sessionId);
+    this.flush(sessionId, { preserveLiveTransientState: true });
+    const page = this.store.loadUiMessagePage(sessionId, request);
+    if (!page) return null;
+
+    const entry = this.getCachedSessionEntry(sessionId);
+    const cachedById = new Map(
+      (entry?.session.messages || []).map(
+        (message) => [message.id, message] as const,
+      ),
+    );
+    const recoveredPage = sanitizeUiSession(
+      {
+        id: sessionId,
+        title: "",
+        updatedAt: 0,
+        messages: page.entries.map((item) => item.message),
+      },
+      {
+        recoverInterruptedCommands: true,
+        normalizeCompactionBoundaries: false,
+      },
+    );
+    const recoveredById = new Map(
+      recoveredPage.messages.map((message) => [message.id, message] as const),
+    );
+    const durableEntries = page.entries.map((item) => ({
+      ...item,
+      message: projectUiMessageForList(
+        cachedById.get(item.message.id) ||
+          recoveredById.get(item.message.id) ||
+          item.message,
+      ),
+    }));
+    const transientMessages = (entry?.session.messages || []).filter(
+      (message) => message.type === "ask",
+    );
+    const isTailRequest =
+      request?.beforePosition === undefined &&
+      request?.aroundPosition === undefined &&
+      (request?.afterPosition === undefined || page.hasNewer === false);
+    if (!isTailRequest || transientMessages.length === 0) {
+      return {
+        ...page,
+        entries: durableEntries,
+        uiRevision: this.getUiRevision(sessionId),
+      };
+    }
+
+    const durableCount = page.totalCount;
+    const entries = [
+      ...durableEntries,
+      ...transientMessages.map((message, index) => ({
+        position: durableCount + index,
+        message: projectUiMessageForList(message),
+      })),
+    ];
+    return {
+      ...page,
+      entries,
+      totalCount: durableCount + transientMessages.length,
+      startPosition: entries[0]?.position ?? null,
+      endPosition: entries[entries.length - 1]?.position ?? null,
+      hasNewer: false,
+      uiRevision: this.getUiRevision(sessionId),
+    };
+  }
+
+  getFullMessagesByIds(
+    sessionId: string,
+    messageIds: string[],
+  ): UiFullMessagesResult {
+    this.flush(sessionId, { preserveLiveTransientState: true });
+    const ids = new Set(messageIds.filter(Boolean));
+    const durable = this.store.loadUiMessagesByIds(sessionId, [...ids]);
+    const durableById = new Map(
+      durable.map((message) => [message.id, message] as const),
+    );
+    const cached = this.getCachedSessionEntry(sessionId);
+    cached?.session.messages.forEach((message) => {
+      if (
+        ids.has(message.id) &&
+        (message.type === "ask" || message.streaming === true)
+      ) {
+        durableById.set(message.id, message);
+      }
+    });
+    return {
+      sessionId,
+      messages: [...durableById.values()],
+      uiRevision: this.getUiRevision(sessionId),
+    };
+  }
+
+  searchMessages(
+    sessionId: string,
+    query: string,
+    limit?: number,
+  ): UiMessageSearchResult {
+    this.flush(sessionId, { preserveLiveTransientState: true });
+    return {
+      ...this.store.searchUiMessages(sessionId, query, limit),
+      uiRevision: this.getUiRevision(sessionId),
+    };
+  }
+
   getMessages(sessionId: string): ChatMessage[] {
-    return this.getOrLoadSession(sessionId)?.messages || [];
+    return this.getSession(sessionId)?.messages || [];
   }
 
   getSession(sessionId: string): UIChatSession | null {
-    return this.getOrLoadSession(sessionId);
+    const cached = this.getCachedSessionEntry(sessionId);
+    if (!cached) {
+      const loaded = this.store.loadUiSession(sessionId);
+      return loaded ? sanitizeUiSession(loaded) : null;
+    }
+
+    cached.lastAccessedAt = Date.now();
+    const loaded = this.store.loadUiSession(sessionId);
+    if (!loaded) return cached.session;
+
+    const durableById = new Map(
+      loaded.messages.map((message) => [message.id, message] as const),
+    );
+    if (cached.requiresFullRewrite) {
+      return {
+        ...loaded,
+        messages: [
+          ...loaded.messages.slice(0, cached.startPosition),
+          ...cached.session.messages.map((message) =>
+            this.mergeProjectedMessageWithDurable(
+              message,
+              durableById.get(message.id),
+            ),
+          ),
+        ],
+      };
+    }
+
+    const cachedById = new Map(
+      cached.session.messages.map((message) => [message.id, message] as const),
+    );
+    const dirtyIds = cached.dirtyMessageIds;
+    const mergedMessages = loaded.messages.map((message) =>
+      dirtyIds.has(message.id)
+        ? this.mergeProjectedMessageWithDurable(
+            cachedById.get(message.id) || message,
+            message,
+          )
+        : message,
+    );
+    const loadedIds = new Set(loaded.messages.map((message) => message.id));
+    cached.session.messages.forEach((message) => {
+      if (!loadedIds.has(message.id)) mergedMessages.push(message);
+    });
+    return {
+      ...loaded,
+      messages: mergedMessages,
+    };
   }
 
   getAllSessions(): UIChatSession[] {
@@ -798,37 +1416,62 @@ export class UIHistoryService {
     const normalizedId = String(feedbackId || "").trim();
     if (!normalizedId) return null;
 
-    for (const summary of this.getAllSessionSummaries()) {
-      const session = this.getOrLoadSession(summary.id);
-      if (!session) continue;
-      const message = [...session.messages].reverse().find((entry) => {
-        if (entry.type !== "ask") return false;
+    for (const [sessionId, entry] of Object.entries(this.sessionsCache)) {
+      const message = [...entry.session.messages].reverse().find((candidate) => {
+        if (candidate.type !== "ask") return false;
         return (
-          entry.backendMessageId === normalizedId ||
-          entry.metadata?.approvalId === normalizedId
+          candidate.backendMessageId === normalizedId ||
+          candidate.metadata?.approvalId === normalizedId
         );
       });
       if (!message) continue;
       if (message.metadata?.decision === decision) return null;
-
-      message.metadata = {
-        ...(message.metadata || {}),
-        decision,
-      };
-      session.updatedAt = Date.now();
-      this.syncSessionSummary(session.id);
-      this.dirtySessions.add(session.id);
-      this.flush(session.id);
+      message.metadata = { ...(message.metadata || {}), decision };
+      entry.session.updatedAt = Date.now();
+      this.syncSessionSummary(sessionId);
+      this.dirtySessions.add(sessionId);
+      this.flush(sessionId);
       return {
         type: "UPDATE_MESSAGE",
-        sessionId: session.id,
+        sessionId,
         messageId: message.id,
-        patch: {
-          metadata: { ...message.metadata },
-        },
+        patch: { metadata: { ...message.metadata } },
       };
     }
-    return null;
+
+    const findStoredFeedback = (this.store as any).findUiMessageByFeedbackId;
+    if (typeof findStoredFeedback !== "function") return null;
+    const stored = findStoredFeedback.call(this.store, normalizedId) as
+      | { sessionId: string; message: ChatMessage }
+      | null;
+    if (!stored || stored.message.metadata?.decision === decision) return null;
+    stored.message.metadata = {
+      ...(stored.message.metadata || {}),
+      decision,
+    };
+    const updatedAt = Date.now();
+    const updateStoredMessage = (this.store as any).updateUiMessage;
+    if (
+      typeof updateStoredMessage !== "function" ||
+      !updateStoredMessage.call(
+        this.store,
+        stored.sessionId,
+        stored.message,
+        updatedAt,
+      )
+    ) {
+      return null;
+    }
+    const summary = this.sessionSummaryCache[stored.sessionId];
+    if (summary) {
+      this.sessionSummaryCache[stored.sessionId] = { ...summary, updatedAt };
+    }
+    return {
+      type: "UPDATE_MESSAGE",
+      sessionId: stored.sessionId,
+      messageId: stored.message.id,
+      patch: { metadata: { ...stored.message.metadata } },
+    };
   }
 
   deleteSession(sessionId: string): void {
@@ -845,7 +1488,9 @@ export class UIHistoryService {
     ids.forEach((id) => {
       delete this.sessionsCache[id];
       delete this.sessionSummaryCache[id];
+      this.sessionUiRevisionById.delete(id);
       this.dirtySessions.delete(id);
+      this.revisionDirtySessions.delete(id);
     });
     this.store.deleteUiSessions(ids);
   }
@@ -870,7 +1515,14 @@ export class UIHistoryService {
         messages: [],
         updatedAt,
       };
-      this.sessionsCache[sessionId] = createdSession;
+      this.sessionsCache[sessionId] = {
+        session: createdSession,
+        startPosition: 0,
+        totalCount: 0,
+        lastAccessedAt: updatedAt,
+        dirtyMessageIds: new Set(),
+        requiresFullRewrite: false,
+      };
       this.syncSessionSummary(sessionId);
       this.dirtySessions.add(sessionId);
       this.flush(sessionId);
@@ -885,29 +1537,32 @@ export class UIHistoryService {
   }
 
   rollbackToMessage(sessionId: string, backendMessageId: string): number {
-    const session = this.getOrLoadSession(sessionId);
-    if (!session) return 0;
-
-    const index = session.messages.findIndex(
-      (message) => message.backendMessageId === backendMessageId,
+    const result = this.store.truncateUiSessionBeforeBackendMessage(
+      sessionId,
+      backendMessageId,
+      Date.now(),
     );
-    if (index === -1) return 0;
+    if (!result) return 0;
 
-    const removedCount = session.messages.length - index;
-    session.messages = normalizeCompactionBoundaryMarkers(
-      session.messages.slice(0, index),
-    );
-    this.syncSessionSummary(sessionId);
-    this.dirtySessions.add(sessionId);
-    this.flush(sessionId);
-    return removedCount;
+    delete this.sessionsCache[sessionId];
+    this.dirtySessions.delete(sessionId);
+    const storedSummary = this.store.getUiSessionSummary(sessionId);
+    if (storedSummary) {
+      this.sessionSummaryCache[sessionId] = {
+        ...storedSummary,
+        lastMessagePreview: extractCommandOutputDisplayText(
+          storedSummary.lastMessagePreview || "",
+        ),
+      };
+    }
+    return result.removedCount;
   }
 
   validateBranchFromMessage(
     sourceSessionId: string,
     backendMessageId: string,
   ): { ok: boolean; reason?: string } {
-    const source = this.getOrLoadSession(sourceSessionId);
+    const source = this.getSession(sourceSessionId);
     if (!source) {
       return { ok: false, reason: "Source UI session not found." };
     }
@@ -958,7 +1613,7 @@ export class UIHistoryService {
     );
     if (!validation.ok) return validation;
 
-    const source = this.getOrLoadSession(sourceSessionId)!;
+    const source = this.getSession(sourceSessionId)!;
     const index = source.messages.findIndex(
       (message) => message.backendMessageId === backendMessageId,
     );
@@ -976,7 +1631,14 @@ export class UIHistoryService {
         })),
       ),
     };
-    this.sessionsCache[branchSessionId] = branch;
+    this.sessionsCache[branchSessionId] = {
+      session: branch,
+      startPosition: 0,
+      totalCount: branch.messages.length,
+      lastAccessedAt: updatedAt,
+      dirtyMessageIds: new Set(branch.messages.map((message) => message.id)),
+      requiresFullRewrite: true,
+    };
     this.syncSessionSummary(branchSessionId);
     this.dirtySessions.add(branchSessionId);
     this.flush(branchSessionId);
@@ -1032,15 +1694,7 @@ export class UIHistoryService {
     sessionId: string,
     messageIds: string[],
   ): string {
-    const session = this.getOrLoadSession(sessionId);
-    if (!session) return "";
-    const ids = new Set(
-      (messageIds || []).filter(
-        (id) => typeof id === "string" && id.length > 0,
-      ),
-    );
-    if (ids.size === 0) return "";
-    const selected = session.messages.filter((message) => ids.has(message.id));
+    const selected = this.store.loadUiMessagesByIds(sessionId, messageIds);
     return this.toReadableMarkdownFragment(selected);
   }
 

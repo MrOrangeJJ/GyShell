@@ -55,6 +55,7 @@ export interface RendererWindowContext {
   detachedStateToken: string | null
   sourceClientId: string | null
   clientId: string
+  safeMode: boolean
 }
 
 export interface DetachedWindowState {
@@ -196,7 +197,8 @@ const readWindowContext = (): RendererWindowContext => {
     role,
     detachedStateToken: detachedStateToken && detachedStateToken.trim().length > 0 ? detachedStateToken : null,
     sourceClientId: sourceClientId && sourceClientId.trim().length > 0 ? sourceClientId : null,
-    clientId: ensureClientId()
+    clientId: ensureClientId(),
+    safeMode: params.get('safeMode') === '1'
   }
 }
 

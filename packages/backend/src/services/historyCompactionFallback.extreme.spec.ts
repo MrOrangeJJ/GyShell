@@ -773,7 +773,16 @@ await runCase(
       const result = await runFallbackCompaction(agent, messages);
 
       assert.equal(result.changed, true);
-      assert.equal(result.messages.length, messages.length + 1);
+      assert.ok(
+        result.messages.length < messages.length + 1,
+        "the graph-facing result should be reduced to the bounded runtime window",
+      );
+      const durable = agent.exportChatSession("session-1");
+      assert.equal(
+        durable?.messages.length,
+        messages.length + 1,
+        "the authoritative transcript should retain all history plus the inserted summary",
+      );
       const summary = result.messages.find((message) =>
         TokenManager.hasLastCompactionFlag(message),
       ) as any;
@@ -811,15 +820,32 @@ await runCase(
         messages,
         undefined,
       ).plan.cutIndex;
-      assert.equal(
-        result.messages[insertionIndex + 1],
-        messages[insertionIndex],
-        "first protected backend message should remain exact after the summary",
+      const durableIds =
+        durable?.messages.map((message: any) => message.id) || [];
+      const originalIds = messages.map((message) =>
+        String(message.additional_kwargs?._gyshellMessageId || ""),
+      );
+      assert.deepEqual(
+        durableIds.slice(0, insertionIndex),
+        originalIds.slice(0, insertionIndex),
+        "the durable prefix should remain in order",
+      );
+      assert.notEqual(
+        durableIds[insertionIndex],
+        originalIds[insertionIndex],
+        "the durable cut should contain a newly inserted summary marker",
       );
       assert.equal(
-        result.messages[result.messages.length - 1],
-        messages[messages.length - 1],
-        "last protected backend message should remain exact",
+        durableIds[insertionIndex + 1],
+        originalIds[insertionIndex],
+        "the first protected backend message should remain exact after the durable summary",
+      );
+      assert.equal(
+        durableIds[durableIds.length - 1],
+        String(
+          messages[messages.length - 1].additional_kwargs?._gyshellMessageId || "",
+        ),
+        "the last protected backend message should remain exact in the raw transcript",
       );
 
       const view = buildDynamicRequestHistory(result.messages);

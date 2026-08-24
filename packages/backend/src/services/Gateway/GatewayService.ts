@@ -8,6 +8,7 @@ import type {
   IClientTransport,
   StartTaskOptions,
   StartTaskInput,
+  GatewaySessionMetadata,
   GatewaySessionSnapshot,
   GatewaySessionSummary,
 } from "./types";
@@ -68,6 +69,7 @@ export class GatewayService extends EventEmitter implements IGatewayRuntime {
   private registeredRendererSessionOwners: Map<string, Set<string>> = new Map();
   private deletedSessionIds: Set<string> = new Set();
   private uiRevision = 0;
+  private sessionUiRevisionById: Map<string, number> = new Map();
   private lastRunStateKey = "";
 
   constructor(
@@ -79,6 +81,18 @@ export class GatewayService extends EventEmitter implements IGatewayRuntime {
     private mcpToolService: IMcpRuntime,
   ) {
     super();
+
+    const getMaxUiRevision = (this.uiHistoryService as any).getMaxUiRevision;
+    this.uiRevision =
+      typeof getMaxUiRevision === "function"
+        ? getMaxUiRevision.call(this.uiHistoryService)
+        : 0;
+    this.uiHistoryService.getAllSessionSummaries().forEach((summary) => {
+      this.sessionUiRevisionById.set(
+        summary.id,
+        Math.max(0, Math.floor(summary.uiRevision || 0)),
+      );
+    });
 
     this.terminalService.setRawEventPublisher((channel, data) =>
       this.broadcastRaw(channel, data),
@@ -205,9 +219,15 @@ export class GatewayService extends EventEmitter implements IGatewayRuntime {
 
   private sendUIUpdate(action: UIUpdateAction): void {
     this.uiRevision += 1;
+    const uiRevision = this.uiRevision;
+    this.sessionUiRevisionById.set(action.sessionId, uiRevision);
+    const noteUiRevision = (this.uiHistoryService as any).noteUiRevision;
+    if (typeof noteUiRevision === "function") {
+      noteUiRevision.call(this.uiHistoryService, action.sessionId, uiRevision);
+    }
     this.transportHub.sendUIUpdate({
       ...action,
-      uiRevision: this.uiRevision,
+      uiRevision,
     } satisfies UIUpdateAction);
   }
 
@@ -440,7 +460,6 @@ export class GatewayService extends EventEmitter implements IGatewayRuntime {
   }
 
   listSessionSummaries(): GatewaySessionSummary[] {
-    const uiRevision = this.uiRevision;
     const uiSummaryById = new Map(
       this.uiHistoryService
         .getAllSessionSummaries()
@@ -487,31 +506,52 @@ export class GatewayService extends EventEmitter implements IGatewayRuntime {
           ),
           isBusy,
           lockedProfileId,
-          uiRevision,
+          uiRevision: Math.max(
+            this.sessionUiRevisionById.get(sessionId) || 0,
+            uiSummary?.uiRevision || 0,
+          ),
         };
       })
       .sort((left, right) => right.updatedAt - left.updatedAt);
   }
 
+  getSessionMetadata(sessionId: string): GatewaySessionMetadata | null {
+    const summary = this.listSessionSummaries().find(
+      (candidate) => candidate.id === sessionId,
+    );
+    if (!summary) return null;
+    return {
+      id: summary.id,
+      title: summary.title,
+      updatedAt: summary.updatedAt,
+      messagesCount: summary.messagesCount,
+      isBusy: summary.isBusy,
+      lockedProfileId: summary.lockedProfileId,
+      uiRevision: summary.uiRevision,
+    };
+  }
+
   getSessionSnapshot(sessionId: string): GatewaySessionSnapshot | null {
     const session = this.uiHistoryService.getSession(sessionId);
-    const storedSession = this.agentService.exportChatSession(sessionId);
+    const storedSummary = this.agentService
+      .listStoredChatSessionSummaries()
+      .find((candidate) => candidate.id === sessionId);
     const context = this.sessions.get(sessionId);
-    if (!session && !storedSession && !context) return null;
+    if (!session && !storedSummary && !context) return null;
 
-    const resolvedSessionId = session?.id || storedSession?.id || sessionId;
+    const resolvedSessionId = session?.id || storedSummary?.id || sessionId;
     const isBusy = context ? context.status !== "idle" : false;
     const lockedProfileId = isBusy ? context?.lockedProfileId || null : null;
     return {
       id: resolvedSessionId,
       title: this.resolveSessionTitle(
         session?.title,
-        storedSession?.title,
+        storedSummary?.title,
         context,
       ),
       updatedAt: this.resolveSessionUpdatedAt(
         session?.updatedAt,
-        storedSession?.updatedAt,
+        storedSummary?.updatedAt,
         context,
       ),
       messages: (session?.messages || []).map((message) => ({
@@ -520,7 +560,12 @@ export class GatewayService extends EventEmitter implements IGatewayRuntime {
       })),
       isBusy,
       lockedProfileId,
-      uiRevision: this.uiRevision,
+      uiRevision: Math.max(
+        this.sessionUiRevisionById.get(sessionId) || 0,
+        typeof (this.uiHistoryService as any).getUiRevision === "function"
+          ? (this.uiHistoryService as any).getUiRevision(sessionId)
+          : 0,
+      ),
     };
   }
 
@@ -552,6 +597,7 @@ export class GatewayService extends EventEmitter implements IGatewayRuntime {
     }
     this.sessions.delete(sessionId);
     this.registeredRendererSessionOwners.delete(sessionId);
+    this.sessionUiRevisionById.delete(sessionId);
     this.cleanupSessionAgentRuns(sessionId);
   }
 
@@ -576,6 +622,7 @@ export class GatewayService extends EventEmitter implements IGatewayRuntime {
     ids.forEach((id) => {
       this.sessions.delete(id);
       this.registeredRendererSessionOwners.delete(id);
+      this.sessionUiRevisionById.delete(id);
       this.cleanupSessionAgentRuns(id);
     });
   }
@@ -588,7 +635,10 @@ export class GatewayService extends EventEmitter implements IGatewayRuntime {
     if (
       !normalizedSessionId ||
       this.deletedSessionIds.has(normalizedSessionId) ||
-      (!isRegistered && !this.getSessionSnapshot(normalizedSessionId))
+      (!isRegistered &&
+        !this.listSessionSummaries().some(
+          (summary) => summary.id === normalizedSessionId,
+        ))
     ) {
       throw new Error(`Session not found: ${normalizedSessionId || sessionId}`);
     }

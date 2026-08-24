@@ -2472,17 +2472,6 @@ export class AppStore {
 
   async bootstrap(): Promise<void> {
     if (this.isBootstrapped) return;
-    const deferredUiUpdates: any[] = [];
-    let deferUiUpdates = false;
-    const flushDeferredUiUpdates = () => {
-      if (!deferUiUpdates) return;
-      deferUiUpdates = false;
-      if (deferredUiUpdates.length === 0) return;
-      const pending = deferredUiUpdates.splice(0, deferredUiUpdates.length);
-      pending.forEach((action) => {
-        this.chat.handleUiUpdate(action);
-      });
-    };
     try {
       window.gyshell.historyMigration.onStateChanged((state) => {
         runInAction(() => {
@@ -2591,8 +2580,6 @@ export class AppStore {
       const xtermTheme = toXtermTheme(theme.terminal, {
         transparentBackground: true,
       });
-      deferUiUpdates = persistedChatInventoryState.tabIds.length > 0;
-
       const persistedMonitorSources = Array.isArray(
         uiSettings.monitorEnabledSources,
       )
@@ -2623,10 +2610,6 @@ export class AppStore {
       // Register before awaiting hydration to avoid dropping updates emitted during startup.
       window.gyshell.agent.onUiUpdate((action) => {
         runInAction(() => {
-          if (deferUiUpdates) {
-            deferredUiUpdates.push(action);
-            return;
-          }
           this.chat.handleUiUpdate(action);
         });
       });
@@ -2637,10 +2620,6 @@ export class AppStore {
           persistedChatInventoryState.preferredActiveTabId,
         );
       }
-      runInAction(() => {
-        flushDeferredUiUpdates();
-      });
-
       // Terminal exit should not auto-close tabs. UI tab lifecycle is user-driven.
       window.gyshell.terminal.onExit(() => {
         // No-op: runtime state is synchronized through terminal:tabs updates.
@@ -2763,7 +2742,6 @@ export class AppStore {
       void this.checkVersion({ showPopupOnVersionChange: true });
     } catch (err) {
       runInAction(() => {
-        flushDeferredUiUpdates();
         if (
           this.historyMigrationState &&
           (this.historyMigrationState.blocking ||

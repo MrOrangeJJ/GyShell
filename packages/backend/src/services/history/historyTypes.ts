@@ -26,12 +26,62 @@ export interface ChatSessionSummaryRecord {
   lastProfileMaxTokens?: number;
 }
 
+export interface StoredChatSessionHeader extends ChatSessionSummaryRecord {
+  runtimeStartPosition?: number;
+  runtimeMarkerMessageId?: string;
+}
+
+export interface PositionedUiMessage {
+  position: number;
+  message: ChatMessage;
+}
+
+export interface UiMessagePage {
+  sessionId: string;
+  entries: PositionedUiMessage[];
+  totalCount: number;
+  startPosition: number | null;
+  endPosition: number | null;
+  hasOlder: boolean;
+  hasNewer: boolean;
+  uiRevision: number;
+}
+
+export interface UiMessagePageRequest {
+  limit?: number;
+  beforePosition?: number;
+  afterPosition?: number;
+  aroundPosition?: number;
+}
+
+export interface UiMessageSearchMatch {
+  messageId: string;
+  position: number;
+  preview: string;
+}
+
+export interface UiMessageSearchResult {
+  sessionId: string;
+  query: string;
+  matches: UiMessageSearchMatch[];
+  totalMatches: number;
+  truncated: boolean;
+  uiRevision: number;
+}
+
+export interface UiFullMessagesResult {
+  sessionId: string;
+  messages: ChatMessage[];
+  uiRevision: number;
+}
+
 export interface UISessionSummaryRecord {
   id: string;
   title: string;
   updatedAt: number;
   messagesCount: number;
   lastMessagePreview: string;
+  uiRevision: number;
 }
 
 export interface UISessionRecord extends UIChatSession {

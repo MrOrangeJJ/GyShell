@@ -19,7 +19,7 @@ import { extractCommandOutputDisplayText } from '@gyshell/shared'
 import {
   buildSeamlessStepPresentation,
   getCommandOutputUiPresentation,
-  getSeamlessGroupTone,
+  getSeamlessStepTone,
   isSeamlessGroupRunning,
   sliceFromStartAtUnicodeBoundary,
   type SeamlessStepDetail,
@@ -811,6 +811,8 @@ const SeamlessStepRow = ({
   expandedDetailIds,
   onToggleStep,
   onToggleDetail,
+  style,
+  onHeightChange,
 }: {
   message: ChatMessage
   presentation: SeamlessStepPresentation
@@ -819,14 +821,28 @@ const SeamlessStepRow = ({
   expandedDetailIds: ReadonlySet<string>
   onToggleStep: () => void
   onToggleDetail: (detailId: string) => void
+  style?: React.CSSProperties
+  onHeightChange?: (height: number) => void
 }) => {
+  const rowRef = React.useRef<HTMLDivElement | null>(null)
   const hasDetails = presentation.details.length > 0
   const detailsId = React.useId()
   const state = getSeamlessStepState(message, presentation)
   const stepInfo = [presentation.meta, state].filter(Boolean).join(' · ')
 
+  React.useLayoutEffect(() => {
+    const element = rowRef.current
+    if (!element || !onHeightChange) return
+    const report = () => onHeightChange(Math.ceil(element.getBoundingClientRect().height))
+    report()
+    if (typeof ResizeObserver === 'undefined') return
+    const observer = new ResizeObserver(report)
+    observer.observe(element)
+    return () => observer.disconnect()
+  }, [message.id, onHeightChange])
+
   return (
-    <div className="stg-step">
+    <div ref={rowRef} className="stg-step" style={style}>
       <button
         type="button"
         className="stg-step-toggle"
@@ -865,6 +881,183 @@ const SeamlessStepRow = ({
   )
 }
 
+const SEAMLESS_VIRTUAL_STEP_THRESHOLD = 240
+const SEAMLESS_VIRTUAL_STEP_HEIGHT = 20
+const SEAMLESS_VIRTUAL_OVERSCAN_PX = 500
+
+interface SeamlessStepListProps {
+  messages: ChatMessage[]
+  expandedStepIds: ReadonlySet<string>
+  expandedDetailIds: ReadonlySet<string>
+  onToggleStep: (message: ChatMessage, expanded: boolean) => void
+  onToggleDetail: (detailId: string) => void
+  onRequestFullMessages?: (messageIds: string[]) => Promise<unknown>
+}
+
+const SeamlessVirtualStepList = ({
+  messages,
+  expandedStepIds,
+  expandedDetailIds,
+  onToggleStep,
+  onToggleDetail,
+  onRequestFullMessages,
+}: SeamlessStepListProps) => {
+  const containerRef = React.useRef<HTMLDivElement | null>(null)
+  const measuredHeightsRef = React.useRef(new Map<string, number>())
+  const frameRef = React.useRef<number | null>(null)
+  const [layoutVersion, setLayoutVersion] = React.useState(0)
+  const [viewport, setViewport] = React.useState({ top: 0, bottom: 800 })
+
+  const layout = React.useMemo(() => {
+    const offsets: number[] = []
+    const heights: number[] = []
+    let totalHeight = 0
+    messages.forEach((message) => {
+      offsets.push(totalHeight)
+      const height =
+        measuredHeightsRef.current.get(message.id) ?? SEAMLESS_VIRTUAL_STEP_HEIGHT
+      heights.push(height)
+      totalHeight += height
+    })
+    return { offsets, heights, totalHeight }
+  }, [layoutVersion, messages])
+
+  const syncViewport = React.useCallback(() => {
+    const container = containerRef.current
+    if (!container) return
+    const scrollParent = container.closest('.panel-body')
+    const containerRect = container.getBoundingClientRect()
+    const viewportRect = scrollParent?.getBoundingClientRect() ?? {
+      top: 0,
+      bottom: window.innerHeight,
+    }
+    const nextTop = Math.max(0, viewportRect.top - containerRect.top)
+    const nextBottom = Math.max(
+      nextTop,
+      Math.min(containerRect.height, viewportRect.bottom - containerRect.top),
+    )
+    setViewport((current) =>
+      Math.abs(current.top - nextTop) < 1 &&
+      Math.abs(current.bottom - nextBottom) < 1
+        ? current
+        : { top: nextTop, bottom: nextBottom },
+    )
+  }, [])
+
+  const scheduleViewportSync = React.useCallback(() => {
+    if (frameRef.current !== null) return
+    frameRef.current = window.requestAnimationFrame(() => {
+      frameRef.current = null
+      syncViewport()
+    })
+  }, [syncViewport])
+
+  React.useLayoutEffect(() => {
+    const container = containerRef.current
+    if (!container) return
+    const scrollParent = container.closest('.panel-body')
+    scheduleViewportSync()
+    scrollParent?.addEventListener('scroll', scheduleViewportSync, {
+      passive: true,
+    })
+    window.addEventListener('resize', scheduleViewportSync)
+    const observer =
+      typeof ResizeObserver === 'undefined'
+        ? null
+        : new ResizeObserver(scheduleViewportSync)
+    observer?.observe(container)
+    if (scrollParent) observer?.observe(scrollParent)
+    return () => {
+      scrollParent?.removeEventListener('scroll', scheduleViewportSync)
+      window.removeEventListener('resize', scheduleViewportSync)
+      observer?.disconnect()
+      if (frameRef.current !== null) {
+        window.cancelAnimationFrame(frameRef.current)
+        frameRef.current = null
+      }
+    }
+  }, [scheduleViewportSync])
+
+  const range = React.useMemo(() => {
+    const startBoundary = Math.max(0, viewport.top - SEAMLESS_VIRTUAL_OVERSCAN_PX)
+    const endBoundary = viewport.bottom + SEAMLESS_VIRTUAL_OVERSCAN_PX
+    let start = 0
+    while (
+      start < messages.length &&
+      layout.offsets[start] + layout.heights[start] <= startBoundary
+    ) {
+      start += 1
+    }
+    let end = start
+    while (end < messages.length && layout.offsets[end] < endBoundary) {
+      end += 1
+    }
+    return {
+      start: Math.min(start, Math.max(0, messages.length - 1)),
+      end: Math.max(Math.min(messages.length, end), Math.min(messages.length, start + 1)),
+    }
+  }, [layout.heights, layout.offsets, messages.length, viewport])
+
+  const visibleMessages = messages.slice(range.start, range.end)
+  const summaryCriticalIds = visibleMessages
+    .filter((message) =>
+      message.deferredPayload?.fields.some(
+        (field) => field === 'content' || field === 'diff',
+      ),
+    )
+    .map((message) => message.id)
+  const summaryCriticalKey = summaryCriticalIds.join(':')
+  React.useEffect(() => {
+    if (!summaryCriticalKey || !onRequestFullMessages) return
+    void onRequestFullMessages(summaryCriticalIds).catch((error) => {
+      console.warn('Failed to hydrate seamless step summaries:', error)
+    })
+  }, [onRequestFullMessages, summaryCriticalKey])
+
+  return (
+    <div
+      ref={containerRef}
+      style={{ position: 'relative', height: layout.totalHeight }}
+    >
+      {visibleMessages.map((message, visibleIndex) => {
+        const index = range.start + visibleIndex
+        const hasDeferredSummary = message.deferredPayload?.fields.some(
+          (field) => field === 'content' || field === 'diff',
+        )
+        if (hasDeferredSummary) return null
+        const presentation = buildSeamlessStepPresentation(message)
+        const stepExpanded = expandedStepIds.has(message.id)
+        return (
+          <SeamlessStepRow
+            key={message.id}
+            message={message}
+            presentation={presentation}
+            isLast={index === messages.length - 1}
+            expanded={stepExpanded}
+            expandedDetailIds={expandedDetailIds}
+            style={{
+              position: 'absolute',
+              top: layout.offsets[index],
+              left: 0,
+              right: 0,
+            }}
+            onHeightChange={(height) => {
+              const previous =
+                measuredHeightsRef.current.get(message.id) ??
+                SEAMLESS_VIRTUAL_STEP_HEIGHT
+              if (previous === height || height <= 0) return
+              measuredHeightsRef.current.set(message.id, height)
+              setLayoutVersion((current) => current + 1)
+            }}
+            onToggleStep={() => onToggleStep(message, stepExpanded)}
+            onToggleDetail={onToggleDetail}
+          />
+        )
+      })}
+    </div>
+  )
+}
+
 export const SeamlessToolGroupBanner = observer(
   ({
     messages,
@@ -874,6 +1067,7 @@ export const SeamlessToolGroupBanner = observer(
     onExpandedStepIdsChange,
     expandedDetailIds: expandedDetailIdsProp,
     onExpandedDetailIdsChange,
+    onRequestFullMessages,
   }: {
     messages: ChatMessage[]
     expanded?: boolean
@@ -882,6 +1076,7 @@ export const SeamlessToolGroupBanner = observer(
     onExpandedStepIdsChange?: (nextValue: string[]) => void
     expandedDetailIds?: readonly string[]
     onExpandedDetailIdsChange?: (nextValue: string[]) => void
+    onRequestFullMessages?: (messageIds: string[]) => Promise<unknown>
   }) => {
     const [expanded, setExpanded] = useControllableBoolean(
       expandedProp,
@@ -899,9 +1094,19 @@ export const SeamlessToolGroupBanner = observer(
 
     const isStreaming = isSeamlessGroupRunning(messages)
     const stepCount = messages.length
-    const presentations = messages.map(buildSeamlessStepPresentation)
-    const lastStep = presentations[presentations.length - 1]
-    const headerTone = getSeamlessGroupTone(presentations)
+    const lastMessage = messages[messages.length - 1]
+    const lastStep = lastMessage
+      ? buildSeamlessStepPresentation(lastMessage)
+      : undefined
+    const headerTone = React.useMemo(() => {
+      let tone: SeamlessStepPresentation['tone'] = 'neutral'
+      for (const message of messages) {
+        const nextTone = getSeamlessStepTone(message)
+        if (nextTone === 'error') return 'error'
+        if (nextTone === 'warning') tone = 'warning'
+      }
+      return tone
+    }, [messages])
     const headerText = lastStep?.summary || 'Working…'
     const headerInfo = stepCount > 1 ? `${stepCount} steps` : lastStep?.meta
     const headerStateText = isStreaming
@@ -911,14 +1116,53 @@ export const SeamlessToolGroupBanner = observer(
         : headerTone === 'warning'
           ? 'Warning'
           : 'Completed'
-    const canExpand =
-      stepCount > 1 || presentations.some((step) => step.details.length > 0)
+    const canExpand = stepCount > 1 || (lastStep?.details.length || 0) > 0
     const isExpanded = canExpand && expanded
     const detailsId = React.useId()
 
-    const handleGroupToggle = () => {
+    const requestFullMessage = async (message: ChatMessage): Promise<void> => {
+      if (!message.deferredPayload?.fields.length || !onRequestFullMessages) return
+      try {
+        await onRequestFullMessages([message.id])
+      } catch (error) {
+        console.warn('Failed to hydrate seamless step details:', error)
+      }
+    }
+    const handleStepToggle = async (
+      message: ChatMessage,
+      stepExpanded: boolean,
+    ): Promise<void> => {
+      if (!stepExpanded) await requestFullMessage(message)
+      if (stepExpanded) {
+        clearExpandedDetailScope(setExpandedDetailIds, message.id)
+      }
+      toggleExpandedKey(setExpandedStepIds, message.id)
+    }
+    const handleGroupToggle = async (): Promise<void> => {
       if (!canExpand) return
       const nextExpanded = !isExpanded
+      if (nextExpanded && stepCount === 1 && lastMessage) {
+        await requestFullMessage(lastMessage)
+      } else if (nextExpanded && onRequestFullMessages) {
+        const summaryMessages = (
+          stepCount <= SEAMLESS_VIRTUAL_STEP_THRESHOLD
+            ? messages
+            : messages.slice(0, 64)
+        ).filter((message) =>
+          message.deferredPayload?.fields.some(
+            (field) => field === 'content' || field === 'diff',
+          ),
+        )
+        if (summaryMessages.length > 0) {
+          try {
+            await onRequestFullMessages(
+              summaryMessages.map((message) => message.id),
+            )
+          } catch (error) {
+            console.warn('Failed to hydrate seamless step summaries:', error)
+          }
+        }
+      }
       if (!nextExpanded) {
         setExpandedStepIds(() => new Set())
         setExpandedDetailIds(() => new Set())
@@ -933,7 +1177,9 @@ export const SeamlessToolGroupBanner = observer(
         <button
           type="button"
           className="stg-header"
-          onClick={handleGroupToggle}
+          onClick={() => {
+            void handleGroupToggle()
+          }}
           aria-expanded={canExpand ? isExpanded : undefined}
           aria-controls={canExpand ? detailsId : undefined}
           aria-label={[headerStateText, headerText, headerInfo]
@@ -963,16 +1209,28 @@ export const SeamlessToolGroupBanner = observer(
             {stepCount === 1 ? (
               <SeamlessStepDetails
                 scopeId={messages[0]?.id || 'single'}
-                details={presentations[0]?.details || []}
+                details={lastStep?.details || []}
                 expandedDetailIds={expandedDetailIds}
                 onToggleDetail={(detailId) =>
                   toggleExpandedKey(setExpandedDetailIds, detailId)
                 }
               />
+            ) : messages.length > SEAMLESS_VIRTUAL_STEP_THRESHOLD ? (
+              <SeamlessVirtualStepList
+                messages={messages}
+                expandedStepIds={expandedStepIds}
+                expandedDetailIds={expandedDetailIds}
+                onToggleStep={(message, stepExpanded) => {
+                  void handleStepToggle(message, stepExpanded)
+                }}
+                onToggleDetail={(detailId) =>
+                  toggleExpandedKey(setExpandedDetailIds, detailId)
+                }
+                onRequestFullMessages={onRequestFullMessages}
+              />
             ) : (
               messages.map((message, index) => {
-                const presentation = presentations[index]
-                if (!presentation) return null
+                const presentation = buildSeamlessStepPresentation(message)
                 const stepExpanded = expandedStepIds.has(message.id)
                 return (
                   <SeamlessStepRow
@@ -983,13 +1241,7 @@ export const SeamlessToolGroupBanner = observer(
                     expanded={stepExpanded}
                     expandedDetailIds={expandedDetailIds}
                     onToggleStep={() => {
-                      if (stepExpanded) {
-                        clearExpandedDetailScope(
-                          setExpandedDetailIds,
-                          message.id,
-                        )
-                      }
-                      toggleExpandedKey(setExpandedStepIds, message.id)
+                      void handleStepToggle(message, stepExpanded)
                     }}
                     onToggleDetail={(detailId) =>
                       toggleExpandedKey(setExpandedDetailIds, detailId)

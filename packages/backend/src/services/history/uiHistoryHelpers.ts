@@ -56,6 +56,7 @@ export function sanitizeUiSession(
   options?: {
     restoreLegacyAutoTitle?: boolean;
     recoverInterruptedCommands?: boolean;
+    normalizeCompactionBoundaries?: boolean;
   },
 ): UIChatSession {
   const sanitized = cloneUiSession(session);
@@ -110,7 +111,11 @@ export function sanitizeUiSession(
       }
     }
   });
-  sanitized.messages = normalizeCompactionBoundaryMarkers(sanitized.messages);
+  if (options?.normalizeCompactionBoundaries !== false) {
+    sanitized.messages = normalizeCompactionBoundaryMarkers(
+      sanitized.messages,
+    );
+  }
   if (options?.restoreLegacyAutoTitle) {
     restoreLegacyAutoTitleIfTruncated(sanitized);
   }
@@ -230,5 +235,6 @@ export function buildUiSessionSummary(
     updatedAt: session.updatedAt,
     messagesCount: session.messages.length,
     lastMessagePreview: getLastVisiblePreview(session.messages),
+    uiRevision: Math.max(0, Math.floor(session.uiRevision || 0)),
   };
 }

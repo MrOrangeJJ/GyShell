@@ -111,6 +111,10 @@ export const ChatMessageList: React.FC<ChatMessageListProps> = observer(
     const rowHeightsRef = React.useRef<Map<string, number>>(new Map());
     const scrollFrameRef = React.useRef<number | null>(null);
     const pendingScrollAdjustmentRef = React.useRef(0);
+    const pendingPrependAnchorRef = React.useRef<{
+      scrollTop: number;
+      scrollHeight: number;
+    } | null>(null);
     const renderItemIndexByIdRef = React.useRef<Map<string, number>>(new Map());
     const lastUserTailAutoScrollMessageIdRef = React.useRef<string | null>(
       null,
@@ -312,6 +316,55 @@ export const ChatMessageList: React.FC<ChatMessageListProps> = observer(
       scheduleScrollMetricSync();
       const onScroll = () => {
         scheduleScrollMetricSync();
+        if (!sessionId || !session) return;
+
+        const nearTop = element.scrollTop <= 96;
+        if (
+          nearTop &&
+          !shouldAutoScrollRef.current &&
+          element.scrollHeight > element.clientHeight + 96 &&
+          session.hasOlderMessages === true &&
+          !session.isLoadingOlderMessages &&
+          !pendingPrependAnchorRef.current
+        ) {
+          pendingPrependAnchorRef.current = {
+            scrollTop: element.scrollTop,
+            scrollHeight: element.scrollHeight,
+          };
+          void store.chat
+            .loadOlderMessages(sessionId)
+            .then((loaded) => {
+              if (!loaded) pendingPrependAnchorRef.current = null;
+            })
+            .catch((error) => {
+              pendingPrependAnchorRef.current = null;
+              console.warn("Failed to load older chat messages:", error);
+            });
+          return;
+        }
+
+        const nearBottom =
+          element.scrollHeight - element.scrollTop - element.clientHeight <= 96;
+        if (
+          nearBottom &&
+          session.hasNewerMessages === true &&
+          !session.isLoadingNewerMessages
+        ) {
+          void store.chat.loadNewerMessages(sessionId).then((loaded) => {
+            if (!loaded || !shouldAutoScrollRef.current) return;
+            requestAnimationFrame(() => {
+              const current = scrollRef.current;
+              if (!current) return;
+              current.scrollTop = Math.max(
+                0,
+                current.scrollHeight - current.clientHeight,
+              );
+              scheduleScrollMetricSync();
+            });
+          }).catch((error) => {
+            console.warn("Failed to load newer chat messages:", error);
+          });
+        }
       };
 
       element.addEventListener("scroll", onScroll, { passive: true });
@@ -345,7 +398,7 @@ export const ChatMessageList: React.FC<ChatMessageListProps> = observer(
           scrollFrameRef.current = null;
         }
       };
-    }, [scheduleScrollMetricSync]);
+    }, [scheduleScrollMetricSync, session, sessionId, store.chat]);
 
     const virtualLayout = React.useMemo(
       () => buildChatVirtualLayout(renderItems, rowHeightsRef.current),
@@ -367,22 +420,32 @@ export const ChatMessageList: React.FC<ChatMessageListProps> = observer(
 
     React.useLayoutEffect(() => {
       const pendingScrollAdjustment = pendingScrollAdjustmentRef.current;
-      if (pendingScrollAdjustment === 0) {
-        return;
-      }
-
       const element = scrollRef.current;
-      pendingScrollAdjustmentRef.current = 0;
-      if (!element) {
-        return;
+      if (pendingScrollAdjustment !== 0 && element) {
+        pendingScrollAdjustmentRef.current = 0;
+        element.scrollTop = Math.max(
+          0,
+          element.scrollTop + pendingScrollAdjustment,
+        );
+        scheduleScrollMetricSync();
       }
 
-      element.scrollTop = Math.max(
-        0,
-        element.scrollTop + pendingScrollAdjustment,
-      );
-      scheduleScrollMetricSync();
-    }, [heightVersion, scheduleScrollMetricSync, sessionId]);
+      const prependAnchor = pendingPrependAnchorRef.current;
+      if (prependAnchor && element) {
+        const heightDelta = element.scrollHeight - prependAnchor.scrollHeight;
+        pendingPrependAnchorRef.current = null;
+        element.scrollTop = Math.max(0, prependAnchor.scrollTop + heightDelta);
+        scheduleScrollMetricSync();
+      }
+    }, [
+      heightVersion,
+      messageCount,
+      scheduleScrollMetricSync,
+      session?.loadedStartPosition,
+      session?.loadedEndPosition,
+      sessionId,
+      virtualLayout.totalHeight,
+    ]);
 
     React.useLayoutEffect(() => {
       const element = scrollRef.current;

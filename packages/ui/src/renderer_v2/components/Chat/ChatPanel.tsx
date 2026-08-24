@@ -41,7 +41,6 @@ import {
 import type { ComposerDraft, InputImageAttachment } from "../../lib/userInput";
 import {
   cycleSearchIndex,
-  findTextMatches,
   isFindShortcutEvent,
 } from "../../lib/textSearch";
 import "./chat.scss";
@@ -192,6 +191,9 @@ export const ChatPanel: React.FC<ChatPanelProps> = observer(
     const [findOpen, setFindOpen] = useState(false);
     const [searchQuery, setSearchQuery] = useState("");
     const [searchResultIndex, setSearchResultIndex] = useState(-1);
+    const [searchMatches, setSearchMatches] = useState<
+      Array<{ messageId: string; position: number; preview: string }>
+    >([]);
     const [exportMenuStyle, setExportMenuStyle] = useState<
       React.CSSProperties | undefined
     >(undefined);
@@ -216,25 +218,13 @@ export const ChatPanel: React.FC<ChatPanelProps> = observer(
     const activeHeaderSession =
       activeSession || store.chat.getSessionById(sessionIds[0] || "");
     const normalizedSearchQuery = searchQuery.trim();
-    const searchResultMessageIds = React.useMemo(() => {
-      if (!activeSession || !normalizedSearchQuery) {
-        return [];
-      }
-      return activeSession.messageIds.filter((messageId) => {
-        const message = activeSession.messagesById.get(messageId);
-        if (!message || message.type !== "text") {
-          return false;
-        }
-        return (
-          findTextMatches(String(message.content || ""), normalizedSearchQuery)
-            .length > 0
-        );
-      });
-    }, [activeSession, normalizedSearchQuery]);
-    const activeSearchMessageId =
-      searchResultIndex >= 0
-        ? searchResultMessageIds[searchResultIndex] || null
-        : null;
+    const searchResultMessageIds = React.useMemo(
+      () => searchMatches.map((match) => match.messageId),
+      [searchMatches],
+    );
+    const activeSearchMatch =
+      searchResultIndex >= 0 ? searchMatches[searchResultIndex] || null : null;
+    const activeSearchMessageId = activeSearchMatch?.messageId || null;
     const searchResultMessageIdSet = React.useMemo(
       () => new Set(searchResultMessageIds),
       [searchResultMessageIds],
@@ -664,12 +654,60 @@ export const ChatPanel: React.FC<ChatPanelProps> = observer(
     }, [showExportMenu, computeExportMenuPosition]);
 
     useEffect(() => {
-      if (!normalizedSearchQuery) {
+      let cancelled = false;
+      if (!activeSessionId || !normalizedSearchQuery) {
+        setSearchMatches([]);
         setSearchResultIndex(-1);
-        return;
+        return () => {
+          cancelled = true;
+        };
       }
-      setSearchResultIndex(0);
-    }, [activeSessionId, normalizedSearchQuery]);
+      const timer = window.setTimeout(() => {
+        void store.chat
+          .searchMessages(activeSessionId, normalizedSearchQuery, 2_000)
+          .then((result) => {
+            if (cancelled || result === null) return;
+            const matches = Array.isArray(result?.matches)
+              ? result.matches.filter(
+                  (match: any) =>
+                    match && typeof match.messageId === "string" &&
+                    Number.isFinite(Number(match.position)),
+                )
+              : [];
+            setSearchMatches(matches);
+            setSearchResultIndex(matches.length > 0 ? 0 : -1);
+          })
+          .catch((error) => {
+            if (cancelled) return;
+            console.warn("Failed to search chat history:", error);
+            setSearchMatches([]);
+            setSearchResultIndex(-1);
+          });
+      }, 150);
+      return () => {
+        cancelled = true;
+        window.clearTimeout(timer);
+      };
+    }, [activeSessionId, normalizedSearchQuery, store.chat]);
+
+    useEffect(() => {
+      if (!activeSessionId || !activeSearchMatch) return;
+      if (activeSession?.messagesById.has(activeSearchMatch.messageId)) return;
+      void store.chat
+        .loadMessagesAroundPosition(
+          activeSessionId,
+          activeSearchMatch.position,
+          300,
+        )
+        .catch((error) => {
+          console.warn("Failed to load search target chat page:", error);
+        });
+    }, [
+      activeSearchMatch,
+      activeSession,
+      activeSessionId,
+      store.chat,
+    ]);
 
     useEffect(() => {
       setSearchResultIndex((current) => {
