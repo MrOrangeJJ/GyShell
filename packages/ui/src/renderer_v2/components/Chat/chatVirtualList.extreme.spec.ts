@@ -1,15 +1,21 @@
 import {
   buildChatVirtualLayout,
+  captureChatViewportAnchor,
   CHAT_MESSAGE_LIST_BOTTOM_PADDING,
   resolveChatAutoScrollOnRender,
   resolveChatOffscreenLayoutChangedItems,
   resolveNextChatOffscreenMeasurementRetentionState,
   resolveChatOffscreenStreamingItems,
   resolveChatScrollAnchorAdjustment,
+  resolveChatViewportAnchorScrollTop,
   resolveChatVirtualRange,
   shouldInvalidateChatMeasuredHeights,
 } from './chatVirtualList'
 import type { ChatRenderItem } from './chatRenderModel'
+import {
+  createChatTextHeightShape,
+  createFixedChatRowHeightEstimate,
+} from './chatRowHeightEstimate'
 
 const assertEqual = <T>(actual: T, expected: T, message: string): void => {
   if (actual !== expected) {
@@ -30,7 +36,7 @@ const createItem = (
 ): ChatRenderItem => ({
   id,
   kind: 'assistant',
-  estimatedHeight,
+  heightEstimate: createFixedChatRowHeightEstimate(estimatedHeight),
   mergeWithPreviousAssistant: false,
   showAssistantRoleLabel: false,
   showAssistantGroupCopy: false,
@@ -89,6 +95,71 @@ runCase('virtual range expands in both directions when overscan is enabled', () 
     range.endIndex,
     2,
     'overscan should include rows whose top edge enters the overscan window',
+  )
+})
+
+runCase('viewport anchors preserve the same message and intra-row offset after resize', () => {
+  const items: ChatRenderItem[] = [
+    createItem('row-1', 100),
+    {
+      ...createItem('row-2', 100),
+      heightEstimate: {
+        fixedHeight: 8,
+        textShape: createChatTextHeightShape('x'.repeat(600)),
+      },
+    },
+    createItem('row-3', 100),
+  ]
+  const wideLayout = buildChatVirtualLayout(items, new Map(), {
+    viewportWidth: 720,
+  })
+  const wideScrollTop = wideLayout.offsets[1] + 24
+  const anchor = captureChatViewportAnchor(
+    items,
+    wideLayout,
+    wideScrollTop,
+  )
+
+  assertEqual(anchor?.itemId, 'row-2', 'the top visible message should be captured')
+  assertEqual(
+    anchor?.offsetWithinItem,
+    24,
+    'the viewport offset inside the top message should be captured',
+  )
+
+  const narrowLayout = buildChatVirtualLayout(items, new Map(), {
+    viewportWidth: 291,
+  })
+  const narrowScrollTop = anchor
+    ? resolveChatViewportAnchorScrollTop(items, narrowLayout, anchor)
+    : null
+
+  assertEqual(
+    narrowScrollTop,
+    narrowLayout.offsets[1] + 24,
+    'resize should restore the same message and intra-row offset',
+  )
+  assertEqual(
+    narrowLayout.heights[1] > wideLayout.heights[1],
+    true,
+    'the anchor test must exercise a width-sensitive row',
+  )
+})
+
+runCase('viewport anchor restoration fails closed when its message was removed', () => {
+  const beforeItems = [createItem('row-1', 100), createItem('row-2', 100)]
+  const beforeLayout = buildChatVirtualLayout(beforeItems, new Map())
+  const anchor = captureChatViewportAnchor(beforeItems, beforeLayout, 125)
+  const afterItems = [createItem('row-1', 100)]
+  const afterLayout = buildChatVirtualLayout(afterItems, new Map())
+
+  assertEqual(anchor?.itemId, 'row-2', 'the removed message should own the anchor')
+  assertEqual(
+    anchor
+      ? resolveChatViewportAnchorScrollTop(afterItems, afterLayout, anchor)
+      : -1,
+    null,
+    'a removed anchor must not produce a fabricated scroll position',
   )
 })
 
@@ -314,6 +385,39 @@ runCase('offscreen layout invalidation selects rows whose assistant label change
     invalidatedItems.map((item) => item.id).join(','),
     'row-2',
     'offscreen rows should be re-measured when assistant role labels appear',
+  )
+})
+
+runCase('equivalent height descriptors do not fan out hidden measurements', () => {
+  const previousItems = [
+    {
+      ...createItem('row-1', 30),
+      heightEstimate: {
+        fixedHeight: 8,
+        textShape: createChatTextHeightShape('same content\nwith wrapping'),
+      },
+    },
+  ]
+  const nextItems = [
+    {
+      ...previousItems[0],
+      heightEstimate: {
+        fixedHeight: 8,
+        textShape: createChatTextHeightShape('same content\nwith wrapping'),
+      },
+    },
+  ]
+
+  const invalidatedItems = resolveChatOffscreenLayoutChangedItems(
+    nextItems,
+    new Map(previousItems.map((item) => [item.id, item])),
+    { startIndex: 1, endIndex: 1 },
+  )
+
+  assertEqual(
+    invalidatedItems.length,
+    0,
+    'descriptor reallocation without semantic changes must not mount offscreen rows',
   )
 })
 

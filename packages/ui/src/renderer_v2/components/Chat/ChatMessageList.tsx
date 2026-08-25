@@ -14,6 +14,7 @@ import {
 import {
   type ChatOffscreenMeasurementRetentionState,
   buildChatVirtualLayout,
+  captureChatViewportAnchor,
   resolveChatAutoScrollOnRender,
   resolveChatOffscreenLayoutChangedItems,
   resolveChatOffscreenStreamingItems,
@@ -22,6 +23,7 @@ import {
   resolveChatVirtualRange,
   shouldInvalidateChatMeasuredHeights,
 } from "./chatVirtualList";
+import { useChatResizeAnchor } from "./useChatResizeAnchor";
 
 interface ChatMessageListProps {
   store: AppStore;
@@ -115,7 +117,9 @@ export const ChatMessageList: React.FC<ChatMessageListProps> = observer(
       scrollTop: number;
       scrollHeight: number;
     } | null>(null);
+    const resizeAnchor = useChatResizeAnchor();
     const renderItemIndexByIdRef = React.useRef<Map<string, number>>(new Map());
+    const renderItemsRef = React.useRef<ChatRenderItem[]>([]);
     const lastUserTailAutoScrollMessageIdRef = React.useRef<string | null>(
       null,
     );
@@ -140,6 +144,8 @@ export const ChatMessageList: React.FC<ChatMessageListProps> = observer(
     const [measurementEpoch, setMeasurementEpoch] = React.useState(0);
     const [scrollTop, setScrollTop] = React.useState(0);
     const [viewportHeight, setViewportHeight] = React.useState(0);
+    const [estimateViewportWidth, setEstimateViewportWidth] =
+      React.useState<number | null>(null);
     const [, setShouldAutoScroll] = React.useState(true);
     const [bannerUiStateByKey, setBannerUiStateByKey] =
       React.useState<ChatBannerUiStateMap>({});
@@ -192,6 +198,7 @@ export const ChatMessageList: React.FC<ChatMessageListProps> = observer(
         sessionId,
       ],
     );
+    renderItemsRef.current = renderItems;
     const previousRenderItemsById =
       previousRenderItemsSnapshotRef.current.sessionId === sessionId
         ? previousRenderItemsSnapshotRef.current.itemsById
@@ -228,10 +235,19 @@ export const ChatMessageList: React.FC<ChatMessageListProps> = observer(
         BOTTOM_AUTO_SCROLL_THRESHOLD_PX;
 
       shouldAutoScrollRef.current = isAtBottom;
+      resizeAnchor.rememberStableAnchor(
+        isAtBottom
+          ? null
+          : captureChatViewportAnchor(
+              renderItemsRef.current,
+              virtualLayoutRef.current,
+              nextScrollTop,
+            ),
+      );
       setScrollTop(nextScrollTop);
       setViewportHeight(nextViewportHeight);
       setShouldAutoScroll(isAtBottom);
-    }, []);
+    }, [resizeAnchor]);
 
     const scheduleScrollMetricSync = React.useCallback(() => {
       if (scrollFrameRef.current !== null) return;
@@ -254,7 +270,9 @@ export const ChatMessageList: React.FC<ChatMessageListProps> = observer(
           return;
         }
 
-        if (typeof itemIndex === "number") {
+        if (resizeAnchor.isActive()) {
+          resizeAnchor.keepAlive();
+        } else if (typeof itemIndex === "number") {
           const element = scrollRef.current;
           const scrollAdjustment = resolveChatScrollAnchorAdjustment({
             layout: virtualLayoutRef.current,
@@ -271,7 +289,7 @@ export const ChatMessageList: React.FC<ChatMessageListProps> = observer(
         rowHeightsRef.current.set(itemId, nextHeight);
         setHeightVersion((current) => current + 1);
       },
-      [],
+      [resizeAnchor],
     );
 
     React.useLayoutEffect(() => {
@@ -280,23 +298,25 @@ export const ChatMessageList: React.FC<ChatMessageListProps> = observer(
       setScrollTop(0);
       setViewportHeight(0);
       pendingScrollAdjustmentRef.current = 0;
+      resizeAnchor.reset();
       lastUserTailAutoScrollMessageIdRef.current = null;
       rowHeightsRef.current = new Map();
       setRetainedOffscreenMeasurementState({});
       setMeasurementEpoch((current) => current + 1);
       setHeightVersion((current) => current + 1);
-    }, [sessionId]);
+    }, [resizeAnchor, sessionId]);
 
     // When display mode changes (e.g. settings load after initial render),
     // item structure changes (classic individual items → seamless groups).
     // Stale measured heights from the old mode cause wrong virtual scroll
     // offsets, so invalidate all measurements to force a fresh layout.
     React.useLayoutEffect(() => {
+      resizeAnchor.reset();
       rowHeightsRef.current = new Map();
       pendingScrollAdjustmentRef.current = 0;
       setMeasurementEpoch((current) => current + 1);
       setHeightVersion((current) => current + 1);
-    }, [chatDisplayMode]);
+    }, [chatDisplayMode, resizeAnchor]);
 
     React.useEffect(() => {
       setBannerUiStateByKey((current) =>
@@ -312,7 +332,9 @@ export const ChatMessageList: React.FC<ChatMessageListProps> = observer(
       const element = scrollRef.current;
       if (!element) return;
 
-      viewportWidthRef.current = Math.round(element.clientWidth);
+      const initialViewportWidth = Math.round(element.clientWidth);
+      viewportWidthRef.current = initialViewportWidth;
+      setEstimateViewportWidth(initialViewportWidth);
       scheduleScrollMetricSync();
       const onScroll = () => {
         scheduleScrollMetricSync();
@@ -322,6 +344,7 @@ export const ChatMessageList: React.FC<ChatMessageListProps> = observer(
         if (
           nearTop &&
           !shouldAutoScrollRef.current &&
+          !resizeAnchor.isActive() &&
           element.scrollHeight > element.clientHeight + 96 &&
           session.hasOlderMessages === true &&
           !session.isLoadingOlderMessages &&
@@ -379,12 +402,30 @@ export const ChatMessageList: React.FC<ChatMessageListProps> = observer(
                   nextWidth,
                 )
               ) {
+                if (
+                  !shouldAutoScrollRef.current &&
+                  !pendingPrependAnchorRef.current
+                ) {
+                  resizeAnchor.beginResize(
+                    captureChatViewportAnchor(
+                      renderItemsRef.current,
+                      virtualLayoutRef.current,
+                      element.scrollTop,
+                    ),
+                  );
+                }
                 rowHeightsRef.current = new Map();
                 pendingScrollAdjustmentRef.current = 0;
                 setMeasurementEpoch((current) => current + 1);
                 setHeightVersion((current) => current + 1);
               }
-              viewportWidthRef.current = Math.round(nextWidth);
+              const normalizedNextWidth = Math.round(nextWidth);
+              viewportWidthRef.current = normalizedNextWidth;
+              setEstimateViewportWidth((current) =>
+                current === normalizedNextWidth
+                  ? current
+                  : normalizedNextWidth,
+              );
               scheduleScrollMetricSync();
             })
           : null;
@@ -398,11 +439,20 @@ export const ChatMessageList: React.FC<ChatMessageListProps> = observer(
           scrollFrameRef.current = null;
         }
       };
-    }, [scheduleScrollMetricSync, session, sessionId, store.chat]);
+    }, [
+      resizeAnchor,
+      scheduleScrollMetricSync,
+      session,
+      sessionId,
+      store.chat,
+    ]);
 
     const virtualLayout = React.useMemo(
-      () => buildChatVirtualLayout(renderItems, rowHeightsRef.current),
-      [renderItems, heightVersion],
+      () =>
+        buildChatVirtualLayout(renderItems, rowHeightsRef.current, {
+          viewportWidth: estimateViewportWidth,
+        }),
+      [estimateViewportWidth, renderItems, heightVersion],
     );
     renderItemIndexByIdRef.current = renderItemIndexById;
     virtualLayoutRef.current = virtualLayout;
@@ -419,8 +469,19 @@ export const ChatMessageList: React.FC<ChatMessageListProps> = observer(
     );
 
     React.useLayoutEffect(() => {
-      const pendingScrollAdjustment = pendingScrollAdjustmentRef.current;
       const element = scrollRef.current;
+      if (element) {
+        const anchoredScrollTop = resizeAnchor.resolveScrollTop(
+          renderItems,
+          virtualLayout,
+        );
+        if (anchoredScrollTop !== null) {
+          element.scrollTop = Math.max(0, anchoredScrollTop);
+          scheduleScrollMetricSync();
+        }
+      }
+
+      const pendingScrollAdjustment = pendingScrollAdjustmentRef.current;
       if (pendingScrollAdjustment !== 0 && element) {
         pendingScrollAdjustmentRef.current = 0;
         element.scrollTop = Math.max(
@@ -440,6 +501,8 @@ export const ChatMessageList: React.FC<ChatMessageListProps> = observer(
     }, [
       heightVersion,
       messageCount,
+      renderItems,
+      resizeAnchor,
       scheduleScrollMetricSync,
       session?.loadedStartPosition,
       session?.loadedEndPosition,

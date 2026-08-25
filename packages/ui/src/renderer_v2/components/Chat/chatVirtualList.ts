@@ -1,4 +1,5 @@
 import type { ChatRenderItem } from './chatRenderModel'
+import { resolveChatRowHeightEstimate } from './chatRowHeightEstimate'
 
 export const CHAT_MESSAGE_LIST_BOTTOM_PADDING = 20
 export const DEFAULT_CHAT_MESSAGE_ROW_HEIGHT = 140
@@ -13,6 +14,11 @@ export interface ChatVirtualLayout {
 export interface ChatVirtualRange {
   startIndex: number
   endIndex: number
+}
+
+export interface ChatViewportAnchor {
+  itemId: string
+  offsetWithinItem: number
 }
 
 export interface ChatIndexedRenderItem {
@@ -119,6 +125,7 @@ export const buildChatVirtualLayout = (
   measuredHeights: ReadonlyMap<string, number>,
   options?: {
     bottomPadding?: number
+    viewportWidth?: number | null
   },
 ): ChatVirtualLayout => {
   const offsets: number[] = []
@@ -130,7 +137,12 @@ export const buildChatVirtualLayout = (
   items.forEach((item) => {
     offsets.push(cursor)
     const nextHeight = normalizeRowHeight(
-      measuredHeights.get(item.id) ?? item.estimatedHeight,
+      measuredHeights.get(item.id) ??
+        resolveChatRowHeightEstimate(item.heightEstimate, {
+          viewportWidth: options?.viewportWidth,
+          showAssistantRoleLabel: item.showAssistantRoleLabel,
+          showAssistantGroupActions: item.showAssistantGroupCopy,
+        }),
     )
     heights.push(nextHeight)
     cursor += nextHeight
@@ -180,6 +192,55 @@ const findFirstIndexStartingAfter = (
   }
 
   return low
+}
+
+export const captureChatViewportAnchor = (
+  items: readonly ChatRenderItem[],
+  layout: ChatVirtualLayout,
+  scrollTop: number,
+): ChatViewportAnchor | null => {
+  if (
+    items.length === 0 ||
+    layout.heights.length !== items.length ||
+    !Number.isFinite(scrollTop)
+  ) {
+    return null
+  }
+
+  const itemIndex = Math.min(
+    items.length - 1,
+    findFirstIndexWithBottomAfter(layout, Math.max(0, scrollTop)),
+  )
+  const item = items[itemIndex]
+  if (!item) return null
+
+  return {
+    itemId: item.id,
+    offsetWithinItem: Math.max(
+      0,
+      Math.min(
+        layout.heights[itemIndex],
+        Math.max(0, scrollTop) - layout.offsets[itemIndex],
+      ),
+    ),
+  }
+}
+
+export const resolveChatViewportAnchorScrollTop = (
+  items: readonly ChatRenderItem[],
+  layout: ChatVirtualLayout,
+  anchor: ChatViewportAnchor,
+): number | null => {
+  const itemIndex = items.findIndex((item) => item.id === anchor.itemId)
+  if (itemIndex < 0 || itemIndex >= layout.heights.length) return null
+
+  return (
+    layout.offsets[itemIndex] +
+    Math.min(
+      Math.max(0, anchor.offsetWithinItem),
+      layout.heights[itemIndex],
+    )
+  )
 }
 
 export const resolveChatVirtualRange = (
@@ -236,6 +297,29 @@ export const resolveChatOffscreenStreamingItems = (
   }, [])
 }
 
+const areChatTextHeightShapesEqual = (
+  previousItem: ChatRenderItem,
+  nextItem: ChatRenderItem,
+): boolean => {
+  const previousShape = previousItem.heightEstimate.textShape
+  const nextShape = nextItem.heightEstimate.textShape
+  if (previousShape === nextShape) return true
+  if (!previousShape || !nextShape) return false
+  if (
+    previousShape.blankLineCount !== nextShape.blankLineCount ||
+    previousShape.lineBuckets.length !== nextShape.lineBuckets.length
+  ) {
+    return false
+  }
+  return previousShape.lineBuckets.every((bucket, index) => {
+    const nextBucket = nextShape.lineBuckets[index]
+    return (
+      bucket.characterUnits === nextBucket?.characterUnits &&
+      bucket.lineCount === nextBucket.lineCount
+    )
+  })
+}
+
 const hasChatRenderItemLayoutChange = (
   previousItem: ChatRenderItem | undefined,
   nextItem: ChatRenderItem,
@@ -246,7 +330,9 @@ const hasChatRenderItemLayoutChange = (
 
   return (
     previousItem.kind !== nextItem.kind ||
-    previousItem.estimatedHeight !== nextItem.estimatedHeight ||
+    previousItem.heightEstimate.fixedHeight !==
+      nextItem.heightEstimate.fixedHeight ||
+    !areChatTextHeightShapesEqual(previousItem, nextItem) ||
     previousItem.mergeWithPreviousAssistant !==
       nextItem.mergeWithPreviousAssistant ||
     previousItem.showAssistantRoleLabel !== nextItem.showAssistantRoleLabel ||

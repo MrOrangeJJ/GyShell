@@ -3,6 +3,7 @@ import {
   buildChatRenderItems,
   resolveSeamlessOverlayMessages,
 } from './chatRenderModel'
+import { resolveChatRowHeightEstimate } from './chatRowHeightEstimate'
 import type { ChatMessage, ChatSession } from '../../stores/ChatStore'
 import type { CommandOutputContractV1 } from '@gyshell/shared'
 
@@ -260,8 +261,8 @@ runCase(
       'seamless grouped tool row should include consecutive tool activity',
     )
     assertEqual(
-      items[1]?.estimatedHeight,
-      72,
+      items[1]?.heightEstimate.fixedHeight,
+      38,
       'collapsed seamless groups should keep a compact estimate independent of step count',
     )
     const restoredExpandedItems = buildChatRenderItems(
@@ -271,7 +272,7 @@ runCase(
       new Set(['tool1']),
     )
     assertEqual(
-      (restoredExpandedItems[1]?.estimatedHeight || 0) > 72,
+      (restoredExpandedItems[1]?.heightEstimate.fixedHeight || 0) > 38,
       true,
       'restored expanded groups should retain a disclosure-aware estimate before measurement',
     )
@@ -375,8 +376,8 @@ runCase('expanded seamless estimates track compact disclosure rows', () => {
   )
 
   assertEqual(
-    items[1]?.estimatedHeight,
-    524,
+    items[1]?.heightEstimate.fixedHeight,
+    490,
     'the expanded fallback should estimate 20 compact rows without sizing for hidden detail payloads',
   )
 })
@@ -552,7 +553,7 @@ runCase(
       'boundary marker should not suppress copy controls for the preceding assistant turn',
     )
     assertEqual(
-      items[2]?.estimatedHeight,
+      resolveChatRowHeightEstimate(items[2]?.heightEstimate),
       40,
       'boundary marker should use a compact virtual height estimate',
     )

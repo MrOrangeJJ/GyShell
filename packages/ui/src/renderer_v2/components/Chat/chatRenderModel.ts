@@ -1,5 +1,10 @@
 import type { ChatMessage, ChatSession } from '../../stores/ChatStore'
 import {
+  createChatRowHeightEstimate,
+  createFixedChatRowHeightEstimate,
+  type ChatRowHeightEstimate,
+} from './chatRowHeightEstimate'
+import {
   buildSeamlessStepPresentation,
   isSeamlessGroupRunning,
 } from './seamlessToolPresentation'
@@ -9,7 +14,7 @@ export type ChatVisibleRowKind = 'assistant' | 'user' | 'boundary'
 export interface ChatRenderItem {
   id: string
   kind: ChatVisibleRowKind
-  estimatedHeight: number
+  heightEstimate: ChatRowHeightEstimate
   mergeWithPreviousAssistant: boolean
   showAssistantRoleLabel: boolean
   showAssistantGroupCopy: boolean
@@ -49,7 +54,7 @@ const SEAMLESS_TOOL_TYPES: ReadonlySet<ChatMessage['type']> = new Set([
   'sub_tool',
 ])
 
-const SEAMLESS_COLLAPSED_ESTIMATED_HEIGHT = 72
+const SEAMLESS_COLLAPSED_ESTIMATED_HEIGHT = 38
 const SEAMLESS_DISCLOSURE_ROW_ESTIMATED_HEIGHT = 22
 const SEAMLESS_EXPANDED_VERTICAL_CHROME = 12
 const EMPTY_EXPANDED_SEAMLESS_GROUP_IDS: ReadonlySet<string> = new Set()
@@ -151,39 +156,6 @@ const getRowDisplayKind = (
   return candidate.role === 'assistant' ? 'assistant' : 'hidden'
 }
 
-const estimateRowHeight = (
-  message: ChatMessage,
-  kind: ChatVisibleRowKind,
-): number => {
-  if (kind === 'user') {
-    return Array.isArray(message.metadata?.inputImages) &&
-      message.metadata.inputImages.length > 0
-      ? 156
-      : 92
-  }
-  if (kind === 'boundary') return 40
-
-  switch (message.type) {
-    case 'command':
-      return 168
-    case 'tool_call':
-      return 150
-    case 'file_edit':
-      return 176
-    case 'sub_tool':
-    case 'reasoning':
-    case 'compaction':
-      return 160
-    case 'ask':
-      return 132
-    case 'alert':
-    case 'error':
-      return 118
-    default:
-      return 140
-  }
-}
-
 const hasAssistantItemInCurrentTurn = (
   items: readonly ChatRenderItem[],
 ): boolean => {
@@ -246,7 +218,7 @@ export const buildChatRenderItems = (
       items.push({
         id: row.id,
         kind: row.kind,
-        estimatedHeight: estimateRowHeight(row.msg, row.kind),
+        heightEstimate: createChatRowHeightEstimate(row.msg, row.kind),
         mergeWithPreviousAssistant: false,
         showAssistantRoleLabel: false,
         showAssistantGroupCopy: false,
@@ -302,9 +274,11 @@ export const buildChatRenderItems = (
         // Restored group state can outlive measured heights across session
         // switches, so estimate the compact first disclosure level until the
         // ResizeObserver reports its real size.
-        estimatedHeight: expandedSeamlessGroupIds.has(groupFirstId)
-          ? estimateExpandedSeamlessGroupHeight(seamlessGroupMessages)
-          : SEAMLESS_COLLAPSED_ESTIMATED_HEIGHT,
+        heightEstimate: createFixedChatRowHeightEstimate(
+          expandedSeamlessGroupIds.has(groupFirstId)
+            ? estimateExpandedSeamlessGroupHeight(seamlessGroupMessages)
+            : SEAMLESS_COLLAPSED_ESTIMATED_HEIGHT,
+        ),
         mergeWithPreviousAssistant: prevIsAssistant,
         showAssistantRoleLabel: !turnAlreadyHasLabel,
         showAssistantGroupCopy: isTurnTail,
@@ -365,7 +339,10 @@ export const buildChatRenderItems = (
       items.push({
         id: assistantRow.id,
         kind: assistantRow.kind,
-        estimatedHeight: estimateRowHeight(assistantRow.msg, assistantRow.kind),
+        heightEstimate: createChatRowHeightEstimate(
+          assistantRow.msg,
+          assistantRow.kind,
+        ),
         mergeWithPreviousAssistant: prevIsAssistant,
         showAssistantRoleLabel,
         showAssistantGroupCopy: canShowGroupCopy && index === runEnd,
