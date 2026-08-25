@@ -1,4 +1,5 @@
 import { canReconnectTerminalRuntime } from "../../lib/terminalConnectionModel";
+import { normalizeSessionTitleText } from "../../lib/sessionTitleDisplay";
 
 export type ListPanelTabKind = "terminal" | "chat";
 export type ListPanelRowContextAction = "reconnect" | "rename";
@@ -16,6 +17,21 @@ export interface ListPanelTabSource {
   subtitle: string;
   statusLabel: string;
   updatedAt?: number;
+}
+
+export interface ListPanelChatSourceInput {
+  id: string;
+  title: string;
+  loadedMessageCount: number;
+  totalMessageCount?: number;
+  isSessionBusy: boolean;
+  updatedAt?: number;
+}
+
+export interface ListPanelChatSourceLabels {
+  messages: (count: number) => string;
+  running: string;
+  ready: string;
 }
 
 export interface ListPanelRow extends ListPanelTabSource {
@@ -50,6 +66,41 @@ export type ListPanelCreatedTerminalActivation =
 export const resolveListPanelChatStatusLabel = (
   isSessionBusy: boolean,
 ): "running" | "inactive" => (isSessionBusy ? "running" : "inactive");
+
+export const buildListPanelChatSources = (
+  sessions: readonly ListPanelChatSourceInput[],
+  labels: ListPanelChatSourceLabels,
+): ListPanelTabSource[] =>
+  sessions.map((session) => {
+    const loadedMessageCount = Math.max(
+      0,
+      Math.floor(Number(session.loadedMessageCount) || 0),
+    );
+    const totalMessageCount = Math.max(
+      loadedMessageCount,
+      Math.floor(Number(session.totalMessageCount) || 0),
+    );
+    // Loaded messages are a mutable pagination window, so they must never
+    // determine directory order. Only stable session metadata owns recency.
+    const metadataUpdatedAt = Number(session.updatedAt);
+    const stableUpdatedAt = Number.isFinite(metadataUpdatedAt)
+      ? metadataUpdatedAt
+      : undefined;
+
+    return {
+      id: session.id,
+      kind: "chat",
+      title: normalizeSessionTitleText(session.title),
+      subtitle:
+        totalMessageCount > 0
+          ? labels.messages(totalMessageCount)
+          : session.isSessionBusy
+            ? labels.running
+            : labels.ready,
+      statusLabel: resolveListPanelChatStatusLabel(session.isSessionBusy),
+      updatedAt: stableUpdatedAt,
+    };
+  });
 
 export const resolveListPanelRowContextAction = (input: {
   kind: ListPanelTabKind;

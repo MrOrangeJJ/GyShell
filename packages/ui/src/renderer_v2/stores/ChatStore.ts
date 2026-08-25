@@ -88,6 +88,7 @@ export interface ChatMessage {
 export interface ChatSession {
   id: string;
   title: string;
+  updatedAt?: number;
   messagesById: ObservableMap<string, ChatMessage>;
   messageIds: string[];
   renderListVersion: number;
@@ -134,6 +135,7 @@ interface ChatHydrationPayload {
   exists: boolean;
   loaded: boolean;
   title: string | null;
+  updatedAt?: number;
   messages: ChatMessage[];
   page?: UiMessagePagePayload | null;
   isBusy: boolean;
@@ -300,6 +302,7 @@ export class ChatStore {
     return {
       id,
       title,
+      updatedAt: loaded ? Date.now() : undefined,
       messagesById: observable.map<string, ChatMessage>(),
       messageIds: [],
       renderListVersion: 0,
@@ -574,6 +577,39 @@ export class ChatStore {
     ]).has(String(updateType || ""));
   }
 
+  private doesUiUpdateAdvanceSessionRecency(updateType: unknown): boolean {
+    switch (String(updateType || "")) {
+      case "ADD_MESSAGE":
+      case "INSERT_MESSAGE":
+      case "REMOVE_MESSAGE":
+      case "UPDATE_MESSAGE":
+      case "ROLLBACK":
+      case "SESSION_RENAMED":
+        return true;
+      default:
+        return false;
+    }
+  }
+
+  private advanceSessionRecencyFromUiUpdate(
+    session: ChatSession,
+    update: any,
+  ): void {
+    if (!this.doesUiUpdateAdvanceSessionRecency(update?.type)) return;
+    const incomingRevision = this.normalizeUiRevision(update?.uiRevision);
+    if (
+      incomingRevision > 0 &&
+      (session.uiRevision || 0) > 0 &&
+      incomingRevision <= (session.uiRevision || 0)
+    ) {
+      return;
+    }
+    const messageTimestamp = Number(update?.message?.timestamp);
+    session.updatedAt = Number.isFinite(messageTimestamp)
+      ? Math.max(session.updatedAt || 0, messageTimestamp)
+      : Date.now();
+  }
+
   private normalizeUiRevision(value: unknown): number {
     const revision = Number(value);
     return Number.isSafeInteger(revision) && revision >= 0 ? revision : 0;
@@ -727,6 +763,12 @@ export class ChatStore {
     }
     const title = String(metadata?.title || fallbackTitle || "").trim();
     if (title) session.title = title;
+    if (
+      typeof metadata?.updatedAt === "number" &&
+      Number.isFinite(metadata.updatedAt)
+    ) {
+      session.updatedAt = metadata.updatedAt;
+    }
     if (typeof metadata?.messagesCount === "number") {
       session.totalMessageCount = Math.max(0, Math.floor(metadata.messagesCount));
     }
@@ -992,6 +1034,13 @@ export class ChatStore {
       exists,
       loaded: loadMessages && !!page,
       title: resolvedTitle || null,
+      updatedAt: [
+        page?.metadata?.updatedAt,
+        metadata?.updatedAt,
+        legacySnapshot?.updatedAt,
+      ].find((value): value is number =>
+        typeof value === "number" && Number.isFinite(value),
+      ),
       messages,
       page,
       isBusy:
@@ -1237,6 +1286,7 @@ export class ChatStore {
       if (session) {
         session.messagesById.set(id, fullMsg);
         session.messageIds.push(id);
+        session.updatedAt = fullMsg.timestamp;
         this.bumpSessionRenderListVersion(session);
         // Auto-update title based on first user message if title is default
         if (msg.role === "user") {
@@ -1370,6 +1420,7 @@ export class ChatStore {
       this.isTranscriptUiUpdate(update?.type) && !session.hasLoadedMessagePage;
     if (isHydrating || isUnloadedTranscriptUpdate) {
       this.queuePendingUiUpdate(sessionId, recorded);
+      this.advanceSessionRecencyFromUiUpdate(session, update);
       if (update.type === "ADD_MESSAGE" && update.message?.role === "user") {
         session.isThinking = true;
         session.isSessionBusy = true;
@@ -1565,6 +1616,7 @@ export class ChatStore {
           break;
         }
       }
+      this.advanceSessionRecencyFromUiUpdate(session, update);
       if (uiRevision > 0) {
         session.uiRevision = Math.max(session.uiRevision || 0, uiRevision);
       }
@@ -1628,6 +1680,7 @@ export class ChatStore {
         this.applySessionMetadata(session, {
           id: payload.id,
           title: payload.title || session.title,
+          updatedAt: payload.updatedAt,
           messagesCount: payload.totalMessageCount,
           isBusy: payload.isBusy,
           lockedProfileId: payload.lockedProfileId,
@@ -2142,6 +2195,7 @@ export class ChatStore {
         const session = this.sessions.find((s) => s.id === sessionId);
         if (session) {
           session.title = newTitle;
+          session.updatedAt = Date.now();
         }
       });
     } catch (error) {

@@ -1,4 +1,5 @@
 import {
+  buildListPanelChatSources,
   buildListPanelRows,
   resolveCreatedTerminalTabActivation,
   resolveListPanelChatStatusLabel,
@@ -31,6 +32,12 @@ const assertDeepEqual = (
 const runCase = (name: string, fn: () => void): void => {
   fn();
   console.log(`PASS ${name}`);
+};
+
+const chatSourceLabels = {
+  messages: (count: number) => `${count} messages`,
+  running: "Running",
+  ready: "Ready",
 };
 
 const sources: ListPanelTabSource[] = [
@@ -163,6 +170,118 @@ runCase("row activation selects hosted rows but opens unhosted rows", () => {
     "single-clicking an unhosted row should restore it through the open path",
   );
 });
+
+runCase(
+  "chat hydration preserves metadata order and total-count subtitles",
+  () => {
+    const metadataSessions = [
+      {
+        id: "chat-newest",
+        title: "Newest",
+        loadedMessageCount: 0,
+        totalMessageCount: 80,
+        isSessionBusy: false,
+        updatedAt: 300,
+      },
+      {
+        id: "chat-target",
+        title: "Target",
+        loadedMessageCount: 0,
+        totalMessageCount: 2_400,
+        isSessionBusy: false,
+        updatedAt: 200,
+      },
+      {
+        id: "chat-oldest",
+        title: "Oldest",
+        loadedMessageCount: 0,
+        totalMessageCount: 40,
+        isSessionBusy: false,
+        updatedAt: 100,
+      },
+    ];
+    const metadataOnlySources = buildListPanelChatSources(
+      metadataSessions,
+      chatSourceLabels,
+    );
+    const hydratedSources = buildListPanelChatSources(
+      metadataSessions.map((session) =>
+        session.id === "chat-target"
+          ? { ...session, loadedMessageCount: 300 }
+          : session,
+      ),
+      chatSourceLabels,
+    );
+    const buildRows = (chatSources: ListPanelTabSource[]) =>
+      buildListPanelRows({
+        sources: chatSources,
+        visibleTabIds: chatSources.map((source) => source.id),
+        panelIds: ["panel-chat"],
+        getPanelTabIds: () => chatSources.map((source) => source.id),
+        getPanelActiveTabId: () => "chat-target",
+        globalActiveTabId: "chat-target",
+      });
+    const beforeRows = buildRows(metadataOnlySources);
+    const afterRows = buildRows(hydratedSources);
+
+    assertDeepEqual(
+      beforeRows.map((row) => row.id),
+      ["chat-newest", "chat-target", "chat-oldest"],
+      "metadata-only rows should use durable session recency",
+    );
+    assertDeepEqual(
+      afterRows.map((row) => row.id),
+      beforeRows.map((row) => row.id),
+      "loading a bounded message page must not reorder the chat directory",
+    );
+    assertEqual(
+      afterRows.find((row) => row.id === "chat-target")?.subtitle,
+      "2400 messages",
+      "hydration should keep the durable total instead of showing the 300-row page size",
+    );
+  },
+);
+
+runCase(
+  "new chat activity can still move a session after its metadata advances",
+  () => {
+    const chatSources = buildListPanelChatSources(
+      [
+        {
+          id: "chat-current",
+          title: "Current",
+          loadedMessageCount: 20,
+          totalMessageCount: 20,
+          isSessionBusy: false,
+          updatedAt: 300,
+        },
+        {
+          id: "chat-active",
+          title: "Active",
+          loadedMessageCount: 21,
+          totalMessageCount: 21,
+          isSessionBusy: true,
+          updatedAt: 400,
+        },
+      ],
+      chatSourceLabels,
+    );
+    const rows = buildListPanelRows({
+      sources: chatSources,
+      visibleTabIds: chatSources.map((source) => source.id),
+      panelIds: ["panel-chat"],
+      getPanelTabIds: () => chatSources.map((source) => source.id),
+      getPanelActiveTabId: () => "chat-active",
+      globalActiveTabId: "chat-active",
+    });
+
+    assertDeepEqual(
+      rows.map((row) => row.id),
+      ["chat-active", "chat-current"],
+      "a genuinely newer message should still move its session to the top",
+    );
+  },
+);
 
 runCase("chat status dots are green only for busy sessions", () => {
   assertEqual(

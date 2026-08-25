@@ -98,6 +98,31 @@ runCase('SESSION_RENAMED updates only an already-open session', () => {
   )
 })
 
+runCase('stale UI updates cannot change chat-directory recency', () => {
+  const store = new ChatStore()
+  const session = getActiveSessionOrThrow(store)
+  session.updatedAt = 100
+  session.uiRevision = 5
+
+  store.handleUiUpdate({
+    type: 'SESSION_RENAMED',
+    sessionId: session.id,
+    title: 'Stale title',
+    uiRevision: 4,
+  })
+
+  assertEqual(
+    session.title,
+    'New Chat',
+    'a stale update must not change session metadata',
+  )
+  assertEqual(
+    session.updatedAt,
+    100,
+    'a stale update must not change chat-directory ordering',
+  )
+})
+
 runCase('ADD_MESSAGE increments renderListVersion for the active session', () => {
   const store = new ChatStore()
   const session = getActiveSessionOrThrow(store)
@@ -126,6 +151,7 @@ runCase('APPEND_CONTENT keeps renderListVersion stable during streaming', () => 
     message: createAssistantMessage('assistant-1', { content: 'a' }),
   })
   const versionAfterAdd = session.renderListVersion
+  const updatedAtAfterAdd = session.updatedAt
 
   for (let index = 0; index < 32; index += 1) {
     store.handleUiUpdate({
@@ -140,6 +166,11 @@ runCase('APPEND_CONTENT keeps renderListVersion stable during streaming', () => 
     session.renderListVersion,
     versionAfterAdd,
     'stream deltas should not invalidate the structural render model',
+  )
+  assertEqual(
+    session.updatedAt,
+    updatedAtAfterAdd,
+    'stream deltas should not churn chat-directory recency on every token',
   )
 })
 
@@ -644,6 +675,17 @@ const runAsyncCases = async (): Promise<void> => {
       revisionSessionId,
     )
     await initialPageRequested
+    const metadataOnlySession = raceStore.getSessionById(revisionSessionId)!
+    assertEqual(
+      metadataOnlySession.updatedAt,
+      1,
+      'inventory hydration should retain the durable session recency before loading messages',
+    )
+    assertEqual(
+      metadataOnlySession.totalMessageCount,
+      1,
+      'inventory hydration should retain the durable total before loading messages',
+    )
     raceStore.handleUiUpdate({
       type: 'SESSION_RENAMED',
       sessionId: revisionSessionId,

@@ -11,7 +11,6 @@ import {
   X,
 } from "lucide-react";
 import type { AppStore, TerminalTabModel } from "../../stores/AppStore";
-import type { ChatSession } from "../../stores/ChatStore";
 import type { TabDragPayload } from "../../layout";
 import {
   getTerminalConnectionIconKind,
@@ -22,9 +21,9 @@ import { normalizeSessionTitleText } from "../../lib/sessionTitleDisplay";
 import { TerminalAddButton } from "../Terminal/TerminalAddButton";
 import { resolveTerminalTabIcon } from "../Terminal/terminalTabIcons";
 import {
+  buildListPanelChatSources,
   buildListPanelRows,
   resolveCreatedTerminalTabActivation,
-  resolveListPanelChatStatusLabel,
   resolveListPanelRowContextAction,
   resolveListPanelRowActivation,
   type ListPanelRowContextAction,
@@ -79,38 +78,6 @@ const buildTerminalSources = (store: AppStore): ListPanelTabSource[] =>
     statusLabel: tab.runtimeState || "initializing",
     updatedAt: index,
   }));
-
-interface ChatSourceLabels {
-  messages: (count: number) => string;
-  running: string;
-  ready: string;
-}
-
-const buildChatSources = (
-  sessions: readonly ChatSession[],
-  labels: ChatSourceLabels,
-): ListPanelTabSource[] =>
-  sessions.map((session, index) => {
-    const lastMessageId = session.messageIds[session.messageIds.length - 1];
-    const lastMessageTimestamp = lastMessageId
-      ? session.messagesById.get(lastMessageId)?.timestamp
-      : undefined;
-    return {
-      id: session.id,
-      kind: "chat",
-      title: normalizeSessionTitleText(session.title),
-      subtitle:
-        session.messageIds.length > 0
-          ? labels.messages(session.messageIds.length)
-          : session.isSessionBusy
-            ? labels.running
-            : labels.ready,
-      statusLabel: resolveListPanelChatStatusLabel(session.isSessionBusy),
-      updatedAt: Number.isFinite(lastMessageTimestamp)
-        ? lastMessageTimestamp
-        : Number.MAX_SAFE_INTEGER - (sessions.length - index),
-    };
-  });
 
 const getTerminalStatusClassName = (
   store: AppStore,
@@ -169,11 +136,21 @@ export const ListPanel: React.FC<ListPanelProps> = observer(
     });
 
     const chatRows = buildListPanelRows({
-      sources: buildChatSources(store.chat.sessions, {
-        messages: t.layout.listPanelChatMessages,
-        running: t.layout.listPanelChatRunning,
-        ready: t.layout.listPanelChatReady,
-      }),
+      sources: buildListPanelChatSources(
+        store.chat.sessions.map((session) => ({
+          id: session.id,
+          title: session.title,
+          loadedMessageCount: session.messageIds.length,
+          totalMessageCount: session.totalMessageCount,
+          isSessionBusy: session.isSessionBusy,
+          updatedAt: session.updatedAt,
+        })),
+        {
+          messages: t.layout.listPanelChatMessages,
+          running: t.layout.listPanelChatRunning,
+          ready: t.layout.listPanelChatReady,
+        },
+      ),
       visibleTabIds: store.chat.sessions.map((session) => session.id),
       panelIds: store.layout.getPanelIdsByKind("chat"),
       getPanelTabIds: (targetPanelId) =>
