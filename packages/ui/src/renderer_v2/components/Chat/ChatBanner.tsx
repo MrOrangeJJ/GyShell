@@ -1000,10 +1000,12 @@ const SeamlessVirtualStepList = ({
 
   const visibleMessages = messages.slice(range.start, range.end)
   const summaryCriticalIds = visibleMessages
-    .filter((message) =>
-      message.deferredPayload?.fields.some(
-        (field) => field === 'content' || field === 'diff',
-      ),
+    .filter(
+      (message) =>
+        message.payloadState !== 'geometry' &&
+        message.deferredPayload?.fields.some(
+          (field) => field === 'content' || field === 'diff',
+        ),
     )
     .map((message) => message.id)
   const summaryCriticalKey = summaryCriticalIds.join(':')
@@ -1021,9 +1023,11 @@ const SeamlessVirtualStepList = ({
     >
       {visibleMessages.map((message, visibleIndex) => {
         const index = range.start + visibleIndex
-        const hasDeferredSummary = message.deferredPayload?.fields.some(
-          (field) => field === 'content' || field === 'diff',
-        )
+        const hasDeferredSummary =
+          message.payloadState !== 'geometry' &&
+          message.deferredPayload?.fields.some(
+            (field) => field === 'content' || field === 'diff',
+          )
         if (hasDeferredSummary) return null
         const presentation = buildSeamlessStepPresentation(message)
         const stepExpanded = expandedStepIds.has(message.id)
@@ -1148,10 +1152,12 @@ export const SeamlessToolGroupBanner = observer(
           stepCount <= SEAMLESS_VIRTUAL_STEP_THRESHOLD
             ? messages
             : messages.slice(0, 64)
-        ).filter((message) =>
-          message.deferredPayload?.fields.some(
-            (field) => field === 'content' || field === 'diff',
-          ),
+        ).filter(
+          (message) =>
+            message.payloadState !== 'geometry' &&
+            message.deferredPayload?.fields.some(
+              (field) => field === 'content' || field === 'diff',
+            ),
         )
         if (summaryMessages.length > 0) {
           try {

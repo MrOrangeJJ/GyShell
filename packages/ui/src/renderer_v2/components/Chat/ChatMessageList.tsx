@@ -342,6 +342,7 @@ export const ChatMessageList: React.FC<ChatMessageListProps> = observer(
 
         const nearTop = element.scrollTop <= 96;
         if (
+          !session.geometryLoaded &&
           nearTop &&
           !shouldAutoScrollRef.current &&
           !resizeAnchor.isActive() &&
@@ -369,6 +370,7 @@ export const ChatMessageList: React.FC<ChatMessageListProps> = observer(
         const nearBottom =
           element.scrollHeight - element.scrollTop - element.clientHeight <= 96;
         if (
+          !session.geometryLoaded &&
           nearBottom &&
           session.hasNewerMessages === true &&
           !session.isLoadingNewerMessages
@@ -467,6 +469,68 @@ export const ChatMessageList: React.FC<ChatMessageListProps> = observer(
         ),
       [effectiveViewportHeight, scrollTop, virtualLayout],
     );
+
+    React.useEffect(() => {
+      if (
+        !sessionId ||
+        !session?.geometryLoaded ||
+        renderItems.length === 0 ||
+        typeof store.chat.loadMessageRange !== "function"
+      ) {
+        return;
+      }
+      const firstItem = renderItems[virtualRange.startIndex];
+      const lastItem =
+        renderItems[Math.max(virtualRange.startIndex, virtualRange.endIndex - 1)];
+      const firstPosition = firstItem
+        ? session.messagePositionById?.get(firstItem.id)
+        : undefined;
+      const lastPosition = lastItem
+        ? session.messagePositionById?.get(lastItem.id)
+        : undefined;
+      if (typeof firstPosition !== "number" || typeof lastPosition !== "number") {
+        return;
+      }
+      const total = Math.max(0, (session.totalMessageCount || 1) - 1);
+      const prefetchPadding = 180;
+      const deferredIds = Array.from(
+        new Set(
+          renderItems
+            .slice(virtualRange.startIndex, virtualRange.endIndex)
+            .flatMap((item) =>
+              item.seamlessGroupMessageIds?.length ? [] : [item.id],
+            )
+            .map((messageId) => session.messagesById.get(messageId))
+            .filter(
+              (message): message is ChatMessage =>
+                !!message && !!message.deferredPayload?.fields.length,
+            )
+            .map((message) => message.id),
+        ),
+      );
+      void Promise.all([
+        store.chat.loadMessageRange(
+          sessionId,
+          Math.max(0, firstPosition - prefetchPadding),
+          Math.min(total, lastPosition + prefetchPadding),
+        ),
+        deferredIds.length > 0
+          ? store.chat.loadFullMessages(sessionId, deferredIds)
+          : Promise.resolve([]),
+      ]).catch((error) => {
+        console.warn("Failed to load visible chat message range:", error);
+      });
+    }, [
+      renderItems,
+      session?.geometryLoaded,
+      session?.messagePositionById,
+      session?.messagesById,
+      session?.totalMessageCount,
+      sessionId,
+      store.chat,
+      virtualRange.endIndex,
+      virtualRange.startIndex,
+    ]);
 
     React.useLayoutEffect(() => {
       const element = scrollRef.current;

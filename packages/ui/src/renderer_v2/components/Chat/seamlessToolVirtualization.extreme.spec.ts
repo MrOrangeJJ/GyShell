@@ -99,17 +99,23 @@ const harnessHtml = String.raw`<!doctype html>
       content: JSON.stringify({ index, path: "/tmp/item-" + index }),
       timestamp: index + 1,
       streaming: false,
+      payloadState: "geometry",
+      deferredPayload: { fields: ["content", "output"] },
       metadata: {
         toolName: "read",
-        output: "result-" + index,
+        output: "result-preview-" + index,
       },
     }));
+    const fullPayloadRequests = [];
 
     const startedAt = performance.now();
     createRoot(document.getElementById("root")).render(
       React.createElement(SeamlessToolGroupBanner, {
         messages,
         expanded: true,
+        onRequestFullMessages: async (messageIds) => {
+          fullPayloadRequests.push([...messageIds]);
+        },
       }),
     );
 
@@ -130,6 +136,7 @@ const harnessHtml = String.raw`<!doctype html>
         scrollHeight: panel.scrollHeight,
         clientHeight: panel.clientHeight,
         firstVisibleText: document.querySelector(".stg-step-text")?.textContent || "",
+        fullPayloadRequests: fullPayloadRequests.map((ids) => [...ids]),
       };
 
       panel.scrollTop = panel.scrollHeight;
@@ -142,6 +149,7 @@ const harnessHtml = String.raw`<!doctype html>
         nodes: document.querySelectorAll("*").length,
         lastVisibleText: bottomRows[bottomRows.length - 1] || "",
         containsLast: bottomRows.some((text) => text.includes("9999")),
+        fullPayloadRequests: fullPayloadRequests.map((ids) => [...ids]),
       };
 
       const lastButton = Array.from(document.querySelectorAll(".stg-step-toggle"))
@@ -152,6 +160,7 @@ const harnessHtml = String.raw`<!doctype html>
         detailRows: document.querySelectorAll(".stg-step-details").length,
         stepRows: document.querySelectorAll(".stg-step").length,
         nodes: document.querySelectorAll("*").length,
+        fullPayloadRequests: fullPayloadRequests.map((ids) => [...ids]),
       };
 
       panel.scrollTop = 0;
@@ -254,6 +263,17 @@ check(
 );
 check(result.bottom.containsLast, "scrolling to the bottom must render step 9,999");
 check(result.top.containsFirst, "scrolling back to the top must render step 0");
+check(
+  result.initial.fullPayloadRequests.length === 0 &&
+    result.bottom.fullPayloadRequests.length === 0,
+  "geometry-only group expansion and scrolling must not fan out full-payload requests",
+);
+check(
+  result.expanded.fullPayloadRequests.length === 1 &&
+    result.expanded.fullPayloadRequests[0]?.length === 1 &&
+    result.expanded.fullPayloadRequests[0]?.[0] === "tool-9999",
+  `expanding one geometry step must request only tool-9999, got ${JSON.stringify(result.expanded.fullPayloadRequests)}`,
+);
 check(
   result.expanded.detailRows === 1,
   `an on-screen step must retain its original expand interaction, got ${result.expanded.detailRows} details`,

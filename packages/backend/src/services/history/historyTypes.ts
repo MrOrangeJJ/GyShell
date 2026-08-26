@@ -1,4 +1,5 @@
 import type { ChatMessage, UIChatSession } from "../../types/ui-chat";
+import type { UiMessageGeometryIndex } from "@gyshell/shared";
 
 export interface StoredChatMessageRecord {
   id: string;
@@ -53,6 +54,8 @@ export interface UiMessagePageRequest {
   afterPosition?: number;
   aroundPosition?: number;
 }
+
+export type { UiMessageGeometryIndex };
 
 export interface UiMessageSearchMatch {
   messageId: string;

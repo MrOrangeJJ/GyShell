@@ -10,9 +10,43 @@ import { v4 as uuidv4 } from "uuid";
 import { ChatQueueStore, type QueueItem } from "./ChatQueueStore";
 import type { InputImageAttachment, UserInputPayload } from "../lib/userInput";
 import { WINDOW_CONTEXT } from "../lib/windowing";
-import type { CommandOutputContractV1 } from "@gyshell/shared";
+import {
+  createChatTextGeometryShape,
+  extractCommandOutputDisplayText,
+  parseCommandOutputContractV1,
+  type ChatMessageGeometry,
+  type CommandOutputContractV1,
+  type UiMessageGeometryIndex,
+} from "@gyshell/shared";
 
 const SESSION_REGISTRATION_RETRY_DELAYS_MS = [50, 100, 200, 400, 800, 1_600];
+const CHAT_GEOMETRY_PAYLOAD_CHUNK_SIZE = 512;
+const CHAT_GEOMETRY_PAGE_CHUNK_LIMIT = 8;
+const CHAT_GEOMETRY_PREVIEW_LIMIT = 512;
+const CHAT_FULL_PAYLOAD_MAX_MESSAGES = 128;
+const CHAT_FULL_PAYLOAD_MAX_CHARACTERS = 8_000_000;
+const CHAT_FULL_PAYLOAD_REQUEST_MAX_MESSAGES = 16;
+const CHAT_GEOMETRY_OUTPUT_MESSAGE_TYPES: ReadonlySet<MessageType> = new Set([
+  "command",
+  "tool_call",
+  "file_edit",
+  "sub_tool",
+  "reasoning",
+]);
+const CHAT_STRUCTURAL_METADATA_STRING_FIELDS = [
+  "tabName",
+  "commandId",
+  "filePath",
+  "toolName",
+  "subToolTitle",
+  "subToolHint",
+  "approvalId",
+  "command",
+  "modelName",
+  "compactionBoundaryTargetBackendMessageId",
+  "compactionBoundaryPreviousBackendMessageId",
+  "compactionBoundarySummaryBackendMessageId",
+] as const;
 
 const isSessionRegistrationHandlerUnavailable = (error: unknown): boolean =>
   /No handler registered for ['"]agent:registerSession['"]/i.test(
@@ -81,8 +115,12 @@ export interface ChatMessage {
   timestamp: number;
   streaming?: boolean;
   deferredPayload?: {
-    fields: Array<"content" | "output" | "diff" | "details" | "inputImages">;
+    fields: Array<
+      "content" | "output" | "diff" | "details" | "inputImages" | "metadata"
+    >;
   };
+  geometry?: ChatMessageGeometry;
+  payloadState?: "geometry" | "page" | "full";
 }
 
 export interface ChatSession {
@@ -104,6 +142,9 @@ export interface ChatSession {
   isLoadingNewerMessages?: boolean;
   hasLoadedMessagePage?: boolean;
   uiRevision?: number;
+  geometryLoaded?: boolean;
+  loadedPayloadPositions?: Set<number>;
+  messagePositionById?: Map<string, number>;
 }
 
 interface SessionMetadataPayload {
@@ -240,10 +281,25 @@ export class ChatStore {
   private uiUpdateSequence = 0;
   private sessionLoadPromises = new Map<string, Promise<void>>();
   private fullMessageLoadPromises = new Map<string, Promise<ChatMessage[]>>();
+  private fullMessageLoadByIdPromises = new Map<
+    string,
+    Promise<ChatMessage | undefined>
+  >();
   private readonly initialMessagePageSize = 300;
   private readonly maxLoadedMessagesPerSession = WINDOW_CONTEXT.safeMode
     ? 300
     : 600;
+  private geometryLoadPromises = new Map<string, Promise<boolean>>();
+  private messageRangeLoadPromises = new Map<string, Promise<boolean>>();
+  private pagePayloadChunksBySession = new Map<string, Map<number, true>>();
+  private fullPayloadRetentionBySession = new Map<
+    string,
+    Map<string, number>
+  >();
+  private geometryPlaceholdersBySession = new Map<
+    string,
+    Map<string, ChatMessage>
+  >();
 
   constructor() {
     makeObservable(this, {
@@ -271,6 +327,7 @@ export class ChatStore {
       loadOlderMessages: action,
       loadNewerMessages: action,
       loadMessagesAroundPosition: action,
+      loadMessageRange: action,
       loadFullMessages: action,
       searchMessages: action,
       deleteChatSession: action,
@@ -303,7 +360,12 @@ export class ChatStore {
       id,
       title,
       updatedAt: loaded ? Date.now() : undefined,
-      messagesById: observable.map<string, ChatMessage>(),
+      // Message payloads are immutable snapshots at the map boundary. A
+      // shallow map avoids creating one MobX observable proxy per historical
+      // message, metadata object, and geometry bucket.
+      messagesById: observable.map<string, ChatMessage>(undefined, {
+        deep: false,
+      }),
       messageIds: [],
       renderListVersion: 0,
       isThinking: false,
@@ -318,6 +380,9 @@ export class ChatStore {
       isLoadingNewerMessages: false,
       hasLoadedMessagePage: loaded,
       uiRevision: 0,
+      geometryLoaded: false,
+      loadedPayloadPositions: new Set<number>(),
+      messagePositionById: new Map<string, number>(),
     };
   }
 
@@ -386,9 +451,7 @@ export class ChatStore {
         this.invokeSessionRegistrationWithRetry(sessionId, ownershipVersion),
       )
       .catch((error) => {
-        if (
-          this.sessionOwnershipVersions.get(sessionId) === ownershipVersion
-        ) {
+        if (this.sessionOwnershipVersions.get(sessionId) === ownershipVersion) {
           this.ownedBackendSessionIds.delete(sessionId);
         }
         console.error(`Failed to register chat session ${sessionId}:`, error);
@@ -533,7 +596,10 @@ export class ChatStore {
     );
     this.sessions
       .filter((session) => !ids.includes(session.id))
-      .forEach((session) => this.unregisterSessionWithBackend(session.id));
+      .forEach((session) => {
+        this.clearGeometryRuntimeState(session.id);
+        this.unregisterSessionWithBackend(session.id);
+      });
     const nextSessions = ids.map(
       (id) =>
         existingById.get(id) ||
@@ -625,6 +691,626 @@ export class ChatStore {
     );
   }
 
+  private createGeometryPreview(value: string): {
+    value: string;
+    deferred: boolean;
+  } {
+    const normalized = String(value || "");
+    if (normalized.length <= CHAT_GEOMETRY_PREVIEW_LIMIT) {
+      return { value: normalized, deferred: false };
+    }
+    const headLength = Math.ceil(CHAT_GEOMETRY_PREVIEW_LIMIT / 2);
+    const tailLength = Math.floor(CHAT_GEOMETRY_PREVIEW_LIMIT / 2);
+    let headEnd = headLength;
+    if (
+      headEnd > 0 &&
+      headEnd < normalized.length &&
+      /[\uD800-\uDBFF]/.test(normalized[headEnd - 1]) &&
+      /[\uDC00-\uDFFF]/.test(normalized[headEnd])
+    ) {
+      headEnd -= 1;
+    }
+    let tailStart = normalized.length - tailLength;
+    if (
+      tailStart > 0 &&
+      tailStart < normalized.length &&
+      /[\uD800-\uDBFF]/.test(normalized[tailStart - 1]) &&
+      /[\uDC00-\uDFFF]/.test(normalized[tailStart])
+    ) {
+      tailStart += 1;
+    }
+    return {
+      value: `${normalized.slice(0, headEnd)}${normalized.slice(tailStart)}`,
+      deferred: true,
+    };
+  }
+
+  private createGeometryPlaceholder(message: ChatMessage): ChatMessage {
+    const geometry = message.geometry || this.createLiveMessageGeometry(message);
+    const needsContent =
+      message.type !== "tokens_count" &&
+      message.type !== "compaction_boundary";
+    const needsOutput = CHAT_GEOMETRY_OUTPUT_MESSAGE_TYPES.has(message.type);
+    const needsDiff = message.type === "file_edit";
+    const needsDetails = message.type === "error";
+    const output = extractCommandOutputDisplayText(
+      String(message.metadata?.output || ""),
+    );
+    const contentPreview = this.createGeometryPreview(
+      needsContent ? message.content : "",
+    );
+    const outputPreview = this.createGeometryPreview(
+      needsOutput ? output : "",
+    );
+    const diffPreview = this.createGeometryPreview(
+      needsDiff ? String(message.metadata?.diff || "") : "",
+    );
+    const detailsPreview = this.createGeometryPreview(
+      needsDetails ? String(message.metadata?.details || "") : "",
+    );
+    const deferredFields: NonNullable<
+      ChatMessage["deferredPayload"]
+    >["fields"] = [];
+    const defer = (
+      field: NonNullable<ChatMessage["deferredPayload"]>["fields"][number],
+    ): void => {
+      if (!deferredFields.includes(field)) deferredFields.push(field);
+    };
+    if (contentPreview.deferred) defer("content");
+    if (outputPreview.deferred) defer("output");
+    if (diffPreview.deferred) defer("diff");
+    if (detailsPreview.deferred) defer("details");
+
+    const sourceMetadata = message.metadata || {};
+    const metadata: NonNullable<ChatMessage["metadata"]> = {};
+    for (const field of CHAT_STRUCTURAL_METADATA_STRING_FIELDS) {
+      const value = sourceMetadata[field];
+      if (typeof value !== "string" || value.length === 0) continue;
+      const preview = this.createGeometryPreview(value);
+      metadata[field] = preview.value as never;
+      if (preview.deferred) defer("metadata");
+    }
+    for (const field of [
+      "exitCode",
+      "action",
+      "collapsed",
+      "isNowait",
+      "subToolLevel",
+      "decision",
+      "totalTokens",
+      "maxTokens",
+      "inputKind",
+      "compactionBoundaryProtectedNormalRounds",
+    ] as const) {
+      const value = sourceMetadata[field];
+      if (value !== undefined) metadata[field] = value as never;
+    }
+    const commandOutput = parseCommandOutputContractV1(
+      sourceMetadata.commandOutput,
+    );
+    if (commandOutput) metadata.commandOutput = commandOutput;
+    if (outputPreview.value) metadata.output = outputPreview.value;
+    if (diffPreview.value) metadata.diff = diffPreview.value;
+    if (detailsPreview.value) metadata.details = detailsPreview.value;
+    const inputImageCount = Array.isArray(sourceMetadata.inputImages)
+      ? sourceMetadata.inputImages.length
+      : geometry.inputImageCount || 0;
+    if (inputImageCount > 0) defer("inputImages");
+
+    return {
+      id: message.id,
+      backendMessageId: message.backendMessageId,
+      role: message.role,
+      type: message.type,
+      content: contentPreview.value,
+      ...(Object.keys(metadata).length > 0 ? { metadata } : {}),
+      timestamp: message.timestamp,
+      streaming: message.streaming,
+      geometry: {
+        ...geometry,
+        inputImageCount,
+      },
+      payloadState: "geometry",
+      ...(deferredFields.length > 0
+        ? { deferredPayload: { fields: deferredFields } }
+        : {}),
+    };
+  }
+
+  private rememberGeometryPlaceholder(
+    session: ChatSession,
+    message: ChatMessage,
+  ): void {
+    if (
+      !session.geometryLoaded ||
+      message.streaming === true ||
+      message.type === "ask" ||
+      message.deferredPayload?.fields.length
+    ) {
+      return;
+    }
+    const placeholders =
+      this.geometryPlaceholdersBySession.get(session.id) || new Map();
+    placeholders.set(message.id, this.createGeometryPlaceholder(message));
+    this.geometryPlaceholdersBySession.set(session.id, placeholders);
+  }
+
+  private estimateFullPayloadCharacters(message: ChatMessage): number {
+    let total = String(message.content || "").length;
+    if (!message.metadata) return total;
+    try {
+      total += JSON.stringify(message.metadata).length;
+    } catch {
+      total += String(message.metadata.output || "").length;
+      total += String(message.metadata.diff || "").length;
+      total += String(message.metadata.details || "").length;
+    }
+    return total;
+  }
+
+  private touchFullPayload(
+    session: ChatSession,
+    message: ChatMessage,
+  ): void {
+    if (
+      message.payloadState !== "full" ||
+      message.streaming === true ||
+      message.type === "ask"
+    ) {
+      return;
+    }
+    const retention =
+      this.fullPayloadRetentionBySession.get(session.id) || new Map();
+    retention.delete(message.id);
+    retention.set(message.id, this.estimateFullPayloadCharacters(message));
+    this.fullPayloadRetentionBySession.set(session.id, retention);
+  }
+
+  private pruneFullPayloads(
+    session: ChatSession,
+    protectedMessageIds: ReadonlySet<string> = new Set(),
+  ): void {
+    const retention = this.fullPayloadRetentionBySession.get(session.id);
+    const placeholders = this.geometryPlaceholdersBySession.get(session.id);
+    if (!retention || !placeholders) return;
+
+    for (const messageId of Array.from(retention.keys())) {
+      if (session.messagesById.get(messageId)?.payloadState !== "full") {
+        retention.delete(messageId);
+      }
+    }
+    let totalCharacters = Array.from(retention.values()).reduce(
+      (total, size) => total + size,
+      0,
+    );
+    for (const [messageId, size] of Array.from(retention.entries())) {
+      if (
+        retention.size <= CHAT_FULL_PAYLOAD_MAX_MESSAGES &&
+        totalCharacters <= CHAT_FULL_PAYLOAD_MAX_CHARACTERS
+      ) {
+        break;
+      }
+      if (protectedMessageIds.has(messageId)) continue;
+      const message = session.messagesById.get(messageId);
+      const placeholder = placeholders.get(messageId);
+      if (
+        !message ||
+        !placeholder ||
+        message.streaming === true ||
+        message.type === "ask"
+      ) {
+        continue;
+      }
+      session.messagesById.set(messageId, placeholder);
+      const position = session.messagePositionById?.get(messageId);
+      if (typeof position === "number") {
+        session.loadedPayloadPositions?.delete(position);
+      }
+      retention.delete(messageId);
+      totalCharacters -= size;
+    }
+  }
+
+  private clearGeometryRuntimeState(sessionId: string): void {
+    this.geometryPlaceholdersBySession.delete(sessionId);
+    this.pagePayloadChunksBySession.delete(sessionId);
+    this.fullPayloadRetentionBySession.delete(sessionId);
+  }
+
+  private trackGeometryMessagePayload(
+    session: ChatSession,
+    message: ChatMessage,
+    options?: { protect?: boolean },
+  ): void {
+    if (!session.geometryLoaded) return;
+    this.rememberGeometryPlaceholder(session, message);
+    this.touchFullPayload(session, message);
+    this.pruneFullPayloads(
+      session,
+      options?.protect ? new Set([message.id]) : undefined,
+    );
+  }
+
+  private createLiveMessageGeometry(message: ChatMessage): ChatMessageGeometry {
+    const output = extractCommandOutputDisplayText(
+      String(message.metadata?.output || ""),
+    );
+    return {
+      contentShape: createChatTextGeometryShape(message.content),
+      ...(output ? { outputShape: createChatTextGeometryShape(output) } : {}),
+      ...(message.metadata?.diff
+        ? { diffShape: createChatTextGeometryShape(message.metadata.diff) }
+        : {}),
+      ...(message.metadata?.details
+        ? {
+            detailsShape: createChatTextGeometryShape(message.metadata.details),
+          }
+        : {}),
+      inputImageCount: Array.isArray(message.metadata?.inputImages)
+        ? message.metadata.inputImages.length
+        : message.geometry?.inputImageCount || 0,
+    };
+  }
+
+  private refreshLiveMessageGeometry(
+    session: ChatSession,
+    message: ChatMessage,
+  ): ChatMessage {
+    if (
+      !session.geometryLoaded ||
+      message.deferredPayload?.fields.length ||
+      typeof session.messagePositionById?.get(message.id) !== "number"
+    ) {
+      return message;
+    }
+    return {
+      ...message,
+      geometry: this.createLiveMessageGeometry(message),
+    };
+  }
+
+  private mergeLiveMessage(
+    session: ChatSession,
+    previous: ChatMessage | undefined,
+    incoming: ChatMessage,
+  ): ChatMessage {
+    if (!session.geometryLoaded) return incoming;
+    return {
+      ...incoming,
+      payloadState: incoming.deferredPayload?.fields.length ? "page" : "full",
+      ...(previous?.geometry ? { geometry: previous.geometry } : {}),
+    };
+  }
+
+  private rebuildGeometryPositionMap(
+    session: ChatSession,
+    options?: { clearLoadedPayloadPositions?: boolean },
+  ): void {
+    if (!session.geometryLoaded) return;
+    session.messagePositionById = new Map(
+      session.messageIds.map((messageId, position) => [messageId, position]),
+    );
+    if (options?.clearLoadedPayloadPositions) {
+      const loadedPositions = new Set<number>();
+      const pageChunkStarts = new Set<number>();
+      session.messageIds.forEach((messageId, position) => {
+        const message = session.messagesById.get(messageId);
+        if (!message) return;
+        if (
+          message.payloadState === "page" ||
+          message.payloadState === "full" ||
+          !message.deferredPayload?.fields.length
+        ) {
+          loadedPositions.add(position);
+        }
+        if (message.payloadState === "page") {
+          pageChunkStarts.add(
+            Math.floor(position / CHAT_GEOMETRY_PAYLOAD_CHUNK_SIZE) *
+              CHAT_GEOMETRY_PAYLOAD_CHUNK_SIZE,
+          );
+        }
+      });
+      session.loadedPayloadPositions = loadedPositions;
+      this.pagePayloadChunksBySession.set(session.id, new Map());
+      this.touchGeometryPagePayloadChunks(session, pageChunkStarts);
+    }
+    // Geometry mode owns the complete ordered ID list, including live
+    // transients appended after the durable index. Structural mutations can
+    // therefore keep the public total exact instead of preserving a stale
+    // paged-history count.
+    session.totalMessageCount = session.messageIds.length;
+    session.loadedStartPosition = session.messageIds.length > 0 ? 0 : null;
+    session.loadedEndPosition =
+      session.messageIds.length > 0 ? session.messageIds.length - 1 : null;
+    session.hasOlderMessages = false;
+    session.hasNewerMessages = false;
+  }
+
+  private createMessageFromGeometryEntry(
+    entry: UiMessageGeometryIndex["entries"][number],
+  ): ChatMessage {
+    const metadata = {
+      ...(entry.metadata || {}),
+      ...(entry.projection.output ? { output: entry.projection.output } : {}),
+      ...(entry.projection.diff ? { diff: entry.projection.diff } : {}),
+      ...(entry.projection.details
+        ? { details: entry.projection.details }
+        : {}),
+    };
+    const hasMetadata = Object.keys(metadata).length > 0;
+    const deferredFields = entry.projection.deferredFields || [];
+    const message: ChatMessage = {
+      id: entry.id,
+      backendMessageId: entry.backendMessageId,
+      role: entry.role,
+      type: entry.type,
+      content: entry.projection.content || "",
+      ...(hasMetadata ? { metadata } : {}),
+      timestamp: entry.timestamp,
+      streaming: entry.streaming,
+      geometry: entry.geometry,
+      payloadState: "geometry",
+      ...(deferredFields.length > 0
+        ? { deferredPayload: { fields: deferredFields } }
+        : {}),
+    };
+    return message;
+  }
+
+  private applyMessageGeometryIndex(
+    session: ChatSession,
+    index: UiMessageGeometryIndex,
+  ): void {
+    const existingMessages = [...session.messagesById.values()];
+    const existingById = new Map(
+      existingMessages.map((message) => [message.id, message]),
+    );
+    const incomingIds = index.entries.map((entry) => entry.id);
+    const geometryPlaceholderById = new Map<string, ChatMessage>();
+    const incomingById = new Map(
+      index.entries.map((entry) => {
+        const previous = existingById.get(entry.id);
+        const geometryMessage = this.createMessageFromGeometryEntry(entry);
+        geometryPlaceholderById.set(entry.id, geometryMessage);
+        return [
+          entry.id,
+          previous?.payloadState === "full" || previous?.streaming === true
+            ? {
+                ...previous,
+                geometry: geometryMessage.geometry,
+                payloadState:
+                  previous.payloadState ||
+                  (previous.deferredPayload?.fields.length ? "page" : "full"),
+              }
+            : geometryMessage,
+        ] as const;
+      }),
+    );
+    this.geometryPlaceholdersBySession.set(
+      session.id,
+      geometryPlaceholderById,
+    );
+    this.pagePayloadChunksBySession.set(session.id, new Map());
+    this.fullPayloadRetentionBySession.set(session.id, new Map());
+    session.geometryLoaded = true;
+    session.loadedPayloadPositions = new Set(
+      index.entries
+        .filter((entry) => !entry.projection.deferredFields?.length)
+        .map((entry) => entry.position),
+    );
+    session.messagePositionById = new Map(
+      index.entries.map((entry) => [entry.id, entry.position]),
+    );
+    session.messagesById.clear();
+    incomingById.forEach((message, id) =>
+      session.messagesById.set(id, message),
+    );
+    const incomingIdSet = new Set(incomingIds);
+    existingMessages.forEach((message) => {
+      if (incomingIdSet.has(message.id)) return;
+      const position = incomingIds.length;
+      incomingIds.push(message.id);
+      session.messagePositionById?.set(message.id, position);
+      const preservedMessage: ChatMessage = {
+        ...message,
+        payloadState: message.payloadState === "full" ? "full" : "page",
+      };
+      session.messagesById.set(message.id, preservedMessage);
+      if (!preservedMessage.deferredPayload?.fields.length) {
+        session.loadedPayloadPositions?.add(position);
+      }
+    });
+    session.messageIds = incomingIds;
+    session.totalMessageCount = Math.max(index.totalCount, incomingIds.length);
+    session.loadedStartPosition = incomingIds.length > 0 ? 0 : null;
+    session.loadedEndPosition =
+      incomingIds.length > 0 ? incomingIds.length - 1 : null;
+    session.hasOlderMessages = false;
+    session.hasNewerMessages = false;
+    session.hasLoadedMessagePage = true;
+    session.uiRevision = Math.max(
+      session.uiRevision || 0,
+      index.uiRevision || 0,
+    );
+    incomingById.forEach((message) => {
+      if (message.payloadState === "full") {
+        this.rememberGeometryPlaceholder(session, message);
+        this.touchFullPayload(session, message);
+      }
+    });
+    this.pruneFullPayloads(session);
+    this.bumpSessionRenderListVersion(session);
+  }
+
+  private evictGeometryPagePayloadChunk(
+    session: ChatSession,
+    chunkStart: number,
+  ): void {
+    const geometryPlaceholders = this.geometryPlaceholdersBySession.get(
+      session.id,
+    );
+    if (!geometryPlaceholders) return;
+    const chunkEnd = Math.min(
+      session.messageIds.length - 1,
+      chunkStart + CHAT_GEOMETRY_PAYLOAD_CHUNK_SIZE - 1,
+    );
+    for (let position = chunkStart; position <= chunkEnd; position += 1) {
+      const messageId = session.messageIds[position];
+      const message = messageId
+        ? session.messagesById.get(messageId)
+        : undefined;
+      if (
+        !message ||
+        message.payloadState !== "page" ||
+        message.streaming === true ||
+        message.type === "ask"
+      ) {
+        continue;
+      }
+      const geometryPlaceholder = geometryPlaceholders.get(messageId);
+      if (!geometryPlaceholder) continue;
+      session.messagesById.set(messageId, geometryPlaceholder);
+      session.loadedPayloadPositions?.delete(position);
+    }
+  }
+
+  private touchGeometryPagePayloadChunks(
+    session: ChatSession,
+    chunkStarts: Iterable<number>,
+  ): void {
+    const chunks =
+      this.pagePayloadChunksBySession.get(session.id) || new Map<number, true>();
+    for (const chunkStart of chunkStarts) {
+      chunks.delete(chunkStart);
+      chunks.set(chunkStart, true);
+    }
+    while (chunks.size > CHAT_GEOMETRY_PAGE_CHUNK_LIMIT) {
+      const oldestChunkStart = chunks.keys().next().value;
+      if (typeof oldestChunkStart !== "number") break;
+      chunks.delete(oldestChunkStart);
+      this.evictGeometryPagePayloadChunk(session, oldestChunkStart);
+    }
+    this.pagePayloadChunksBySession.set(session.id, chunks);
+  }
+
+  private mergeLoadedPageIntoGeometrySession(
+    session: ChatSession,
+    page: UiMessagePagePayload,
+    retainRange?: { start: number; end: number },
+  ): boolean {
+    const incomingRevision = this.getPageRevision(page);
+    if (
+      page.revisionPresent !== false &&
+      this.isUiRevisionStale(incomingRevision, session.uiRevision || 0)
+    ) {
+      return false;
+    }
+    this.applySessionMetadata(session, page.metadata || null);
+    let insertedMessage = false;
+    const touchedChunkStarts = new Set<number>();
+    page.entries.forEach((entry) => {
+      const position =
+        typeof entry.position === "number"
+          ? entry.position
+          : session.messagePositionById?.get(entry.message.id);
+      if (
+        retainRange &&
+        (typeof position !== "number" ||
+          position < retainRange.start ||
+          position > retainRange.end)
+      ) {
+        return;
+      }
+      if (typeof position !== "number") return;
+      touchedChunkStarts.add(
+        Math.floor(position / CHAT_GEOMETRY_PAYLOAD_CHUNK_SIZE) *
+          CHAT_GEOMETRY_PAYLOAD_CHUNK_SIZE,
+      );
+      const previous = session.messagesById.get(entry.message.id);
+      const alreadyIndexed = session.messagePositionById?.has(entry.message.id);
+      session.messagePositionById?.set(entry.message.id, position);
+      if (!alreadyIndexed) {
+        const insertIndex = Math.min(position, session.messageIds.length);
+        session.messageIds.splice(insertIndex, 0, entry.message.id);
+        session.totalMessageCount = Math.max(
+          session.totalMessageCount || 0,
+          position + 1,
+        );
+        insertedMessage = true;
+      }
+      // A page response is bounded and may race a full-payload response for a
+      // visible row. Never downgrade a full/live message back to its preview.
+      if (
+        previous?.payloadState === "full" ||
+        (previous?.streaming === true && previous.payloadState !== "geometry")
+      ) {
+        session.loadedPayloadPositions?.add(position);
+        return;
+      }
+      const next = {
+        ...entry.message,
+        payloadState: "page" as const,
+        geometry: previous?.geometry || entry.message.geometry,
+      };
+      session.messagesById.set(entry.message.id, next);
+      session.loadedPayloadPositions?.add(position);
+    });
+    if (insertedMessage) {
+      this.rebuildGeometryPositionMap(session, {
+        clearLoadedPayloadPositions: true,
+      });
+    }
+    this.touchGeometryPagePayloadChunks(session, touchedChunkStarts);
+    session.uiRevision = Math.max(session.uiRevision || 0, incomingRevision);
+    this.bumpSessionRenderListVersion(session);
+    return true;
+  }
+
+  private async loadMessageGeometryIndex(sessionId: string): Promise<boolean> {
+    const getGeometry = (window.gyshell.agent as any).getUiMessageGeometry;
+    if (typeof getGeometry !== "function") return false;
+    const existing = this.geometryLoadPromises.get(sessionId);
+    if (existing) return existing;
+    const promise = (async () => {
+      try {
+        const raw = await getGeometry(sessionId);
+        if (!raw || !Array.isArray(raw.entries)) return false;
+        const current = this.getSessionById(sessionId);
+        if (
+          !current ||
+          raw.sessionId !== sessionId ||
+          this.isUiRevisionStale(
+            this.normalizeUiRevision(raw.uiRevision),
+            current.uiRevision || 0,
+          )
+        ) {
+          return false;
+        }
+        runInAction(() => {
+          this.applyMessageGeometryIndex(
+            current,
+            raw as UiMessageGeometryIndex,
+          );
+        });
+        return true;
+      } catch (error) {
+        // Geometry is an optional desktop optimization. A missing handler,
+        // stale preload, or a transient IPC failure must fall back to the
+        // existing paged transcript path instead of blocking session hydration.
+        console.warn(`Failed to load chat geometry for ${sessionId}:`, error);
+        return false;
+      }
+    })();
+    this.geometryLoadPromises.set(sessionId, promise);
+    try {
+      return await promise;
+    } finally {
+      if (this.geometryLoadPromises.get(sessionId) === promise) {
+        this.geometryLoadPromises.delete(sessionId);
+      }
+    }
+  }
+
   private getPageRevision(page: UiMessagePagePayload): number {
     return Math.max(
       this.normalizeUiRevision(page.uiRevision),
@@ -647,7 +1333,10 @@ export class ChatStore {
     );
   }
 
-  private recordUiUpdate(sessionId: string, update: any): {
+  private recordUiUpdate(
+    sessionId: string,
+    update: any,
+  ): {
     sequence: number;
     update: any;
   } {
@@ -694,11 +1383,15 @@ export class ChatStore {
         ) {
           return null;
         }
-        return { position: Math.floor(position), message: message as ChatMessage };
+        return {
+          position: Math.floor(position),
+          message: message as ChatMessage,
+        };
       })
       .filter(
-        (entry: { position: number; message: ChatMessage } | null):
-          entry is { position: number; message: ChatMessage } => !!entry,
+        (
+          entry: { position: number; message: ChatMessage } | null,
+        ): entry is { position: number; message: ChatMessage } => !!entry,
       )
       .sort(
         (
@@ -718,11 +1411,11 @@ export class ChatStore {
       totalCount,
       startPosition:
         value.startPosition === null || value.startPosition === undefined
-          ? entries[0]?.position ?? null
+          ? (entries[0]?.position ?? null)
           : Math.max(0, Math.floor(Number(value.startPosition))),
       endPosition:
         value.endPosition === null || value.endPosition === undefined
-          ? entries[entries.length - 1]?.position ?? null
+          ? (entries[entries.length - 1]?.position ?? null)
           : Math.max(0, Math.floor(Number(value.endPosition))),
       hasOlder: value.hasOlder === true,
       hasNewer: value.hasNewer === true,
@@ -734,8 +1427,10 @@ export class ChatStore {
         value.metadata && typeof value.metadata === "object"
           ? {
               ...(value.metadata as SessionMetadataPayload),
-              revisionPresent:
-                Object.prototype.hasOwnProperty.call(value.metadata, "uiRevision"),
+              revisionPresent: Object.prototype.hasOwnProperty.call(
+                value.metadata,
+                "uiRevision",
+              ),
             }
           : null,
       revisionPresent:
@@ -770,7 +1465,10 @@ export class ChatStore {
       session.updatedAt = metadata.updatedAt;
     }
     if (typeof metadata?.messagesCount === "number") {
-      session.totalMessageCount = Math.max(0, Math.floor(metadata.messagesCount));
+      session.totalMessageCount = Math.max(
+        0,
+        Math.floor(metadata.messagesCount),
+      );
     }
     if (metadata?.isBusy !== undefined) {
       session.isThinking = metadata.isBusy === true;
@@ -796,6 +1494,12 @@ export class ChatStore {
     }
 
     this.applySessionMetadata(session, page.metadata || null);
+    if (session.geometryLoaded) {
+      return this.mergeLoadedPageIntoGeometrySession(session, page, {
+        start: page.startPosition ?? 0,
+        end: page.endPosition ?? Math.max(0, page.totalCount - 1),
+      });
+    }
     const incomingIds = page.entries.map((entry) => entry.message.id);
     const incomingIdSet = new Set(incomingIds);
     page.entries.forEach((entry) => {
@@ -843,7 +1547,8 @@ export class ChatStore {
             ? previousEnd
             : Math.max(previousEnd, page.endPosition);
     }
-    session.hasOlderMessages = page.hasOlder || (session.loadedStartPosition ?? 0) > 0;
+    session.hasOlderMessages =
+      page.hasOlder || (session.loadedStartPosition ?? 0) > 0;
     session.hasNewerMessages =
       page.hasNewer ||
       (session.loadedEndPosition ?? -1) < (session.totalMessageCount || 0) - 1;
@@ -956,7 +1661,8 @@ export class ChatStore {
     // path once the metadata API is available.
     if (!metadata) {
       try {
-        legacySnapshot = await window.gyshell.agent.getSessionSnapshot(sessionId);
+        legacySnapshot =
+          await window.gyshell.agent.getSessionSnapshot(sessionId);
       } catch (error) {
         console.warn(
           `Failed to read legacy session snapshot for ${sessionId}:`,
@@ -974,12 +1680,16 @@ export class ChatStore {
             sessionId,
           );
         } catch (error) {
-          console.warn(`Failed to read chat message page for ${sessionId}:`, error);
+          console.warn(
+            `Failed to read chat message page for ${sessionId}:`,
+            error,
+          );
         }
       }
       if (!page) {
         try {
-          const messagesRaw = await window.gyshell.agent.getUiMessages(sessionId);
+          const messagesRaw =
+            await window.gyshell.agent.getUiMessages(sessionId);
           const messages = Array.isArray(messagesRaw)
             ? (messagesRaw.filter(
                 (item) => item && typeof item.id === "string",
@@ -987,7 +1697,10 @@ export class ChatStore {
             : [];
           page = {
             sessionId,
-            entries: messages.map((message, position) => ({ position, message })),
+            entries: messages.map((message, position) => ({
+              position,
+              message,
+            })),
             totalCount: messages.length,
             startPosition: messages.length > 0 ? 0 : null,
             endPosition: messages.length > 0 ? messages.length - 1 : null,
@@ -1038,7 +1751,8 @@ export class ChatStore {
         page?.metadata?.updatedAt,
         metadata?.updatedAt,
         legacySnapshot?.updatedAt,
-      ].find((value): value is number =>
+      ].find(
+        (value): value is number =>
         typeof value === "number" && Number.isFinite(value),
       ),
       messages,
@@ -1151,9 +1865,12 @@ export class ChatStore {
         ? this.activeSessionId
         : null;
     const activeId =
-      (normalizedPreferredActiveId && validIds.includes(normalizedPreferredActiveId)
+      (normalizedPreferredActiveId &&
+      validIds.includes(normalizedPreferredActiveId)
         ? normalizedPreferredActiveId
-        : existingActiveId) || validIds[0] || null;
+        : existingActiveId) ||
+      validIds[0] ||
+      null;
 
     runInAction(() => {
       const existingById = new Map(
@@ -1174,8 +1891,13 @@ export class ChatStore {
         this.registerSessionWithBackend(fallbackSessionId);
       }
       this.sessions
-        .filter((session) => !resolvedSessions.some((next) => next.id === session.id))
-        .forEach((session) => this.unregisterSessionWithBackend(session.id));
+        .filter(
+          (session) => !resolvedSessions.some((next) => next.id === session.id),
+        )
+        .forEach((session) => {
+          this.clearGeometryRuntimeState(session.id);
+          this.unregisterSessionWithBackend(session.id);
+        });
       this.sessions = resolvedSessions;
       this.activeSessionId =
         activeId && resolvedSessions.some((session) => session.id === activeId)
@@ -1185,7 +1907,10 @@ export class ChatStore {
     });
     this.emitSessionsChanged();
 
-    if (this.activeSessionId && !this.sessionLoadPromises.has(this.activeSessionId)) {
+    if (
+      this.activeSessionId &&
+      !this.sessionLoadPromises.has(this.activeSessionId)
+    ) {
       await this.hydrateSessionFromBackend(this.activeSessionId, {
         activate: false,
         loadAgentContext: true,
@@ -1233,14 +1958,21 @@ export class ChatStore {
     if (!normalizedId) return;
     this.activeSessionId = normalizedId;
     const session = this.getSessionById(normalizedId);
-    if (!session || session.hasLoadedMessagePage || this.sessionLoadPromises.has(normalizedId)) {
+    if (
+      !session ||
+      session.hasLoadedMessagePage ||
+      this.sessionLoadPromises.has(normalizedId)
+    ) {
       return;
     }
     void this.hydrateSessionFromBackend(normalizedId, {
       activate: false,
       loadAgentContext: true,
     }).catch((error) => {
-      console.warn(`Failed to hydrate active chat session ${normalizedId}:`, error);
+      console.warn(
+        `Failed to hydrate active chat session ${normalizedId}:`,
+        error,
+      );
     });
   }
 
@@ -1261,6 +1993,7 @@ export class ChatStore {
       this.sessions = nextSessions;
       this.activeSessionId = nextActiveId;
     });
+    this.clearGeometryRuntimeState(id);
     this.queue.clearSession(id);
 
     if (this.sessions.length === 0) {
@@ -1284,9 +2017,27 @@ export class ChatStore {
     runInAction(() => {
       const session = this.sessions.find((s) => s.id === sessionId);
       if (session) {
-        session.messagesById.set(id, fullMsg);
+        const nextMessage = session.geometryLoaded
+          ? this.mergeLiveMessage(session, undefined, fullMsg)
+          : fullMsg;
+        session.messagesById.set(id, nextMessage);
         session.messageIds.push(id);
-        session.updatedAt = fullMsg.timestamp;
+        session.updatedAt = nextMessage.timestamp;
+        this.rebuildGeometryPositionMap(session);
+        const nextPosition = session.messagePositionById?.get(id);
+        if (typeof nextPosition === "number" && !nextMessage.deferredPayload) {
+          session.loadedPayloadPositions?.add(nextPosition);
+        }
+        const renderedMessage = this.refreshLiveMessageGeometry(
+          session,
+          nextMessage,
+        );
+        if (renderedMessage !== nextMessage) {
+          session.messagesById.set(id, renderedMessage);
+        }
+        this.trackGeometryMessagePayload(session, renderedMessage, {
+          protect: true,
+        });
         this.bumpSessionRenderListVersion(session);
         // Auto-update title based on first user message if title is default
         if (msg.role === "user") {
@@ -1314,7 +2065,27 @@ export class ChatStore {
     const msg = session.messagesById.get(id);
     if (msg) {
       runInAction(() => {
-        Object.assign(msg, patch);
+        let nextMessage: ChatMessage = {
+          ...msg,
+          ...patch,
+          metadata:
+            patch.metadata === undefined
+              ? msg.metadata
+              : { ...(msg.metadata || {}), ...(patch.metadata || {}) },
+        };
+        if (session.geometryLoaded) {
+          nextMessage = {
+            ...nextMessage,
+            payloadState: nextMessage.deferredPayload?.fields.length
+              ? "page"
+              : "full",
+          };
+          nextMessage = this.refreshLiveMessageGeometry(session, nextMessage);
+        }
+        session.messagesById.set(id, nextMessage);
+        this.trackGeometryMessagePayload(session, nextMessage, {
+          protect: true,
+        });
         this.bumpSessionRenderListVersion(session);
       });
     }
@@ -1326,6 +2097,11 @@ export class ChatStore {
     runInAction(() => {
       session.messagesById.delete(id);
       session.messageIds = session.messageIds.filter((msgId) => msgId !== id);
+      this.geometryPlaceholdersBySession.get(session.id)?.delete(id);
+      this.fullPayloadRetentionBySession.get(session.id)?.delete(id);
+      this.rebuildGeometryPositionMap(session, {
+        clearLoadedPayloadPositions: true,
+      });
       this.bumpSessionRenderListVersion(session);
     });
   }
@@ -1401,8 +2177,13 @@ export class ChatStore {
     const session = this.sessions.find((s) => s.id === this.activeSessionId);
     if (session) {
       runInAction(() => {
+        this.clearGeometryRuntimeState(session.id);
+        session.geometryLoaded = false;
+        session.loadedPayloadPositions = new Set();
+        session.messagePositionById = new Map();
         session.messagesById.clear();
         session.messageIds = [];
+        this.markEmptySessionLoaded(session);
         this.bumpSessionRenderListVersion(session);
       });
     }
@@ -1411,7 +2192,9 @@ export class ChatStore {
   handleUiUpdate(update: any): void {
     const sessionId = String(update?.sessionId || "").trim();
     if (!sessionId) return;
-    const session = this.sessions.find((candidate) => candidate.id === sessionId);
+    const session = this.sessions.find(
+      (candidate) => candidate.id === sessionId,
+    );
     if (!session) return;
 
     const recorded = this.recordUiUpdate(sessionId, update);
@@ -1465,8 +2248,12 @@ export class ChatStore {
           if (!msg || typeof msg.id !== "string" || msg.id.length === 0) {
             break;
           }
-          const existed = session.messagesById.has(msg.id);
-          session.messagesById.set(msg.id, msg);
+          const previous = session.messagesById.get(msg.id);
+          const existed = !!previous;
+          const nextMessage = session.geometryLoaded
+            ? this.mergeLiveMessage(session, previous, msg)
+            : msg;
+          session.messagesById.set(msg.id, nextMessage);
           if (!existed) {
             const previousTotal = Math.max(
               session.totalMessageCount || 0,
@@ -1478,6 +2265,37 @@ export class ChatStore {
               session.loadedEndPosition = previousTotal;
               session.hasNewerMessages = false;
             }
+            this.rebuildGeometryPositionMap(session);
+            const nextPosition = session.messagePositionById?.get(msg.id);
+            if (
+              typeof nextPosition === "number" &&
+              !nextMessage.deferredPayload
+            ) {
+              session.loadedPayloadPositions?.add(nextPosition);
+            }
+            const renderedMessage = this.refreshLiveMessageGeometry(
+              session,
+              nextMessage,
+            );
+            if (renderedMessage !== nextMessage) {
+              session.messagesById.set(msg.id, renderedMessage);
+            }
+            this.trackGeometryMessagePayload(session, renderedMessage, {
+              protect: true,
+            });
+            this.bumpSessionRenderListVersion(session);
+          }
+          if (existed) {
+            const renderedMessage = this.refreshLiveMessageGeometry(
+              session,
+              nextMessage,
+            );
+            if (renderedMessage !== nextMessage) {
+              session.messagesById.set(msg.id, renderedMessage);
+            }
+            this.trackGeometryMessagePayload(session, renderedMessage, {
+              protect: true,
+            });
             this.bumpSessionRenderListVersion(session);
           }
           // Auto-update title logic if needed (backend also does this, but for UX we can do it here too)
@@ -1510,7 +2328,10 @@ export class ChatStore {
           if (existingIndex >= 0) {
             session.messageIds.splice(existingIndex, 1);
           }
-          session.messagesById.set(msg.id, msg);
+          const nextMessage = session.geometryLoaded
+            ? this.mergeLiveMessage(session, session.messagesById.get(msg.id), msg)
+            : msg;
+          session.messagesById.set(msg.id, nextMessage);
 
           const adjustedAnchorIndex =
             existingIndex >= 0 && existingIndex < anchorIndex
@@ -1523,17 +2344,40 @@ export class ChatStore {
           session.messageIds.splice(insertIndex, 0, msg.id);
           if (existingIndex < 0) {
             session.totalMessageCount =
-              Math.max(session.totalMessageCount || 0, session.messageIds.length - 1) + 1;
+              Math.max(
+                session.totalMessageCount || 0,
+                session.messageIds.length - 1,
+              ) + 1;
             if (typeof session.loadedEndPosition === "number") {
               session.loadedEndPosition += 1;
             }
           }
           this.normalizeCompactionBoundaryMessages(session);
+          this.rebuildGeometryPositionMap(session, {
+            clearLoadedPayloadPositions: true,
+          });
+          const insertedMessage = session.messagesById.get(msg.id) || msg;
+          const renderedMessage = this.refreshLiveMessageGeometry(
+            session,
+            insertedMessage,
+          );
+          if (renderedMessage !== insertedMessage) {
+            session.messagesById.set(msg.id, renderedMessage);
+          }
+          this.trackGeometryMessagePayload(session, renderedMessage, {
+            protect: true,
+          });
           this.bumpSessionRenderListVersion(session);
           break;
         }
         case "REMOVE_MESSAGE": {
           const existed = session.messagesById.delete(update.messageId);
+          this.geometryPlaceholdersBySession
+            .get(session.id)
+            ?.delete(update.messageId);
+          this.fullPayloadRetentionBySession
+            .get(session.id)
+            ?.delete(update.messageId);
           session.messageIds = session.messageIds.filter(
             (id) => id !== update.messageId,
           );
@@ -1549,30 +2393,73 @@ export class ChatStore {
               );
             }
           }
+          this.rebuildGeometryPositionMap(session, {
+            clearLoadedPayloadPositions: true,
+          });
           this.bumpSessionRenderListVersion(session);
           break;
         }
         case "APPEND_CONTENT": {
-          const msg = session.messagesById.get(update.messageId);
-          if (msg) {
-            msg.content += update.content;
+          const currentMessage = session.messagesById.get(update.messageId);
+          if (currentMessage) {
+            session.messagesById.set(currentMessage.id, {
+              ...currentMessage,
+              content: currentMessage.content + String(update.content || ""),
+              ...(currentMessage.payloadState === "geometry"
+                ? { payloadState: "page" as const }
+                : {}),
+            });
           }
           break;
         }
         case "APPEND_OUTPUT": {
-          const msg = session.messagesById.get(update.messageId);
-          if (msg) {
-            msg.metadata = {
-              ...(msg.metadata || {}),
-              output: (msg.metadata?.output || "") + (update.outputDelta || ""),
-            };
+          const currentMessage = session.messagesById.get(update.messageId);
+          if (currentMessage) {
+            session.messagesById.set(currentMessage.id, {
+              ...currentMessage,
+              metadata: {
+                ...(currentMessage.metadata || {}),
+                output:
+                  (currentMessage.metadata?.output || "") +
+                  String(update.outputDelta || ""),
+              },
+              ...(currentMessage.payloadState === "geometry"
+                ? { payloadState: "page" as const }
+                : {}),
+            });
           }
           break;
         }
         case "UPDATE_MESSAGE": {
           const msg = session.messagesById.get(update.messageId);
           if (msg) {
-            Object.assign(msg, update.patch);
+            let nextMessage: ChatMessage = {
+              ...msg,
+              ...update.patch,
+              metadata:
+                update.patch?.metadata === undefined
+                  ? msg.metadata
+                  : {
+                      ...(msg.metadata || {}),
+                      ...(update.patch.metadata || {}),
+                    },
+            };
+            if (session.geometryLoaded) {
+              nextMessage = {
+                ...nextMessage,
+                payloadState: nextMessage.deferredPayload?.fields.length
+                  ? "page"
+                  : "full",
+              };
+              nextMessage = this.refreshLiveMessageGeometry(
+                session,
+                nextMessage,
+              );
+            }
+            session.messagesById.set(msg.id, nextMessage);
+            this.trackGeometryMessagePayload(session, nextMessage, {
+              protect: true,
+            });
             this.bumpSessionRenderListVersion(session);
           }
           break;
@@ -1598,9 +2485,15 @@ export class ChatStore {
           });
           if (rollbackIndex !== -1) {
             const removedIds = session.messageIds.slice(rollbackIndex);
-            removedIds.forEach((messageId) =>
-              session.messagesById.delete(messageId),
-            );
+            removedIds.forEach((messageId) => {
+              session.messagesById.delete(messageId);
+              this.geometryPlaceholdersBySession
+                .get(session.id)
+                ?.delete(messageId);
+              this.fullPayloadRetentionBySession
+                .get(session.id)
+                ?.delete(messageId);
+            });
             session.messageIds = session.messageIds.slice(0, rollbackIndex);
             const nextTotal =
               Math.max(0, session.loadedStartPosition || 0) + rollbackIndex;
@@ -1608,6 +2501,9 @@ export class ChatStore {
             session.loadedEndPosition = nextTotal - 1;
             session.hasNewerMessages = false;
             this.normalizeCompactionBoundaryMessages(session);
+            this.rebuildGeometryPositionMap(session, {
+              clearLoadedPayloadPositions: true,
+            });
             this.bumpSessionRenderListVersion(session);
           }
           session.isThinking = false;
@@ -1652,20 +2548,10 @@ export class ChatStore {
       throw new Error(`Session not found: ${sessionId}`);
     }
 
-    const pending = this.pendingUiUpdatesBySession.get(sessionId) || [];
-    const pendingMessageIds = Array.from(
-      new Set(
-        pending.flatMap(({ update }) => {
-          const ids: string[] = [];
-          if (typeof update?.messageId === "string") ids.push(update.messageId);
-          if (typeof update?.message?.id === "string") ids.push(update.message.id);
-          return ids;
-        }),
-      ),
-    );
-
     runInAction(() => {
-      let session = this.sessions.find((candidate) => candidate.id === sessionId);
+      let session = this.sessions.find(
+        (candidate) => candidate.id === sessionId,
+      );
       if (!session) {
         session = this.createEmptySession(
           sessionId,
@@ -1697,8 +2583,34 @@ export class ChatStore {
 
     // The page is now the baseline. Allow live events to apply while replaying
     // only updates that are newer than the returned snapshot.
-    this.sessionLoadPromises.delete(sessionId);
+    const geometryLoaded = await this.loadMessageGeometryIndex(sessionId);
+    if (geometryLoaded && payload.page) {
+      runInAction(() => {
+        const current = this.getSessionById(sessionId);
+        if (current) {
+          this.mergeLoadedPageIntoGeometrySession(current, payload.page!, {
+            start: payload.page!.startPosition ?? 0,
+            end: payload.page!.endPosition ?? 0,
+          });
+        }
+      });
+    }
+    const pendingMessageIds = Array.from(
+      new Set(
+        (this.pendingUiUpdatesBySession.get(sessionId) || []).flatMap(
+          ({ update }) => {
+            const ids: string[] = [];
+            if (typeof update?.messageId === "string") ids.push(update.messageId);
+            if (typeof update?.message?.id === "string") {
+              ids.push(update.message.id);
+            }
+            return ids;
+          },
+        ),
+      ),
+    );
     this.replayPendingUiUpdates(sessionId, payload.uiRevision);
+    this.sessionLoadPromises.delete(sessionId);
     if (pendingMessageIds.length > 0) {
       await this.loadFullMessages(sessionId, pendingMessageIds);
     }
@@ -1747,11 +2659,104 @@ export class ChatStore {
     }
   }
 
-  async loadOlderMessages(
+  async loadMessageRange(
     sessionId: string,
-    limit = 300,
+    startPosition: number,
+    endPosition: number,
   ): Promise<boolean> {
     const session = this.getSessionById(sessionId);
+    if (!session || !session.geometryLoaded) return false;
+    const start = Math.max(0, Math.floor(startPosition));
+    const end = Math.min(
+      Math.max(start, Math.floor(endPosition)),
+      Math.max(0, (session.totalMessageCount || 0) - 1),
+    );
+    const residentChunkStarts = new Set<number>();
+    const requiredChunkStarts = new Set<number>();
+    for (let position = start; position <= end; position += 1) {
+      const messageId = session.messageIds[position];
+      const message = messageId
+        ? session.messagesById.get(messageId)
+        : undefined;
+      const chunkStart =
+        Math.floor(position / CHAT_GEOMETRY_PAYLOAD_CHUNK_SIZE) *
+        CHAT_GEOMETRY_PAYLOAD_CHUNK_SIZE;
+      if (message?.payloadState === "page") {
+        residentChunkStarts.add(chunkStart);
+      }
+      if (session.loadedPayloadPositions?.has(position)) continue;
+      if (!message?.deferredPayload?.fields.length) {
+        session.loadedPayloadPositions?.add(position);
+        continue;
+      }
+      requiredChunkStarts.add(chunkStart);
+    }
+
+    runInAction(() => {
+      const current = this.getSessionById(sessionId);
+      if (current?.geometryLoaded) {
+        this.touchGeometryPagePayloadChunks(current, residentChunkStarts);
+      }
+    });
+
+    const loadChunk = (chunkStart: number): Promise<boolean> => {
+      const key = `${sessionId}:${chunkStart}`;
+      const existing = this.messageRangeLoadPromises.get(key);
+      if (existing) return existing;
+      const promise = (async () => {
+        const currentBeforeRequest = this.getSessionById(sessionId);
+        if (!currentBeforeRequest?.geometryLoaded) return false;
+        const chunkEnd = Math.min(
+          chunkStart + CHAT_GEOMETRY_PAYLOAD_CHUNK_SIZE - 1,
+          Math.max(0, (currentBeforeRequest.totalMessageCount || 0) - 1),
+        );
+        let hasMissingPayload = false;
+        for (let position = chunkStart; position <= chunkEnd; position += 1) {
+          if (!currentBeforeRequest.loadedPayloadPositions?.has(position)) {
+            hasMissingPayload = true;
+            break;
+          }
+        }
+        if (!hasMissingPayload) return true;
+
+        const limit = chunkEnd - chunkStart + 1;
+        const page = this.normalizeUiMessagePage(
+          await window.gyshell.agent.getUiMessagePage(sessionId, {
+            aroundPosition: chunkStart + Math.floor(limit / 2),
+            limit,
+          }),
+          sessionId,
+        );
+        if (!page) return false;
+        let applied = false;
+        runInAction(() => {
+          const current = this.getSessionById(sessionId);
+          if (!current?.geometryLoaded) return;
+          applied = this.mergeLoadedPageIntoGeometrySession(current, page);
+        });
+        return applied;
+      })();
+      this.messageRangeLoadPromises.set(key, promise);
+      const releasePromise = (): void => {
+        if (this.messageRangeLoadPromises.get(key) === promise) {
+          this.messageRangeLoadPromises.delete(key);
+        }
+      };
+      void promise.then(releasePromise, releasePromise);
+      return promise;
+    };
+
+    const results = await Promise.all(
+      Array.from(requiredChunkStarts, loadChunk),
+    );
+    return requiredChunkStarts.size === 0 || results.some(Boolean);
+  }
+
+  async loadOlderMessages(sessionId: string, limit = 300): Promise<boolean> {
+    const session = this.getSessionById(sessionId);
+    if (session?.geometryLoaded) {
+      return false;
+    }
     if (
       !session ||
       session.isLoadingOlderMessages ||
@@ -1788,11 +2793,11 @@ export class ChatStore {
     }
   }
 
-  async loadNewerMessages(
-    sessionId: string,
-    limit = 300,
-  ): Promise<boolean> {
+  async loadNewerMessages(sessionId: string, limit = 300): Promise<boolean> {
     const session = this.getSessionById(sessionId);
+    if (session?.geometryLoaded) {
+      return false;
+    }
     if (
       !session ||
       session.isLoadingNewerMessages ||
@@ -1847,7 +2852,8 @@ export class ChatStore {
       const session = this.getSessionById(sessionId);
       if (!session) return;
       applied = this.applyMessagePage(session, page, "replace");
-      if (applied) this.replayRecentUiUpdates(sessionId, this.getPageRevision(page));
+      if (applied)
+        this.replayRecentUiUpdates(sessionId, this.getPageRevision(page));
     });
     return applied;
   }
@@ -1880,7 +2886,9 @@ export class ChatStore {
     // metadata from a newer renderer revision. Even when the response is old
     // because an unrelated session update raced it, the deferred fields remain
     // safe to hydrate; only message-targeted newer actions are replayed below.
-    const deferredFields = new Set(currentMessage.deferredPayload?.fields || []);
+    const deferredFields = new Set(
+      currentMessage.deferredPayload?.fields || [],
+    );
     const staleVersionedResponse =
       responseRevisionPresent &&
       currentRevision > 0 &&
@@ -1905,6 +2913,23 @@ export class ChatStore {
     };
     const metadata = { ...(reconciled.metadata || {}) };
 
+    if (deferredFields.has("metadata") && canHydrateStaleRow) {
+      const payloadMetadataFields = new Set([
+        "output",
+        "diff",
+        "details",
+        "inputImages",
+      ]);
+      const mutableMetadata = metadata as Record<string, unknown>;
+      Object.keys(mutableMetadata).forEach((key) => {
+        if (!payloadMetadataFields.has(key)) delete mutableMetadata[key];
+      });
+      Object.entries(incomingMessage.metadata || {}).forEach(([key, value]) => {
+        if (!payloadMetadataFields.has(key)) mutableMetadata[key] = value;
+      });
+      hydratedFields.add("metadata");
+    }
+
     if (
       deferredFields.has("content") &&
       canHydrateStaleRow &&
@@ -1915,7 +2940,8 @@ export class ChatStore {
     }
     for (const field of ["output", "diff", "details", "inputImages"] as const) {
       if (!deferredFields.has(field) || !canHydrateStaleRow) continue;
-      const incomingValue = incomingMessage.metadata?.[
+      const incomingValue =
+        incomingMessage.metadata?.[
         field as keyof NonNullable<ChatMessage["metadata"]>
       ];
       if (incomingValue !== undefined) {
@@ -1923,7 +2949,8 @@ export class ChatStore {
         hydratedFields.add(field);
       }
     }
-    reconciled.metadata = Object.keys(metadata).length > 0 ? metadata : undefined;
+    reconciled.metadata =
+      Object.keys(metadata).length > 0 ? metadata : undefined;
     const remainingFields = [...deferredFields].filter(
       (field) => !hydratedFields.has(field),
     ) as Array<NonNullable<ChatMessage["deferredPayload"]>["fields"][number]>;
@@ -1968,19 +2995,10 @@ export class ChatStore {
     return reconciled;
   }
 
-  async loadFullMessages(
+  private async loadFullMessageBatch(
     sessionId: string,
-    messageIds: string[],
+    ids: string[],
   ): Promise<ChatMessage[]> {
-    const session = this.getSessionById(sessionId);
-    const ids = Array.from(
-      new Set(
-        messageIds.filter((messageId) => {
-          if (!messageId) return false;
-          return session?.messagesById.get(messageId)?.deferredPayload !== undefined;
-        }),
-      ),
-    ).sort();
     if (ids.length === 0) return [];
     const loadKey = `${sessionId}:${ids.join(":")}`;
     const existingLoad = this.fullMessageLoadPromises.get(loadKey);
@@ -2006,6 +3024,7 @@ export class ChatStore {
       );
       const current = this.getSessionById(sessionId);
       if (!current) return [];
+      const requestedIds = new Set(ids);
       const messages: ChatMessage[] = [];
       for (const rawMessage of rawMessages as unknown[]) {
         if (
@@ -2016,6 +3035,7 @@ export class ChatStore {
           continue;
         }
         const incoming = rawMessage as ChatMessage;
+        if (!requestedIds.has(incoming.id)) continue;
         const existing = current.messagesById.get(incoming.id);
         if (!existing) continue;
         const reconciled = this.reconcileFullMessageWithRecentUpdates(
@@ -2031,15 +3051,37 @@ export class ChatStore {
       runInAction(() => {
         const latest = this.getSessionById(sessionId);
         if (!latest) return;
+        const protectedMessageIds = new Set<string>();
+        let protectedCharacters = 0;
+        for (let index = messages.length - 1; index >= 0; index -= 1) {
+          const message = messages[index];
+          const size = this.estimateFullPayloadCharacters(message);
+          if (
+            protectedMessageIds.size > 0 &&
+            protectedCharacters + size > CHAT_FULL_PAYLOAD_MAX_CHARACTERS
+          ) {
+            break;
+          }
+          protectedMessageIds.add(message.id);
+          protectedCharacters += size;
+        }
         messages.forEach((message) => {
-          if (latest.messagesById.has(message.id)) {
-            latest.messagesById.set(message.id, message);
+          if (!latest.messagesById.has(message.id)) return;
+          const storedMessage = message.deferredPayload?.fields.length
+            ? message
+            : { ...message, payloadState: "full" as const };
+          latest.messagesById.set(message.id, storedMessage);
+          const position = latest.messagePositionById?.get(message.id);
+          if (typeof position === "number") {
+            latest.loadedPayloadPositions?.add(position);
+          }
+          if (storedMessage.payloadState === "full") {
+            this.rememberGeometryPlaceholder(latest, storedMessage);
+            this.touchFullPayload(latest, storedMessage);
           }
         });
-        latest.uiRevision = Math.max(
-          latest.uiRevision || 0,
-          responseRevision,
-        );
+        this.pruneFullPayloads(latest, protectedMessageIds);
+        latest.uiRevision = Math.max(latest.uiRevision || 0, responseRevision);
         if (messages.length > 0) this.bumpSessionRenderListVersion(latest);
       });
       return messages;
@@ -2052,6 +3094,74 @@ export class ChatStore {
         this.fullMessageLoadPromises.delete(loadKey);
       }
     }
+  }
+
+  async loadFullMessages(
+    sessionId: string,
+    messageIds: string[],
+  ): Promise<ChatMessage[]> {
+    const session = this.getSessionById(sessionId);
+    if (!session) return [];
+    const ids = Array.from(
+      new Set(
+        messageIds.filter(
+          (messageId) =>
+            !!messageId &&
+            session.messagesById.get(messageId)?.deferredPayload !== undefined,
+        ),
+      ),
+    );
+    if (ids.length === 0) return [];
+
+    const promiseById = new Map<string, Promise<ChatMessage | undefined>>();
+    const missingIds: string[] = [];
+    ids.forEach((messageId) => {
+      const key = `${sessionId}:${messageId}`;
+      const existing = this.fullMessageLoadByIdPromises.get(key);
+      if (existing) {
+        promiseById.set(messageId, existing);
+      } else {
+        missingIds.push(messageId);
+      }
+    });
+
+    let previousBatch = Promise.resolve<void>(undefined);
+    for (
+      let offset = 0;
+      offset < missingIds.length;
+      offset += CHAT_FULL_PAYLOAD_REQUEST_MAX_MESSAGES
+    ) {
+      const batchIds = missingIds.slice(
+        offset,
+        offset + CHAT_FULL_PAYLOAD_REQUEST_MAX_MESSAGES,
+      );
+      const batchPromise = previousBatch.then(() =>
+        this.loadFullMessageBatch(sessionId, batchIds),
+      );
+      previousBatch = batchPromise.then(
+        () => undefined,
+        () => undefined,
+      );
+      batchIds.forEach((messageId) => {
+        const key = `${sessionId}:${messageId}`;
+        const messagePromise = batchPromise.then((messages) =>
+          messages.find((message) => message.id === messageId),
+        );
+        this.fullMessageLoadByIdPromises.set(key, messagePromise);
+        promiseById.set(messageId, messagePromise);
+        const release = (): void => {
+          if (this.fullMessageLoadByIdPromises.get(key) === messagePromise) {
+            this.fullMessageLoadByIdPromises.delete(key);
+          }
+        };
+        void messagePromise.then(release, release);
+      });
+    }
+
+    const messages = await Promise.all(
+      ids.map((messageId) => promiseById.get(messageId)!),
+    );
+    return messages.filter((message): message is ChatMessage => !!message);
   }
 
   async searchMessages(
@@ -2080,15 +3190,23 @@ export class ChatStore {
         : retry;
     }
     const session = this.getSessionById(sessionId);
-    const normalized = String(query || "").trim().toLowerCase();
+    const normalized = String(query || "")
+      .trim()
+      .toLowerCase();
     const matches = session
       ? session.messageIds
-          .map((id, position) => ({ id, position, message: session.messagesById.get(id) }))
+          .map((id, position) => ({
+            id,
+            position,
+            message: session.messagesById.get(id),
+          }))
           .filter(
             (entry) =>
               !!entry.message &&
               normalized.length > 0 &&
-              String(entry.message.content || "").toLowerCase().includes(normalized),
+              String(entry.message.content || "")
+                .toLowerCase()
+                .includes(normalized),
           )
           .slice(0, limit)
           .map((entry) => ({
@@ -2167,6 +3285,7 @@ export class ChatStore {
         }
       });
       ids.forEach((id) => {
+        this.clearGeometryRuntimeState(id);
         this.ownedBackendSessionIds.delete(id);
         this.sessionOwnershipVersions.delete(id);
         this.sessionRegistrationPromises.delete(id);
@@ -2245,11 +3364,18 @@ export class ChatStore {
       const removedIds = session.messageIds.slice(idx);
 
       // Delete from Map
-      removedIds.forEach((msgId) => session.messagesById.delete(msgId));
+      removedIds.forEach((msgId) => {
+        session.messagesById.delete(msgId);
+        this.geometryPlaceholdersBySession.get(session.id)?.delete(msgId);
+        this.fullPayloadRetentionBySession.get(session.id)?.delete(msgId);
+      });
 
       // Update IDs array
       session.messageIds = keptIds;
       this.normalizeCompactionBoundaryMessages(session);
+      this.rebuildGeometryPositionMap(session, {
+        clearLoadedPayloadPositions: true,
+      });
       this.bumpSessionRenderListVersion(session);
       session.isThinking = false;
     });

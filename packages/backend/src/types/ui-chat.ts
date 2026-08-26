@@ -1,5 +1,6 @@
 import type { CommandOutputContractV1 } from '@gyshell/shared'
 import type { InputImageAttachment } from './index'
+import type { ChatMessageGeometry } from '@gyshell/shared'
 
 export type MessageType =
   | 'text'
@@ -21,6 +22,7 @@ export type DeferredUiMessageField =
   | 'diff'
   | 'details'
   | 'inputImages'
+  | 'metadata'
 
 export interface DeferredUiMessagePayload {
   fields: DeferredUiMessageField[]
@@ -64,6 +66,8 @@ export interface ChatMessage {
   timestamp: number
   streaming?: boolean
   deferredPayload?: DeferredUiMessagePayload
+  geometry?: ChatMessageGeometry
+  payloadState?: 'geometry' | 'page' | 'full'
 }
 
 export interface UIChatSession {

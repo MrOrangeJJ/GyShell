@@ -468,6 +468,11 @@ export class ElectronGatewayIpcAdapter {
       },
     );
     ipcMain.handle(
+      "agent:getUiMessageGeometry",
+      (_: any, sessionId: string) =>
+        this.uiHistoryService.getMessageGeometryIndex(sessionId),
+    );
+    ipcMain.handle(
       "agent:getFullUiMessages",
       (_: any, sessionId: string, messageIds: string[]) =>
         this.uiHistoryService.getFullMessagesByIds(sessionId, messageIds),

@@ -12,6 +12,7 @@ import type {
 } from "../types/ui-chat";
 import type {
   UiFullMessagesResult,
+  UiMessageGeometryIndex,
   UiMessagePage,
   UiMessagePageRequest,
   UiMessageSearchResult,
@@ -21,6 +22,7 @@ import {
   HistorySqliteStore,
   projectUiMessageForList,
 } from "./history/HistorySqliteStore";
+import { expireUnbackedCommandOutputContract } from "./AgentHelper/tools/command_output_contract";
 import {
   buildAutoSessionTitle,
   buildUiSessionSummary,
@@ -46,6 +48,21 @@ interface CachedUiSession {
 
 const UI_HISTORY_LIVE_TAIL_LIMIT = 500;
 const UI_HISTORY_MAX_CACHED_SESSIONS = 4;
+const UI_HISTORY_FULL_MESSAGE_REQUEST_LIMIT = 16;
+const UI_HISTORY_STRUCTURAL_METADATA_STRING_FIELDS = [
+  "tabName",
+  "commandId",
+  "filePath",
+  "toolName",
+  "subToolTitle",
+  "subToolHint",
+  "approvalId",
+  "command",
+  "modelName",
+  "compactionBoundaryTargetBackendMessageId",
+  "compactionBoundaryPreviousBackendMessageId",
+  "compactionBoundarySummaryBackendMessageId",
+] as const;
 
 export class UIHistoryService {
   private readonly store: HistorySqliteStore;
@@ -542,9 +559,22 @@ export class UIHistoryService {
       ...(durable.metadata || {}),
       ...(projected.metadata || {}),
     };
+    if (deferredFields.has("metadata")) {
+      for (const field of UI_HISTORY_STRUCTURAL_METADATA_STRING_FIELDS) {
+        const durableValue = durable.metadata?.[field];
+        if (durableValue === undefined) {
+          delete metadata[field];
+        } else {
+          metadata[field] = durableValue as never;
+        }
+      }
+    }
     for (const field of deferredFields) {
-      const durableValue = durable.metadata?.[field as keyof NonNullable<ChatMessage["metadata"]>];
-      if (field === "content") continue;
+      if (field === "content" || field === "metadata") continue;
+      const durableValue =
+        durable.metadata?.[
+          field as keyof NonNullable<ChatMessage["metadata"]>
+        ];
       if (durableValue === undefined) {
         delete metadata[field as keyof typeof metadata];
       } else {
@@ -1304,24 +1334,101 @@ export class UIHistoryService {
     };
   }
 
+  getMessageGeometryIndex(sessionId: string): UiMessageGeometryIndex | null {
+    // Materialize the bounded live tail first so persisted process-local
+    // running/cursor state receives the same restart recovery as page reads.
+    this.getOrLoadSession(sessionId);
+    this.flush(sessionId, { preserveLiveTransientState: true });
+    const loadGeometry = (this.store as any).loadUiMessageGeometryIndex;
+    if (typeof loadGeometry !== "function") return null;
+    const index = loadGeometry.call(
+      this.store,
+      sessionId,
+    ) as UiMessageGeometryIndex | null;
+    if (!index) return null;
+
+    const cachedById = new Map(
+      (this.getCachedSessionEntry(sessionId)?.session.messages || []).map(
+        (message) => [message.id, message] as const,
+      ),
+    );
+    return {
+      ...index,
+      uiRevision: this.getUiRevision(sessionId),
+      entries: index.entries.map((entry) => {
+        const cached = cachedById.get(entry.id);
+        const persistedContract = parseCommandOutputContractV1(
+          entry.metadata?.commandOutput,
+        );
+        const cachedContract = parseCommandOutputContractV1(
+          cached?.metadata?.commandOutput,
+        );
+        const commandOutput = cached
+          ? cachedContract
+          : persistedContract
+            ? expireUnbackedCommandOutputContract(persistedContract)
+            : undefined;
+        const metadata = {
+          ...(entry.metadata || {}),
+          ...(cached?.metadata?.exitCode !== undefined
+            ? { exitCode: cached.metadata.exitCode }
+            : {}),
+          ...(cached?.metadata?.isNowait !== undefined
+            ? { isNowait: cached.metadata.isNowait }
+            : {}),
+          ...(commandOutput ? { commandOutput } : {}),
+        };
+        if (!commandOutput) delete metadata.commandOutput;
+        const streaming = cached?.streaming === true;
+        if (!cached && entry.streaming && entry.type === "command") {
+          metadata.exitCode ??= -1;
+        }
+        return {
+          ...entry,
+          streaming,
+          ...(Object.keys(metadata).length > 0 ? { metadata } : {}),
+        };
+      }),
+    };
+  }
+
   getFullMessagesByIds(
     sessionId: string,
     messageIds: string[],
   ): UiFullMessagesResult {
     this.flush(sessionId, { preserveLiveTransientState: true });
-    const ids = new Set(messageIds.filter(Boolean));
+    const ids = new Set(
+      Array.from(new Set(messageIds.filter(Boolean))).slice(
+        0,
+        UI_HISTORY_FULL_MESSAGE_REQUEST_LIMIT,
+      ),
+    );
     const durable = this.store.loadUiMessagesByIds(sessionId, [...ids]);
+    const recoveredDurable = sanitizeUiSession(
+      {
+        id: sessionId,
+        title: "",
+        updatedAt: 0,
+        messages: durable,
+      },
+      {
+        recoverInterruptedCommands: true,
+        normalizeCompactionBoundaries: false,
+      },
+    ).messages;
     const durableById = new Map(
-      durable.map((message) => [message.id, message] as const),
+      recoveredDurable.map((message) => [message.id, message] as const),
     );
     const cached = this.getCachedSessionEntry(sessionId);
     cached?.session.messages.forEach((message) => {
-      if (
-        ids.has(message.id) &&
-        (message.type === "ask" || message.streaming === true)
-      ) {
-        durableById.set(message.id, message);
-      }
+      if (!ids.has(message.id)) return;
+      durableById.set(
+        message.id,
+        this.mergeProjectedMessageWithDurable(
+          message,
+          durableById.get(message.id),
+        ),
+      );
     });
     return {
       sessionId,

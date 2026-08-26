@@ -16,6 +16,17 @@ import type {
   UiMessageSearchResult,
   UISessionSummaryRecord,
 } from "./historyTypes";
+import {
+  createChatTextGeometryShape,
+  extractCommandOutputDisplayText,
+  parseCommandOutputContractV1,
+  type ChatGeometryDeferredField,
+  type CommandOutputContractV1,
+  type ChatMessageGeometryMetadata,
+  type ChatMessageGeometryProjection,
+  type UiMessageGeometryEntry,
+  type UiMessageGeometryIndex,
+} from "@gyshell/shared";
 import { openBetterSqlite3Database } from "./betterSqlite3Runtime";
 import { resolveHistoryStoragePaths } from "./historyStoragePaths";
 
@@ -63,8 +74,29 @@ interface UiSessionMessageRow {
   streaming: number;
 }
 
+interface UiCommandOutputProjectionFields {
+  metadata_command_output_contract_version: unknown;
+  metadata_command_output_terminal_id: unknown;
+  metadata_command_output_history_command_match_id: unknown;
+  metadata_command_output_execution_state: unknown;
+  metadata_command_output_exit_code: unknown;
+  metadata_command_output_capture_state: unknown;
+  metadata_command_output_capture_reason: unknown;
+  metadata_command_output_observed_utf8_bytes: unknown;
+  metadata_command_output_retained_utf8_bytes: unknown;
+  metadata_command_output_available_line_count: unknown;
+  metadata_command_output_capture_revision: unknown;
+  metadata_command_output_terminal_controls_observed: unknown;
+  metadata_command_output_presentation_state: unknown;
+  metadata_command_output_returned_utf8_bytes: unknown;
+  metadata_command_output_has_more_captured_output: unknown;
+  metadata_command_output_next_cursor: unknown;
+  metadata_command_output_poll_cursor: unknown;
+}
+
 interface UiSessionMessageProjectionRow
-  extends Omit<UiSessionMessageRow, "content" | "metadata_json"> {
+  extends Omit<UiSessionMessageRow, "content" | "metadata_json">,
+    UiCommandOutputProjectionFields {
   content_length: number;
   content_head: string | null;
   content_tail: string | null;
@@ -81,7 +113,6 @@ interface UiSessionMessageProjectionRow
   metadata_action: string | null;
   metadata_collapsed: number | null;
   metadata_is_nowait: number | null;
-  metadata_command_output_json: string | null;
   metadata_tool_name: string | null;
   metadata_sub_tool_title: string | null;
   metadata_sub_tool_hint: string | null;
@@ -104,9 +135,58 @@ interface UiSessionMessageProjectionRow
   metadata_compaction_rounds: number | null;
 }
 
+interface UiSessionMessageGeometryRow
+  extends Omit<UiSessionMessageRow, "metadata_json">,
+    UiCommandOutputProjectionFields {
+  metadata_tab_name: unknown;
+  metadata_command_id: unknown;
+  metadata_exit_code: unknown;
+  metadata_output: unknown;
+  metadata_diff: unknown;
+  metadata_file_path: unknown;
+  metadata_action: unknown;
+  metadata_collapsed: unknown;
+  metadata_is_nowait: unknown;
+  metadata_tool_name: unknown;
+  metadata_sub_tool_title: unknown;
+  metadata_sub_tool_hint: unknown;
+  metadata_sub_tool_level: unknown;
+  metadata_approval_id: unknown;
+  metadata_decision: unknown;
+  metadata_command: unknown;
+  metadata_model_name: unknown;
+  metadata_total_tokens: unknown;
+  metadata_max_tokens: unknown;
+  metadata_details: unknown;
+  metadata_input_kind: unknown;
+  metadata_input_image_count: number | null;
+  metadata_compaction_target: unknown;
+  metadata_compaction_previous: unknown;
+  metadata_compaction_summary: unknown;
+  metadata_compaction_rounds: unknown;
+  metadata_deferred: number | null;
+}
+
 const UI_MESSAGE_PAGE_DEFAULT_LIMIT = 300;
 const UI_MESSAGE_PAGE_MAX_LIMIT = 1_000;
 const UI_MESSAGE_LIST_FIELD_LIMIT = 12_000;
+const UI_MESSAGE_GEOMETRY_PREVIEW_LIMIT = 512;
+const UI_GEOMETRY_OUTPUT_MESSAGE_TYPES: ReadonlySet<ChatMessage["type"]> =
+  new Set(["command", "tool_call", "file_edit", "sub_tool", "reasoning"]);
+const UI_MESSAGE_STRUCTURAL_METADATA_STRING_FIELDS = [
+  "tabName",
+  "commandId",
+  "filePath",
+  "toolName",
+  "subToolTitle",
+  "subToolHint",
+  "approvalId",
+  "command",
+  "modelName",
+  "compactionBoundaryTargetBackendMessageId",
+  "compactionBoundaryPreviousBackendMessageId",
+  "compactionBoundarySummaryBackendMessageId",
+] as const;
 
 const isHighSurrogate = (codeUnit: number): boolean =>
   codeUnit >= 0xd800 && codeUnit <= 0xdbff;
@@ -148,10 +228,7 @@ const sliceFromEndAtUnicodeBoundary = (
 const normalizePageLimit = (value: unknown): number => {
   const parsed = Number(value);
   if (!Number.isFinite(parsed)) return UI_MESSAGE_PAGE_DEFAULT_LIMIT;
-  return Math.min(
-    UI_MESSAGE_PAGE_MAX_LIMIT,
-    Math.max(1, Math.floor(parsed)),
-  );
+  return Math.min(UI_MESSAGE_PAGE_MAX_LIMIT, Math.max(1, Math.floor(parsed)));
 };
 
 // Keep the projection textually silent. The deferredPayload flag is an
@@ -163,13 +240,118 @@ const createBoundedListPreview = (value: string): string => {
   return `${sliceFromStartAtUnicodeBoundary(value, headLength)}${sliceFromEndAtUnicodeBoundary(value, tailLength)}`;
 };
 
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  !!value && typeof value === "object" && !Array.isArray(value);
+
+const sanitizeUiMessageMetadata = (
+  value: unknown,
+): ChatMessage["metadata"] => {
+  if (!isRecord(value)) return undefined;
+  const metadata: NonNullable<ChatMessage["metadata"]> = {};
+  const assignString = <K extends keyof typeof metadata>(key: K): void => {
+    const candidate = value[key];
+    if (typeof candidate === "string") {
+      metadata[key] = candidate as (typeof metadata)[K];
+    }
+  };
+  for (const field of [
+    ...UI_MESSAGE_STRUCTURAL_METADATA_STRING_FIELDS,
+    "output",
+    "diff",
+    "details",
+  ] as const) {
+    assignString(field);
+  }
+  if (
+    value.action === "created" ||
+    value.action === "edited" ||
+    value.action === "error"
+  ) {
+    metadata.action = value.action;
+  }
+  if (
+    value.subToolLevel === "info" ||
+    value.subToolLevel === "warning" ||
+    value.subToolLevel === "error"
+  ) {
+    metadata.subToolLevel = value.subToolLevel;
+  }
+  if (value.decision === "allow" || value.decision === "deny") {
+    metadata.decision = value.decision;
+  }
+  if (value.inputKind === "normal" || value.inputKind === "inserted") {
+    metadata.inputKind = value.inputKind;
+  }
+  for (const field of ["collapsed", "isNowait"] as const) {
+    if (typeof value[field] === "boolean") {
+      metadata[field] = value[field];
+    }
+  }
+  if (Number.isSafeInteger(value.exitCode)) {
+    metadata.exitCode = Number(value.exitCode);
+  }
+  for (const field of [
+    "totalTokens",
+    "maxTokens",
+    "compactionBoundaryProtectedNormalRounds",
+  ] as const) {
+    if (Number.isSafeInteger(value[field]) && Number(value[field]) >= 0) {
+      metadata[field] = Number(value[field]);
+    }
+  }
+  const commandOutput = parseCommandOutputContractV1(value.commandOutput);
+  if (commandOutput) metadata.commandOutput = commandOutput;
+  if (Array.isArray(value.inputImages)) {
+    const images = value.inputImages.flatMap((candidate) => {
+      if (!isRecord(candidate)) return [];
+      const image: NonNullable<
+        NonNullable<ChatMessage["metadata"]>["inputImages"]
+      >[number] = {};
+      for (const field of [
+        "attachmentId",
+        "fileName",
+        "mimeType",
+        "sha256",
+        "previewDataUrl",
+      ] as const) {
+        if (typeof candidate[field] === "string") {
+          image[field] = candidate[field];
+        }
+      }
+      if (
+        Number.isSafeInteger(candidate.sizeBytes) &&
+        Number(candidate.sizeBytes) >= 0
+      ) {
+        image.sizeBytes = Number(candidate.sizeBytes);
+      }
+      if (candidate.status === "ready" || candidate.status === "missing") {
+        image.status = candidate.status;
+      }
+      return Object.keys(image).length > 0 ? [image] : [];
+    });
+    if (images.length > 0) metadata.inputImages = images;
+  }
+  return Object.keys(metadata).length > 0 ? metadata : undefined;
+};
+
+const parseUiMessageMetadata = (
+  rawMetadata: string | null,
+): ChatMessage["metadata"] => {
+  if (!rawMetadata) return undefined;
+  try {
+    return sanitizeUiMessageMetadata(JSON.parse(rawMetadata));
+  } catch {
+    return undefined;
+  }
+};
+
 const parseUiMessageRow = (row: UiSessionMessageRow): ChatMessage => ({
   id: row.ui_message_id,
   backendMessageId: row.backend_message_id ?? undefined,
   role: row.role,
   type: row.message_type,
   content: row.content,
-  metadata: row.metadata_json ? JSON.parse(row.metadata_json) : undefined,
+  metadata: parseUiMessageMetadata(row.metadata_json),
   timestamp: row.timestamp,
   streaming: Boolean(row.streaming),
 });
@@ -220,71 +402,76 @@ const parseUiMessageProjectionRow = (
     row.metadata_details_length,
   );
   const deferredFields: DeferredUiMessageField[] = [];
-  if (content.deferred) deferredFields.push("content");
-  if (output.deferred) deferredFields.push("output");
-  if (diff.deferred) deferredFields.push("diff");
-  if (details.deferred) deferredFields.push("details");
+  const defer = (field: DeferredUiMessageField): void => {
+    if (!deferredFields.includes(field)) deferredFields.push(field);
+  };
+  if (content.deferred) defer("content");
+  if (output.deferred) defer("output");
+  if (diff.deferred) defer("diff");
+  if (details.deferred) defer("details");
   if (
-    Number(row.metadata_input_images_length || 0) >
-    UI_MESSAGE_LIST_FIELD_LIMIT
+    Number(row.metadata_input_images_length || 0) > UI_MESSAGE_LIST_FIELD_LIMIT
   ) {
-    deferredFields.push("inputImages");
+    defer("inputImages");
   }
-
   const metadata: Record<string, any> = {};
   const assign = (key: string, value: unknown): void => {
     if (value !== null && value !== undefined && value !== "") {
       metadata[key] = value;
     }
   };
-  assign("tabName", row.metadata_tab_name);
-  assign("commandId", row.metadata_command_id);
+  const assignBoundedString = (key: string, value: unknown): void => {
+    if (typeof value !== "string" || value.length === 0) return;
+    const bounded = createBoundedListPreview(value);
+    metadata[key] = bounded;
+    if (bounded !== value) defer("metadata");
+  };
+  assignBoundedString("tabName", row.metadata_tab_name);
+  assignBoundedString("commandId", row.metadata_command_id);
   assign("exitCode", row.metadata_exit_code);
   if (output.value) assign("output", output.value);
   if (diff.value) assign("diff", diff.value);
-  assign("filePath", row.metadata_file_path);
-  assign("action", row.metadata_action);
+  assignBoundedString("filePath", row.metadata_file_path);
+  assignBoundedString("action", row.metadata_action);
   if (row.metadata_collapsed !== null) {
     metadata.collapsed = Boolean(row.metadata_collapsed);
   }
   if (row.metadata_is_nowait !== null) {
     metadata.isNowait = Boolean(row.metadata_is_nowait);
   }
-  if (row.metadata_command_output_json) {
-    try {
-      metadata.commandOutput = JSON.parse(row.metadata_command_output_json);
-    } catch {
-      // Ignore malformed optional metadata in the bounded list projection.
-    }
-  }
-  assign("toolName", row.metadata_tool_name);
-  assign("subToolTitle", row.metadata_sub_tool_title);
-  assign("subToolHint", row.metadata_sub_tool_hint);
-  assign("subToolLevel", row.metadata_sub_tool_level);
-  assign("approvalId", row.metadata_approval_id);
-  assign("decision", row.metadata_decision);
-  assign("command", row.metadata_command);
-  assign("modelName", row.metadata_model_name);
+  const commandOutput = readProjectedCommandOutput(row);
+  if (commandOutput) metadata.commandOutput = commandOutput;
+  assignBoundedString("toolName", row.metadata_tool_name);
+  assignBoundedString("subToolTitle", row.metadata_sub_tool_title);
+  assignBoundedString("subToolHint", row.metadata_sub_tool_hint);
+  assignBoundedString("subToolLevel", row.metadata_sub_tool_level);
+  assignBoundedString("approvalId", row.metadata_approval_id);
+  assignBoundedString("decision", row.metadata_decision);
+  assignBoundedString("command", row.metadata_command);
+  assignBoundedString("modelName", row.metadata_model_name);
   assign("totalTokens", row.metadata_total_tokens);
   assign("maxTokens", row.metadata_max_tokens);
   if (details.value) assign("details", details.value);
-  assign("inputKind", row.metadata_input_kind);
-  if (row.metadata_input_images_json && !deferredFields.includes("inputImages")) {
+  assignBoundedString("inputKind", row.metadata_input_kind);
+  if (
+    row.metadata_input_images_json &&
+    !deferredFields.includes("inputImages")
+  ) {
     try {
       metadata.inputImages = JSON.parse(row.metadata_input_images_json);
     } catch {
       // Ignore malformed optional metadata in the bounded list projection.
     }
   }
-  assign(
+  assignBoundedString(
     "compactionBoundaryTargetBackendMessageId",
     row.metadata_compaction_target,
   );
-  assign(
+  assignBoundedString(
     "compactionBoundaryPreviousBackendMessageId",
     row.metadata_compaction_previous,
   );
-  assign(
+  assignBoundedString(
     "compactionBoundarySummaryBackendMessageId",
     row.metadata_compaction_summary,
   );
@@ -309,8 +496,132 @@ const parseUiMessageProjectionRow = (
   return message;
 };
 
-const SQL_JSON_FIELD = (field: string): string =>
-  `CASE WHEN json_valid(metadata_json) THEN json_extract(metadata_json, '$.${field}') END`;
+const SQL_JSON_TEXT_FIELD = (field: string): string =>
+  `CASE WHEN json_valid(metadata_json) AND json_type(metadata_json, '$.${field}') = 'text' THEN json_extract(metadata_json, '$.${field}') END`;
+
+const SQL_JSON_INTEGER_FIELD = (field: string): string =>
+  `CASE WHEN json_valid(metadata_json) AND json_type(metadata_json, '$.${field}') = 'integer' THEN json_extract(metadata_json, '$.${field}') END`;
+
+const SQL_JSON_BOOLEAN_FIELD = (field: string): string =>
+  `CASE WHEN json_valid(metadata_json) AND json_type(metadata_json, '$.${field}') IN ('true', 'false') THEN json_extract(metadata_json, '$.${field}') END`;
+
+const SQL_JSON_ARRAY_FIELD = (field: string): string =>
+  `CASE WHEN json_valid(metadata_json) AND json_type(metadata_json, '$.${field}') = 'array' THEN json_extract(metadata_json, '$.${field}') END`;
+
+const SQL_JSON_TEXT_PATH_FIELD = (path: string): string =>
+  `CASE WHEN json_valid(metadata_json) AND json_type(metadata_json, '$.${path}') = 'text' THEN json_extract(metadata_json, '$.${path}') END`;
+
+const SQL_JSON_INTEGER_PATH_FIELD = (path: string): string =>
+  `CASE WHEN json_valid(metadata_json) AND json_type(metadata_json, '$.${path}') = 'integer' THEN json_extract(metadata_json, '$.${path}') END`;
+
+const SQL_JSON_BOOLEAN_PATH_FIELD = (path: string): string =>
+  `CASE WHEN json_valid(metadata_json) AND json_type(metadata_json, '$.${path}') IN ('true', 'false') THEN json_extract(metadata_json, '$.${path}') END`;
+
+const SQL_JSON_BOUNDED_TEXT_PATH_FIELD = (
+  path: string,
+  maximumLength: number,
+): string => {
+  const expression = SQL_JSON_TEXT_PATH_FIELD(path);
+  return `CASE WHEN length(${expression}) <= ${maximumLength} THEN ${expression} END`;
+};
+
+const UI_COMMAND_OUTPUT_IDENTIFIER_LIMIT = 1_024;
+const UI_COMMAND_OUTPUT_CURSOR_LIMIT = 4_096;
+const UI_COMMAND_OUTPUT_ENUM_LIMIT = 64;
+
+const UI_COMMAND_OUTPUT_PROJECTION_COLUMNS = `
+  ${SQL_JSON_INTEGER_PATH_FIELD("commandOutput.contractVersion")} AS metadata_command_output_contract_version,
+  ${SQL_JSON_BOUNDED_TEXT_PATH_FIELD(
+    "commandOutput.terminalId",
+    UI_COMMAND_OUTPUT_IDENTIFIER_LIMIT,
+  )} AS metadata_command_output_terminal_id,
+  ${SQL_JSON_BOUNDED_TEXT_PATH_FIELD(
+    "commandOutput.historyCommandMatchId",
+    UI_COMMAND_OUTPUT_IDENTIFIER_LIMIT,
+  )} AS metadata_command_output_history_command_match_id,
+  ${SQL_JSON_BOUNDED_TEXT_PATH_FIELD(
+    "commandOutput.executionState",
+    UI_COMMAND_OUTPUT_ENUM_LIMIT,
+  )} AS metadata_command_output_execution_state,
+  ${SQL_JSON_INTEGER_PATH_FIELD("commandOutput.exitCode")} AS metadata_command_output_exit_code,
+  ${SQL_JSON_BOUNDED_TEXT_PATH_FIELD(
+    "commandOutput.capture.state",
+    UI_COMMAND_OUTPUT_ENUM_LIMIT,
+  )} AS metadata_command_output_capture_state,
+  ${SQL_JSON_BOUNDED_TEXT_PATH_FIELD(
+    "commandOutput.capture.reason",
+    UI_COMMAND_OUTPUT_ENUM_LIMIT,
+  )} AS metadata_command_output_capture_reason,
+  ${SQL_JSON_INTEGER_PATH_FIELD("commandOutput.capture.observedUtf8Bytes")} AS metadata_command_output_observed_utf8_bytes,
+  ${SQL_JSON_INTEGER_PATH_FIELD("commandOutput.capture.retainedUtf8Bytes")} AS metadata_command_output_retained_utf8_bytes,
+  ${SQL_JSON_INTEGER_PATH_FIELD("commandOutput.capture.availableLineCount")} AS metadata_command_output_available_line_count,
+  ${SQL_JSON_INTEGER_PATH_FIELD("commandOutput.capture.revision")} AS metadata_command_output_capture_revision,
+  ${SQL_JSON_BOOLEAN_PATH_FIELD("commandOutput.capture.terminalControlsObserved")} AS metadata_command_output_terminal_controls_observed,
+  ${SQL_JSON_BOUNDED_TEXT_PATH_FIELD(
+    "commandOutput.presentation.state",
+    UI_COMMAND_OUTPUT_ENUM_LIMIT,
+  )} AS metadata_command_output_presentation_state,
+  ${SQL_JSON_INTEGER_PATH_FIELD("commandOutput.presentation.returnedUtf8Bytes")} AS metadata_command_output_returned_utf8_bytes,
+  ${SQL_JSON_BOOLEAN_PATH_FIELD("commandOutput.presentation.hasMoreCapturedOutput")} AS metadata_command_output_has_more_captured_output,
+  ${SQL_JSON_BOUNDED_TEXT_PATH_FIELD(
+    "commandOutput.presentation.nextCursor",
+    UI_COMMAND_OUTPUT_CURSOR_LIMIT,
+  )} AS metadata_command_output_next_cursor,
+  ${SQL_JSON_BOUNDED_TEXT_PATH_FIELD(
+    "commandOutput.presentation.pollCursor",
+    UI_COMMAND_OUTPUT_CURSOR_LIMIT,
+  )} AS metadata_command_output_poll_cursor`;
+
+const readSqlBoolean = (value: unknown): unknown => {
+  if (value === 0 || value === 1) return Boolean(value);
+  return value;
+};
+
+const readProjectedCommandOutput = (
+  row: UiCommandOutputProjectionFields,
+): CommandOutputContractV1 | undefined => {
+  const captureReason = row.metadata_command_output_capture_reason;
+  const nextCursor = row.metadata_command_output_next_cursor;
+  const pollCursor = row.metadata_command_output_poll_cursor;
+  return parseCommandOutputContractV1({
+    contractVersion: row.metadata_command_output_contract_version,
+    terminalId: row.metadata_command_output_terminal_id,
+    historyCommandMatchId:
+      row.metadata_command_output_history_command_match_id,
+    executionState: row.metadata_command_output_execution_state,
+    exitCode:
+      row.metadata_command_output_exit_code === null ||
+      row.metadata_command_output_exit_code === undefined
+        ? null
+        : row.metadata_command_output_exit_code,
+    capture: {
+      state: row.metadata_command_output_capture_state,
+      ...(captureReason !== null && captureReason !== undefined
+        ? { reason: captureReason }
+        : {}),
+      observedUtf8Bytes: row.metadata_command_output_observed_utf8_bytes,
+      retainedUtf8Bytes: row.metadata_command_output_retained_utf8_bytes,
+      availableLineCount: row.metadata_command_output_available_line_count,
+      revision: row.metadata_command_output_capture_revision,
+      terminalControlsObserved: readSqlBoolean(
+        row.metadata_command_output_terminal_controls_observed,
+      ),
+    },
+    presentation: {
+      state: row.metadata_command_output_presentation_state,
+      returnedUtf8Bytes: row.metadata_command_output_returned_utf8_bytes,
+      hasMoreCapturedOutput: readSqlBoolean(
+        row.metadata_command_output_has_more_captured_output,
+      ),
+      ...(nextCursor !== null && nextCursor !== undefined
+        ? { nextCursor }
+        : {}),
+      ...(pollCursor !== null && pollCursor !== undefined
+        ? { pollCursor }
+        : {}),
+    },
+  });
+};
 
 const UI_MESSAGE_LIST_COLUMNS = `
   position, ui_message_id, backend_message_id, role, message_type,
@@ -324,70 +635,130 @@ const UI_MESSAGE_LIST_COLUMNS = `
          UI_MESSAGE_LIST_FIELD_LIMIT / 2,
        )}) END AS content_tail,
   timestamp, streaming,
-  ${SQL_JSON_FIELD("tabName")} AS metadata_tab_name,
-  ${SQL_JSON_FIELD("commandId")} AS metadata_command_id,
-  ${SQL_JSON_FIELD("exitCode")} AS metadata_exit_code,
-  length(CAST(${SQL_JSON_FIELD("output")} AS TEXT)) AS metadata_output_length,
-  CASE WHEN length(CAST(${SQL_JSON_FIELD("output")} AS TEXT)) <= ${UI_MESSAGE_LIST_FIELD_LIMIT}
-       THEN CAST(${SQL_JSON_FIELD("output")} AS TEXT)
-       ELSE substr(CAST(${SQL_JSON_FIELD("output")} AS TEXT), 1, ${Math.ceil(
+  ${SQL_JSON_TEXT_FIELD("tabName")} AS metadata_tab_name,
+  ${SQL_JSON_TEXT_FIELD("commandId")} AS metadata_command_id,
+  ${SQL_JSON_INTEGER_FIELD("exitCode")} AS metadata_exit_code,
+  length(${SQL_JSON_TEXT_FIELD("output")}) AS metadata_output_length,
+  CASE WHEN length(${SQL_JSON_TEXT_FIELD("output")}) <= ${UI_MESSAGE_LIST_FIELD_LIMIT}
+       THEN ${SQL_JSON_TEXT_FIELD("output")}
+       ELSE substr(${SQL_JSON_TEXT_FIELD("output")}, 1, ${Math.ceil(
          UI_MESSAGE_LIST_FIELD_LIMIT / 2,
        )}) END AS metadata_output_head,
-  CASE WHEN length(CAST(${SQL_JSON_FIELD("output")} AS TEXT)) <= ${UI_MESSAGE_LIST_FIELD_LIMIT}
-       THEN '' ELSE substr(CAST(${SQL_JSON_FIELD("output")} AS TEXT), -${Math.floor(
+  CASE WHEN length(${SQL_JSON_TEXT_FIELD("output")}) <= ${UI_MESSAGE_LIST_FIELD_LIMIT}
+       THEN '' ELSE substr(${SQL_JSON_TEXT_FIELD("output")}, -${Math.floor(
          UI_MESSAGE_LIST_FIELD_LIMIT / 2,
        )}) END AS metadata_output_tail,
-  length(CAST(${SQL_JSON_FIELD("diff")} AS TEXT)) AS metadata_diff_length,
-  CASE WHEN length(CAST(${SQL_JSON_FIELD("diff")} AS TEXT)) <= ${UI_MESSAGE_LIST_FIELD_LIMIT}
-       THEN CAST(${SQL_JSON_FIELD("diff")} AS TEXT)
-       ELSE substr(CAST(${SQL_JSON_FIELD("diff")} AS TEXT), 1, ${Math.ceil(
+  length(${SQL_JSON_TEXT_FIELD("diff")}) AS metadata_diff_length,
+  CASE WHEN length(${SQL_JSON_TEXT_FIELD("diff")}) <= ${UI_MESSAGE_LIST_FIELD_LIMIT}
+       THEN ${SQL_JSON_TEXT_FIELD("diff")}
+       ELSE substr(${SQL_JSON_TEXT_FIELD("diff")}, 1, ${Math.ceil(
          UI_MESSAGE_LIST_FIELD_LIMIT / 2,
        )}) END AS metadata_diff_head,
-  CASE WHEN length(CAST(${SQL_JSON_FIELD("diff")} AS TEXT)) <= ${UI_MESSAGE_LIST_FIELD_LIMIT}
-       THEN '' ELSE substr(CAST(${SQL_JSON_FIELD("diff")} AS TEXT), -${Math.floor(
+  CASE WHEN length(${SQL_JSON_TEXT_FIELD("diff")}) <= ${UI_MESSAGE_LIST_FIELD_LIMIT}
+       THEN '' ELSE substr(${SQL_JSON_TEXT_FIELD("diff")}, -${Math.floor(
          UI_MESSAGE_LIST_FIELD_LIMIT / 2,
        )}) END AS metadata_diff_tail,
-  ${SQL_JSON_FIELD("filePath")} AS metadata_file_path,
-  ${SQL_JSON_FIELD("action")} AS metadata_action,
-  ${SQL_JSON_FIELD("collapsed")} AS metadata_collapsed,
-  ${SQL_JSON_FIELD("isNowait")} AS metadata_is_nowait,
-  CASE WHEN length(CAST(${SQL_JSON_FIELD("commandOutput")} AS TEXT)) <= 65536
-       THEN CAST(${SQL_JSON_FIELD("commandOutput")} AS TEXT) END AS metadata_command_output_json,
-  ${SQL_JSON_FIELD("toolName")} AS metadata_tool_name,
-  ${SQL_JSON_FIELD("subToolTitle")} AS metadata_sub_tool_title,
-  ${SQL_JSON_FIELD("subToolHint")} AS metadata_sub_tool_hint,
-  ${SQL_JSON_FIELD("subToolLevel")} AS metadata_sub_tool_level,
-  ${SQL_JSON_FIELD("approvalId")} AS metadata_approval_id,
-  ${SQL_JSON_FIELD("decision")} AS metadata_decision,
-  ${SQL_JSON_FIELD("command")} AS metadata_command,
-  ${SQL_JSON_FIELD("modelName")} AS metadata_model_name,
-  ${SQL_JSON_FIELD("totalTokens")} AS metadata_total_tokens,
-  ${SQL_JSON_FIELD("maxTokens")} AS metadata_max_tokens,
-  length(CAST(${SQL_JSON_FIELD("details")} AS TEXT)) AS metadata_details_length,
-  CASE WHEN length(CAST(${SQL_JSON_FIELD("details")} AS TEXT)) <= ${UI_MESSAGE_LIST_FIELD_LIMIT}
-       THEN CAST(${SQL_JSON_FIELD("details")} AS TEXT)
-       ELSE substr(CAST(${SQL_JSON_FIELD("details")} AS TEXT), 1, ${Math.ceil(
+  ${SQL_JSON_TEXT_FIELD("filePath")} AS metadata_file_path,
+  ${SQL_JSON_TEXT_FIELD("action")} AS metadata_action,
+  ${SQL_JSON_BOOLEAN_FIELD("collapsed")} AS metadata_collapsed,
+  ${SQL_JSON_BOOLEAN_FIELD("isNowait")} AS metadata_is_nowait,
+  ${UI_COMMAND_OUTPUT_PROJECTION_COLUMNS},
+  ${SQL_JSON_TEXT_FIELD("toolName")} AS metadata_tool_name,
+  ${SQL_JSON_TEXT_FIELD("subToolTitle")} AS metadata_sub_tool_title,
+  ${SQL_JSON_TEXT_FIELD("subToolHint")} AS metadata_sub_tool_hint,
+  ${SQL_JSON_TEXT_FIELD("subToolLevel")} AS metadata_sub_tool_level,
+  ${SQL_JSON_TEXT_FIELD("approvalId")} AS metadata_approval_id,
+  ${SQL_JSON_TEXT_FIELD("decision")} AS metadata_decision,
+  ${SQL_JSON_TEXT_FIELD("command")} AS metadata_command,
+  ${SQL_JSON_TEXT_FIELD("modelName")} AS metadata_model_name,
+  ${SQL_JSON_INTEGER_FIELD("totalTokens")} AS metadata_total_tokens,
+  ${SQL_JSON_INTEGER_FIELD("maxTokens")} AS metadata_max_tokens,
+  length(${SQL_JSON_TEXT_FIELD("details")}) AS metadata_details_length,
+  CASE WHEN length(${SQL_JSON_TEXT_FIELD("details")}) <= ${UI_MESSAGE_LIST_FIELD_LIMIT}
+       THEN ${SQL_JSON_TEXT_FIELD("details")}
+       ELSE substr(${SQL_JSON_TEXT_FIELD("details")}, 1, ${Math.ceil(
          UI_MESSAGE_LIST_FIELD_LIMIT / 2,
        )}) END AS metadata_details_head,
-  CASE WHEN length(CAST(${SQL_JSON_FIELD("details")} AS TEXT)) <= ${UI_MESSAGE_LIST_FIELD_LIMIT}
-       THEN '' ELSE substr(CAST(${SQL_JSON_FIELD("details")} AS TEXT), -${Math.floor(
+  CASE WHEN length(${SQL_JSON_TEXT_FIELD("details")}) <= ${UI_MESSAGE_LIST_FIELD_LIMIT}
+       THEN '' ELSE substr(${SQL_JSON_TEXT_FIELD("details")}, -${Math.floor(
          UI_MESSAGE_LIST_FIELD_LIMIT / 2,
        )}) END AS metadata_details_tail,
-  ${SQL_JSON_FIELD("inputKind")} AS metadata_input_kind,
-  CASE WHEN length(CAST(${SQL_JSON_FIELD("inputImages")} AS TEXT)) <= 65536
-       THEN CAST(${SQL_JSON_FIELD("inputImages")} AS TEXT) END AS metadata_input_images_json,
-  length(CAST(${SQL_JSON_FIELD("inputImages")} AS TEXT)) AS metadata_input_images_length,
-  ${SQL_JSON_FIELD("compactionBoundaryTargetBackendMessageId")} AS metadata_compaction_target,
-  ${SQL_JSON_FIELD("compactionBoundaryPreviousBackendMessageId")} AS metadata_compaction_previous,
-  ${SQL_JSON_FIELD("compactionBoundarySummaryBackendMessageId")} AS metadata_compaction_summary,
-  ${SQL_JSON_FIELD("compactionBoundaryProtectedNormalRounds")} AS metadata_compaction_rounds`;
+  ${SQL_JSON_TEXT_FIELD("inputKind")} AS metadata_input_kind,
+  CASE WHEN length(CAST(${SQL_JSON_ARRAY_FIELD("inputImages")} AS TEXT)) <= ${UI_MESSAGE_LIST_FIELD_LIMIT}
+       THEN CAST(${SQL_JSON_ARRAY_FIELD("inputImages")} AS TEXT) END AS metadata_input_images_json,
+  length(CAST(${SQL_JSON_ARRAY_FIELD("inputImages")} AS TEXT)) AS metadata_input_images_length,
+  ${SQL_JSON_TEXT_FIELD("compactionBoundaryTargetBackendMessageId")} AS metadata_compaction_target,
+  ${SQL_JSON_TEXT_FIELD("compactionBoundaryPreviousBackendMessageId")} AS metadata_compaction_previous,
+  ${SQL_JSON_TEXT_FIELD("compactionBoundarySummaryBackendMessageId")} AS metadata_compaction_summary,
+  ${SQL_JSON_INTEGER_FIELD("compactionBoundaryProtectedNormalRounds")} AS metadata_compaction_rounds`;
+
+const SQL_GEOMETRY_BOUNDED_STRING_FIELD = (field: string): string => {
+  const expression = SQL_JSON_TEXT_FIELD(field);
+  const headLength = Math.ceil(UI_MESSAGE_GEOMETRY_PREVIEW_LIMIT / 2);
+  const tailLength = Math.floor(UI_MESSAGE_GEOMETRY_PREVIEW_LIMIT / 2);
+  return `CASE WHEN length(${expression}) <= ${UI_MESSAGE_GEOMETRY_PREVIEW_LIMIT}
+               THEN ${expression}
+               ELSE substr(${expression}, 1, ${headLength}) || substr(${expression}, -${tailLength}) END`;
+};
+
+const SQL_GEOMETRY_METADATA_DEFERRED = [
+  ...UI_MESSAGE_STRUCTURAL_METADATA_STRING_FIELDS,
+  "action",
+  "subToolLevel",
+  "decision",
+  "inputKind",
+]
+  .map(
+    (field) =>
+      `length(${SQL_JSON_TEXT_FIELD(field)}) > ${UI_MESSAGE_GEOMETRY_PREVIEW_LIMIT}`,
+  )
+  .join(" OR ");
+
+const UI_MESSAGE_GEOMETRY_COLUMNS = `
+  position, ui_message_id, backend_message_id, role, message_type, content,
+  timestamp, streaming,
+  ${SQL_GEOMETRY_BOUNDED_STRING_FIELD("tabName")} AS metadata_tab_name,
+  ${SQL_GEOMETRY_BOUNDED_STRING_FIELD("commandId")} AS metadata_command_id,
+  ${SQL_JSON_INTEGER_FIELD("exitCode")} AS metadata_exit_code,
+  ${SQL_JSON_TEXT_FIELD("output")} AS metadata_output,
+  ${SQL_JSON_TEXT_FIELD("diff")} AS metadata_diff,
+  ${SQL_GEOMETRY_BOUNDED_STRING_FIELD("filePath")} AS metadata_file_path,
+  ${SQL_GEOMETRY_BOUNDED_STRING_FIELD("action")} AS metadata_action,
+  ${SQL_JSON_BOOLEAN_FIELD("collapsed")} AS metadata_collapsed,
+  ${SQL_JSON_BOOLEAN_FIELD("isNowait")} AS metadata_is_nowait,
+  ${UI_COMMAND_OUTPUT_PROJECTION_COLUMNS},
+  ${SQL_GEOMETRY_BOUNDED_STRING_FIELD("toolName")} AS metadata_tool_name,
+  ${SQL_GEOMETRY_BOUNDED_STRING_FIELD("subToolTitle")} AS metadata_sub_tool_title,
+  ${SQL_GEOMETRY_BOUNDED_STRING_FIELD("subToolHint")} AS metadata_sub_tool_hint,
+  ${SQL_GEOMETRY_BOUNDED_STRING_FIELD("subToolLevel")} AS metadata_sub_tool_level,
+  ${SQL_GEOMETRY_BOUNDED_STRING_FIELD("approvalId")} AS metadata_approval_id,
+  ${SQL_GEOMETRY_BOUNDED_STRING_FIELD("decision")} AS metadata_decision,
+  ${SQL_GEOMETRY_BOUNDED_STRING_FIELD("command")} AS metadata_command,
+  ${SQL_GEOMETRY_BOUNDED_STRING_FIELD("modelName")} AS metadata_model_name,
+  ${SQL_JSON_INTEGER_FIELD("totalTokens")} AS metadata_total_tokens,
+  ${SQL_JSON_INTEGER_FIELD("maxTokens")} AS metadata_max_tokens,
+  ${SQL_JSON_TEXT_FIELD("details")} AS metadata_details,
+  ${SQL_GEOMETRY_BOUNDED_STRING_FIELD("inputKind")} AS metadata_input_kind,
+  CASE WHEN json_valid(metadata_json)
+             AND json_type(metadata_json, '$.inputImages') = 'array'
+       THEN json_array_length(metadata_json, '$.inputImages') ELSE 0 END AS metadata_input_image_count,
+  ${SQL_GEOMETRY_BOUNDED_STRING_FIELD("compactionBoundaryTargetBackendMessageId")} AS metadata_compaction_target,
+  ${SQL_GEOMETRY_BOUNDED_STRING_FIELD("compactionBoundaryPreviousBackendMessageId")} AS metadata_compaction_previous,
+  ${SQL_GEOMETRY_BOUNDED_STRING_FIELD("compactionBoundarySummaryBackendMessageId")} AS metadata_compaction_summary,
+  ${SQL_JSON_INTEGER_FIELD("compactionBoundaryProtectedNormalRounds")} AS metadata_compaction_rounds,
+  CASE WHEN ${SQL_GEOMETRY_METADATA_DEFERRED} THEN 1 ELSE 0 END AS metadata_deferred`;
 
 export const projectUiMessageForList = (message: ChatMessage): ChatMessage => {
-  const deferredFields: DeferredUiMessageField[] = [];
+  const deferredFields: DeferredUiMessageField[] = Array.from(
+    new Set(message.deferredPayload?.fields || []),
+  );
+  const defer = (field: DeferredUiMessageField): void => {
+    if (!deferredFields.includes(field)) deferredFields.push(field);
+  };
   const boundedContent = createBoundedListPreview(message.content);
-  if (boundedContent !== message.content) deferredFields.push("content");
+  if (boundedContent !== message.content) defer("content");
 
-  let metadata = message.metadata ? { ...message.metadata } : undefined;
+  let metadata = sanitizeUiMessageMetadata(message.metadata);
   if (metadata) {
     for (const field of ["output", "diff", "details"] as const) {
       const current = metadata[field];
@@ -395,23 +766,35 @@ export const projectUiMessageForList = (message: ChatMessage): ChatMessage => {
       const bounded = createBoundedListPreview(current);
       if (bounded !== current) {
         metadata[field] = bounded;
-        deferredFields.push(field);
+        defer(field);
       }
     }
+    for (const field of UI_MESSAGE_STRUCTURAL_METADATA_STRING_FIELDS) {
+      const current = metadata[field];
+      if (typeof current !== "string") continue;
+      const bounded = createBoundedListPreview(current);
+      if (bounded !== current) {
+        metadata[field] = bounded as never;
+        defer("metadata");
+      }
+    }
+    const commandOutput = parseCommandOutputContractV1(metadata.commandOutput);
+    if (commandOutput) {
+      metadata.commandOutput = commandOutput;
+    } else {
+      delete metadata.commandOutput;
+    }
     if (Array.isArray(metadata.inputImages)) {
-      let imagesDeferred = false;
-      metadata.inputImages = metadata.inputImages.map((image) => {
-        if (
-          typeof image.previewDataUrl !== "string" ||
-          image.previewDataUrl.length <= UI_MESSAGE_LIST_FIELD_LIMIT
-        ) {
-          return image;
-        }
-        imagesDeferred = true;
-        const { previewDataUrl: _previewDataUrl, ...lightweightImage } = image;
-        return lightweightImage;
-      });
-      if (imagesDeferred) deferredFields.push("inputImages");
+      let serializedImagesLength = Number.POSITIVE_INFINITY;
+      try {
+        serializedImagesLength = JSON.stringify(metadata.inputImages).length;
+      } catch {
+        // Cyclic or otherwise non-serializable attachment metadata is deferred.
+      }
+      if (serializedImagesLength > UI_MESSAGE_LIST_FIELD_LIMIT) {
+        delete metadata.inputImages;
+        defer("inputImages");
+      }
     }
   }
 
@@ -428,9 +811,7 @@ export const projectUiMessageForList = (message: ChatMessage): ChatMessage => {
 const serializeUiMessageMetadata = (message: ChatMessage): string | null =>
   message.metadata ? JSON.stringify(message.metadata) : null;
 
-const isStoredCompactionMarker = (
-  message: StoredChatMessageRecord,
-): boolean =>
+const isStoredCompactionMarker = (message: StoredChatMessageRecord): boolean =>
   message.data?.data?.additional_kwargs?.last_compaction === true ||
   message.data?.additional_kwargs?.last_compaction === true;
 
@@ -442,10 +823,206 @@ const mapStoredChatMessageRow = (
   data: JSON.parse(message.message_data_json),
 });
 
+const createGeometryPreview = (
+  value: string,
+): { value: string; deferred: boolean } => {
+  if (value.length <= UI_MESSAGE_GEOMETRY_PREVIEW_LIMIT) {
+    return { value, deferred: false };
+  }
+  const head = Math.ceil(UI_MESSAGE_GEOMETRY_PREVIEW_LIMIT / 2);
+  const tail = Math.floor(UI_MESSAGE_GEOMETRY_PREVIEW_LIMIT / 2);
+  return {
+    // Keep the bounded geometry projection textually silent, matching the
+    // existing list projection contract. The full field is loaded on demand.
+    value: `${sliceFromStartAtUnicodeBoundary(value, head)}${sliceFromEndAtUnicodeBoundary(value, tail)}`,
+    deferred: true,
+  };
+};
+
+const readGeometryMetadata = (
+  row: UiSessionMessageGeometryRow,
+): {
+  metadata?: ChatMessageGeometryMetadata;
+  output: string;
+  diff: string;
+  details: string;
+  inputImageCount: number;
+  deferred: boolean;
+} => {
+  const output = extractCommandOutputDisplayText(
+    typeof row.metadata_output === "string" ? row.metadata_output : "",
+  );
+  const diff =
+    typeof row.metadata_diff === "string" ? row.metadata_diff : "";
+  const details =
+    typeof row.metadata_details === "string" ? row.metadata_details : "";
+  const inputImageCount = Math.max(
+    0,
+    Math.floor(Number(row.metadata_input_image_count || 0)),
+  );
+  const metadata: ChatMessageGeometryMetadata = {};
+  let deferred = row.metadata_deferred === 1;
+  const assignBoundedString = <
+    K extends keyof ChatMessageGeometryMetadata,
+  >(
+    key: K,
+    value: unknown,
+  ): void => {
+    if (typeof value !== "string" || value.length === 0) return;
+    const bounded = createGeometryPreview(value);
+    metadata[key] = bounded.value as ChatMessageGeometryMetadata[K];
+    deferred ||= bounded.deferred;
+  };
+  assignBoundedString("tabName", row.metadata_tab_name);
+  assignBoundedString("commandId", row.metadata_command_id);
+  assignBoundedString("filePath", row.metadata_file_path);
+  assignBoundedString("toolName", row.metadata_tool_name);
+  assignBoundedString("subToolTitle", row.metadata_sub_tool_title);
+  assignBoundedString("subToolHint", row.metadata_sub_tool_hint);
+  assignBoundedString("approvalId", row.metadata_approval_id);
+  assignBoundedString("command", row.metadata_command);
+  assignBoundedString("modelName", row.metadata_model_name);
+  assignBoundedString(
+    "compactionBoundaryTargetBackendMessageId",
+    row.metadata_compaction_target,
+  );
+  assignBoundedString(
+    "compactionBoundaryPreviousBackendMessageId",
+    row.metadata_compaction_previous,
+  );
+  assignBoundedString(
+    "compactionBoundarySummaryBackendMessageId",
+    row.metadata_compaction_summary,
+  );
+
+  if (Number.isSafeInteger(row.metadata_exit_code)) {
+    metadata.exitCode = Number(row.metadata_exit_code);
+  }
+  if (typeof row.metadata_collapsed === "boolean") {
+    metadata.collapsed = row.metadata_collapsed;
+  } else if (row.metadata_collapsed === 0 || row.metadata_collapsed === 1) {
+    metadata.collapsed = Boolean(row.metadata_collapsed);
+  }
+  if (typeof row.metadata_is_nowait === "boolean") {
+    metadata.isNowait = row.metadata_is_nowait;
+  } else if (row.metadata_is_nowait === 0 || row.metadata_is_nowait === 1) {
+    metadata.isNowait = Boolean(row.metadata_is_nowait);
+  }
+  if (
+    row.metadata_action === "created" ||
+    row.metadata_action === "edited" ||
+    row.metadata_action === "error"
+  ) {
+    metadata.action = row.metadata_action;
+  }
+  if (
+    row.metadata_sub_tool_level === "info" ||
+    row.metadata_sub_tool_level === "warning" ||
+    row.metadata_sub_tool_level === "error"
+  ) {
+    metadata.subToolLevel = row.metadata_sub_tool_level;
+  }
+  if (
+    row.metadata_decision === "allow" ||
+    row.metadata_decision === "deny"
+  ) {
+    metadata.decision = row.metadata_decision;
+  }
+  if (
+    row.metadata_input_kind === "normal" ||
+    row.metadata_input_kind === "inserted"
+  ) {
+    metadata.inputKind = row.metadata_input_kind;
+  }
+  for (const [key, value] of [
+    ["totalTokens", row.metadata_total_tokens],
+    ["maxTokens", row.metadata_max_tokens],
+    [
+      "compactionBoundaryProtectedNormalRounds",
+      row.metadata_compaction_rounds,
+    ],
+  ] as const) {
+    if (Number.isSafeInteger(value) && Number(value) >= 0) {
+      metadata[key] = Number(value);
+    }
+  }
+  const commandOutput = readProjectedCommandOutput(row);
+  if (commandOutput) metadata.commandOutput = commandOutput;
+  return {
+    metadata: Object.keys(metadata).length > 0 ? metadata : undefined,
+    output,
+    diff,
+    details,
+    inputImageCount,
+    deferred,
+  };
+};
+
+const createUiMessageGeometryEntry = (
+  row: UiSessionMessageGeometryRow,
+): UiMessageGeometryEntry => {
+  const metadata = readGeometryMetadata(row);
+  const needsContent =
+    row.message_type !== "tokens_count" &&
+    row.message_type !== "compaction_boundary";
+  const needsOutput = UI_GEOMETRY_OUTPUT_MESSAGE_TYPES.has(row.message_type);
+  const needsDiff = row.message_type === "file_edit";
+  const needsDetails = row.message_type === "error";
+  const contentPreview = createGeometryPreview(needsContent ? row.content : "");
+  const outputPreview = createGeometryPreview(
+    needsOutput ? metadata.output : "",
+  );
+  const diffPreview = createGeometryPreview(needsDiff ? metadata.diff : "");
+  const detailsPreview = createGeometryPreview(
+    needsDetails ? metadata.details : "",
+  );
+  const deferredFields: ChatGeometryDeferredField[] = [];
+  if (contentPreview.deferred) deferredFields.push("content");
+  if (outputPreview.deferred) deferredFields.push("output");
+  if (diffPreview.deferred) deferredFields.push("diff");
+  if (detailsPreview.deferred) deferredFields.push("details");
+  if (metadata.inputImageCount > 0) deferredFields.push("inputImages");
+  if (metadata.deferred) deferredFields.push("metadata");
+  const projection: ChatMessageGeometryProjection = {
+    content: contentPreview.value,
+    ...(outputPreview.value ? { output: outputPreview.value } : {}),
+    ...(diffPreview.value ? { diff: diffPreview.value } : {}),
+    ...(detailsPreview.value ? { details: detailsPreview.value } : {}),
+    ...(deferredFields.length > 0 ? { deferredFields } : {}),
+  };
+  return {
+    position: Number(row.position),
+    id: row.ui_message_id,
+    ...(row.backend_message_id
+      ? { backendMessageId: row.backend_message_id }
+      : {}),
+    role: row.role,
+    type: row.message_type,
+    timestamp: row.timestamp,
+    streaming: Boolean(row.streaming),
+    ...(metadata.metadata ? { metadata: metadata.metadata } : {}),
+    geometry: {
+      contentShape: needsContent
+        ? createChatTextGeometryShape(row.content)
+        : { lineBuckets: [], blankLineCount: 1 },
+      ...(needsOutput && metadata.output
+        ? { outputShape: createChatTextGeometryShape(metadata.output) }
+        : {}),
+      ...(needsDiff && metadata.diff
+        ? { diffShape: createChatTextGeometryShape(metadata.diff) }
+        : {}),
+      ...(needsDetails && metadata.details
+        ? { detailsShape: createChatTextGeometryShape(metadata.details) }
+        : {}),
+      inputImageCount: metadata.inputImageCount,
+    },
+    projection,
+  };
+};
+
 export class HistorySqliteStore {
   private readonly filePath: string;
   private readonly db: DatabaseHandle;
-
   constructor(options?: HistorySqliteStoreOptions) {
     this.filePath =
       options?.filePath || resolveHistoryStoragePaths().sqliteDbPath;
@@ -676,9 +1253,7 @@ export class HistorySqliteStore {
          ORDER BY position DESC
          LIMIT 1`,
       )
-      .get(sessionId) as
-      | { position: number; message_id: string }
-      | undefined;
+      .get(sessionId) as { position: number; message_id: string } | undefined;
 
     return {
       id: row.id,
@@ -739,8 +1314,10 @@ export class HistorySqliteStore {
          WHERE session_id = ? AND position >= ?
          ORDER BY position ASC`,
       )
-      .all(sessionId, Math.max(0, Math.floor(startPosition))) as
-      ChatSessionMessageRow[];
+      .all(
+        sessionId,
+        Math.max(0, Math.floor(startPosition)),
+      ) as ChatSessionMessageRow[];
     return rows.map(mapStoredChatMessageRow);
   }
 
@@ -1192,9 +1769,7 @@ export class HistorySqliteStore {
         role: message.role,
         type: message.message_type,
         content: message.content,
-        metadata: message.metadata_json
-          ? JSON.parse(message.metadata_json)
-          : undefined,
+        metadata: parseUiMessageMetadata(message.metadata_json),
         timestamp: message.timestamp,
         streaming: Boolean(message.streaming),
       })),
@@ -1361,10 +1936,40 @@ export class HistorySqliteStore {
     };
   }
 
-  loadUiMessagesByIds(
-    sessionId: string,
-    messageIds: string[],
-  ): ChatMessage[] {
+  loadUiMessageGeometryIndex(sessionId: string): UiMessageGeometryIndex | null {
+    const summary = this.db
+      .prepare(
+        `SELECT messages_count, ui_revision
+         FROM ui_sessions
+         WHERE id = ?`,
+      )
+      .get(sessionId) as
+      | { messages_count: number; ui_revision: number }
+      | undefined;
+    if (!summary) return null;
+
+    const entries: UiMessageGeometryEntry[] = [];
+    const statement = this.db.prepare(
+      `SELECT ${UI_MESSAGE_GEOMETRY_COLUMNS}
+       FROM ui_session_messages
+       WHERE session_id = ?
+       ORDER BY position ASC`,
+    );
+    for (const row of statement.iterate(
+      sessionId,
+    ) as Iterable<UiSessionMessageGeometryRow>) {
+      entries.push(createUiMessageGeometryEntry(row));
+    }
+    const index: UiMessageGeometryIndex = {
+      sessionId,
+      entries,
+      totalCount: Math.max(summary.messages_count, entries.length),
+      uiRevision: Math.max(0, Math.floor(Number(summary.ui_revision || 0))),
+    };
+    return index;
+  }
+
+  loadUiMessagesByIds(sessionId: string, messageIds: string[]): ChatMessage[] {
     const ids = Array.from(new Set(messageIds.filter(Boolean)));
     if (ids.length === 0) return [];
     const placeholders = ids.map(() => "?").join(", ");
@@ -1436,7 +2041,10 @@ export class HistorySqliteStore {
     );
   }
 
-  loadUiMessage(sessionId: string, messageId: string): PositionedUiMessage | null {
+  loadUiMessage(
+    sessionId: string,
+    messageId: string,
+  ): PositionedUiMessage | null {
     const row = this.db
       .prepare(
         `SELECT position, ui_message_id, backend_message_id, role,
@@ -1569,18 +2177,19 @@ export class HistorySqliteStore {
       0,
       currentSummary.messagesCount - remainingCount,
     );
-    const lastMessage = remainingCount > 0
-      ? (this.db
-          .prepare(
+    const lastMessage =
+      remainingCount > 0
+        ? (this.db
+            .prepare(
             `SELECT position, ui_message_id, backend_message_id, role,
                     message_type, content, metadata_json, timestamp, streaming
              FROM ui_session_messages
              WHERE session_id = ? AND position < ?
              ORDER BY position DESC
              LIMIT 1`,
-          )
-          .get(sessionId, row.position) as UiSessionMessageRow | undefined)
-      : undefined;
+            )
+            .get(sessionId, row.position) as UiSessionMessageRow | undefined)
+        : undefined;
     const lastPreview = lastMessage
       ? String(
           parseUiMessageRow(lastMessage).content ||
@@ -1746,11 +2355,15 @@ export class HistorySqliteStore {
           summary.uiRevision,
         );
         const messageIndexById = new Map(
-          session.messages.map((message, index) => [message.id, index] as const),
+          session.messages.map(
+            (message, index) => [message.id, index] as const,
+          ),
         );
         const messagesToPersist =
           dirtyMessageIds !== undefined
-            ? session.messages.filter((message) => dirtyMessageIds.has(message.id))
+            ? session.messages.filter((message) =>
+                dirtyMessageIds.has(message.id),
+              )
             : session.messages;
         messagesToPersist.forEach((message) => {
           const index = messageIndexById.get(message.id);
@@ -1931,7 +2544,9 @@ export class HistorySqliteStore {
          ORDER BY position ASC
          LIMIT 1`,
       )
-      .get(sessionId, anchorBackendMessageId) as { position: number } | undefined;
+      .get(sessionId, anchorBackendMessageId) as
+      | { position: number }
+      | undefined;
     if (!anchor) return false;
     const insertPosition = anchor.position + (placement === "after" ? 1 : 0);
     const shiftNegative = this.db.prepare(

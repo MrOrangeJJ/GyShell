@@ -298,11 +298,17 @@ export const resolveChatOffscreenStreamingItems = (
 }
 
 const areChatTextHeightShapesEqual = (
-  previousItem: ChatRenderItem,
-  nextItem: ChatRenderItem,
+  previousShape:
+    | ChatRenderItem['heightEstimate']['textShape']
+    | ChatRenderItem['heightEstimate']['outputShape']
+    | ChatRenderItem['heightEstimate']['diffShape']
+    | ChatRenderItem['heightEstimate']['detailsShape'],
+  nextShape:
+    | ChatRenderItem['heightEstimate']['textShape']
+    | ChatRenderItem['heightEstimate']['outputShape']
+    | ChatRenderItem['heightEstimate']['diffShape']
+    | ChatRenderItem['heightEstimate']['detailsShape'],
 ): boolean => {
-  const previousShape = previousItem.heightEstimate.textShape
-  const nextShape = nextItem.heightEstimate.textShape
   if (previousShape === nextShape) return true
   if (!previousShape || !nextShape) return false
   if (
@@ -311,13 +317,9 @@ const areChatTextHeightShapesEqual = (
   ) {
     return false
   }
-  return previousShape.lineBuckets.every((bucket, index) => {
-    const nextBucket = nextShape.lineBuckets[index]
-    return (
-      bucket.characterUnits === nextBucket?.characterUnits &&
-      bucket.lineCount === nextBucket.lineCount
-    )
-  })
+  return previousShape.lineBuckets.every(
+    (value, index) => value === nextShape.lineBuckets[index],
+  )
 }
 
 const hasChatRenderItemLayoutChange = (
@@ -332,7 +334,24 @@ const hasChatRenderItemLayoutChange = (
     previousItem.kind !== nextItem.kind ||
     previousItem.heightEstimate.fixedHeight !==
       nextItem.heightEstimate.fixedHeight ||
-    !areChatTextHeightShapesEqual(previousItem, nextItem) ||
+    !areChatTextHeightShapesEqual(
+      previousItem.heightEstimate.textShape,
+      nextItem.heightEstimate.textShape,
+    ) ||
+    !areChatTextHeightShapesEqual(
+      previousItem.heightEstimate.outputShape,
+      nextItem.heightEstimate.outputShape,
+    ) ||
+    !areChatTextHeightShapesEqual(
+      previousItem.heightEstimate.diffShape,
+      nextItem.heightEstimate.diffShape,
+    ) ||
+    !areChatTextHeightShapesEqual(
+      previousItem.heightEstimate.detailsShape,
+      nextItem.heightEstimate.detailsShape,
+    ) ||
+    previousItem.heightEstimate.bannerKind !==
+      nextItem.heightEstimate.bannerKind ||
     previousItem.mergeWithPreviousAssistant !==
       nextItem.mergeWithPreviousAssistant ||
     previousItem.showAssistantRoleLabel !== nextItem.showAssistantRoleLabel ||

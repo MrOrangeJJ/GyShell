@@ -826,6 +826,7 @@ export interface GyShellAPI {
         aroundPosition?: number;
       },
     ) => Promise<any>;
+    getUiMessageGeometry: (sessionId: string) => Promise<any>;
     getFullUiMessages: (
       sessionId: string,
       messageIds: string[],
@@ -1379,6 +1380,8 @@ const api: GyShellAPI = {
       ipcRenderer.invoke("agent:getUiMessages", sessionId),
     getUiMessagePage: (sessionId, request) =>
       ipcRenderer.invoke("agent:getUiMessagePage", sessionId, request),
+    getUiMessageGeometry: (sessionId) =>
+      ipcRenderer.invoke("agent:getUiMessageGeometry", sessionId),
     getFullUiMessages: (sessionId, messageIds) =>
       ipcRenderer.invoke("agent:getFullUiMessages", sessionId, messageIds),
     searchUiMessages: (sessionId, query, limit) =>

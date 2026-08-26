@@ -124,7 +124,7 @@ export const MessageRow: React.FC<MessageRowProps> = observer(
       normalizedAssistantGroupMessageIds.length > 0 &&
       !assistantGroupIsRunning;
     const deferredAutoLoadIds = (() => {
-      if (!session) return [];
+      if (!session || session.geometryLoaded) return [];
       if (seamlessGroupMessageIds && seamlessGroupMessageIds.length > 0) {
         const tailId = seamlessGroupMessageIds[seamlessGroupMessageIds.length - 1];
         const tail = tailId ? session.messagesById.get(tailId) : undefined;
@@ -177,10 +177,9 @@ export const MessageRow: React.FC<MessageRowProps> = observer(
     );
 
     if (!session) return null;
-    // Historical list pages carry bounded projections for unusually large
-    // fields. Keep the original row UI offscreen for this brief local fetch so
-    // users never see a truncation control or alternate presentation.
-    if (deferredAutoLoadKey) return null;
+    // Historical rows may start from a bounded projection. Render that
+    // projection immediately; the store hydrates deferred fields in the
+    // background so a long history never turns into a blank-row/reflow loop.
 
     const assistantGroupBranchMessage = assistantGroupBranchMessageId
       ? session.messagesById.get(assistantGroupBranchMessageId)

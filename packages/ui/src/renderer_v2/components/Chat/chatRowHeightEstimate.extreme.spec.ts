@@ -183,13 +183,38 @@ runCase('user image strips and banner defaults stay component-specific', () => {
   assertEqual(
     resolveChatRowHeightEstimate(command),
     168,
-    'expanded command banners should preserve their established fallback',
+    'short expanded command banners should preserve the established fallback',
   )
   assertEqual(
     resolveChatRowHeightEstimate(fileEdit),
     38,
     'collapsed file-edit banners should use their compact measured height',
   )
+})
+
+runCase('command output estimates grow with content and cap at banner max height', () => {
+  const short = createChatRowHeightEstimate(
+    createMessage({
+      role: 'assistant',
+      type: 'command',
+      content: 'echo ok',
+      metadata: { output: 'ok\\n' },
+    }),
+    'assistant',
+  )
+  const long = createChatRowHeightEstimate(
+    createMessage({
+      role: 'assistant',
+      type: 'command',
+      content: 'echo many',
+      metadata: { output: 'line\\n'.repeat(2_000) },
+    }),
+    'assistant',
+  )
+  const shortHeight = resolveChatRowHeightEstimate(short, { viewportWidth: 710 })
+  const longHeight = resolveChatRowHeightEstimate(long, { viewportWidth: 710 })
+  assertEqual(longHeight > shortHeight, true, 'long command output should reserve more banner height')
+  assertEqual(longHeight <= 300, true, 'command banners should honor the bounded CSS body height')
 })
 
 runCase('extreme payload estimates stay finite and bounded by linear work', () => {
@@ -210,8 +235,8 @@ runCase('extreme payload estimates stay finite and bounded by linear work', () =
   )
   assertEqual(
     estimate.textShape.lineBuckets.length,
-    1,
-    'a long unbroken line should retain one compact bucket, not one entry per character',
+    2,
+    'a long unbroken line should retain one compact bucket pair, not one entry per character',
   )
 })
 
@@ -244,11 +269,11 @@ runCase('repeated non-empty lines collapse into one histogram bucket', () => {
 
   assertEqual(
     shape.lineBuckets.length,
-    1,
-    'half a million equal-width lines should retain one histogram bucket',
+    2,
+    'half a million equal-width lines should retain one histogram bucket pair',
   )
   assertEqual(
-    shape.lineBuckets[0]?.lineCount,
+    shape.lineBuckets[1],
     500_000,
     'the histogram bucket should retain the exact repeated-line count',
   )
