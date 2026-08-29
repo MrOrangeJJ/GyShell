@@ -43,6 +43,13 @@ export interface ChatScrollAnchorAdjustmentInput {
   autoScrollEnabled: boolean
 }
 
+export interface ChatDragReleaseScrollTopInput {
+  preserveBottom: boolean
+  scrollHeight: number
+  viewportHeight: number
+  anchoredScrollTop: number | null
+}
+
 export type ChatTailMessageRole = 'user' | 'assistant' | null
 
 export interface ChatAutoScrollOnRenderInput {
@@ -218,10 +225,7 @@ export const captureChatViewportAnchor = (
     itemId: item.id,
     offsetWithinItem: Math.max(
       0,
-      Math.min(
-        layout.heights[itemIndex],
-        Math.max(0, scrollTop) - layout.offsets[itemIndex],
-      ),
+      Math.max(0, scrollTop) - layout.offsets[itemIndex],
     ),
   }
 }
@@ -234,13 +238,10 @@ export const resolveChatViewportAnchorScrollTop = (
   const itemIndex = items.findIndex((item) => item.id === anchor.itemId)
   if (itemIndex < 0 || itemIndex >= layout.heights.length) return null
 
-  return (
-    layout.offsets[itemIndex] +
-    Math.min(
-      Math.max(0, anchor.offsetWithinItem),
-      layout.heights[itemIndex],
-    )
-  )
+  // The offset is kept whole rather than clamped to the row: a row that shrank
+  // after being measured would otherwise silently drop the remainder and move
+  // the viewport by that much.
+  return layout.offsets[itemIndex] + Math.max(0, anchor.offsetWithinItem)
 }
 
 export const resolveChatVirtualRange = (
@@ -442,6 +443,23 @@ export const resolveNextChatOffscreenMeasurementRetentionState = ({
     ([itemId, mode]) => nextState[itemId] !== mode,
   )
   return changed ? nextState : currentState
+}
+
+export const resolveChatDragReleaseScrollTop = ({
+  preserveBottom,
+  scrollHeight,
+  viewportHeight,
+  anchoredScrollTop,
+}: ChatDragReleaseScrollTopInput): number | null => {
+  if (preserveBottom) {
+    if (!Number.isFinite(scrollHeight) || !Number.isFinite(viewportHeight)) {
+      return null
+    }
+    return Math.max(0, scrollHeight - viewportHeight)
+  }
+  return anchoredScrollTop === null || !Number.isFinite(anchoredScrollTop)
+    ? null
+    : Math.max(0, anchoredScrollTop)
 }
 
 export const resolveChatScrollAnchorAdjustment = ({

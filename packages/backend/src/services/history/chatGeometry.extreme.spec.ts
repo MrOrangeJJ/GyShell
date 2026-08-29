@@ -302,4 +302,32 @@ runCase("geometry index reflects a revision change", () => {
   });
 });
 
+
+runCase("loadChatSessionSummary matches the list query for every session", () => {
+  withStore((store) => {
+    const now = Date.now();
+    for (let sessionIndex = 0; sessionIndex < 4; sessionIndex += 1) {
+      store.saveChatSession({
+        id: `summary-session-${sessionIndex}`,
+        title: `Summary session ${sessionIndex}`,
+        messages: Array.from({ length: sessionIndex * 3 + 1 }, (_, index) => ({
+          id: `summary-${sessionIndex}-${index}`,
+          type: "message",
+          data: { role: "user", content: `message-${index}` },
+        })),
+        lastCheckpointOffset: sessionIndex,
+        createdAt: now - sessionIndex,
+        updatedAt: now + sessionIndex,
+      });
+    }
+
+    const listed = store.listChatSessionSummaries();
+    assert.equal(listed.length, 4);
+    for (const expected of listed) {
+      assert.deepEqual(store.loadChatSessionSummary(expected.id), expected);
+    }
+    assert.equal(store.loadChatSessionSummary("missing-session"), null);
+  });
+});
+
 console.log("All chat geometry extreme tests passed.");

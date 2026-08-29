@@ -44,6 +44,7 @@ export interface IChatHistoryRuntime {
   loadRuntimeSession(sessionId: string): ChatSession | null;
   getAllSessions(): StoredChatSession[];
   getAllSessionSummaries(): ChatSessionSummaryRecord[];
+  getSessionSummary(sessionId: string): ChatSessionSummaryRecord | null;
   deleteSession(sessionId: string): void;
   deleteSessions(sessionIds: string[]): void;
   renameSession(sessionId: string, newTitle: string): void;
@@ -182,6 +183,7 @@ export interface IAgentRuntime {
   releaseSessionModelBinding(sessionId: string): void;
   listStoredChatSessions(): StoredChatSession[];
   listStoredChatSessionSummaries(): ChatSessionSummaryRecord[];
+  getStoredChatSessionSummary(sessionId: string): ChatSessionSummaryRecord | null;
   loadChatSession(sessionId: string): ChatSession | null;
   deleteChatSession(sessionId: string): void;
   deleteChatSessions(sessionIds: string[]): void;

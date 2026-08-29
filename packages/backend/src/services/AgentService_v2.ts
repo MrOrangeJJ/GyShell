@@ -6522,6 +6522,10 @@ export class AgentService_v2 {
     return this.chatHistoryService.getAllSessionSummaries();
   }
 
+  getStoredChatSessionSummary(sessionId: string) {
+    return this.chatHistoryService.getSessionSummary(sessionId);
+  }
+
   deleteChatSession(sessionId: string): void {
     this.releaseSessionModelBinding(sessionId);
     this.getFallbackCompactionHistoryExportService().deleteExportsForSession(

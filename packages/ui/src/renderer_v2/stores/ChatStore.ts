@@ -141,6 +141,7 @@ export interface ChatSession {
   isLoadingOlderMessages?: boolean;
   isLoadingNewerMessages?: boolean;
   hasLoadedMessagePage?: boolean;
+  isLoadingInitialHistory?: boolean;
   uiRevision?: number;
   geometryLoaded?: boolean;
   loadedPayloadPositions?: Set<number>;
@@ -289,7 +290,10 @@ export class ChatStore {
   private readonly maxLoadedMessagesPerSession = WINDOW_CONTEXT.safeMode
     ? 300
     : 600;
-  private geometryLoadPromises = new Map<string, Promise<boolean>>();
+  private geometryLoadPromises = new Map<
+    string,
+    Promise<UiMessageGeometryIndex | null>
+  >();
   private messageRangeLoadPromises = new Map<string, Promise<boolean>>();
   private pagePayloadChunksBySession = new Map<string, Map<number, true>>();
   private fullPayloadRetentionBySession = new Map<
@@ -379,6 +383,7 @@ export class ChatStore {
       isLoadingOlderMessages: false,
       isLoadingNewerMessages: false,
       hasLoadedMessagePage: loaded,
+      isLoadingInitialHistory: false,
       uiRevision: 0,
       geometryLoaded: false,
       loadedPayloadPositions: new Set<number>(),
@@ -1266,39 +1271,30 @@ export class ChatStore {
     return true;
   }
 
-  private async loadMessageGeometryIndex(sessionId: string): Promise<boolean> {
+  private async fetchMessageGeometryIndex(
+    sessionId: string,
+  ): Promise<UiMessageGeometryIndex | null> {
     const getGeometry = (window.gyshell.agent as any).getUiMessageGeometry;
-    if (typeof getGeometry !== "function") return false;
+    if (typeof getGeometry !== "function") return null;
     const existing = this.geometryLoadPromises.get(sessionId);
     if (existing) return existing;
     const promise = (async () => {
       try {
         const raw = await getGeometry(sessionId);
-        if (!raw || !Array.isArray(raw.entries)) return false;
-        const current = this.getSessionById(sessionId);
         if (
-          !current ||
+          !raw ||
           raw.sessionId !== sessionId ||
-          this.isUiRevisionStale(
-            this.normalizeUiRevision(raw.uiRevision),
-            current.uiRevision || 0,
-          )
+          !Array.isArray(raw.entries)
         ) {
-          return false;
+          return null;
         }
-        runInAction(() => {
-          this.applyMessageGeometryIndex(
-            current,
-            raw as UiMessageGeometryIndex,
-          );
-        });
-        return true;
+        return raw as UiMessageGeometryIndex;
       } catch (error) {
         // Geometry is an optional desktop optimization. A missing handler,
         // stale preload, or a transient IPC failure must fall back to the
         // existing paged transcript path instead of blocking session hydration.
         console.warn(`Failed to load chat geometry for ${sessionId}:`, error);
-        return false;
+        return null;
       }
     })();
     this.geometryLoadPromises.set(sessionId, promise);
@@ -2539,15 +2535,21 @@ export class ChatStore {
     },
   ): Promise<void> {
     const existing = this.sessions.find((session) => session.id === sessionId);
+    // Fetch both snapshots before mutating observable transcript state. Keep
+    // the established page-before-geometry order so a running session cannot
+    // produce a geometry revision older than its page baseline, but do not
+    // expose the page as an intermediate transcript.
     const payload = await this.resolveHydrationPayload(
       sessionId,
       existing?.title || null,
       true,
     );
+    const geometry = await this.fetchMessageGeometryIndex(sessionId);
     if (!payload.exists) {
       throw new Error(`Session not found: ${sessionId}`);
     }
 
+    let hydrationBaselineRevision = payload.uiRevision;
     runInAction(() => {
       let session = this.sessions.find(
         (candidate) => candidate.id === sessionId,
@@ -2557,12 +2559,41 @@ export class ChatStore {
           sessionId,
           payload.title || "Loaded Session",
         );
+        session.isLoadingInitialHistory = true;
         this.sessions.push(session);
       }
-      if (payload.page) {
+
+      const geometryRevision = this.normalizeUiRevision(geometry?.uiRevision);
+      const expectedRevision = Math.max(
+        session.uiRevision || 0,
+        payload.uiRevision,
+      );
+      const canApplyGeometry =
+        !!geometry &&
+        geometry.sessionId === sessionId &&
+        !this.isUiRevisionStale(geometryRevision, expectedRevision);
+
+      if (canApplyGeometry) {
+        this.applyMessageGeometryIndex(session, geometry);
+        if (payload.page) {
+          this.mergeLoadedPageIntoGeometrySession(session, payload.page, {
+            start: payload.page.startPosition ?? 0,
+            end: payload.page.endPosition ?? 0,
+          });
+        } else {
+          this.applySessionMetadata(session, {
+            id: payload.id,
+            title: payload.title || session.title,
+            updatedAt: payload.updatedAt,
+            messagesCount: payload.totalMessageCount,
+            isBusy: payload.isBusy,
+            lockedProfileId: payload.lockedProfileId,
+            uiRevision: payload.uiRevision,
+          });
+        }
+      } else if (payload.page) {
         this.applyMessagePage(session, payload.page, "replace");
-      }
-      if (!payload.page) {
+      } else {
         this.applySessionMetadata(session, {
           id: payload.id,
           title: payload.title || session.title,
@@ -2573,28 +2604,18 @@ export class ChatStore {
           uiRevision: payload.uiRevision,
         });
       }
-      if (!payload.page && payload.totalMessageCount === 0) {
+      if (!canApplyGeometry && !payload.page && payload.totalMessageCount === 0) {
         this.markEmptySessionLoaded(session);
       }
       if (options?.activate !== false) {
         this.activeSessionId = sessionId;
       }
+      hydrationBaselineRevision = Math.max(
+        hydrationBaselineRevision,
+        session.uiRevision || 0,
+      );
     });
 
-    // The page is now the baseline. Allow live events to apply while replaying
-    // only updates that are newer than the returned snapshot.
-    const geometryLoaded = await this.loadMessageGeometryIndex(sessionId);
-    if (geometryLoaded && payload.page) {
-      runInAction(() => {
-        const current = this.getSessionById(sessionId);
-        if (current) {
-          this.mergeLoadedPageIntoGeometrySession(current, payload.page!, {
-            start: payload.page!.startPosition ?? 0,
-            end: payload.page!.endPosition ?? 0,
-          });
-        }
-      });
-    }
     const pendingMessageIds = Array.from(
       new Set(
         (this.pendingUiUpdatesBySession.get(sessionId) || []).flatMap(
@@ -2609,11 +2630,15 @@ export class ChatStore {
         ),
       ),
     );
-    this.replayPendingUiUpdates(sessionId, payload.uiRevision);
+    this.replayPendingUiUpdates(sessionId, hydrationBaselineRevision);
     this.sessionLoadPromises.delete(sessionId);
     if (pendingMessageIds.length > 0) {
       await this.loadFullMessages(sessionId, pendingMessageIds);
     }
+    runInAction(() => {
+      const current = this.getSessionById(sessionId);
+      if (current) current.isLoadingInitialHistory = false;
+    });
     this.emitSessionsChanged();
 
     if (options?.loadAgentContext !== false) {
@@ -2645,6 +2670,10 @@ export class ChatStore {
       return;
     }
 
+    const current = this.getSessionById(normalizedSessionId);
+    if (current && !current.hasLoadedMessagePage) {
+      current.isLoadingInitialHistory = true;
+    }
     const loadPromise = this.hydrateSessionFromBackendInternal(
       normalizedSessionId,
       options,
@@ -2656,6 +2685,10 @@ export class ChatStore {
       if (this.sessionLoadPromises.get(normalizedSessionId) === loadPromise) {
         this.sessionLoadPromises.delete(normalizedSessionId);
       }
+      runInAction(() => {
+        const latest = this.getSessionById(normalizedSessionId);
+        if (latest) latest.isLoadingInitialHistory = false;
+      });
     }
   }
 

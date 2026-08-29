@@ -3,6 +3,7 @@ import {
   captureChatViewportAnchor,
   CHAT_MESSAGE_LIST_BOTTOM_PADDING,
   resolveChatAutoScrollOnRender,
+  resolveChatDragReleaseScrollTop,
   resolveChatOffscreenLayoutChangedItems,
   resolveNextChatOffscreenMeasurementRetentionState,
   resolveChatOffscreenStreamingItems,
@@ -661,6 +662,32 @@ runCase('scroll anchor does not shift while auto-scroll is enabled', () => {
     adjustment,
     0,
     'bottom-follow mode should defer to auto-scroll instead of applying anchor corrections',
+  )
+})
+
+runCase('scrollbar release keeps the tail authoritative after buffered height changes', () => {
+  assertEqual(
+    resolveChatDragReleaseScrollTop({
+      preserveBottom: true,
+      scrollHeight: 1_812_663,
+      viewportHeight: 532,
+      anchoredScrollTop: 1_811_139,
+    }),
+    1_812_131,
+    'a thumb released at the tail must follow the new bottom instead of a stale row anchor',
+  )
+})
+
+runCase('scrollbar release preserves a message anchor away from the tail', () => {
+  assertEqual(
+    resolveChatDragReleaseScrollTop({
+      preserveBottom: false,
+      scrollHeight: 1_812_663,
+      viewportHeight: 532,
+      anchoredScrollTop: 940_125,
+    }),
+    940_125,
+    'a non-tail release must preserve the reader viewport anchor',
   )
 })
 

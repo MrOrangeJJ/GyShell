@@ -2,6 +2,7 @@ import type { UiMessageGeometryIndex } from '@gyshell/shared'
 import { ChatStore, type ChatMessage } from './ChatStore'
 
 const SESSION_ID = 'geometry-store-session'
+const ATOMIC_SESSION_ID = 'atomic-geometry-store-session'
 const STALE_SESSION_ID = 'stale-geometry-store-session'
 const MESSAGE_COUNT = 8_192
 const UI_REVISION = 5
@@ -112,6 +113,16 @@ const run = async (): Promise<void> => {
     aroundPosition?: number
   }> = []
   const fullRequests: string[][] = []
+  let resolveAtomicPage: ((value: ReturnType<typeof createPage>) => void) | null = null
+  let resolveAtomicGeometry: ((value: UiMessageGeometryIndex) => void) | null = null
+  let notifyAtomicPageRequested: (() => void) | null = null
+  let notifyAtomicGeometryRequested: (() => void) | null = null
+  const atomicPageRequested = new Promise<void>((resolve) => {
+    notifyAtomicPageRequested = resolve
+  })
+  const atomicGeometryRequested = new Promise<void>((resolve) => {
+    notifyAtomicGeometryRequested = resolve
+  })
 
   ;(globalThis as any).window = {
     gyshell: {
@@ -134,16 +145,29 @@ const run = async (): Promise<void> => {
           request?: { limit?: number; aroundPosition?: number },
         ) => {
           pageRequests.push({ sessionId, ...request })
+          if (sessionId === ATOMIC_SESSION_ID) {
+            notifyAtomicPageRequested?.()
+            return await new Promise<ReturnType<typeof createPage>>((resolve) => {
+              resolveAtomicPage = resolve
+            })
+          }
           if (typeof request?.aroundPosition === 'number') {
             await new Promise((resolve) => setTimeout(resolve, 20))
           }
           return createPage(sessionId, request)
         },
-        getUiMessageGeometry: async (sessionId: string) =>
-          createGeometryIndex(
+        getUiMessageGeometry: async (sessionId: string) => {
+          if (sessionId === ATOMIC_SESSION_ID) {
+            notifyAtomicGeometryRequested?.()
+            return await new Promise<UiMessageGeometryIndex>((resolve) => {
+              resolveAtomicGeometry = resolve
+            })
+          }
+          return createGeometryIndex(
             sessionId,
             sessionId === STALE_SESSION_ID ? UI_REVISION - 1 : UI_REVISION,
-          ),
+          )
+        },
         getFullUiMessages: async (
           _sessionId: string,
           messageIds: string[],
@@ -164,6 +188,50 @@ const run = async (): Promise<void> => {
   }
 
   try {
+    const atomicStore = new ChatStore()
+    atomicStore.ensureSession(ATOMIC_SESSION_ID)
+    const atomicHydration = atomicStore.hydrateSessionFromBackend(
+      ATOMIC_SESSION_ID,
+      { activate: true, loadAgentContext: false },
+    )
+    await atomicPageRequested
+    const atomicSession = atomicStore.getSessionById(ATOMIC_SESSION_ID)!
+    assertEqual(
+      atomicSession.isLoadingInitialHistory,
+      true,
+      'initial history should remain hidden while the page is pending',
+    )
+    ;(resolveAtomicPage as ((value: ReturnType<typeof createPage>) => void) | null)?.(
+      createPage(ATOMIC_SESSION_ID),
+    )
+    await atomicGeometryRequested
+    await new Promise((resolve) => setTimeout(resolve, 20))
+    assertEqual(
+      atomicSession.messageIds.length,
+      0,
+      'a resolved tail page must not become an intermediate visible transcript',
+    )
+    ;(resolveAtomicGeometry as ((value: UiMessageGeometryIndex) => void) | null)?.(
+      createGeometryIndex(ATOMIC_SESSION_ID, UI_REVISION),
+    )
+    await atomicHydration
+    assertEqual(
+      atomicSession.messageIds.length,
+      MESSAGE_COUNT,
+      'the first committed transcript should contain the full geometry index',
+    )
+    assertEqual(
+      atomicSession.geometryLoaded,
+      true,
+      'the atomic first commit should enter geometry mode',
+    )
+    assertEqual(
+      atomicSession.isLoadingInitialHistory,
+      false,
+      'the transcript should become visible after the atomic commit',
+    )
+    console.log('PASS initial page and geometry hydrate atomically')
+
     const store = new ChatStore()
     store.ensureSession(SESSION_ID)
     await store.hydrateSessionFromBackend(SESSION_ID, {

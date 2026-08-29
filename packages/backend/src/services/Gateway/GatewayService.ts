@@ -516,18 +516,39 @@ export class GatewayService extends EventEmitter implements IGatewayRuntime {
   }
 
   getSessionMetadata(sessionId: string): GatewaySessionMetadata | null {
-    const summary = this.listSessionSummaries().find(
-      (candidate) => candidate.id === sessionId,
-    );
-    if (!summary) return null;
+    // Reading one session must not aggregate every stored session: this runs on
+    // the paging path, where the cost lands on the main process input loop.
+    const uiSummary = this.uiHistoryService
+      .getAllSessionSummaries()
+      .find((candidate) => candidate.id === sessionId);
+    const storedSummary =
+      this.agentService.getStoredChatSessionSummary(sessionId);
+    const context = this.sessions.get(sessionId);
+    if (!uiSummary && !storedSummary && !context) return null;
+
+    const isBusy = context ? context.status !== "idle" : false;
     return {
-      id: summary.id,
-      title: summary.title,
-      updatedAt: summary.updatedAt,
-      messagesCount: summary.messagesCount,
-      isBusy: summary.isBusy,
-      lockedProfileId: summary.lockedProfileId,
-      uiRevision: summary.uiRevision,
+      id: sessionId,
+      title: this.resolveSessionTitle(
+        uiSummary?.title,
+        storedSummary?.title,
+        context,
+      ),
+      updatedAt: this.resolveSessionUpdatedAt(
+        uiSummary?.updatedAt,
+        storedSummary?.updatedAt,
+        context,
+      ),
+      messagesCount: this.resolveSessionMessageCount(
+        uiSummary,
+        storedSummary ?? undefined,
+      ),
+      isBusy,
+      lockedProfileId: isBusy ? context?.lockedProfileId || null : null,
+      uiRevision: Math.max(
+        this.sessionUiRevisionById.get(sessionId) || 0,
+        uiSummary?.uiRevision || 0,
+      ),
     };
   }
 

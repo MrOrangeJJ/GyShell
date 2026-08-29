@@ -234,6 +234,56 @@ body.chat-drag-selection-suppressed * {
   min-height: 100%;
 }
 
+.message-list-loading {
+  align-items: center;
+  justify-content: center;
+  padding-bottom: 0;
+}
+
+.message-list-loading-dots {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 16px;
+}
+
+.message-list-loading-dots > span {
+  width: 4px;
+  height: 4px;
+  border-radius: 50%;
+  background: color-mix(in srgb, var(--fg-muted) 72%, transparent);
+  animation: message-list-loading-pulse 1.2s ease-in-out infinite;
+}
+
+.message-list-loading-dots > span:nth-child(2) {
+  animation-delay: 0.14s;
+}
+
+.message-list-loading-dots > span:nth-child(3) {
+  animation-delay: 0.28s;
+}
+
+@keyframes message-list-loading-pulse {
+  0%,
+  60%,
+  100% {
+    opacity: 0.28;
+    transform: translateY(0);
+  }
+
+  30% {
+    opacity: 0.9;
+    transform: translateY(-2px);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .message-list-loading-dots > span {
+    animation: none;
+    opacity: 0.55;
+  }
+}
+
 .message-list-virtual {
   position: relative;
   display: block;

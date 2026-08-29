@@ -183,6 +183,10 @@ export class ChatHistoryService {
     return this.store.listChatSessionSummaries();
   }
 
+  getSessionSummary(sessionId: string): ChatSessionSummaryRecord | null {
+    return this.store.loadChatSessionSummary(sessionId);
+  }
+
   deleteSession(sessionId: string): void {
     this.store.deleteChatSessions([sessionId]);
   }

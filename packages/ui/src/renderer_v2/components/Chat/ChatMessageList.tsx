@@ -19,11 +19,15 @@ import {
   resolveChatOffscreenLayoutChangedItems,
   resolveChatOffscreenStreamingItems,
   resolveNextChatOffscreenMeasurementRetentionState,
+  resolveChatDragReleaseScrollTop,
   resolveChatScrollAnchorAdjustment,
   resolveChatVirtualRange,
+  resolveChatViewportAnchorScrollTop,
   shouldInvalidateChatMeasuredHeights,
 } from "./chatVirtualList";
+import type { ChatViewportAnchor } from "./chatVirtualList";
 import { useChatResizeAnchor } from "./useChatResizeAnchor";
+import { useChatScrollbarDrag } from "./useChatScrollbarDrag";
 
 interface ChatMessageListProps {
   store: AppStore;
@@ -54,6 +58,7 @@ interface ObservedChatRowProps {
 }
 
 const BOTTOM_AUTO_SCROLL_THRESHOLD_PX = 50;
+const DRAG_BOTTOM_SETTLE_MS = 200;
 
 const ObservedChatRow: React.FC<ObservedChatRowProps> = ({
   itemId,
@@ -118,6 +123,76 @@ export const ChatMessageList: React.FC<ChatMessageListProps> = observer(
       scrollHeight: number;
     } | null>(null);
     const resizeAnchor = useChatResizeAnchor();
+    const bufferedRowHeightsRef = React.useRef<Map<string, number>>(new Map());
+    const postDragBottomFollowRef = React.useRef(false);
+    const postDragBottomFollowTimerRef = React.useRef<number | null>(null);
+    const resetPostDragBottomFollow = React.useCallback(() => {
+      if (postDragBottomFollowTimerRef.current !== null) {
+        window.clearTimeout(postDragBottomFollowTimerRef.current);
+        postDragBottomFollowTimerRef.current = null;
+      }
+      postDragBottomFollowRef.current = false;
+    }, []);
+    const keepPostDragBottomFollowAlive = React.useCallback(() => {
+      if (!postDragBottomFollowRef.current) return;
+      if (postDragBottomFollowTimerRef.current !== null) {
+        window.clearTimeout(postDragBottomFollowTimerRef.current);
+      }
+      postDragBottomFollowTimerRef.current = window.setTimeout(() => {
+        const element = scrollRef.current;
+        if (element) {
+          element.scrollTop = Math.max(
+            0,
+            element.scrollHeight - element.clientHeight,
+          );
+        }
+        postDragBottomFollowRef.current = false;
+        postDragBottomFollowTimerRef.current = null;
+      }, DRAG_BOTTOM_SETTLE_MS);
+    }, []);
+    React.useEffect(
+      () => resetPostDragBottomFollow,
+      [resetPostDragBottomFollow],
+    );
+    const pendingDragFlushRef = React.useRef<
+      | { mode: "bottom" }
+      | { mode: "anchor"; anchor: ChatViewportAnchor | null }
+      | null
+    >(null);
+    const scrollbarDrag = useChatScrollbarDrag(
+      React.useCallback(() => {
+        const element = scrollRef.current;
+        const preserveBottom =
+          !!element &&
+          element.scrollHeight - element.scrollTop - element.clientHeight <=
+            BOTTOM_AUTO_SCROLL_THRESHOLD_PX;
+        // The final native-thumb scroll can precede the scheduled metric rAF.
+        // Read the DOM synchronously so bottom intent outranks a stale anchor.
+        const anchor =
+          element && !preserveBottom
+            ? captureChatViewportAnchor(
+                renderItemsRef.current,
+                virtualLayoutRef.current,
+                element.scrollTop,
+              )
+            : null;
+        const buffered = bufferedRowHeightsRef.current;
+        buffered.forEach((height, itemId) => {
+          rowHeightsRef.current.set(itemId, height);
+        });
+        buffered.clear();
+        pendingDragFlushRef.current = preserveBottom
+          ? { mode: "bottom" }
+          : { mode: "anchor", anchor };
+        if (preserveBottom) {
+          postDragBottomFollowRef.current = true;
+          keepPostDragBottomFollowAlive();
+        } else {
+          resetPostDragBottomFollow();
+        }
+        setHeightVersion((current) => current + 1);
+      }, [keepPostDragBottomFollowAlive, resetPostDragBottomFollow]),
+    );
     const renderItemIndexByIdRef = React.useRef<Map<string, number>>(new Map());
     const renderItemsRef = React.useRef<ChatRenderItem[]>([]);
     const lastUserTailAutoScrollMessageIdRef = React.useRef<string | null>(
@@ -228,11 +303,19 @@ export const ChatMessageList: React.FC<ChatMessageListProps> = observer(
       const element = scrollRef.current;
       if (!element) return;
 
-      const nextScrollTop = element.scrollTop;
       const nextViewportHeight = element.clientHeight;
+      const preservePostDragBottom = postDragBottomFollowRef.current;
+      if (preservePostDragBottom) {
+        element.scrollTop = Math.max(
+          0,
+          element.scrollHeight - nextViewportHeight,
+        );
+      }
+      const nextScrollTop = element.scrollTop;
       const isAtBottom =
+        preservePostDragBottom ||
         element.scrollHeight - nextScrollTop - nextViewportHeight <
-        BOTTOM_AUTO_SCROLL_THRESHOLD_PX;
+          BOTTOM_AUTO_SCROLL_THRESHOLD_PX;
 
       shouldAutoScrollRef.current = isAtBottom;
       resizeAnchor.rememberStableAnchor(
@@ -270,7 +353,17 @@ export const ChatMessageList: React.FC<ChatMessageListProps> = observer(
           return;
         }
 
-        if (resizeAnchor.isActive()) {
+        // Applying a measured height mid thumb-drag changes the scroller
+        // length, which makes Chromium drop that drag frame. Hold the value
+        // until the pointer is released.
+        if (scrollbarDrag.isDragging()) {
+          bufferedRowHeightsRef.current.set(itemId, nextHeight);
+          return;
+        }
+
+        if (postDragBottomFollowRef.current) {
+          keepPostDragBottomFollowAlive();
+        } else if (resizeAnchor.isActive()) {
           resizeAnchor.keepAlive();
         } else if (typeof itemIndex === "number") {
           const element = scrollRef.current;
@@ -289,7 +382,7 @@ export const ChatMessageList: React.FC<ChatMessageListProps> = observer(
         rowHeightsRef.current.set(itemId, nextHeight);
         setHeightVersion((current) => current + 1);
       },
-      [resizeAnchor],
+      [keepPostDragBottomFollowAlive, resizeAnchor, scrollbarDrag],
     );
 
     React.useLayoutEffect(() => {
@@ -301,10 +394,13 @@ export const ChatMessageList: React.FC<ChatMessageListProps> = observer(
       resizeAnchor.reset();
       lastUserTailAutoScrollMessageIdRef.current = null;
       rowHeightsRef.current = new Map();
+      bufferedRowHeightsRef.current.clear();
+      pendingDragFlushRef.current = null;
+      resetPostDragBottomFollow();
       setRetainedOffscreenMeasurementState({});
       setMeasurementEpoch((current) => current + 1);
       setHeightVersion((current) => current + 1);
-    }, [resizeAnchor, sessionId]);
+    }, [resetPostDragBottomFollow, resizeAnchor, sessionId]);
 
     // When display mode changes (e.g. settings load after initial render),
     // item structure changes (classic individual items → seamless groups).
@@ -313,10 +409,13 @@ export const ChatMessageList: React.FC<ChatMessageListProps> = observer(
     React.useLayoutEffect(() => {
       resizeAnchor.reset();
       rowHeightsRef.current = new Map();
+      bufferedRowHeightsRef.current.clear();
+      pendingDragFlushRef.current = null;
+      resetPostDragBottomFollow();
       pendingScrollAdjustmentRef.current = 0;
       setMeasurementEpoch((current) => current + 1);
       setHeightVersion((current) => current + 1);
-    }, [chatDisplayMode, resizeAnchor]);
+    }, [chatDisplayMode, resetPostDragBottomFollow, resizeAnchor]);
 
     React.useEffect(() => {
       setBannerUiStateByKey((current) =>
@@ -337,6 +436,15 @@ export const ChatMessageList: React.FC<ChatMessageListProps> = observer(
       setEstimateViewportWidth(initialViewportWidth);
       scheduleScrollMetricSync();
       const onScroll = () => {
+        // A temporary scrollHeight contraction clamps scrollTop before the next
+        // rAF. Correct that clamp in the scroll event itself so no intermediate
+        // frame can paint above the tail during post-drag measurement settling.
+        if (postDragBottomFollowRef.current) {
+          element.scrollTop = Math.max(
+            0,
+            element.scrollHeight - element.clientHeight,
+          );
+        }
         scheduleScrollMetricSync();
         if (!sessionId || !session) return;
 
@@ -392,7 +500,27 @@ export const ChatMessageList: React.FC<ChatMessageListProps> = observer(
         }
       };
 
+      // A press whose target is the scroll container itself lands on the native
+      // scrollbar: the track has no child elements, every row is nested deeper.
+      const onPointerDown = (event: PointerEvent) => {
+        if (event.button !== 0) return;
+        resetPostDragBottomFollow();
+        if (event.target !== element) return;
+        scrollbarDrag.begin(virtualLayoutRef.current.totalHeight);
+      };
+      const onWheel = () => {
+        resetPostDragBottomFollow();
+      };
+      // The release can land outside the list, so it is observed on the window.
+      const onPointerUp = () => {
+        scrollbarDrag.end();
+      };
+
       element.addEventListener("scroll", onScroll, { passive: true });
+      element.addEventListener("wheel", onWheel, { passive: true });
+      element.addEventListener("pointerdown", onPointerDown);
+      window.addEventListener("pointerup", onPointerUp);
+      window.addEventListener("pointercancel", onPointerUp);
       const resizeObserver =
         typeof ResizeObserver !== "undefined"
           ? new ResizeObserver((entries) => {
@@ -417,6 +545,9 @@ export const ChatMessageList: React.FC<ChatMessageListProps> = observer(
                   );
                 }
                 rowHeightsRef.current = new Map();
+                bufferedRowHeightsRef.current.clear();
+                pendingDragFlushRef.current = null;
+                resetPostDragBottomFollow();
                 pendingScrollAdjustmentRef.current = 0;
                 setMeasurementEpoch((current) => current + 1);
                 setHeightVersion((current) => current + 1);
@@ -435,6 +566,10 @@ export const ChatMessageList: React.FC<ChatMessageListProps> = observer(
 
       return () => {
         element.removeEventListener("scroll", onScroll);
+        element.removeEventListener("wheel", onWheel);
+        element.removeEventListener("pointerdown", onPointerDown);
+        window.removeEventListener("pointerup", onPointerUp);
+        window.removeEventListener("pointercancel", onPointerUp);
         resizeObserver?.disconnect();
         if (scrollFrameRef.current !== null) {
           window.cancelAnimationFrame(scrollFrameRef.current);
@@ -442,8 +577,10 @@ export const ChatMessageList: React.FC<ChatMessageListProps> = observer(
         }
       };
     }, [
+      resetPostDragBottomFollow,
       resizeAnchor,
       scheduleScrollMetricSync,
+      scrollbarDrag,
       session,
       sessionId,
       store.chat,
@@ -458,6 +595,13 @@ export const ChatMessageList: React.FC<ChatMessageListProps> = observer(
     );
     renderItemIndexByIdRef.current = renderItemIndexById;
     virtualLayoutRef.current = virtualLayout;
+    // Growth from streaming or pagination is still allowed to extend the frozen
+    // height; only measurement-driven changes are withheld during a drag.
+    scrollbarDrag.syncNaturalHeight(virtualLayout.totalHeight);
+    const renderedTotalHeight = Math.max(
+      virtualLayout.totalHeight,
+      scrollbarDrag.frozenTotalHeight() ?? 0,
+    );
     const effectiveViewportHeight = viewportHeight > 0 ? viewportHeight : 800;
 
     const virtualRange = React.useMemo(
@@ -473,6 +617,7 @@ export const ChatMessageList: React.FC<ChatMessageListProps> = observer(
     React.useEffect(() => {
       if (
         !sessionId ||
+        session?.isLoadingInitialHistory ||
         !session?.geometryLoaded ||
         renderItems.length === 0 ||
         typeof store.chat.loadMessageRange !== "function"
@@ -523,6 +668,7 @@ export const ChatMessageList: React.FC<ChatMessageListProps> = observer(
     }, [
       renderItems,
       session?.geometryLoaded,
+      session?.isLoadingInitialHistory,
       session?.messagePositionById,
       session?.messagesById,
       session?.totalMessageCount,
@@ -534,6 +680,49 @@ export const ChatMessageList: React.FC<ChatMessageListProps> = observer(
 
     React.useLayoutEffect(() => {
       const element = scrollRef.current;
+      const dragFlush = pendingDragFlushRef.current;
+      if (dragFlush && element) {
+        pendingDragFlushRef.current = null;
+        const anchoredScrollTop =
+          dragFlush.mode === "anchor" && dragFlush.anchor
+            ? resolveChatViewportAnchorScrollTop(
+                renderItems,
+                virtualLayout,
+                dragFlush.anchor,
+              )
+            : null;
+        const restoredScrollTop = resolveChatDragReleaseScrollTop({
+          preserveBottom: dragFlush.mode === "bottom",
+          scrollHeight: element.scrollHeight,
+          viewportHeight: element.clientHeight,
+          anchoredScrollTop,
+        });
+        if (restoredScrollTop !== null) {
+          element.scrollTop = restoredScrollTop;
+          scheduleScrollMetricSync();
+        }
+        if (dragFlush.mode === "bottom") {
+          shouldAutoScrollRef.current = true;
+          setShouldAutoScroll(true);
+        }
+        // Buffered heights land in this commit. Further anchor adjustments
+        // would apply the same movement twice.
+        resizeAnchor.reset();
+        pendingScrollAdjustmentRef.current = 0;
+        return;
+      }
+
+      if (element && postDragBottomFollowRef.current) {
+        element.scrollTop = Math.max(
+          0,
+          element.scrollHeight - element.clientHeight,
+        );
+        resizeAnchor.reset();
+        pendingScrollAdjustmentRef.current = 0;
+        scheduleScrollMetricSync();
+        return;
+      }
+
       if (element) {
         const anchoredScrollTop = resizeAnchor.resolveScrollTop(
           renderItems,
@@ -576,7 +765,7 @@ export const ChatMessageList: React.FC<ChatMessageListProps> = observer(
 
     React.useLayoutEffect(() => {
       const element = scrollRef.current;
-      if (!element) return;
+      if (!element || session?.isLoadingInitialHistory) return;
 
       const decision = resolveChatAutoScrollOnRender({
         lastMessageId,
@@ -602,16 +791,17 @@ export const ChatMessageList: React.FC<ChatMessageListProps> = observer(
 
       element.scrollTop = Math.max(
         0,
-        virtualLayout.totalHeight - element.clientHeight,
+        renderedTotalHeight - element.clientHeight,
       );
       scheduleScrollMetricSync();
     }, [
       lastMessageId,
       lastMessage?.role,
       messageCount,
+      renderedTotalHeight,
       scheduleScrollMetricSync,
+      session?.isLoadingInitialHistory,
       sessionId,
-      virtualLayout.totalHeight,
     ]);
 
     React.useLayoutEffect(() => {
@@ -767,14 +957,26 @@ export const ChatMessageList: React.FC<ChatMessageListProps> = observer(
 
     return (
       <div className="panel-body" ref={scrollRef}>
-        {messageCount === 0 ? (
+        {session?.isLoadingInitialHistory ? (
+          <div
+            className="message-list message-list-empty message-list-loading"
+            role="status"
+            aria-label="Loading conversation"
+          >
+            <span className="message-list-loading-dots" aria-hidden="true">
+              <span />
+              <span />
+              <span />
+            </span>
+          </div>
+        ) : messageCount === 0 ? (
           <div className="message-list message-list-empty">
             <div className="placeholder">{placeholder}</div>
           </div>
         ) : (
           <div
             className="message-list message-list-virtual"
-            style={{ height: virtualLayout.totalHeight }}
+            style={{ height: renderedTotalHeight }}
           >
             {visibleItems.map((item, index) => {
               const itemIndex = virtualRange.startIndex + index;

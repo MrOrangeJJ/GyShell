@@ -1396,7 +1396,33 @@ export class HistorySqliteStore {
       }
     >;
 
-    return rows.map((row) => ({
+    return rows.map((row) => this.toChatSessionSummary(row));
+  }
+
+  loadChatSessionSummary(sessionId: string): ChatSessionSummaryRecord | null {
+    // Counting through a correlated subquery keeps this on the session index
+    // instead of aggregating every message row like the list query does.
+    const row = this.db
+      .prepare(
+        `SELECT chat.id, chat.title, chat.updated_at, chat.created_at,
+                chat.last_checkpoint_offset, chat.last_profile_max_tokens,
+                (SELECT COUNT(*)
+                   FROM chat_session_messages AS messages
+                  WHERE messages.session_id = chat.id) AS messages_count
+         FROM chat_sessions AS chat
+         WHERE chat.id = ?`,
+      )
+      .get(sessionId) as
+      | (ChatSessionRow & { messages_count: number })
+      | undefined;
+
+    return row ? this.toChatSessionSummary(row) : null;
+  }
+
+  private toChatSessionSummary(
+    row: ChatSessionRow & { messages_count: number },
+  ): ChatSessionSummaryRecord {
+    return {
       id: row.id,
       title: row.title,
       updatedAt: row.updated_at,
@@ -1404,7 +1430,7 @@ export class HistorySqliteStore {
       messagesCount: row.messages_count,
       lastCheckpointOffset: row.last_checkpoint_offset,
       lastProfileMaxTokens: row.last_profile_max_tokens ?? undefined,
-    }));
+    };
   }
 
   listChatSessions(): StoredChatSessionRecord[] {
