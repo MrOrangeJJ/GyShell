@@ -32,12 +32,12 @@ import {
 } from "../../lib/filePreviewSupport";
 import {
   FILESYSTEM_PANEL_DRAG_MIME,
+  admitFileSystemPanelDragPayload,
   encodeFileSystemPanelDragPayload,
   extractNativeDropFilePaths,
   getNativeFilePathResolver,
   hasFileSystemPanelDragPayloadType,
   hasNativeFileDragType,
-  parseFileSystemPanelDragPayload,
 } from "../../lib/filesystemDragDrop";
 import { ConfirmDialog } from "../Common/ConfirmDialog";
 import { PanelFindBar } from "../Common/PanelFindBar";
@@ -1583,14 +1583,19 @@ export const FileSystemPanel: React.FC<FileSystemPanelProps> = observer(
         event.preventDefault();
         setExplorerDropHot(false);
 
-        const payload = parseFileSystemPanelDragPayload(event.dataTransfer);
-        const nativePaths = extractNativeDropFilePaths(
+        const filesystemAdmission = admitFileSystemPanelDragPayload(
           event.dataTransfer,
-          getNativeFilePathResolver(),
         );
         if (!activeTerminalId) return;
 
-        if (payload) {
+        if (filesystemAdmission.kind !== "absent") {
+          if (filesystemAdmission.kind === "rejected") return;
+          const payload = filesystemAdmission.payload;
+          const sourceTerminal = store.terminalTabs.find(
+            (tab) => tab.id === payload.sourceTerminalId,
+          );
+          if (sourceTerminal?.capabilities?.supportsFilesystem !== true) return;
+
           const clipboardPayload: FileSystemClipboardState = {
             mode: "copy",
             sourceTerminalId: payload.sourceTerminalId,
@@ -1608,6 +1613,10 @@ export const FileSystemPanel: React.FC<FileSystemPanelProps> = observer(
           return;
         }
 
+        const nativePaths = extractNativeDropFilePaths(
+          event.dataTransfer,
+          getNativeFilePathResolver(),
+        );
         if (nativePaths.length > 0) {
           void handleNativePathDrop(nativePaths).catch((error) => {
             updateTabState(activeTerminalId, (current) => ({

@@ -26,7 +26,9 @@ const normalizeRecord = (raw: unknown): PersistedTerminalRecord | null => {
   if (!isObject(raw)) return null
   const config = normalizePersistedTerminalConfig(raw.config)
   if (!config) return null
-  const id = typeof raw.id === 'string' ? raw.id.trim() : config.id
+  // Terminal IDs are opaque runtime identities. Validate surrounding whitespace
+  // without normalizing it; trimming would turn a valid ID into a different tab.
+  const id = typeof raw.id === 'string' ? raw.id : config.id
   if (!isValidTerminalRuntimeId(id)) return null
   return {
     id,

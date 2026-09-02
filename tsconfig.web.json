@@ -12,6 +12,7 @@
     "packages/shared/src/**/*",
     "apps/mobile-web/src/**/*",
     "apps/mobile-web/vite.config.ts",
-    "apps/electron/src/preload/index.d.ts"
+    "apps/electron/src/preload/index.d.ts",
+    "packages/electron/src/gateway/electronGatewayEventAdmission.ts"
   ]
 }

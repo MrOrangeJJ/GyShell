@@ -94,7 +94,9 @@ async function run(): Promise<void> {
     const events: Array<Record<string, unknown>> = []
     let snapshotIndex = 0
     const terminalService = {
-      resolveTerminal: () => ({ found: [terminal], bestMatch: terminal }),
+      getTerminalById: (terminalId: string) =>
+        terminalId === terminal.id ? terminal : undefined,
+      getDisplayTerminals: () => [terminal],
       getTerminalRuntimeSnapshot: () => {
         const index = Math.min(snapshotIndex, options.snapshots.length - 1)
         snapshotIndex += 1
@@ -137,7 +139,7 @@ async function run(): Promise<void> {
       snapshots: [readySnapshot, readySnapshot],
       output: 'PS C:\\Users\\Tester>',
     })
-    const result = await waitTerminalIdle({ tabIdOrName: terminal.id }, context)
+    const result = await waitTerminalIdle({ terminalId: terminal.id }, context)
     assertEqual(result.includes('verified idle prompt'), true, 'verified prompt state should finish immediately')
     assertEqual(events.at(-1)?.type, 'sub_tool_finished', 'successful monitoring must finish its tool event')
   }
@@ -147,7 +149,7 @@ async function run(): Promise<void> {
       snapshots: [busySnapshot],
       output: 'long-running command has no new output',
     })
-    const result = await waitTerminalIdle({ tabIdOrName: terminal.id }, context)
+    const result = await waitTerminalIdle({ terminalId: terminal.id }, context)
     assertEqual(result.includes('shell is still busy'), true, 'stable output must not be described as command completion')
     assertEqual(result.includes('do not start another command'), true, 'busy stability must give the agent an explicit interaction constraint')
   }
@@ -161,7 +163,7 @@ async function run(): Promise<void> {
         marked = true
       },
     })
-    const result = await waitTerminalIdle({ tabIdOrName: terminal.id }, context)
+    const result = await waitTerminalIdle({ terminalId: terminal.id }, context)
     assertEqual(result.includes('queued agent notification'), true, 'queued work should interrupt terminal monitoring promptly')
     assertEqual(marked, true, 'queued interruption must be recorded in the agent context')
   }
@@ -177,7 +179,7 @@ async function run(): Promise<void> {
     const { context } = createContext({
       snapshots: [busySnapshot, busySnapshot, exitedSnapshot],
     })
-    const result = await waitTerminalIdle({ tabIdOrName: terminal.id }, context)
+    const result = await waitTerminalIdle({ terminalId: terminal.id }, context)
     assertEqual(result.includes('disconnected'), true, 'runtime exit during monitoring must be rechecked and reported')
   }
 

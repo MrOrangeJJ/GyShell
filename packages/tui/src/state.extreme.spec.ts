@@ -1,3 +1,4 @@
+import { encodePassChatMentionToken } from "@gyshell/shared";
 import {
   applyRenameToUnloadedSession,
   applyUiUpdate,
@@ -14,6 +15,11 @@ import {
 } from "./state";
 import { GatewayClient } from "./gateway-client";
 import { handleHeadlessUiUpdate } from "./index";
+import {
+  createTuiSessionRecord,
+  normalizeTuiSessionSummaries,
+  readMatchingTuiSessionSnapshot,
+} from "./session-identity";
 import type { ChatMessage } from "./protocol";
 import { formatInitialCommandOutput } from "../../backend/src/services/AgentHelper/tools/command_output_contract";
 
@@ -109,6 +115,27 @@ runCase(
       ),
       "@Pass Chat: Previous Chat",
       "pass-chat mention should normalize",
+    );
+  },
+);
+
+runCase(
+  "TUI canonical pass-chat display preserves opaque identity and rejects malformed tokens",
+  () => {
+    const sessionId = "  Session#opaque::🙂  ";
+    const title = "Canonical Plan";
+    const token = encodePassChatMentionToken(sessionId, title);
+    assertCondition(!!token, "canonical token should be produced");
+    assertEqual(
+      compactMessageSummary(makeTextMessage(token!), true),
+      `@Pass Chat: ${title}`,
+      "canonical token should render its exact title",
+    );
+    const malformed = "[MENTION_PASS_CHAT_V2:#broken#]";
+    assertEqual(
+      compactMessageSummary(makeTextMessage(malformed), true),
+      malformed,
+      "malformed canonical token must remain literal",
     );
   },
 );
@@ -871,5 +898,139 @@ runCase("TUI gateway reconciles bootstrap updates at the snapshot boundary", () 
     receivedTypes.join(","),
     "ADD_MESSAGE,SESSION_RENAMED",
     "pre-snapshot deltas should be dropped while post-snapshot deltas replay",
+  );
+});
+
+runCase("TUI gateway snapshot selectors preserve exact opaque ids", () => {
+  const client = new GatewayClient("ws://127.0.0.1:1");
+  const enqueue = (sessionId: unknown): void => {
+    (client as any).handleIncoming(
+      Buffer.from(
+        JSON.stringify({
+          type: "gateway:ui-update",
+          payload: {
+            type: "SESSION_RENAMED",
+            sessionId,
+            title: "rename",
+            uiRevision: 1,
+          },
+        }),
+      ),
+    );
+  };
+
+  enqueue(" session ");
+  enqueue("session");
+  enqueue("Session");
+  enqueue(7);
+  client.discardBufferedUiUpdatesCoveredBySnapshot(1, " session ");
+
+  const received: string[] = [];
+  client.on("uiUpdate", (update) => received.push(update.sessionId));
+  assertEqual(
+    received.join("|"),
+    "session|Session",
+    "only the exact snapshot identity should be covered and wrong-type updates should be rejected",
+  );
+});
+
+runCase("TUI malformed snapshot selectors cannot widen discard scope", () => {
+  const client = new GatewayClient("ws://127.0.0.1:1");
+  for (const sessionId of ["session-a", "session-b"]) {
+    (client as any).handleIncoming(
+      Buffer.from(
+        JSON.stringify({
+          type: "gateway:ui-update",
+          payload: {
+            type: "SESSION_RENAMED",
+            sessionId,
+            title: sessionId,
+            uiRevision: 1,
+          },
+        }),
+      ),
+    );
+  }
+  client.discardBufferedUiUpdatesCoveredBySnapshot(1, "   ");
+
+  const received: string[] = [];
+  client.on("uiUpdate", (update) => received.push(update.sessionId));
+  assertEqual(
+    received.join(","),
+    "session-a,session-b",
+    "an invalid explicit selector should leave every buffered session intact",
+  );
+});
+
+runCase("TUI session metadata and snapshots are exact and prototype-safe", () => {
+  const summaries = normalizeTuiSessionSummaries([
+    {
+      id: " session ",
+      title: "spaced",
+      updatedAt: 1,
+      messagesCount: 0,
+      isBusy: false,
+      lockedProfileId: null,
+    },
+    {
+      id: "session",
+      title: "plain",
+      updatedAt: 2,
+      messagesCount: 0,
+      isBusy: false,
+      lockedProfileId: null,
+    },
+    {
+      id: "__proto__",
+      title: "prototype",
+      updatedAt: 3,
+      messagesCount: 0,
+      isBusy: false,
+      lockedProfileId: null,
+    },
+  ]);
+  assertEqual(
+    summaries?.map((summary) => summary.id).join("|"),
+    " session |session|__proto__",
+    "distinct opaque ids should survive metadata admission",
+  );
+  assertEqual(
+    normalizeTuiSessionSummaries([
+      ...(summaries || []),
+      { ...(summaries?.[0] || {}), id: "\ud800" },
+    ]),
+    undefined,
+    "one malformed summary should reject the complete metadata snapshot",
+  );
+
+  const record = createTuiSessionRecord<{ id: string }>();
+  record.__proto__ = { id: "__proto__" };
+  assertCondition(
+    Object.getPrototypeOf(record) === null,
+    "TUI session records should have a null prototype",
+  );
+  assertEqual(
+    record.__proto__?.id,
+    "__proto__",
+    "__proto__ should remain an ordinary session key",
+  );
+
+  const snapshot = {
+    id: " session ",
+    title: "spaced",
+    updatedAt: 1,
+    messages: [],
+    isBusy: false,
+    lockedProfileId: null,
+  };
+  assertEqual(
+    readMatchingTuiSessionSnapshot(snapshot, " session ")?.id,
+    " session ",
+    "an exact snapshot should preserve its session id",
+  );
+  assertEqual(
+    readMatchingTuiSessionSnapshot(snapshot, "session"),
+    undefined,
+    "a whitespace-near snapshot must not hydrate another session",
   );
 });

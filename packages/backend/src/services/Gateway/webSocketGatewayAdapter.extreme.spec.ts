@@ -322,6 +322,117 @@ const run = async (): Promise<void> => {
   );
 
   await runCase(
+    "filesystem async transfer session selectors fail closed before bridge calls",
+    async () => {
+      let startCalls = 0;
+      let listCalls = 0;
+      const adapter = createAdapterWithFilesystemBridge({
+        startTransfer: async () => {
+          startCalls += 1;
+          throw new Error("unexpected start bridge call");
+        },
+        listTransfers: async () => {
+          listCalls += 1;
+          return [];
+        },
+      });
+      const baseStart = {
+        sourceTerminalId: "source-terminal",
+        sourcePaths: ["/src/report.txt"],
+        targetTerminalId: "target-terminal",
+        targetDirPath: "/dst",
+      };
+
+      for (const sessionId of [null, 7, "   ", "\ud800"]) {
+        await assertRejects(
+          async () => {
+            await executeFilesystemMethod(
+              adapter,
+              "filesystem:startTransfer",
+              { ...baseStart, sessionId },
+            );
+          },
+          /sessionId must be a non-blank, well-formed string/,
+          "malformed startTransfer session selector should be rejected",
+        );
+        await assertRejects(
+          async () => {
+            await executeFilesystemMethod(
+              adapter,
+              "filesystem:listTransfers",
+              { sessionId },
+            );
+          },
+          /sessionId must be a non-blank, well-formed string/,
+          "malformed listTransfers session selector should be rejected",
+        );
+      }
+      assertEqual(startCalls, 0, "invalid start selectors must not call bridge");
+      assertEqual(listCalls, 0, "invalid list selectors must not call bridge");
+    },
+  );
+
+  await runCase(
+    "filesystem async transfer preserves exact optional session selectors",
+    async () => {
+      const calls: unknown[] = [];
+      const exactSessionId = "  会话::Case  ";
+      const adapter = createAdapterWithFilesystemBridge({
+        startTransfer: async (input: any) => {
+          calls.push(input.sessionId);
+          return {
+            id: "transfer-exact-session",
+            origin: input.origin,
+            mode: "copy",
+            sourceTerminalId: input.sourceTerminalId,
+            sourceTerminalName: "Source",
+            sourceMachineIdentity: "local://default",
+            sourcePaths: input.sourcePaths,
+            targetTerminalId: input.targetTerminalId,
+            targetTerminalName: "Target",
+            targetMachineIdentity: "ssh://target:22",
+            targetDirPath: input.targetDirPath,
+            itemNames: ["report.txt"],
+            conflictStrategy: "error",
+            status: "queued",
+            bytesDone: 0,
+            totalBytes: 0,
+            transferredFiles: 0,
+            totalFiles: 0,
+            percent: 0,
+            message: "queued",
+            errorMessage: null,
+            cancelRequested: false,
+            createdAt: 1,
+            updatedAt: 1,
+          };
+        },
+        listTransfers: async (options: any) => {
+          calls.push(options.sessionId);
+          return [];
+        },
+      });
+
+      await executeFilesystemMethod(adapter, "filesystem:startTransfer", {
+        sourceTerminalId: "source-terminal",
+        sourcePaths: ["/src/report.txt"],
+        targetTerminalId: "target-terminal",
+        targetDirPath: "/dst",
+        sessionId: exactSessionId,
+      });
+      await executeFilesystemMethod(adapter, "filesystem:listTransfers", {
+        sessionId: exactSessionId,
+      });
+
+      assertDeepEqual(
+        calls,
+        [exactSessionId, exactSessionId],
+        "websocket adapter must preserve opaque session bytes",
+      );
+    },
+  );
+
+  await runCase(
     "filesystem cancelTransferTask RPC cancels async transfer tasks",
     async () => {
       const calls: unknown[] = [];

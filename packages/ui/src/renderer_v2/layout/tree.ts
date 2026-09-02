@@ -1,3 +1,4 @@
+import { readOpaqueNonBlankWellFormedString } from '@gyshell/shared'
 import {
   LAYOUT_V2_SCHEMA_VERSION,
   MAX_LAYOUT_PANELS,
@@ -11,7 +12,12 @@ import {
   type PanelKind,
   type SplitDirection
 } from './types'
-import { isPanelKind } from './panelKindMeta'
+import { getPanelKindMeta, isPanelKind } from './panelKindMeta'
+import {
+  isTabbedPanelKind,
+  normalizePanelTabBinding,
+  readWindowingTabId
+} from './tabIdentity'
 
 interface LegacyLayoutSnapshot {
   panelOrder?: string[]
@@ -107,6 +113,234 @@ const ensureNodeShape = (node: LayoutNode | null | undefined): LayoutNode | null
   return splitNode
 }
 
+const isPlainRecord = (value: unknown): value is Record<string, unknown> => {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    return false
+  }
+  try {
+    const prototype = Object.getPrototypeOf(value)
+    return prototype === Object.prototype || prototype === null
+  } catch {
+    return false
+  }
+}
+
+const hasOnlyKeys = (
+  value: Record<string, unknown>,
+  allowedKeys: readonly string[]
+): boolean => {
+  const allowed = new Set(allowedKeys)
+  return Object.keys(value).every((key) => allowed.has(key))
+}
+
+const hasOwn = (value: Record<string, unknown>, key: string): boolean =>
+  Object.prototype.hasOwnProperty.call(value, key)
+
+const hasOwnKeys = (
+  value: Record<string, unknown>,
+  requiredKeys: readonly string[]
+): boolean => requiredKeys.every((key) => hasOwn(value, key))
+
+const MAX_STRICT_LAYOUT_NODES = MAX_LAYOUT_PANELS * 2 - 1
+
+interface StrictLayoutParseState {
+  nodeIds: Set<string>
+  panelIds: Set<string>
+  panelKindById: Map<string, PanelKind>
+  panelCountByKind: Map<PanelKind, number>
+  panelCount: number
+  nodeCount: number
+}
+
+const parseStrictLayoutNode = (
+  value: unknown,
+  state: StrictLayoutParseState
+): LayoutNode | null => {
+  if (!isPlainRecord(value)) return null
+  state.nodeCount += 1
+  if (state.nodeCount > MAX_STRICT_LAYOUT_NODES) return null
+
+  if (!hasOwnKeys(value, ['type', 'id'])) return null
+  const id = readOpaqueNonBlankWellFormedString(value.id)
+  if (!id || state.nodeIds.has(id)) return null
+  state.nodeIds.add(id)
+
+  if (value.type === 'panel') {
+    if (
+      !hasOnlyKeys(value, ['type', 'id', 'panel']) ||
+      !hasOwn(value, 'panel') ||
+      !isPlainRecord(value.panel)
+    ) {
+      return null
+    }
+    const panel = value.panel
+    if (
+      !hasOnlyKeys(panel, ['id', 'kind']) ||
+      !hasOwnKeys(panel, ['id', 'kind']) ||
+      !isPanelKind(panel.kind)
+    ) {
+      return null
+    }
+    const panelId = readOpaqueNonBlankWellFormedString(panel.id)
+    if (!panelId || state.panelIds.has(panelId)) return null
+    const panelKindCount = (state.panelCountByKind.get(panel.kind) || 0) + 1
+    const maxPanelsForKind = getPanelKindMeta(panel.kind).maxPanels
+    if (
+      maxPanelsForKind !== undefined &&
+      panelKindCount > maxPanelsForKind
+    ) {
+      return null
+    }
+    state.panelIds.add(panelId)
+    state.panelKindById.set(panelId, panel.kind)
+    state.panelCountByKind.set(panel.kind, panelKindCount)
+    state.panelCount += 1
+    if (state.panelCount > MAX_LAYOUT_PANELS) return null
+    return {
+      type: 'panel',
+      id,
+      panel: {
+        id: panelId,
+        kind: panel.kind
+      }
+    }
+  }
+
+  if (
+    value.type !== 'split' ||
+    !hasOnlyKeys(value, ['type', 'id', 'direction', 'children', 'sizes']) ||
+    !hasOwnKeys(value, ['direction', 'children', 'sizes']) ||
+    (value.direction !== 'horizontal' && value.direction !== 'vertical') ||
+    !Array.isArray(value.children) ||
+    value.children.length < 2 ||
+    value.children.length > MAX_LAYOUT_SPLIT_CHILDREN ||
+    !Array.isArray(value.sizes) ||
+    value.sizes.length !== value.children.length ||
+    value.sizes.some(
+      (size) => typeof size !== 'number' || !Number.isFinite(size) || size < 0
+    ) ||
+    !(() => {
+      const total = (value.sizes as number[]).reduce(
+        (sum: number, size: number) => sum + size,
+        0,
+      )
+      return Number.isFinite(total) && total > 0
+    })()
+  ) {
+    return null
+  }
+
+  const children: LayoutNode[] = []
+  for (const child of value.children) {
+    const parsedChild = parseStrictLayoutNode(child, state)
+    if (!parsedChild) return null
+    children.push(parsedChild)
+  }
+  return {
+    type: 'split',
+    id,
+    direction: value.direction,
+    children,
+    sizes: [...value.sizes]
+  }
+}
+
+/**
+ * Parses renderer-owned detached layout state without repairing malformed
+ * structure. Persisted user settings retain their compatibility normalizer;
+ * cross-window detached state is an untrusted ingress and must fail closed as
+ * one payload.
+ */
+export const parseStrictLayoutTree = (raw: unknown): LayoutTree | null => {
+  if (
+    !isPlainRecord(raw) ||
+    !hasOwnKeys(raw, ['schemaVersion', 'root']) ||
+    raw.schemaVersion !== LAYOUT_V2_SCHEMA_VERSION
+  ) {
+    return null
+  }
+  if (!hasOnlyKeys(raw, ['schemaVersion', 'root', 'focusedPanelId', 'panelTabs', 'managerPanels'])) {
+    return null
+  }
+
+  const state: StrictLayoutParseState = {
+    nodeIds: new Set<string>(),
+    panelIds: new Set<string>(),
+    panelKindById: new Map<string, PanelKind>(),
+    panelCountByKind: new Map<PanelKind, number>(),
+    panelCount: 0,
+    nodeCount: 0
+  }
+  const root = parseStrictLayoutNode(raw.root, state)
+  if (!root || state.panelCount === 0) return null
+
+  let focusedPanelId: string | undefined
+  if (Object.prototype.hasOwnProperty.call(raw, 'focusedPanelId')) {
+    focusedPanelId = readOpaqueNonBlankWellFormedString(raw.focusedPanelId)
+    if (!focusedPanelId || !state.panelIds.has(focusedPanelId)) return null
+  }
+
+  let panelTabs: Record<string, LayoutPanelTabBinding> | undefined
+  if (Object.prototype.hasOwnProperty.call(raw, 'panelTabs')) {
+    if (!isPlainRecord(raw.panelTabs)) return null
+    const nextPanelTabs = Object.create(null) as Record<
+      string,
+      LayoutPanelTabBinding
+    >
+    for (const [panelId, candidate] of Object.entries(raw.panelTabs)) {
+      const kind = state.panelKindById.get(panelId)
+      if (
+        !kind ||
+        !isTabbedPanelKind(kind) ||
+        !isPlainRecord(candidate) ||
+        !hasOnlyKeys(candidate, ['tabIds', 'activeTabId']) ||
+        !hasOwn(candidate, 'tabIds') ||
+        !Array.isArray(candidate.tabIds)
+      ) {
+        return null
+      }
+      const normalized = normalizePanelTabBinding(kind, candidate)
+      if (
+        !normalized ||
+        candidate.tabIds.some(
+          (tabId) => readWindowingTabId(kind, tabId) === undefined
+        )
+      ) {
+        return null
+      }
+      if (Object.prototype.hasOwnProperty.call(candidate, 'activeTabId')) {
+        const activeTabId = readWindowingTabId(kind, candidate.activeTabId)
+        if (!activeTabId || !normalized.tabIds.includes(activeTabId)) {
+          return null
+        }
+      }
+      nextPanelTabs[panelId] = normalized
+    }
+    panelTabs = nextPanelTabs
+  }
+
+  let managerPanels: Partial<Record<PanelKind, string>> | undefined
+  if (Object.prototype.hasOwnProperty.call(raw, 'managerPanels')) {
+    if (!isPlainRecord(raw.managerPanels)) return null
+    const nextManagerPanels: Partial<Record<PanelKind, string>> = Object.create(null)
+    for (const [kind, candidate] of Object.entries(raw.managerPanels)) {
+      if (!isPanelKind(kind)) return null
+      const panelId = readOpaqueNonBlankWellFormedString(candidate)
+      if (!panelId || state.panelKindById.get(panelId) !== kind) return null
+      nextManagerPanels[kind] = panelId
+    }
+    managerPanels = nextManagerPanels
+  }
+
+  return {
+    schemaVersion: LAYOUT_V2_SCHEMA_VERSION,
+    root,
+    ...(focusedPanelId ? { focusedPanelId } : {}),
+    ...(panelTabs ? { panelTabs } : {}),
+    ...(managerPanels ? { managerPanels } : {})
+  }
+}
+
 export const parsePersistedLayoutV2 = (raw: unknown): LayoutTree | null => {
   if (!raw || typeof raw !== 'object') return null
   const payload = raw as Partial<LayoutTree>
@@ -116,17 +350,24 @@ export const parsePersistedLayoutV2 = (raw: unknown): LayoutTree | null => {
   const panelTabs = (() => {
     const source = payload.panelTabs
     if (!source || typeof source !== 'object') return undefined
+    const panelKindById = new Map<string, PanelKind>()
+    const pendingNodes: LayoutNode[] = [root]
+    while (pendingNodes.length > 0) {
+      const node = pendingNodes.pop()
+      if (!node) continue
+      if (node.type === 'panel') {
+        panelKindById.set(node.panel.id, node.panel.kind)
+      } else {
+        pendingNodes.push(...node.children)
+      }
+    }
+
     const entries = Object.entries(source as Record<string, unknown>)
       .map(([panelId, value]) => {
-        if (!value || typeof value !== 'object') return null
-        const binding = value as Partial<LayoutPanelTabBinding>
-        const tabIds = Array.isArray(binding.tabIds)
-          ? binding.tabIds.filter((id): id is string => typeof id === 'string' && id.length > 0)
-          : []
-        const activeTabId = typeof binding.activeTabId === 'string' && binding.activeTabId.length > 0
-          ? binding.activeTabId
-          : undefined
-        return [panelId, { tabIds, ...(activeTabId ? { activeTabId } : {}) } satisfies LayoutPanelTabBinding] as const
+        const kind = panelKindById.get(panelId)
+        if (!kind) return null
+        const binding = normalizePanelTabBinding(kind, value)
+        return binding ? ([panelId, binding] as const) : null
       })
       .filter((entry): entry is readonly [string, LayoutPanelTabBinding] => !!entry)
     if (entries.length === 0) return undefined

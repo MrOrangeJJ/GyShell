@@ -196,6 +196,102 @@ const createHangingFileSystemService = (options?: {
 
 const run = async (): Promise<void> => {
   await runCase(
+    'optional session selectors fail closed before transfer admission side effects',
+    async () => {
+      let terminalLookups = 0
+      const terminalService = {
+        getAllTerminals: () => {
+          terminalLookups += 1
+          return []
+        },
+        getTransferMachineIdentity: () => {
+          terminalLookups += 1
+          return null
+        },
+        onTerminalClosed: () => () => undefined,
+      } as unknown as TerminalService
+      const service = new FileTransferService(
+        createFileSystemService(),
+        terminalService,
+        0,
+      )
+      const baseInput = {
+        origin: 'user' as const,
+        sourceTerminalId: 'local-a',
+        sourcePaths: ['/tmp/a.txt'],
+        targetTerminalId: 'remote-a',
+        targetDirPath: '/tmp',
+      }
+
+      for (const sessionId of [null, 123, '   ', '\ud800']) {
+        await assertRejects(
+          () => service.startTransfer({ ...baseInput, sessionId } as any),
+          /Session id must be a non-blank, well-formed string/,
+          'malformed startTransfer sessionId should be rejected',
+        )
+      }
+      await assertRejects(
+        () => service.listTransfers({ sessionId: null } as any),
+        /Session id must be a non-blank, well-formed string/,
+        'malformed listTransfers sessionId should be rejected',
+      )
+      assertEqual(
+        terminalLookups,
+        0,
+        'session validation should run before terminal/runtime admission',
+      )
+      assertEqual(
+        service.listTransfers({ includeCompleted: true }).length,
+        0,
+        'malformed selectors must not register transfer tasks',
+      )
+    },
+  )
+
+  await runCase(
+    'optional session selectors preserve exact opaque identities',
+    () => {
+      const service = new FileTransferService(
+        createFileSystemService(),
+        createTerminalService({
+          'local-a': 'local://default',
+          'remote-a': 'ssh://remote-a:22',
+        }),
+        0,
+      )
+      const sessionIds = [' Session ', 'Session', 'session', '会话🙂']
+      sessionIds.forEach((sessionId, index) => {
+        const task = service.startTransfer({
+          origin: 'user',
+          sourceTerminalId: 'local-a',
+          sourcePaths: [`/tmp/${index}.txt`],
+          targetTerminalId: 'remote-a',
+          targetDirPath: '/tmp',
+          sessionId,
+        })
+        assertEqual(
+          task.sessionId,
+          sessionId,
+          'task snapshot should preserve the exact session identity',
+        )
+      })
+
+      sessionIds.forEach((sessionId) => {
+        const matches = service.listTransfers({
+          includeCompleted: true,
+          sessionId,
+        })
+        assertEqual(matches.length, 1, 'exact selector should match one task')
+        assertEqual(
+          matches[0].sessionId,
+          sessionId,
+          'list selector must not trim or case-fold session identities',
+        )
+      })
+    },
+  )
+
+  await runCase(
     'trusted UI capability and user origin are both required for peer delegation',
     async () => {
       const observed: boolean[] = []

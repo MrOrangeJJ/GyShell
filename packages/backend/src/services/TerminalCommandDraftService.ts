@@ -2,6 +2,7 @@ import { HumanMessage, SystemMessage, type BaseMessage } from '@langchain/core/m
 import { convertToOpenAITool } from '@langchain/core/utils/function_calling'
 import type { ChatOpenAI } from '@langchain/openai'
 import { z } from 'zod'
+import { isValidTerminalRuntimeId } from '@gyshell/shared'
 import { AgentHelpers } from './AgentHelper/helpers'
 import { invokeWithRetryAndSanitizedInput } from './AgentHelper/utils/model_messages'
 import type { TerminalTab } from '../types'
@@ -63,11 +64,11 @@ export class TerminalCommandDraftService {
     signal?: AbortSignal
   ): Promise<TerminalCommandDraftResult> {
     const startedAt = Date.now()
-    const terminalId = String(request.terminalId || '').trim()
+    const terminalId = request.terminalId
     const prompt = String(request.prompt || '').trim()
     const profileId = String(request.profileId || '').trim()
-    if (!terminalId) {
-      throw new Error('Missing terminalId.')
+    if (!isValidTerminalRuntimeId(terminalId)) {
+      throw new Error('Missing or invalid terminalId.')
     }
     if (!prompt) {
       throw new Error('Missing prompt.')
@@ -177,7 +178,7 @@ export class TerminalCommandDraftService {
       'If the user request is ambiguous or underspecified, continue the workflow that best matches the recent terminal content.',
       'You must return the answer only through the exec_command schema or tool.',
       'The schema has exactly one field: command.',
-      'Do not include tabIdOrName, waitMode, explanations, markdown fences, or a trailing newline.',
+      'Do not include terminalId, waitMode, explanations, markdown fences, or a trailing newline.',
       'Do not ignore the recent terminal content when deciding what command to output.',
       'Use only the current terminal tab system info and recent visible output provided in the request.'
     ].join('\n')
@@ -291,7 +292,7 @@ export class TerminalCommandDraftService {
         [
           'You must return the answer by calling tool "exec_command".',
           'Do not return plain text.',
-          'Do not include waitMode or tabIdOrName.',
+          'Do not include waitMode or terminalId.',
           'Return only one tool call.'
         ].join('\n')
       )

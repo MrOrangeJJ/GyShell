@@ -4,9 +4,26 @@ import {
   webUtils,
   type IpcRendererEvent,
 } from "electron";
+import { subscribeToElectronGatewayAgentEvents } from "../../../../packages/electron/src/gateway/electronGatewayEventAdmission";
 
 // Types (duplicated to avoid cross-project imports)
 type JsonValue = string | number | boolean | null | JsonValue[] | { [key: string]: JsonValue };
+
+interface SSHConnectionEntry {
+  id: string;
+  name: string;
+  host: string;
+  port: number;
+  username: string;
+  authMethod: "password" | "privateKey";
+  password?: string;
+  privateKey?: string;
+  privateKeyPath?: string;
+  passphrase?: string;
+  proxyId?: string;
+  tunnelIds?: string[];
+  jumpHost?: SSHConnectionEntry;
+}
 
 interface BackendSettings {
   schemaVersion: 5;
@@ -52,20 +69,7 @@ interface BackendSettings {
     activeProfileId: string;
   };
   connections: {
-    ssh: Array<{
-      id: string;
-      name: string;
-      host: string;
-      port: number;
-      username: string;
-      authMethod: "password" | "privateKey";
-      password?: string;
-      privateKey?: string;
-      privateKeyPath?: string;
-      passphrase?: string;
-      proxyId?: string;
-      tunnelIds?: string[];
-    }>;
+    ssh: SSHConnectionEntry[];
     proxies: Array<{
       id: string;
       name: string;
@@ -225,10 +229,13 @@ type AgentEventType =
   | "error"
   | "debug_history"
   | "user_input"
+  | "rollback"
+  | "compaction_boundary"
   | "tokens_count";
 
 interface AgentEvent {
   type: AgentEventType;
+  messageId?: string;
   inputKind?: "normal" | "inserted";
   inputImages?: InputImageAttachment[];
   level?: "info" | "warning" | "error";
@@ -247,6 +254,9 @@ interface AgentEvent {
   diff?: string;
   exitCode?: number;
   outputDelta?: string;
+  commandOutput?: unknown;
+  outputMode?: "append" | "replace";
+  isNowait?: boolean;
   summary?: string;
   message?: string;
   details?: string;
@@ -254,6 +264,10 @@ interface AgentEvent {
   modelName?: string;
   totalTokens?: number;
   maxTokens?: number;
+  boundaryTargetMessageId?: string;
+  boundaryPreviousMessageId?: string;
+  summaryMessageId?: string;
+  protectedNormalRounds?: number;
 }
 
 interface InputImageAttachment {
@@ -418,7 +432,7 @@ interface TerminalSummary {
 }
 
 // Connection Config Types
-export type ConnectionType = "local" | "ssh";
+export type ConnectionType = string;
 
 export interface BaseConnectionConfig {
   type: ConnectionType;
@@ -447,9 +461,17 @@ export interface SSHConnectionConfig extends BaseConnectionConfig {
   passphrase?: string;
   proxy?: AppSettings["connections"]["proxies"][number];
   tunnels?: AppSettings["connections"]["tunnels"][number][];
+  jumpHost?: SSHConnectionConfig;
 }
 
-export type TerminalConfig = LocalConnectionConfig | SSHConnectionConfig;
+export interface GenericConnectionConfig extends BaseConnectionConfig {
+  [key: string]: unknown;
+}
+
+export type TerminalConfig =
+  | LocalConnectionConfig
+  | SSHConnectionConfig
+  | GenericConnectionConfig;
 
 export interface FileSystemEntry {
   name: string;
@@ -1400,14 +1422,13 @@ const api: GyShellAPI = {
       ipcRenderer.invoke("agent:branchFromMessage", sessionId, messageId),
     replyMessage: (messageId, payload) =>
       ipcRenderer.invoke("agent:replyMessage", messageId, payload),
-    onEvent: (callback) => {
-      const handler = (
-        _: IpcRendererEvent,
-        data: { sessionId: string; event: AgentEvent },
-      ) => callback(data);
-      ipcRenderer.on("agent:event", handler);
-      return () => ipcRenderer.off("agent:event", handler);
-    },
+    onEvent: (callback) =>
+      subscribeToElectronGatewayAgentEvents(ipcRenderer, (admitted) => {
+        callback({
+          sessionId: admitted.sessionId,
+          event: admitted.event as unknown as AgentEvent,
+        });
+      }),
     onUiUpdate: (callback) => {
       const handler = (_: IpcRendererEvent, action: any) => callback(action);
       ipcRenderer.on("agent:ui-update", handler);

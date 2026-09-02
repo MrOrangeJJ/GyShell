@@ -8,6 +8,7 @@ import {
   shell,
 } from "electron";
 import { join, resolve } from "path";
+import { readOpaqueNonBlankWellFormedString } from "@gyshell/shared";
 import { SettingsService } from "../../../backend/src/services/SettingsService";
 import { UiSettingsStore } from "../settings/UiSettingsStore";
 import { TerminalService } from "../../../backend/src/services/TerminalService";
@@ -54,9 +55,16 @@ import { ResourceMonitorService } from "../../../backend/src/services/ResourceMo
 import { MonitorWindowRegistry } from "./MonitorWindowRegistry";
 import {
   DetachedWindowRegistry,
+  normalizeDetachedWindowOpenOptions,
+  normalizeDetachedWindowTabOwnership,
+  type DetachedWindowOpenOptions,
   type DetachedWindowTabOwnership,
-  type DetachedWindowTabTarget,
 } from "./DetachedWindowRegistry";
+import {
+  normalizeAppWindowCreationOptions,
+  type AppWindowCreationOptions,
+  type AppWindowRole,
+} from "./windowCreationAdmission";
 import {
   broadcastTerminalRecoveryHint,
   isDisplayMetricsRecoveryRelevant,
@@ -105,16 +113,6 @@ let historyStore: HistorySqliteStore | null = null;
 let sleepBlockerService: SleepBlockerService | null = null;
 let agentSettingProfileService: AgentSettingProfileService;
 
-type AppWindowRole = "main" | "detached";
-
-interface CreateWindowOptions {
-  role?: AppWindowRole;
-  detachedStateToken?: string;
-  sourceClientId?: string;
-  tabOwnership?: DetachedWindowTabOwnership;
-  safeMode?: boolean;
-}
-
 const DETACHED_WINDOW_DEFAULT_WIDTH_SCALE = 0.5;
 const DETACHED_WINDOW_DEFAULT_HEIGHT_SCALE = 0.75;
 
@@ -122,7 +120,6 @@ interface RendererRecoveryInstallOptions {
   role: AppWindowRole;
   detachedStateToken?: string;
   sourceClientId?: string;
-  tabOwnership?: DetachedWindowTabOwnership;
 }
 
 interface RendererRecoveryRuntimeState {
@@ -278,9 +275,12 @@ const installRendererRecoveryHandlers = (
   });
 };
 
-function createWindow(options?: CreateWindowOptions): BrowserWindow {
-  const role: AppWindowRole =
-    options?.role === "detached" ? "detached" : "main";
+function createWindow(options?: AppWindowCreationOptions): BrowserWindow {
+  const normalizedOptions = normalizeAppWindowCreationOptions(options);
+  if (!normalizedOptions) {
+    throw new Error("Invalid native window creation options.");
+  }
+  const role = normalizedOptions.role;
   const isMainWindow = role === "main";
   const settings = settingsService.getSettings();
   const uiSettings = uiSettingsStore.getSettings();
@@ -352,40 +352,36 @@ function createWindow(options?: CreateWindowOptions): BrowserWindow {
   });
   if (isMainWindow) {
     mainWindow = windowInstance;
-  } else {
-    detachedWindowRegistry.register(
+  } else if (
+    !detachedWindowRegistry.register(
       windowInstance,
-      options?.tabOwnership,
-    );
+      normalizedOptions.tabOwnership,
+    )
+  ) {
+    windowInstance.destroy();
+    throw new Error("Failed to register detached window ownership.");
   }
 
   const query = new URLSearchParams();
-  if (options?.safeMode === true) {
+  if (normalizedOptions.safeMode) {
     query.set("safeMode", "1");
   }
   if (!isMainWindow) {
     query.set("windowRole", "detached");
-    if (
-      typeof options?.detachedStateToken === "string" &&
-      options.detachedStateToken.trim().length > 0
-    ) {
-      query.set("detachedStateToken", options.detachedStateToken.trim());
-    }
-    if (
-      typeof options?.sourceClientId === "string" &&
-      options.sourceClientId.trim().length > 0
-    ) {
-      query.set("sourceClientId", options.sourceClientId.trim());
-    }
+    query.set("detachedStateToken", normalizedOptions.detachedStateToken);
+    query.set("sourceClientId", normalizedOptions.sourceClientId);
   }
   const queryString = query.toString();
   const urlSuffix = queryString.length > 0 ? `?${queryString}` : "";
 
   installRendererRecoveryHandlers(windowInstance, {
     role,
-    detachedStateToken: options?.detachedStateToken,
-    sourceClientId: options?.sourceClientId,
-    tabOwnership: options?.tabOwnership,
+    ...(role === "detached"
+      ? {
+          detachedStateToken: normalizedOptions.detachedStateToken,
+          sourceClientId: normalizedOptions.sourceClientId,
+        }
+      : {}),
   });
 
   // Load the app
@@ -1243,26 +1239,44 @@ export async function startElectronMain(): Promise<void> {
             event: any,
             detachedStateToken: string,
             sourceClientId: string,
-            options?: {
-              tabOwnership?: DetachedWindowTabOwnership;
-              focusTarget?: DetachedWindowTabTarget;
-            },
+            options?: DetachedWindowOpenOptions,
           ) => {
-            const token = String(detachedStateToken || "").trim();
+            const token =
+              typeof detachedStateToken === "string"
+                ? readOpaqueNonBlankWellFormedString(
+                    detachedStateToken.trim(),
+                  )
+                : undefined;
             if (!token) {
               throw new Error("Missing detached state token.");
+            }
+            const normalizedSourceClientId =
+              typeof sourceClientId === "string"
+                ? readOpaqueNonBlankWellFormedString(sourceClientId.trim())
+                : undefined;
+            if (!normalizedSourceClientId) {
+              throw new Error("Missing detached source client id.");
+            }
+            const normalizedOptions = normalizeDetachedWindowOpenOptions(options);
+            if (!normalizedOptions) {
+              throw new Error("Invalid detached window options.");
+            }
+            const focusTarget = normalizedOptions.focusTarget;
+            if (
+              focusTarget &&
+              !normalizedOptions.tabOwnership[focusTarget.kind].includes(
+                focusTarget.tabId,
+              )
+            ) {
+              throw new Error(
+                "Detached focus target must be present in tab ownership.",
+              );
             }
             const senderWindow = BrowserWindow.fromWebContents(event.sender);
             if (!senderWindow || senderWindow.isDestroyed()) {
               throw new Error("Failed to resolve source window.");
             }
-            const focusTarget = options?.focusTarget
-              ? {
-                  kind: options.focusTarget.kind,
-                  tabId: String(options.focusTarget.tabId || "").trim(),
-                }
-              : null;
-            if (focusTarget?.tabId) {
+            if (focusTarget) {
               const existingWindow =
                 detachedWindowRegistry.focusWindowHostingTab(
                   focusTarget,
@@ -1280,8 +1294,8 @@ export async function startElectronMain(): Promise<void> {
             createWindow({
               role: "detached",
               detachedStateToken: token,
-              sourceClientId: String(sourceClientId || "").trim(),
-              tabOwnership: options?.tabOwnership,
+              sourceClientId: normalizedSourceClientId,
+              tabOwnership: normalizedOptions.tabOwnership,
             });
             return { ok: true, reused: false };
           },
@@ -1293,6 +1307,11 @@ export async function startElectronMain(): Promise<void> {
             event: any,
             ownership?: DetachedWindowTabOwnership,
           ) => {
+            const normalizedOwnership =
+              normalizeDetachedWindowTabOwnership(ownership);
+            if (!normalizedOwnership) {
+              throw new Error("Invalid detached tab ownership.");
+            }
             const senderWindow = BrowserWindow.fromWebContents(event.sender);
             if (!senderWindow || senderWindow.isDestroyed()) {
               throw new Error("Failed to resolve source window.");
@@ -1301,7 +1320,7 @@ export async function startElectronMain(): Promise<void> {
               ok: true,
               registered: detachedWindowRegistry.updateOwnership(
                 senderWindow,
-                ownership,
+                normalizedOwnership,
               ),
             };
           },

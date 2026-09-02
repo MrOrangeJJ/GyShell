@@ -1,3 +1,4 @@
+import { readOpaqueNonBlankString } from "@gyshell/shared";
 import { canReconnectTerminalRuntime } from "../../lib/terminalConnectionModel";
 import { normalizeSessionTitleText } from "../../lib/sessionTitleDisplay";
 
@@ -127,7 +128,7 @@ export const resolveListPanelHost = (
   getPanelTabIds: (panelId: string) => readonly string[],
   tabId: string,
 ): ListPanelHostInfo | null => {
-  const normalizedTabId = String(tabId || "").trim();
+  const normalizedTabId = readOpaqueNonBlankString(tabId);
   if (!normalizedTabId) return null;
 
   for (let panelIndex = 0; panelIndex < panelIds.length; panelIndex += 1) {

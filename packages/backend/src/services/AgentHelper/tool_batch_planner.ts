@@ -1,4 +1,3 @@
-import { parseTerminalScopedFilePath } from './terminalScopedFilePath'
 import { getStreamToolCallIntegrityError } from './utils/streamed_tool_call_integrity'
 
 export type ToolCallExecutionStatus =
@@ -15,17 +14,96 @@ export interface ModelToolCall {
   [key: string]: unknown
 }
 
+export interface ToolCallExecutionMetadata {
+  ordinal: number
+  mode: 'execute' | 'not_executed'
+  reason?: string
+  retryable?: boolean
+  outcomeStatus?: Exclude<ToolCallExecutionStatus, 'completed'>
+  parallelGroupId?: string
+  terminalRuntimeBindings?: Array<{
+    terminalId: string
+    runtimeGeneration: number
+  }>
+}
+
+/**
+ * Execution metadata is process-local control state, not model output. Keep it
+ * in a WeakMap so it cannot cross JSON/LangChain serialization boundaries.
+ * A non-enumerable property is installed only as a source-compatible view for
+ * existing internal callers and older test fixtures.
+ */
+const transientExecutionMetadata = new WeakMap<
+  object,
+  ToolCallExecutionMetadata
+>()
+
+export function getToolCallExecutionMetadata(
+  toolCall: ModelToolCall,
+): ToolCallExecutionMetadata | undefined {
+  if (!toolCall || typeof toolCall !== 'object') return undefined
+  const existing = transientExecutionMetadata.get(toolCall)
+  if (existing) return existing
+
+  const descriptor = Object.getOwnPropertyDescriptor(
+    toolCall,
+    '_gyshellExecution',
+  )
+  const legacyValue =
+    descriptor && Object.prototype.hasOwnProperty.call(descriptor, 'value')
+      ? descriptor.value
+      : undefined
+  if (!legacyValue || typeof legacyValue !== 'object') return undefined
+
+  const metadata = legacyValue as ToolCallExecutionMetadata
+  transientExecutionMetadata.set(toolCall, metadata)
+  if (descriptor?.configurable) {
+    installTransientExecutionMetadataView(toolCall, metadata)
+  }
+  return metadata
+}
+
+export function setToolCallExecutionMetadata(
+  toolCall: ModelToolCall,
+  metadata: ToolCallExecutionMetadata,
+): void {
+  if (!toolCall || typeof toolCall !== 'object') return
+  transientExecutionMetadata.set(toolCall, metadata)
+  installTransientExecutionMetadataView(toolCall, metadata)
+}
+
+function installTransientExecutionMetadataView(
+  toolCall: ModelToolCall,
+  _metadata: ToolCallExecutionMetadata,
+): void {
+  const descriptor = Object.getOwnPropertyDescriptor(
+    toolCall,
+    '_gyshellExecution',
+  )
+  if (descriptor && !descriptor.configurable) return
+
+  Object.defineProperty(toolCall, '_gyshellExecution', {
+    configurable: true,
+    enumerable: false,
+    get: () => transientExecutionMetadata.get(toolCall),
+    set: (value: unknown) => {
+      if (value && typeof value === 'object') {
+        transientExecutionMetadata.set(
+          toolCall,
+          value as ToolCallExecutionMetadata,
+        )
+      } else {
+        transientExecutionMetadata.delete(toolCall)
+      }
+    },
+  })
+}
+
 export interface PlannedToolCall extends ModelToolCall {
   id: string
   name: string
-  _gyshellExecution: {
-    ordinal: number
-    mode: 'execute' | 'not_executed'
-    reason?: string
-    retryable?: boolean
-    outcomeStatus?: Exclude<ToolCallExecutionStatus, 'completed'>
-    parallelGroupId?: string
-  }
+  /** @deprecated Use getToolCallExecutionMetadata for new code. */
+  _gyshellExecution: ToolCallExecutionMetadata
 }
 
 export interface ToolCallIdRepair {
@@ -50,6 +128,7 @@ export interface ToolBatchPlanningEnvironment {
   isMcpTool(toolName: string): boolean
   isMcpToolReadOnly(toolName: string): boolean
   resolveTerminalId(reference: string): string | null
+  resolveTerminalRuntimeGeneration?(reference: string): number | undefined
   resolveMachineId(reference: string): string | null
   createParallelGroupId(): string
 }
@@ -70,6 +149,25 @@ const TERMINAL_STATE_BOUNDARY_TOOL_NAMES = new Set([
   'reconnect_terminal_tab',
   'close_terminal_tab'
 ])
+const SINGLE_TERMINAL_TOOL_NAMES = new Set([
+  'exec_command',
+  'read_terminal_tab',
+  'read_command_output',
+  'read_file',
+  'write_stdin',
+  'reconnect_terminal_tab',
+  'close_terminal_tab',
+  'write_file',
+  'edit_file',
+  'create_or_edit',
+  'write_and_edit',
+  'wait_terminal_idle'
+])
+const TERMINAL_RUNTIME_BOUND_TOOL_NAMES = new Set(
+  [...SINGLE_TERMINAL_TOOL_NAMES].filter(
+    (toolName) => toolName !== 'read_command_output'
+  )
+)
 const TERMINAL_MUTATION_TOOL_NAMES = new Set([
   'exec_command',
   'write_stdin',
@@ -80,13 +178,6 @@ const TERMINAL_MUTATION_TOOL_NAMES = new Set([
   'create_or_edit',
   'write_and_edit',
   'copy_between_tabs'
-])
-const TERMINAL_SCOPED_FILE_TOOL_NAMES = new Set([
-  'read_file',
-  'write_file',
-  'edit_file',
-  'create_or_edit',
-  'write_and_edit'
 ])
 const MAX_PARALLEL_TOOL_CALLS = 4
 export const INVALID_TOOL_CALL_NAME = 'gyshell_invalid_tool_call'
@@ -117,22 +208,15 @@ function parseArgs(args: unknown): Record<string, unknown> {
 }
 
 function getTerminalReference(toolCall: ModelToolCall): string | null {
-  const args = parseArgs(toolCall.args)
-  if (
-    TERMINAL_SCOPED_FILE_TOOL_NAMES.has(toolCall.name || '') &&
-    typeof args.filePath === 'string'
-  ) {
-    const scopedReference = parseTerminalScopedFilePath(args.filePath)
-    if (scopedReference) return scopedReference.terminalId
-  }
-  return normalizeNonEmptyString(args.tabIdOrName)
+  if (!SINGLE_TERMINAL_TOOL_NAMES.has(toolCall.name || '')) return null
+  return preserveOpaqueNonBlankString(parseArgs(toolCall.args).terminalId)
 }
 
 function getTerminalReferences(toolCall: ModelToolCall): string[] {
   const args = parseArgs(toolCall.args)
   if (toolCall.name === 'copy_between_tabs') {
-    return [args.sourceTabIdOrName, args.targetTabIdOrName]
-      .map(normalizeNonEmptyString)
+    return [args.sourceTerminalId, args.targetTerminalId]
+      .map(preserveOpaqueNonBlankString)
       .filter((reference): reference is string => reference !== null)
   }
   const reference = getTerminalReference(toolCall)
@@ -157,6 +241,37 @@ export function resolveToolCallTerminalIds(
   environment: ToolBatchPlanningEnvironment
 ): string[] {
   return getTerminalIds(toolCall, environment)
+}
+
+function captureTerminalRuntimeBindings(
+  toolCall: ModelToolCall,
+  environment: ToolBatchPlanningEnvironment
+): Array<{ terminalId: string; runtimeGeneration: number }> {
+  if (
+    !TERMINAL_RUNTIME_BOUND_TOOL_NAMES.has(toolCall.name || '') ||
+    !environment.resolveTerminalRuntimeGeneration
+  ) {
+    return []
+  }
+  const bindings: Array<{ terminalId: string; runtimeGeneration: number }> = []
+  for (const reference of getTerminalReferences(toolCall)) {
+    const terminalId = environment.resolveTerminalId(reference)
+    const runtimeGeneration =
+      environment.resolveTerminalRuntimeGeneration(reference)
+    if (
+      !terminalId ||
+      !Number.isSafeInteger(runtimeGeneration) ||
+      (runtimeGeneration as number) < 1 ||
+      bindings.some((binding) => binding.terminalId === terminalId)
+    ) {
+      continue
+    }
+    bindings.push({
+      terminalId,
+      runtimeGeneration: runtimeGeneration as number
+    })
+  }
+  return bindings
 }
 
 function isExecWaitCall(toolCall: ModelToolCall): boolean {
@@ -337,6 +452,37 @@ export function normalizeToolCallNames(
  * settings, MCP annotations, terminal aliases, or machine bindings may have
  * changed since the model response was planned.
  */
+export function getToolCallRuntimeBindingDriftReason(
+  call: PlannedToolCall,
+  environment: ToolBatchPlanningEnvironment
+): string | null {
+  const bindings = call._gyshellExecution?.terminalRuntimeBindings || []
+  if (bindings.length === 0) return null
+  if (!environment.resolveTerminalRuntimeGeneration) {
+    return 'Terminal runtime binding validation is unavailable. No tool side effect was executed; re-read the current terminal inventory and replan.'
+  }
+
+  const currentTerminalIds = getTerminalIds(call, environment)
+  const expectedTerminalIds = bindings.map((binding) => binding.terminalId)
+  if (
+    currentTerminalIds.length !== expectedTerminalIds.length ||
+    expectedTerminalIds.some(
+      (terminalId) => !currentTerminalIds.includes(terminalId)
+    )
+  ) {
+    return 'A terminal selector changed after this tool batch was planned. No tool side effect was executed; re-read the current terminal inventory and replan.'
+  }
+
+  for (const binding of bindings) {
+    const currentGeneration =
+      environment.resolveTerminalRuntimeGeneration(binding.terminalId)
+    if (currentGeneration !== binding.runtimeGeneration) {
+      return `Terminal runtime terminalId=${JSON.stringify(binding.terminalId)} changed after this tool batch was planned. No tool side effect was executed; re-read the current terminal inventory and replan.`
+    }
+  }
+  return null
+}
+
 export function isParallelToolCallPrefixStillSafe(
   calls: PlannedToolCall[],
   environment: ToolBatchPlanningEnvironment
@@ -345,7 +491,9 @@ export function isParallelToolCallPrefixStillSafe(
     calls.length < 2 ||
     calls.some(
       (call) =>
-        call._gyshellExecution.mode !== 'execute' || !environment.isToolEnabled(call.name)
+        call._gyshellExecution.mode !== 'execute' ||
+        !environment.isToolEnabled(call.name) ||
+        getToolCallRuntimeBindingDriftReason(call, environment) !== null
     )
   ) {
     return false
@@ -378,15 +526,27 @@ export function planToolCallBatch(
       typeof toolCall.name === 'string' && toolCall.name.trim().length > 0
         ? toolCall.name
         : INVALID_TOOL_CALL_NAME
-    return {
+    const plannedCall = {
       ...toolCall,
       id: String(toolCall.id || ''),
       name,
-      _gyshellExecution: { ordinal, mode: 'execute' }
-    }
+    } as PlannedToolCall
+    setToolCallExecutionMetadata(plannedCall, {
+      ordinal,
+      mode: 'execute',
+    })
+    return plannedCall
   })
 
   for (const call of planned) {
+    const terminalRuntimeBindings = captureTerminalRuntimeBindings(
+      call,
+      environment
+    )
+    if (terminalRuntimeBindings.length > 0) {
+      call._gyshellExecution.terminalRuntimeBindings = terminalRuntimeBindings
+    }
+
     const integrityError = getStreamToolCallIntegrityError(call)
     if (integrityError) {
       markNotExecuted(call, integrityError.reason, {
@@ -510,7 +670,7 @@ export function planToolCallBatch(
     }
     if (call.name === 'copy_between_tabs') {
       const args = parseArgs(call.args)
-      const targetReference = normalizeNonEmptyString(args.targetTabIdOrName)
+      const targetReference = preserveOpaqueNonBlankString(args.targetTerminalId)
       const targetTerminalId = targetReference
         ? environment.resolveTerminalId(targetReference)
         : null

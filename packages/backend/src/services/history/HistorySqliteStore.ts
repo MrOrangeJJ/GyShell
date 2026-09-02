@@ -20,6 +20,7 @@ import {
   createChatTextGeometryShape,
   extractCommandOutputDisplayText,
   parseCommandOutputContractV1,
+  readOpaqueNonBlankWellFormedString,
   type ChatGeometryDeferredField,
   type CommandOutputContractV1,
   type ChatMessageGeometryMetadata,
@@ -31,6 +32,23 @@ import { openBetterSqlite3Database } from "./betterSqlite3Runtime";
 import { resolveHistoryStoragePaths } from "./historyStoragePaths";
 
 type DatabaseHandle = InstanceType<typeof import("better-sqlite3")>;
+
+const readHistorySessionId = (value: unknown): string | undefined =>
+  readOpaqueNonBlankWellFormedString(value);
+
+const requireHistorySessionId = (value: unknown): string => {
+  const sessionId = readHistorySessionId(value);
+  if (sessionId === undefined) throw new Error("Session id is required.");
+  return sessionId;
+};
+
+const requireHistorySessionIds = (value: unknown): string[] => {
+  if (!Array.isArray(value)) throw new Error("Session ids must be an array.");
+  const sessionIds = value.map((candidate) => {
+    return requireHistorySessionId(candidate);
+  });
+  return Array.from(new Set(sessionIds));
+};
 
 interface HistorySqliteStoreOptions {
   filePath?: string;
@@ -1167,6 +1185,7 @@ export class HistorySqliteStore {
   }
 
   updateUiSessionRevision(sessionId: string, uiRevision: number): boolean {
+    sessionId = requireHistorySessionId(sessionId);
     const normalizedRevision = Math.max(0, Math.floor(uiRevision));
     const result = this.db
       .prepare(
@@ -1196,6 +1215,9 @@ export class HistorySqliteStore {
   }
 
   loadChatSession(sessionId: string): StoredChatSessionRecord | null {
+    const exactSessionId = readHistorySessionId(sessionId);
+    if (exactSessionId === undefined) return null;
+    sessionId = exactSessionId;
     const row = this.db
       .prepare(
         `SELECT id, title, last_checkpoint_offset, last_profile_max_tokens, created_at, updated_at
@@ -1203,7 +1225,7 @@ export class HistorySqliteStore {
          WHERE id = ?`,
       )
       .get(sessionId) as ChatSessionRow | undefined;
-    if (!row) {
+    if (!row || row.id !== sessionId) {
       return null;
     }
 
@@ -1228,6 +1250,9 @@ export class HistorySqliteStore {
   }
 
   loadChatSessionHeader(sessionId: string): StoredChatSessionHeader | null {
+    const exactSessionId = readHistorySessionId(sessionId);
+    if (exactSessionId === undefined) return null;
+    sessionId = exactSessionId;
     const row = this.db
       .prepare(
         `SELECT chat.id, chat.title, chat.last_checkpoint_offset,
@@ -1242,7 +1267,7 @@ export class HistorySqliteStore {
       .get(sessionId) as
       | (ChatSessionRow & { messages_count: number })
       | undefined;
-    if (!row) return null;
+    if (!row || row.id !== sessionId) return null;
 
     this.backfillChatCompactionMarkers(sessionId);
     const marker = this.db
@@ -1306,6 +1331,9 @@ export class HistorySqliteStore {
     sessionId: string,
     startPosition: number,
   ): StoredChatMessageRecord[] {
+    const exactSessionId = readHistorySessionId(sessionId);
+    if (exactSessionId === undefined) return [];
+    sessionId = exactSessionId;
     const rows = this.db
       .prepare(
         `SELECT position, message_id, message_type, message_data_json,
@@ -1325,6 +1353,9 @@ export class HistorySqliteStore {
     sessionId: string,
     beforePosition: number,
   ): StoredChatMessageRecord[] {
+    const exactSessionId = readHistorySessionId(sessionId);
+    if (exactSessionId === undefined) return [];
+    sessionId = exactSessionId;
     const boundary = Math.max(0, Math.floor(beforePosition));
     if (boundary === 0) return [];
 
@@ -1396,10 +1427,15 @@ export class HistorySqliteStore {
       }
     >;
 
-    return rows.map((row) => this.toChatSessionSummary(row));
+    return rows
+      .filter((row) => readHistorySessionId(row.id) !== undefined)
+      .map((row) => this.toChatSessionSummary(row));
   }
 
   loadChatSessionSummary(sessionId: string): ChatSessionSummaryRecord | null {
+    const exactSessionId = readHistorySessionId(sessionId);
+    if (exactSessionId === undefined) return null;
+    sessionId = exactSessionId;
     // Counting through a correlated subquery keeps this on the session index
     // instead of aggregating every message row like the list query does.
     const row = this.db
@@ -1416,7 +1452,7 @@ export class HistorySqliteStore {
       | (ChatSessionRow & { messages_count: number })
       | undefined;
 
-    return row ? this.toChatSessionSummary(row) : null;
+    return row?.id === sessionId ? this.toChatSessionSummary(row) : null;
   }
 
   private toChatSessionSummary(
@@ -1442,10 +1478,12 @@ export class HistorySqliteStore {
   }
 
   saveChatSession(session: StoredChatSessionRecord): void {
+    requireHistorySessionId(session?.id);
     this.saveChatSessionWindow(session);
   }
 
   mergeChatSessionTranscript(session: StoredChatSessionRecord): void {
+    requireHistorySessionId(session?.id);
     const existingRows = this.db
       .prepare(
         `SELECT position, message_id
@@ -1613,6 +1651,7 @@ export class HistorySqliteStore {
       leadingMessages?: StoredChatMessageRecord[];
     },
   ): void {
+    requireHistorySessionId(session?.id);
     const existingCreatedAt = this.db
       .prepare("SELECT created_at FROM chat_sessions WHERE id = ?")
       .get(session.id) as { created_at: number } | undefined;
@@ -1688,6 +1727,9 @@ export class HistorySqliteStore {
     sessionId: string,
     messageIds: string[],
   ): StoredChatMessageRecord[] {
+    const exactSessionId = readHistorySessionId(sessionId);
+    if (exactSessionId === undefined) return [];
+    sessionId = exactSessionId;
     const ids = Array.from(new Set(messageIds.filter(Boolean)));
     if (ids.length === 0) return [];
     const placeholders = ids.map(() => "?").join(", ");
@@ -1708,6 +1750,7 @@ export class HistorySqliteStore {
     message: StoredChatMessageRecord,
     updatedAt: number,
   ): boolean {
+    sessionId = requireHistorySessionId(sessionId);
     const result = this.db
       .prepare(
         `UPDATE chat_session_messages
@@ -1729,9 +1772,7 @@ export class HistorySqliteStore {
   }
 
   deleteChatSessions(sessionIds: string[]): void {
-    const ids = Array.from(
-      new Set(sessionIds.filter((id) => id.trim().length > 0)),
-    );
+    const ids = requireHistorySessionIds(sessionIds);
     if (ids.length === 0) return;
     const deleteSession = this.db.prepare(
       "DELETE FROM chat_sessions WHERE id = ?",
@@ -1750,6 +1791,7 @@ export class HistorySqliteStore {
     newTitle: string,
     updatedAt: number,
   ): void {
+    sessionId = requireHistorySessionId(sessionId);
     this.db
       .prepare(
         `INSERT INTO chat_sessions (
@@ -1763,6 +1805,9 @@ export class HistorySqliteStore {
   }
 
   loadUiSession(sessionId: string): UIChatSession | null {
+    const exactSessionId = readHistorySessionId(sessionId);
+    if (exactSessionId === undefined) return null;
+    sessionId = exactSessionId;
     const row = this.db
       .prepare(
         `SELECT id, title, updated_at, messages_count, last_message_preview,
@@ -1771,7 +1816,7 @@ export class HistorySqliteStore {
          WHERE id = ?`,
       )
       .get(sessionId) as UiSessionRow | undefined;
-    if (!row) {
+    if (!row || row.id !== sessionId) {
       return null;
     }
 
@@ -1810,6 +1855,9 @@ export class HistorySqliteStore {
     startPosition: number;
     totalCount: number;
   } | null {
+    const exactSessionId = readHistorySessionId(sessionId);
+    if (exactSessionId === undefined) return null;
+    sessionId = exactSessionId;
     const row = this.db
       .prepare(
         `SELECT id, title, updated_at, messages_count, last_message_preview,
@@ -1818,7 +1866,7 @@ export class HistorySqliteStore {
          WHERE id = ?`,
       )
       .get(sessionId) as UiSessionRow | undefined;
-    if (!row) return null;
+    if (!row || row.id !== sessionId) return null;
     const safeLimit = normalizePageLimit(limit);
     const rows = (
       this.db
@@ -1848,6 +1896,9 @@ export class HistorySqliteStore {
   }
 
   getUiSessionSummary(sessionId: string): UISessionSummaryRecord | null {
+    const exactSessionId = readHistorySessionId(sessionId);
+    if (exactSessionId === undefined) return null;
+    sessionId = exactSessionId;
     const row = this.db
       .prepare(
         `SELECT id, title, updated_at, messages_count, last_message_preview,
@@ -1856,7 +1907,7 @@ export class HistorySqliteStore {
          WHERE id = ?`,
       )
       .get(sessionId) as UiSessionRow | undefined;
-    if (!row) return null;
+    if (!row || row.id !== sessionId) return null;
     return {
       id: row.id,
       title: row.title,
@@ -1871,6 +1922,9 @@ export class HistorySqliteStore {
     sessionId: string,
     request?: UiMessagePageRequest,
   ): UiMessagePage | null {
+    const exactSessionId = readHistorySessionId(sessionId);
+    if (exactSessionId === undefined) return null;
+    sessionId = exactSessionId;
     const summary = this.db
       .prepare(
         `SELECT id, messages_count, ui_revision
@@ -1880,7 +1934,7 @@ export class HistorySqliteStore {
       .get(sessionId) as
       | Pick<UiSessionRow, "id" | "messages_count" | "ui_revision">
       | undefined;
-    if (!summary) return null;
+    if (!summary || summary.id !== sessionId) return null;
 
     const limit = normalizePageLimit(request?.limit);
     let rows: UiSessionMessageProjectionRow[];
@@ -1963,6 +2017,9 @@ export class HistorySqliteStore {
   }
 
   loadUiMessageGeometryIndex(sessionId: string): UiMessageGeometryIndex | null {
+    const exactSessionId = readHistorySessionId(sessionId);
+    if (exactSessionId === undefined) return null;
+    sessionId = exactSessionId;
     const summary = this.db
       .prepare(
         `SELECT messages_count, ui_revision
@@ -1996,6 +2053,9 @@ export class HistorySqliteStore {
   }
 
   loadUiMessagesByIds(sessionId: string, messageIds: string[]): ChatMessage[] {
+    const exactSessionId = readHistorySessionId(sessionId);
+    if (exactSessionId === undefined) return [];
+    sessionId = exactSessionId;
     const ids = Array.from(new Set(messageIds.filter(Boolean)));
     if (ids.length === 0) return [];
     const placeholders = ids.map(() => "?").join(", ");
@@ -2330,6 +2390,12 @@ export class HistorySqliteStore {
     entries: Array<{ session: UIChatSession; summary: UISessionSummaryRecord }>,
   ): void {
     entries.forEach(({ session, summary }) => {
+      const sessionId = requireHistorySessionId(session?.id);
+      if (summary?.id !== sessionId) {
+        throw new Error("UI session summary id must match the session id.");
+      }
+    });
+    entries.forEach(({ session, summary }) => {
       this.saveUiSessionWindow(session, summary, 0);
     });
   }
@@ -2340,6 +2406,10 @@ export class HistorySqliteStore {
     startPosition: number,
     dirtyMessageIds?: ReadonlySet<string>,
   ): boolean {
+    const sessionId = requireHistorySessionId(session?.id);
+    if (summary?.id !== sessionId) {
+      throw new Error("UI session summary id must match the session id.");
+    }
     const normalizedStart = Math.max(0, Math.floor(startPosition));
     const upsertSession = this.db.prepare(
       `INSERT INTO ui_sessions (
@@ -2444,6 +2514,10 @@ export class HistorySqliteStore {
     summary: UISessionSummaryRecord,
     startPosition: number,
   ): void {
+    const sessionId = requireHistorySessionId(session?.id);
+    if (summary?.id !== sessionId) {
+      throw new Error("UI session summary id must match the session id.");
+    }
     const normalizedStart = Math.max(0, Math.floor(startPosition));
     const upsertSession = this.db.prepare(
       `INSERT INTO ui_sessions (
@@ -2503,6 +2577,10 @@ export class HistorySqliteStore {
     summary: UISessionSummaryRecord,
     startPosition: number,
   ): void {
+    const sessionId = requireHistorySessionId(session?.id);
+    if (summary?.id !== sessionId) {
+      throw new Error("UI session summary id must match the session id.");
+    }
     const normalizedStart = Math.max(0, Math.floor(startPosition));
     const upsertSession = this.db.prepare(
       `INSERT INTO ui_sessions (
@@ -2562,6 +2640,10 @@ export class HistorySqliteStore {
     placement: "before" | "after",
     summary: UISessionSummaryRecord,
   ): boolean {
+    sessionId = requireHistorySessionId(sessionId);
+    if (summary?.id !== sessionId) {
+      throw new Error("UI session summary id must match the session id.");
+    }
     const anchor = this.db
       .prepare(
         `SELECT position
@@ -2626,9 +2708,7 @@ export class HistorySqliteStore {
   }
 
   deleteUiSessions(sessionIds: string[]): void {
-    const ids = Array.from(
-      new Set(sessionIds.filter((id) => id.trim().length > 0)),
-    );
+    const ids = requireHistorySessionIds(sessionIds);
     if (ids.length === 0) return;
     const deleteSession = this.db.prepare(
       "DELETE FROM ui_sessions WHERE id = ?",
@@ -2643,6 +2723,7 @@ export class HistorySqliteStore {
     newTitle: string,
     updatedAt: number,
   ): void {
+    sessionId = requireHistorySessionId(sessionId);
     this.db
       .prepare(
         `UPDATE ui_sessions

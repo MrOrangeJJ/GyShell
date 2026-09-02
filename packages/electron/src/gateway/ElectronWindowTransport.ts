@@ -1,5 +1,6 @@
 import { BrowserWindow } from 'electron';
 import type { IClientTransport, GatewayEvent } from '../../../backend/src/services/Gateway/types';
+import { ELECTRON_GATEWAY_EVENT_CHANNEL } from './electronGatewayEventAdmission';
 
 /**
  * ElectronWindowTransport implements communication for local Electron windows.
@@ -47,7 +48,7 @@ export class ElectronWindowTransport implements IClientTransport {
    * Emit a Gateway event to all windows
    */
   emitEvent(event: GatewayEvent): void {
-    this.send('gateway:event', event);
+    this.send(ELECTRON_GATEWAY_EVENT_CHANNEL, event);
   }
 
   /**

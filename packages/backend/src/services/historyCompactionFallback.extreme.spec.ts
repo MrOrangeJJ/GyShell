@@ -41,9 +41,14 @@ const runCase = async (
 
 class FakeTerminalService {
   createdLocalTerminals = 0;
-  private localTerminalId = "local-main";
+  private localTerminalId: string;
 
-  constructor(private hasLocalTerminal: boolean = true) {}
+  constructor(
+    private hasLocalTerminal: boolean = true,
+    localTerminalId: string = "local-main",
+  ) {
+    this.localTerminalId = localTerminalId;
+  }
 
   getDisplayTerminals(): any[] {
     if (!this.hasLocalTerminal) return [];
@@ -232,6 +237,7 @@ const seedUiHistory = (
 
 const createAgentHarness = (options?: {
   hasLocalTerminal?: boolean;
+  localTerminalId?: string;
   omitProtectedAnchor?: boolean;
 }): {
   agent: AgentService_v2;
@@ -255,6 +261,7 @@ const createAgentHarness = (options?: {
 
   const terminalService = new FakeTerminalService(
     options?.hasLocalTerminal !== false,
+    options?.localTerminalId,
   );
 
   const agent = new AgentService_v2(
@@ -1832,6 +1839,66 @@ await runCase(
 );
 
 await runCase(
+  "zero-retention recovery preserves an opaque local terminal ID",
+  async () => {
+    const localTerminalId = " local-main ";
+    const { agent, cleanup } = createAgentHarness({ localTerminalId });
+    try {
+      const messages = makeMessages().map((message, index) =>
+        index === 8
+          ? makeUser(
+              "backend-user-4",
+              `fourth protected request ${"q".repeat(80_000)}`,
+            )
+          : message,
+      );
+      forceOrdinaryCompactionFailure(agent);
+
+      const result = await (agent as any).tryCompactHistory(
+        "session-1",
+        messages,
+        undefined,
+        { maxTokens: 15_000 },
+      );
+      const marker = result.messages[result.messages.length - 1] as any;
+      assert.equal(
+        marker.additional_kwargs?.zero_retention_local_terminal_id,
+        localTerminalId,
+      );
+
+      const active = (agent as any).findActiveZeroRetentionRecovery(
+        "session-1",
+        result.messages,
+      );
+      assert.ok(active);
+      assert.equal(active.localTerminalId, localTerminalId);
+
+      marker.additional_kwargs.zero_retention_local_terminal_id = "local-main";
+      assert.equal(
+        (agent as any).findActiveZeroRetentionRecovery(
+          "session-1",
+          result.messages,
+        ),
+        null,
+        "a whitespace-distinct terminal ID must not match the active terminal",
+      );
+
+      marker.additional_kwargs.zero_retention_local_terminal_id = "   ";
+      assert.equal(
+        (agent as any).findActiveZeroRetentionRecovery(
+          "session-1",
+          result.messages,
+        ),
+        null,
+        "an explicitly malformed terminal ID must not fall back to the current terminal",
+      );
+    } finally {
+      cleanup();
+    }
+  },
+);
+
+await runCase(
   "ordinary compaction model is attempted without a local summary-request gate",
   async () => {
     const { agent, cleanup } = createAgentHarness();
@@ -1923,7 +1990,7 @@ await runCase(
               id,
               name: "read_file",
               args: {
-                tabIdOrName: "local-main",
+                terminalId: "local-main",
                 filePath,
                 offset,
                 limit,
@@ -2111,6 +2178,103 @@ await runCase(
 );
 
 await runCase(
+  "zero-retention recovery history accepts only an exact canonical terminalId",
+  () => {
+    const { agent, cleanup } = createAgentHarness();
+    try {
+      const filePath = "/tmp/managed-zero-retention.md";
+      const readCall = (
+        id: string,
+        args: Record<string, unknown>,
+      ): AIMessage =>
+        new AIMessage({
+          content: "",
+          tool_calls: [{ id, name: "read_file", args }],
+          additional_kwargs: makeId(`assistant-${id}`),
+        });
+      const marker = new HumanMessage("zero marker");
+      const canonicalCall = readCall("canonical-read", {
+        terminalId: "local-main",
+        filePath,
+        offset: 0,
+        limit: 1,
+      });
+      const legacyCall = readCall("legacy-read", {
+        tabIdOrName: "local-main",
+        filePath,
+        offset: 0,
+        limit: 1,
+      });
+      const whitespaceDistinctCall = readCall("whitespace-read", {
+        terminalId: " local-main ",
+        filePath,
+        offset: 0,
+        limit: 1,
+      });
+
+      assert.equal(
+        (agent as any).isZeroRetentionRecoveryOnlyTail(
+          [marker, canonicalCall],
+          0,
+          filePath,
+          "local-main",
+        ),
+        true,
+      );
+      assert.equal(
+        (agent as any).isZeroRetentionRecoveryOnlyTail(
+          [marker, legacyCall],
+          0,
+          filePath,
+          "local-main",
+        ),
+        false,
+        "durable recovery parsing must not create a second legacy selector migration path",
+      );
+      assert.equal(
+        (agent as any).isZeroRetentionRecoveryOnlyTail(
+          [marker, whitespaceDistinctCall],
+          0,
+          filePath,
+          "local-main",
+        ),
+        false,
+        "canonical terminal identity must remain byte-for-byte exact",
+      );
+
+      const legacyResult = new ToolMessage({
+        content: [
+          "<file>",
+          "00001| legacy selector must not advance recovery",
+          "",
+          "(End of file - total 1 lines)",
+          "</file>",
+        ].join("\n"),
+        name: "read_file",
+        tool_call_id: "legacy-read",
+      } as any);
+      const progress = (agent as any).resolveZeroRetentionReadProgress(
+        [marker, legacyCall, legacyResult, new AIMessage("durable state")],
+        {
+          markerIndex: 0,
+          filePath,
+          localTerminalId: "local-main",
+          physicalLineCount: 1,
+          progressDigest: "",
+          resumeAfterLine: 0,
+          recommendedReadLimit: 1,
+          historyReadComplete: false,
+        },
+      );
+      assert.equal(progress.resumeAfterLine, 0);
+      assert.equal(progress.historyReadComplete, false);
+    } finally {
+      cleanup();
+    }
+  },
+);
+
+await runCase(
   "zero-retention frontier accepts only a verified opaque wrapped-line jump",
   () => {
     const { agent, cleanup } = createAgentHarness();
@@ -2124,7 +2288,7 @@ await runCase(
               id,
               name: "read_file",
               args: {
-                tabIdOrName: "local-main",
+                terminalId: "local-main",
                 filePath,
                 offset,
                 limit: 1,

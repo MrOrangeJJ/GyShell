@@ -40,10 +40,12 @@ import {
 } from "./terminalRecovery";
 import { isRuntimeOwnedByUi } from "./runtimeOwnership";
 import {
+  admitFileSystemPanelDragPayload,
+  extractNativeDropFilePaths,
+  getFileSystemPanelDragPayloadPaths,
   getNativeFilePathResolver,
   hasFileSystemPanelDragPayloadType,
   hasNativeFileDragType,
-  resolveTerminalDropPathsForTarget,
 } from "../../lib/filesystemDragDrop";
 import {
   resolveTerminalWindowsPty,
@@ -114,6 +116,7 @@ interface XTermViewProps {
   remoteOs?: TerminalRemoteOs;
   systemInfo?: TerminalSystemInfoLike;
   isOwnedByUi?: () => boolean;
+  supportsFilesystem: boolean;
   isActive?: boolean;
   layoutSignature?: string;
   onSelectionChange?: (selectionText: string) => void;
@@ -133,6 +136,7 @@ interface TerminalRuntime {
   selectionHandler?: (selectionText: string) => void;
   settings?: TerminalSettings;
   uiOwnershipCheck?: () => boolean;
+  supportsFilesystem: boolean;
   isActive: boolean;
   hostEl: HTMLDivElement | null;
   refCount: number;
@@ -400,6 +404,7 @@ const createRuntime = (
   config: TerminalConfig,
   theme: ITheme,
   settings: TerminalSettings | undefined,
+  supportsFilesystem: boolean,
   remoteOs?: TerminalRemoteOs,
   systemInfo?: TerminalSystemInfoLike,
 ): TerminalRuntime => {
@@ -452,6 +457,7 @@ const createRuntime = (
     selectionHandler: undefined,
     settings,
     uiOwnershipCheck: undefined,
+    supportsFilesystem,
     isActive: false,
     hostEl: null,
     refCount: 0,
@@ -544,11 +550,33 @@ const createRuntime = (
     if (!isFileDrop) return;
     event.preventDefault();
     event.stopPropagation();
-    const paths = resolveTerminalDropPathsForTarget(
+    const filesystemAdmission = admitFileSystemPanelDragPayload(
       event.dataTransfer,
-      config.id,
-      getNativeFilePathResolver(),
     );
+    let paths: string[];
+    if (filesystemAdmission.kind === "absent") {
+      paths = extractNativeDropFilePaths(
+        event.dataTransfer,
+        getNativeFilePathResolver(),
+      );
+    } else {
+      const sourceIsCurrentlyOwned = (() => {
+        try {
+          return runtime.uiOwnershipCheck?.() === true;
+        } catch {
+          return false;
+        }
+      })();
+      if (
+        filesystemAdmission.kind === "rejected" ||
+        filesystemAdmission.payload.sourceTerminalId !== config.id ||
+        runtime.supportsFilesystem !== true ||
+        !sourceIsCurrentlyOwned
+      ) {
+        return;
+      }
+      paths = getFileSystemPanelDragPayloadPaths(filesystemAdmission.payload);
+    }
     if (!paths.length) return;
     window.gyshell.terminal.writePaths(config.id, paths).catch(() => {
       // ignore
@@ -1195,18 +1223,27 @@ const acquireRuntime = (
   config: TerminalConfig,
   theme: ITheme,
   settings: TerminalSettings | undefined,
+  supportsFilesystem: boolean,
   uiOwnershipCheck?: () => boolean,
   remoteOs?: TerminalRemoteOs,
   systemInfo?: TerminalSystemInfoLike,
 ): TerminalRuntime => {
   let runtime = runtimePool.get(config.id);
   if (!runtime) {
-    runtime = createRuntime(config, theme, settings, remoteOs, systemInfo);
+    runtime = createRuntime(
+      config,
+      theme,
+      settings,
+      supportsFilesystem,
+      remoteOs,
+      systemInfo,
+    );
     runtimePool.set(config.id, runtime);
   }
   if (uiOwnershipCheck) {
     runtime.uiOwnershipCheck = uiOwnershipCheck;
   }
+  runtime.supportsFilesystem = supportsFilesystem;
   runtime.refCount += 1;
   clearTimer(runtime.releaseTimer);
   runtime.releaseTimer = null;
@@ -1515,6 +1552,7 @@ export const XTermView = React.forwardRef<XTermSearchHandle, XTermViewProps>(
         props.config,
         props.theme,
         props.terminalSettings,
+        props.supportsFilesystem,
         props.isOwnedByUi,
         props.remoteOs,
         props.systemInfo,
@@ -1651,7 +1689,8 @@ export const XTermView = React.forwardRef<XTermSearchHandle, XTermViewProps>(
       const runtime = runtimeRef.current;
       if (!runtime) return;
       runtime.uiOwnershipCheck = props.isOwnedByUi;
-    }, [props.isOwnedByUi, props.config.id]);
+      runtime.supportsFilesystem = props.supportsFilesystem;
+    }, [props.isOwnedByUi, props.supportsFilesystem, props.config.id]);
 
     useEffect(() => {
       const runtime = runtimeRef.current;

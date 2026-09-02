@@ -8,6 +8,11 @@ import React, {
 import { createPortal } from "react-dom";
 import { observer } from "mobx-react-lite";
 import { X } from "lucide-react";
+import {
+  encodePassChatMentionToken,
+  parsePassChatMentionToken,
+  readOpaqueNonBlankWellFormedString,
+} from "@gyshell/shared";
 import { AppStore } from "../../stores/AppStore";
 import {
   createImagePreviewDataUrl,
@@ -18,10 +23,11 @@ import {
   type InputImageAttachment,
 } from "../../lib/userInput";
 import {
+  admitFileSystemPanelDragPayload,
   encodeTerminalScopedFilePath,
   getFileMentionDisplayName,
   getNativeFilePathResolver,
-  parseFileSystemPanelDragPayload,
+  type FileSystemPanelDragPayload,
   resolveNativeFilePath,
 } from "../../lib/filesystemDragDrop";
 import {
@@ -94,6 +100,9 @@ type MentionSuggestionAnchorRect = {
   height: number;
 };
 
+const MENTION_TOKEN_REGEX =
+  /(\[MENTION_(?:(?:SKILL|TAB|FILE|IMAGE|PASS_CHAT):#.+?#(?:#.+?#)?|PASS_CHAT_V2:#[^#\r\n]+#)\])/g;
+
 const toMentionSuggestionAnchorRect = (
   rect: Pick<DOMRect, "left" | "top" | "width" | "height">,
 ): MentionSuggestionAnchorRect => ({
@@ -131,11 +140,95 @@ const getMentionTagClassName = (type: RichMentionItem["type"]): string => {
   return `mention-tag mention-${type}`;
 };
 
-const decodeMentionComponent = (value: string): string => {
-  try {
-    return decodeURIComponent(value);
-  } catch {
-    return value;
+const appendRestoredMentionToken = (
+  editor: HTMLElement,
+  token: string,
+): boolean => {
+  const skillMatch = token.match(/^\[MENTION_SKILL:#(.+?)#\]$/);
+  if (skillMatch) {
+    const span = document.createElement("span");
+    span.className = getMentionTagClassName("skill");
+    span.contentEditable = "false";
+    span.dataset.type = "skill";
+    span.dataset.name = skillMatch[1];
+    setMentionDisplayText(span, `@${skillMatch[1]}`);
+    editor.appendChild(span);
+    return true;
+  }
+
+  const terminalMatch = token.match(
+    /^\[MENTION_TAB:#(.+?)##(.+?)#\]$/,
+  );
+  if (terminalMatch) {
+    const span = document.createElement("span");
+    span.className = getMentionTagClassName("terminal");
+    span.contentEditable = "false";
+    span.dataset.type = "terminal";
+    span.dataset.name = terminalMatch[1];
+    span.dataset.id = terminalMatch[2];
+    setMentionDisplayText(span, `@${terminalMatch[1]}`);
+    editor.appendChild(span);
+    return true;
+  }
+
+  const fileMatch = token.match(/^\[MENTION_FILE:#(.+?)#\]$/);
+  if (fileMatch) {
+    const span = document.createElement("span");
+    span.className = getMentionTagClassName("file");
+    span.contentEditable = "false";
+    span.dataset.type = "file";
+    span.dataset.name = fileMatch[1];
+    setMentionDisplayText(
+      span,
+      getFileMentionDisplayName(fileMatch[1]) || fileMatch[1],
+    );
+    editor.appendChild(span);
+    return true;
+  }
+
+  const imageMatch = token.match(
+    /^\[MENTION_IMAGE:#(.+?)(?:##(.+?))?#\]$/,
+  );
+  if (imageMatch) {
+    const span = document.createElement("span");
+    span.className = getMentionTagClassName("file");
+    span.contentEditable = "false";
+    span.dataset.type = "file";
+    span.dataset.name = imageMatch[1];
+    setMentionDisplayText(
+      span,
+      imageMatch[2] ||
+        getFileMentionDisplayName(imageMatch[1]) ||
+        imageMatch[1],
+    );
+    editor.appendChild(span);
+    return true;
+  }
+
+  const passChat = parsePassChatMentionToken(token);
+  if (!passChat) return false;
+  const span = document.createElement("span");
+  span.className = getMentionTagClassName("pass-chat");
+  span.contentEditable = "false";
+  span.dataset.type = "pass-chat";
+  span.dataset.id = passChat.sessionId;
+  span.dataset.name = passChat.title || "Chat";
+  setMentionDisplayText(span, `@Pass Chat: ${span.dataset.name}`);
+  editor.appendChild(span);
+  return true;
+};
+
+const restoreRichInputText = (editor: HTMLElement, value: string): void => {
+  const parts = value.split(MENTION_TOKEN_REGEX);
+  editor.innerHTML = "";
+  for (const part of parts) {
+    if (appendRestoredMentionToken(editor, part)) continue;
+    if (!part) continue;
+    editor.appendChild(
+      document.createTextNode(
+        part.replace(/\u00A0/g, " ").replace(/\uFEFF/g, ""),
+      ),
+    );
   }
 };
 
@@ -529,17 +622,21 @@ export const RichInput = observer(
           const history =
             (await store.chat.getAllChatHistory()) as StoredChatHistorySummary[];
           if (passChatLoadRequestRef.current !== requestId) return;
-          const nextSuggestions = history
-            .filter((session) => String(session?.id || "").trim().length > 0)
-            .map((session) => ({
+          const nextSuggestions = history.map((session) => {
+            const sessionId = readOpaqueNonBlankWellFormedString(session?.id);
+            if (sessionId === undefined) {
+              throw new Error("Chat history returned an invalid session id.");
+            }
+            return {
               type: "pass-chat" as const,
-              id: session.id,
+              id: sessionId,
               name:
                 String(session.title || "")
                   .replace(/\s+/g, " ")
                   .trim() || "Untitled Chat",
               preview: formatPassChatMeta(session),
-            }));
+            };
+          });
           setSuggestions(nextSuggestions);
           setSelectedIndex(0);
         } catch (error) {
@@ -733,7 +830,9 @@ export const RichInput = observer(
               } else if (type === "file") {
                 result += `[MENTION_FILE:#${name}#]`;
               } else if (type === "pass-chat" && id) {
-                result += `[MENTION_PASS_CHAT:#${id}##${encodeURIComponent(name || "Chat")}#]`;
+                result +=
+                  encodePassChatMentionToken(id, name || "Chat") ||
+                  `@Pass Chat: ${name || "Chat"}`;
               }
             } else if (el.tagName === "BR") {
               result += "\n";
@@ -758,88 +857,7 @@ export const RichInput = observer(
         getValue: () => serialize(),
         setValue: (val: string) => {
           if (editorRef.current) {
-            // Parser for [MENTION_XXX:#...#] labels to restore them as rich DOM nodes
-            const parts = val.split(
-              /(\[MENTION_(?:SKILL|TAB|FILE|IMAGE|PASS_CHAT):#.+?#(?:#.+?#)?\])/g,
-            );
-            editorRef.current.innerHTML = "";
-
-            parts.forEach((part) => {
-              const skillMatch = part.match(/\[MENTION_SKILL:#(.+?)#\]/);
-              const terminalMatch = part.match(
-                /\[MENTION_TAB:#(.+?)##(.+?)#\]/,
-              );
-              const passChatMatch = part.match(
-                /\[MENTION_PASS_CHAT:#(.+?)(?:##(.+?))?#\]/,
-              );
-
-              if (skillMatch) {
-                const span = document.createElement("span");
-                span.className = getMentionTagClassName("skill");
-                span.contentEditable = "false";
-                span.dataset.type = "skill";
-                span.dataset.name = skillMatch[1];
-                setMentionDisplayText(span, `@${skillMatch[1]}`);
-                editorRef.current?.appendChild(span);
-              } else if (terminalMatch) {
-                const span = document.createElement("span");
-                span.className = getMentionTagClassName("terminal");
-                span.contentEditable = "false";
-                span.dataset.type = "terminal";
-                span.dataset.name = terminalMatch[1];
-                span.dataset.id = terminalMatch[2];
-                setMentionDisplayText(span, `@${terminalMatch[1]}`);
-                editorRef.current?.appendChild(span);
-              } else if (part.match(/\[MENTION_FILE:#(.+?)#\]/)) {
-                const fileMatch = part.match(/\[MENTION_FILE:#(.+?)#\]/);
-                if (fileMatch) {
-                  const span = document.createElement("span");
-                  span.className = getMentionTagClassName("file");
-                  span.contentEditable = "false";
-                  span.dataset.type = "file";
-                  span.dataset.name = fileMatch[1];
-                  // Extract only the file/folder name for display
-                  const fileName =
-                    getFileMentionDisplayName(fileMatch[1]) || fileMatch[1];
-                  setMentionDisplayText(span, fileName);
-                  editorRef.current?.appendChild(span);
-                }
-              } else if (passChatMatch) {
-                const span = document.createElement("span");
-                span.className = getMentionTagClassName("pass-chat");
-                span.contentEditable = "false";
-                span.dataset.type = "pass-chat";
-                span.dataset.id = passChatMatch[1];
-                span.dataset.name = passChatMatch[2]
-                  ? decodeMentionComponent(passChatMatch[2])
-                  : "Chat";
-                setMentionDisplayText(span, `@Pass Chat: ${span.dataset.name}`);
-                editorRef.current?.appendChild(span);
-              } else if (part.match(/\[MENTION_IMAGE:#(.+?)(?:##(.+?))?#\]/)) {
-                const imageMatch = part.match(
-                  /\[MENTION_IMAGE:#(.+?)(?:##(.+?))?#\]/,
-                );
-                if (imageMatch) {
-                  const span = document.createElement("span");
-                  span.className = getMentionTagClassName("file");
-                  span.contentEditable = "false";
-                  span.dataset.type = "file";
-                  span.dataset.name = imageMatch[1];
-                  const imageName =
-                    imageMatch[2] ||
-                    getFileMentionDisplayName(imageMatch[1]) ||
-                    imageMatch[1];
-                  setMentionDisplayText(span, imageName);
-                  editorRef.current?.appendChild(span);
-                }
-              } else if (part) {
-                editorRef.current?.appendChild(
-                  document.createTextNode(
-                    part.replace(/\u00A0/g, " ").replace(/\uFEFF/g, ""),
-                  ),
-                );
-              }
-            });
+            restoreRichInputText(editorRef.current, val);
           }
           updateImageAttachments(() => []);
         },
@@ -851,85 +869,7 @@ export const RichInput = observer(
           const nextText = typeof draft?.text === "string" ? draft.text : "";
           const nextImages = Array.isArray(draft?.images) ? draft.images : [];
           if (editorRef.current) {
-            // Reuse token parser to restore text mentions.
-            const parts = nextText.split(
-              /(\[MENTION_(?:SKILL|TAB|FILE|IMAGE|PASS_CHAT):#.+?#(?:#.+?#)?\])/g,
-            );
-            editorRef.current.innerHTML = "";
-            parts.forEach((part) => {
-              const skillMatch = part.match(/\[MENTION_SKILL:#(.+?)#\]/);
-              const terminalMatch = part.match(
-                /\[MENTION_TAB:#(.+?)##(.+?)#\]/,
-              );
-              const passChatMatch = part.match(
-                /\[MENTION_PASS_CHAT:#(.+?)(?:##(.+?))?#\]/,
-              );
-              if (skillMatch) {
-                const span = document.createElement("span");
-                span.className = getMentionTagClassName("skill");
-                span.contentEditable = "false";
-                span.dataset.type = "skill";
-                span.dataset.name = skillMatch[1];
-                setMentionDisplayText(span, `@${skillMatch[1]}`);
-                editorRef.current?.appendChild(span);
-              } else if (terminalMatch) {
-                const span = document.createElement("span");
-                span.className = getMentionTagClassName("terminal");
-                span.contentEditable = "false";
-                span.dataset.type = "terminal";
-                span.dataset.name = terminalMatch[1];
-                span.dataset.id = terminalMatch[2];
-                setMentionDisplayText(span, `@${terminalMatch[1]}`);
-                editorRef.current?.appendChild(span);
-              } else if (part.match(/\[MENTION_FILE:#(.+?)#\]/)) {
-                const fileMatch = part.match(/\[MENTION_FILE:#(.+?)#\]/);
-                if (fileMatch) {
-                  const span = document.createElement("span");
-                  span.className = getMentionTagClassName("file");
-                  span.contentEditable = "false";
-                  span.dataset.type = "file";
-                  span.dataset.name = fileMatch[1];
-                  const fileName =
-                    getFileMentionDisplayName(fileMatch[1]) || fileMatch[1];
-                  setMentionDisplayText(span, fileName);
-                  editorRef.current?.appendChild(span);
-                }
-              } else if (passChatMatch) {
-                const span = document.createElement("span");
-                span.className = getMentionTagClassName("pass-chat");
-                span.contentEditable = "false";
-                span.dataset.type = "pass-chat";
-                span.dataset.id = passChatMatch[1];
-                span.dataset.name = passChatMatch[2]
-                  ? decodeMentionComponent(passChatMatch[2])
-                  : "Chat";
-                setMentionDisplayText(span, `@Pass Chat: ${span.dataset.name}`);
-                editorRef.current?.appendChild(span);
-              } else if (part.match(/\[MENTION_IMAGE:#(.+?)(?:##(.+?))?#\]/)) {
-                const imageMatch = part.match(
-                  /\[MENTION_IMAGE:#(.+?)(?:##(.+?))?#\]/,
-                );
-                if (imageMatch) {
-                  const span = document.createElement("span");
-                  span.className = getMentionTagClassName("file");
-                  span.contentEditable = "false";
-                  span.dataset.type = "file";
-                  span.dataset.name = imageMatch[1];
-                  const imageName =
-                    imageMatch[2] ||
-                    getFileMentionDisplayName(imageMatch[1]) ||
-                    imageMatch[1];
-                  setMentionDisplayText(span, imageName);
-                  editorRef.current?.appendChild(span);
-                }
-              } else if (part) {
-                editorRef.current?.appendChild(
-                  document.createTextNode(
-                    part.replace(/\u00A0/g, " ").replace(/\uFEFF/g, ""),
-                  ),
-                );
-              }
-            });
+            restoreRichInputText(editorRef.current, nextText);
           }
           updateImageAttachments(() => {
             const mapped = nextImages
@@ -1161,9 +1101,8 @@ export const RichInput = observer(
       };
 
       const handleFileSystemPanelDrop = async (
-        payload: ReturnType<typeof parseFileSystemPanelDragPayload>,
+        payload: FileSystemPanelDragPayload,
       ): Promise<void> => {
-        if (!payload) return;
         const sourceTerminal =
           store.terminalTabs.find(
             (tab) => tab.id === payload.sourceTerminalId,
@@ -1235,11 +1174,16 @@ export const RichInput = observer(
 
       const handleDrop = (e: React.DragEvent) => {
         e.preventDefault();
-        const filesystemPayload = parseFileSystemPanelDragPayload(
+        const filesystemAdmission = admitFileSystemPanelDragPayload(
           e.dataTransfer,
         );
-        if (filesystemPayload) {
-          void handleFileSystemPanelDrop(filesystemPayload);
+        if (filesystemAdmission.kind !== "absent") {
+          if (filesystemAdmission.kind === "rejected") return;
+          const sourceTerminal = store.terminalTabs.find(
+            (tab) => tab.id === filesystemAdmission.payload.sourceTerminalId,
+          );
+          if (sourceTerminal?.capabilities?.supportsFilesystem !== true) return;
+          void handleFileSystemPanelDrop(filesystemAdmission.payload);
           return;
         }
         const files = Array.from(e.dataTransfer.files);

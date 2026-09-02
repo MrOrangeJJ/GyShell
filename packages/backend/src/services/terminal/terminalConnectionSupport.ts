@@ -1,7 +1,7 @@
 import {
-  COMMAND_OUTPUT_IDENTIFIER_MAX_UTF8_BYTES,
   getTerminalConnectionCapabilities,
   getTerminalConnectionTypeDefinition,
+  isValidTerminalRuntimeId as isValidSharedTerminalRuntimeId,
 } from '@gyshell/shared'
 import { createHmac, randomBytes } from 'node:crypto'
 import { v4 as uuidv4 } from 'uuid'
@@ -58,12 +58,9 @@ const asPositiveInt = (value: unknown, fallback: number): number => {
 const isObject = (value: unknown): value is Record<string, unknown> =>
   typeof value === 'object' && value !== null
 
-export const isValidTerminalRuntimeId = (value: unknown): value is string =>
-  typeof value === 'string' &&
-  value.length > 0 &&
-  !/[\u0000-\u001f\u007f]/.test(value) &&
-  Buffer.byteLength(value, 'utf8') <=
-    COMMAND_OUTPUT_IDENTIFIER_MAX_UTF8_BYTES
+// Keep this compatibility export for backend callers while the shape contract
+// itself lives in the shared package used by renderer and Electron adapters.
+export const isValidTerminalRuntimeId = isValidSharedTerminalRuntimeId
 
 const resolveRequestedTerminalType = (value: unknown): string => {
   if (typeof value !== 'string') {
@@ -96,7 +93,9 @@ export const createAutoTerminalConfig = (
       typeof partial.id === 'string' &&
       partial.id.trim().length > 0
     ) {
-      return partial.id.trim()
+      // The ID is an opaque identity. The trim check only rejects blank input;
+      // preserve legal leading/trailing whitespace byte-for-byte.
+      return partial.id
     }
     const base =
       requestedType === 'local' ? Math.max(2, typeCount + 1) : typeCount + 1
@@ -211,7 +210,10 @@ export const normalizePersistedTerminalConfig = (
   const type = typeof raw.type === 'string' ? raw.type.trim() : ''
   if (!type) return null
 
-  const id = typeof raw.id === 'string' ? raw.id.trim() : ''
+  // Do not normalize an opaque terminal ID while loading persisted state.
+  // Whitespace is checked by isValidTerminalRuntimeId, but remains part of the
+  // identity when it is otherwise valid.
+  const id = typeof raw.id === 'string' ? raw.id : ''
   const title = typeof raw.title === 'string' ? raw.title.trim() : ''
   if (!isValidTerminalRuntimeId(id) || !title) return null
 

@@ -1,5 +1,6 @@
 import { EventEmitter } from 'events'
 import { v4 as uuidv4 } from 'uuid'
+import { readOpaqueNonBlankWellFormedString } from '@gyshell/shared'
 import type {
   FileSystemService,
   FileTransferConflictStrategy,
@@ -7,7 +8,10 @@ import type {
   TransferEntriesResult,
 } from './FileSystemService'
 import { isFileSystemTransferCancelledError } from './FileSystemService'
-import type { TerminalService } from './TerminalService'
+import type {
+  TerminalRuntimeGuard,
+  TerminalService
+} from './TerminalService'
 
 const DEFAULT_TRANSFER_CONCURRENCY = 2
 const COMPLETED_TRANSFER_RETENTION_MS = 15 * 60 * 1000
@@ -69,6 +73,10 @@ export interface StartFileTransferInput {
   agentRunId?: string
   toolMessageId?: string
   onSettled?: (task: FileTransferTaskSnapshot) => void
+  /** Internal execution metadata; never copied into task snapshots or transport payloads. */
+  sourceRuntimeGuard?: TerminalRuntimeGuard
+  /** Internal execution metadata; never copied into task snapshots or transport payloads. */
+  targetRuntimeGuard?: TerminalRuntimeGuard
 }
 
 export interface ListFileTransfersOptions {
@@ -85,6 +93,8 @@ interface FileTransferTaskInternal {
   allowPeerDirect: boolean
   chunkSize?: number
   onSettled?: (task: FileTransferTaskSnapshot) => void
+  sourceRuntimeGuard?: TerminalRuntimeGuard
+  targetRuntimeGuard?: TerminalRuntimeGuard
   cleanupTimer?: ReturnType<typeof setTimeout>
   runSlotAcquired?: boolean
   runSlotReleased?: boolean
@@ -98,6 +108,27 @@ const TERMINAL_STATUSES = new Set<FileTransferTaskStatus>([
   'error',
   'cancelled',
 ])
+
+const readOptionalFileTransferSessionId = (
+  value: unknown,
+): string | undefined => {
+  if (value === undefined) return undefined
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    throw new Error('File transfer input must be an object.')
+  }
+  if (!Object.prototype.hasOwnProperty.call(value, 'sessionId')) {
+    return undefined
+  }
+  const sessionId = readOpaqueNonBlankWellFormedString(
+    (value as Record<string, unknown>).sessionId,
+  )
+  if (sessionId === undefined) {
+    throw new Error(
+      'Session id must be a non-blank, well-formed string when provided.',
+    )
+  }
+  return sessionId
+}
 
 export class FileTransferService extends EventEmitter {
   private readonly tasks = new Map<string, FileTransferTaskInternal>()
@@ -124,6 +155,7 @@ export class FileTransferService extends EventEmitter {
     input: StartFileTransferInput,
     options?: { allowPeerDirect?: boolean },
   ): FileTransferTaskSnapshot {
+    const sessionId = readOptionalFileTransferSessionId(input)
     const sourcePaths = this.normalizeSourcePaths(input.sourcePaths)
     const targetDirPath = this.normalizeTargetDirPath(input.targetDirPath)
     const mode = input.mode === 'move' ? 'move' : 'copy'
@@ -131,12 +163,28 @@ export class FileTransferService extends EventEmitter {
       input.conflictStrategy,
       input.overwrite,
     )
+    const sourceRuntimeGuard = this.resolveRuntimeGuard(
+      input.sourceTerminalId,
+      input.sourceRuntimeGuard
+    )
+    const targetRuntimeGuard = this.resolveRuntimeGuard(
+      input.targetTerminalId,
+      input.targetRuntimeGuard
+    )
     const sourceTerminal = this.resolveTerminalSummary(input.sourceTerminalId)
     const targetTerminal = this.resolveTerminalSummary(input.targetTerminalId)
     const sourceMachineIdentity =
-      this.terminalService.getTransferMachineIdentity(input.sourceTerminalId)
+      this.terminalService.getTransferMachineIdentity(
+        input.sourceTerminalId,
+        sourceRuntimeGuard,
+        { requireActive: true }
+      )
     const targetMachineIdentity =
-      this.terminalService.getTransferMachineIdentity(input.targetTerminalId)
+      this.terminalService.getTransferMachineIdentity(
+        input.targetTerminalId,
+        targetRuntimeGuard,
+        { requireActive: true }
+      )
 
     if (!sourceMachineIdentity) {
       throw new Error(
@@ -191,7 +239,7 @@ export class FileTransferService extends EventEmitter {
       cancelRequested: false,
       createdAt: now,
       updatedAt: now,
-      ...(input.sessionId ? { sessionId: input.sessionId } : {}),
+      ...(sessionId !== undefined ? { sessionId } : {}),
       ...(input.agentRunId ? { agentRunId: input.agentRunId } : {}),
       ...(input.toolMessageId ? { toolMessageId: input.toolMessageId } : {}),
     }
@@ -203,6 +251,8 @@ export class FileTransferService extends EventEmitter {
         options?.allowPeerDirect === true && input.origin === 'user',
       chunkSize: input.chunkSize,
       onSettled: input.onSettled,
+      sourceRuntimeGuard,
+      targetRuntimeGuard,
     })
     this.queue.push(id)
     this.publishTask(snapshot)
@@ -218,6 +268,7 @@ export class FileTransferService extends EventEmitter {
   listTransfers(
     options?: ListFileTransfersOptions,
   ): FileTransferTaskSnapshot[] {
+    const sessionId = readOptionalFileTransferSessionId(options)
     return Array.from(this.tasks.values())
       .map((task) => task.snapshot)
       .filter((task) => {
@@ -234,7 +285,7 @@ export class FileTransferService extends EventEmitter {
         ) {
           return false
         }
-        if (options?.sessionId && task.sessionId !== options.sessionId) {
+        if (sessionId !== undefined && task.sessionId !== sessionId) {
           return false
         }
         if (options?.agentRunId && task.agentRunId !== options.agentRunId) {
@@ -326,6 +377,8 @@ export class FileTransferService extends EventEmitter {
           transferId: task.snapshot.id,
           allowPeerDirect: task.allowPeerDirect,
           signal: task.controller.signal,
+          sourceRuntimeGuard: task.sourceRuntimeGuard,
+          targetRuntimeGuard: task.targetRuntimeGuard,
           onProgress: (progress) => {
             if (this.isTaskTerminal(taskId)) return
             const totalBytes = Math.max(0, Number(progress.totalBytes) || 0)
@@ -512,6 +565,49 @@ export class FileTransferService extends EventEmitter {
     task.cleanupTimer.unref?.()
   }
 
+  private resolveRuntimeGuard(
+    terminalId: string,
+    suppliedGuard: TerminalRuntimeGuard | undefined
+  ): TerminalRuntimeGuard | undefined {
+    const getFilesystemRuntime = (this.terminalService as Partial<
+      Pick<TerminalService, 'getTerminalFilesystemRuntime'>
+    >).getTerminalFilesystemRuntime
+    if (typeof getFilesystemRuntime === 'function') {
+      return getFilesystemRuntime.call(
+        this.terminalService,
+        terminalId,
+        suppliedGuard,
+        'file transfer queue admission'
+      ).runtimeGuard
+    }
+
+    const createRuntimeGuard = (this.terminalService as Partial<
+      Pick<TerminalService, 'createTerminalRuntimeGuard'>
+    >).createTerminalRuntimeGuard
+    const assertRuntimeGuard = (this.terminalService as Partial<
+      Pick<TerminalService, 'assertTerminalRuntimeGuard'>
+    >).assertTerminalRuntimeGuard
+    if (suppliedGuard) {
+      if (suppliedGuard.terminalId !== terminalId) {
+        throw new Error(
+          `Terminal runtime guard ${JSON.stringify(suppliedGuard.terminalId)} cannot authorize transfer terminal ${JSON.stringify(terminalId)}.`
+        )
+      }
+      if (typeof assertRuntimeGuard !== 'function') {
+        throw new Error('Terminal runtime guard validation is unavailable.')
+      }
+      assertRuntimeGuard.call(
+        this.terminalService,
+        suppliedGuard,
+        'file transfer queue admission'
+      )
+      return suppliedGuard
+    }
+    return typeof createRuntimeGuard === 'function'
+      ? createRuntimeGuard.call(this.terminalService, terminalId)
+      : undefined
+  }
+
   private resolveConflictStrategy(
     strategy: FileTransferConflictStrategy | undefined,
     overwrite: boolean | undefined,
@@ -560,9 +656,14 @@ export class FileTransferService extends EventEmitter {
     id: string
     title: string
   } {
-    const terminal = this.terminalService
-      .getAllTerminals()
-      .find((item) => item.id === terminalId)
+    const getTerminalById = (this.terminalService as Partial<
+      Pick<TerminalService, 'getTerminalById'>
+    >).getTerminalById
+    const terminal = typeof getTerminalById === 'function'
+      ? getTerminalById.call(this.terminalService, terminalId)
+      : this.terminalService
+        .getAllTerminals()
+        .find((item) => item.id === terminalId)
     if (!terminal) {
       throw new Error(`Terminal ${terminalId} not found`)
     }

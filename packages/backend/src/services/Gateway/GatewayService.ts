@@ -1,5 +1,6 @@
 import { v4 as uuidv4 } from "uuid";
 import { EventEmitter } from "events";
+import { readOpaqueNonBlankWellFormedString } from "@gyshell/shared";
 import type {
   IGatewayRuntime,
   GatewayEvent,
@@ -44,6 +45,28 @@ export interface GatewayRunStateSnapshot {
 }
 
 type GatewayRunStateListener = (snapshot: GatewayRunStateSnapshot) => void;
+
+const readGatewaySessionId = (value: unknown): string | undefined =>
+  readOpaqueNonBlankWellFormedString(value);
+
+const requireGatewaySessionId = (value: unknown): string => {
+  const sessionId = readGatewaySessionId(value);
+  if (sessionId === undefined) {
+    throw new Error("Session id is required.");
+  }
+  return sessionId;
+};
+
+const requireGatewaySessionIds = (value: unknown): string[] => {
+  if (!Array.isArray(value)) {
+    throw new Error("Session ids must be an array.");
+  }
+  const sessionIds: string[] = [];
+  for (const candidate of value) {
+    sessionIds.push(requireGatewaySessionId(candidate));
+  }
+  return Array.from(new Set(sessionIds));
+};
 
 export class GatewayService extends EventEmitter implements IGatewayRuntime {
   private sessions: Map<string, SessionContext> = new Map();
@@ -177,8 +200,8 @@ export class GatewayService extends EventEmitter implements IGatewayRuntime {
   private setupInternalSubscriptions() {
     // UIHistoryService subscribes to all agent events for persistence
     this.subscribe("agent:event", (event) => {
-      const sessionId = String(event.sessionId || "").trim();
-      if (!sessionId || this.deletedSessionIds.has(sessionId)) {
+      const sessionId = readGatewaySessionId(event.sessionId);
+      if (sessionId === undefined || this.deletedSessionIds.has(sessionId)) {
         return;
       }
       const actions = this.uiHistoryService.recordEvent(
@@ -218,15 +241,18 @@ export class GatewayService extends EventEmitter implements IGatewayRuntime {
   }
 
   private sendUIUpdate(action: UIUpdateAction): void {
+    const sessionId = readGatewaySessionId(action.sessionId);
+    if (sessionId === undefined) return;
     this.uiRevision += 1;
     const uiRevision = this.uiRevision;
-    this.sessionUiRevisionById.set(action.sessionId, uiRevision);
+    this.sessionUiRevisionById.set(sessionId, uiRevision);
     const noteUiRevision = (this.uiHistoryService as any).noteUiRevision;
     if (typeof noteUiRevision === "function") {
-      noteUiRevision.call(this.uiHistoryService, action.sessionId, uiRevision);
+      noteUiRevision.call(this.uiHistoryService, sessionId, uiRevision);
     }
     this.transportHub.sendUIUpdate({
       ...action,
+      sessionId,
       uiRevision,
     } satisfies UIUpdateAction);
   }
@@ -244,30 +270,26 @@ export class GatewayService extends EventEmitter implements IGatewayRuntime {
   }
 
   registerSession(sessionId: string, ownerId = "renderer"): void {
-    const normalizedSessionId = String(sessionId || "").trim();
+    sessionId = requireGatewaySessionId(sessionId);
     const normalizedOwnerId = String(ownerId || "").trim() || "renderer";
-    if (!normalizedSessionId) {
-      throw new Error("Session id is required.");
-    }
-    if (this.deletedSessionIds.has(normalizedSessionId)) {
-      throw new Error(`Session has been deleted: ${normalizedSessionId}`);
+    if (this.deletedSessionIds.has(sessionId)) {
+      throw new Error(`Session has been deleted: ${sessionId}`);
     }
     const owners =
-      this.registeredRendererSessionOwners.get(normalizedSessionId) ||
-      new Set<string>();
+      this.registeredRendererSessionOwners.get(sessionId) || new Set<string>();
     owners.add(normalizedOwnerId);
-    this.registeredRendererSessionOwners.set(normalizedSessionId, owners);
+    this.registeredRendererSessionOwners.set(sessionId, owners);
   }
 
   unregisterSession(sessionId: string, ownerId = "renderer"): void {
-    const normalizedSessionId = String(sessionId || "").trim();
-    if (!normalizedSessionId) return;
-    const owners =
-      this.registeredRendererSessionOwners.get(normalizedSessionId);
+    const exactSessionId = readGatewaySessionId(sessionId);
+    if (exactSessionId === undefined) return;
+    sessionId = exactSessionId;
+    const owners = this.registeredRendererSessionOwners.get(sessionId);
     if (!owners) return;
     owners.delete(String(ownerId || "").trim() || "renderer");
     if (owners.size === 0) {
-      this.registeredRendererSessionOwners.delete(normalizedSessionId);
+      this.registeredRendererSessionOwners.delete(sessionId);
     }
   }
 
@@ -283,7 +305,10 @@ export class GatewayService extends EventEmitter implements IGatewayRuntime {
   }
 
   getSession(sessionId: string): SessionContext | undefined {
-    return this.sessions.get(sessionId);
+    const exactSessionId = readGatewaySessionId(sessionId);
+    return exactSessionId === undefined
+      ? undefined
+      : this.sessions.get(exactSessionId);
   }
 
   async dispatchTask(
@@ -291,6 +316,7 @@ export class GatewayService extends EventEmitter implements IGatewayRuntime {
     input: StartTaskInput,
     options?: StartTaskOptions,
   ): Promise<void> {
+    sessionId = requireGatewaySessionId(sessionId);
     if (this.deletedSessionIds.has(sessionId)) {
       throw new Error(`Session has been deleted: ${sessionId}`);
     }
@@ -405,6 +431,7 @@ export class GatewayService extends EventEmitter implements IGatewayRuntime {
       preserveAgentRun?: boolean;
     },
   ): Promise<void> {
+    sessionId = requireGatewaySessionId(sessionId);
     const context = this.sessions.get(sessionId);
     if (context && context.abortController) {
       const runCompletion = context.metadata.runCompletion as
@@ -456,6 +483,7 @@ export class GatewayService extends EventEmitter implements IGatewayRuntime {
   }
 
   async waitForRunCompletion(sessionId: string): Promise<void> {
+    sessionId = requireGatewaySessionId(sessionId);
     await this.waitForRunCompletionIfAny(sessionId);
   }
 
@@ -516,13 +544,18 @@ export class GatewayService extends EventEmitter implements IGatewayRuntime {
   }
 
   getSessionMetadata(sessionId: string): GatewaySessionMetadata | null {
+    const exactSessionId = readGatewaySessionId(sessionId);
+    if (exactSessionId === undefined) return null;
+    sessionId = exactSessionId;
     // Reading one session must not aggregate every stored session: this runs on
     // the paging path, where the cost lands on the main process input loop.
     const uiSummary = this.uiHistoryService
       .getAllSessionSummaries()
       .find((candidate) => candidate.id === sessionId);
-    const storedSummary =
+    const storedCandidate =
       this.agentService.getStoredChatSessionSummary(sessionId);
+    const storedSummary =
+      storedCandidate?.id === sessionId ? storedCandidate : null;
     const context = this.sessions.get(sessionId);
     if (!uiSummary && !storedSummary && !context) return null;
 
@@ -553,18 +586,22 @@ export class GatewayService extends EventEmitter implements IGatewayRuntime {
   }
 
   getSessionSnapshot(sessionId: string): GatewaySessionSnapshot | null {
-    const session = this.uiHistoryService.getSession(sessionId);
+    const exactSessionId = readGatewaySessionId(sessionId);
+    if (exactSessionId === undefined) return null;
+    sessionId = exactSessionId;
+    const sessionCandidate = this.uiHistoryService.getSession(sessionId);
+    const session =
+      sessionCandidate?.id === sessionId ? sessionCandidate : null;
     const storedSummary = this.agentService
       .listStoredChatSessionSummaries()
       .find((candidate) => candidate.id === sessionId);
     const context = this.sessions.get(sessionId);
     if (!session && !storedSummary && !context) return null;
 
-    const resolvedSessionId = session?.id || storedSummary?.id || sessionId;
     const isBusy = context ? context.status !== "idle" : false;
     const lockedProfileId = isBusy ? context?.lockedProfileId || null : null;
     return {
-      id: resolvedSessionId,
+      id: sessionId,
       title: this.resolveSessionTitle(
         session?.title,
         storedSummary?.title,
@@ -605,6 +642,7 @@ export class GatewayService extends EventEmitter implements IGatewayRuntime {
   }
 
   async deleteChatSession(sessionId: string): Promise<void> {
+    sessionId = requireGatewaySessionId(sessionId);
     const wasAlreadyDeleted = this.deletedSessionIds.has(sessionId);
     this.deletedSessionIds.add(sessionId);
     try {
@@ -623,9 +661,7 @@ export class GatewayService extends EventEmitter implements IGatewayRuntime {
   }
 
   async deleteChatSessions(sessionIds: string[]): Promise<void> {
-    const ids = Array.from(
-      new Set(sessionIds.filter((id) => id.trim().length > 0)),
-    );
+    const ids = requireGatewaySessionIds(sessionIds);
     if (ids.length === 0) {
       return;
     }
@@ -649,25 +685,23 @@ export class GatewayService extends EventEmitter implements IGatewayRuntime {
   }
 
   renameSession(sessionId: string, newTitle: string): void {
-    const normalizedSessionId = String(sessionId || "").trim();
+    sessionId = requireGatewaySessionId(sessionId);
     const isRegistered =
-      (this.registeredRendererSessionOwners.get(normalizedSessionId)?.size ||
-        0) > 0;
+      (this.registeredRendererSessionOwners.get(sessionId)?.size || 0) > 0;
     if (
-      !normalizedSessionId ||
-      this.deletedSessionIds.has(normalizedSessionId) ||
+      this.deletedSessionIds.has(sessionId) ||
       (!isRegistered &&
         !this.listSessionSummaries().some(
-          (summary) => summary.id === normalizedSessionId,
+          (summary) => summary.id === sessionId,
         ))
     ) {
-      throw new Error(`Session not found: ${normalizedSessionId || sessionId}`);
+      throw new Error(`Session not found: ${sessionId}`);
     }
 
-    this.agentService.renameChatSession(normalizedSessionId, newTitle);
+    this.agentService.renameChatSession(sessionId, newTitle);
     this.sendUIUpdate({
       type: "SESSION_RENAMED",
-      sessionId: normalizedSessionId,
+      sessionId,
       title: newTitle,
     } satisfies UIUpdateAction);
   }
@@ -676,6 +710,7 @@ export class GatewayService extends EventEmitter implements IGatewayRuntime {
     sessionId: string,
     messageId: string,
   ): Promise<{ ok: boolean; removedCount: number }> {
+    sessionId = requireGatewaySessionId(sessionId);
     await this.stopTask(sessionId);
     this.broadcast({
       type: "agent:event",
@@ -698,6 +733,7 @@ export class GatewayService extends EventEmitter implements IGatewayRuntime {
     messageCount?: number;
     reason?: string;
   }> {
+    sessionId = requireGatewaySessionId(sessionId);
     const sourceContext = this.sessions.get(sessionId);
     if (sourceContext && sourceContext.status !== "idle") {
       return {
@@ -1157,16 +1193,33 @@ export class GatewayService extends EventEmitter implements IGatewayRuntime {
     });
   }
 
+  /**
+   * Marks an active run as paused for Gateway status consumers only.
+   * Agent execution is not suspended: IAgentRuntime has no cooperative pause
+   * primitive, so tools and graph work continue until completion or stopTask.
+   */
   async pauseTask(sessionId: string): Promise<void> {
+    sessionId = requireGatewaySessionId(sessionId);
     const context = this.sessions.get(sessionId);
-    if (context && context.status !== "paused") {
+    if (
+      context &&
+      context.status !== "idle" &&
+      context.status !== "paused"
+    ) {
       context.status = "paused";
       this.publishRunStateChanged();
     }
   }
 
-  async resumeTask(_sessionId: string): Promise<void> {
-    // Future implementation of re-trigger logic
+  /** Restores the status annotation for a still-live run; never starts a run. */
+  async resumeTask(sessionId: string): Promise<void> {
+    sessionId = requireGatewaySessionId(sessionId);
+    const context = this.sessions.get(sessionId);
+    if (!context || context.status !== "paused") return;
+
+    context.status =
+      context.activeRunId && context.abortController ? "running" : "idle";
+    this.publishRunStateChanged();
   }
 
   // Event distribution method, renamed to broadcast to avoid conflict with EventEmitter's emit

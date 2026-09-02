@@ -1,3 +1,4 @@
+import { readOpaqueNonBlankString } from "@gyshell/shared";
 import {
   makeObservable,
   observable,
@@ -22,7 +23,10 @@ import {
   makeLayoutId,
   normalizeSavedLayoutState,
   movePanel,
+  normalizePanelTabBinding,
+  normalizeWindowingTabIds,
   overwriteSavedLayoutSlot,
+  readWindowingTabId,
   removePanel,
   setSplitSizes,
   splitPanel,
@@ -572,8 +576,9 @@ export class LayoutStore {
     if (!kind) return;
     const adapter = getPanelKindAdapter(kind);
     if (!adapter.supportsTabs) return;
+    const normalizedTabId = readWindowingTabId(kind, tabId);
     const current = this.tree.panelTabs?.[panelId];
-    if (!current || !current.tabIds.includes(tabId)) return;
+    if (!normalizedTabId || !current?.tabIds.includes(normalizedTabId)) return;
 
     this.tree = {
       ...this.tree,
@@ -581,13 +586,13 @@ export class LayoutStore {
         ...this.tree.panelTabs,
         [panelId]: {
           ...current,
-          activeTabId: tabId,
+          activeTabId: normalizedTabId,
         },
       },
       focusedPanelId: panelId,
     };
     this.saveLayoutDebounced();
-    this.syncGlobalActiveFromPanel(kind, tabId);
+    this.syncGlobalActiveFromPanel(kind, normalizedTabId);
   }
 
   ensurePrimaryPanelForKind(kind: PanelKind): string | null {
@@ -673,11 +678,7 @@ export class LayoutStore {
       return;
     }
     if (!Array.isArray(tabIds) || tabIds.length === 0) return;
-    const detachSet = new Set(
-      tabIds
-        .map((tabId) => String(tabId || "").trim())
-        .filter((tabId) => tabId.length > 0),
-    );
+    const detachSet = new Set(normalizeWindowingTabIds(kind, tabIds));
     if (detachSet.size === 0) return;
 
     const panelIds = this.panelNodes
@@ -774,26 +775,10 @@ export class LayoutStore {
       targetPanelId = anchorPanelId;
     }
 
-    const normalizedTabBinding = (() => {
-      if (!getPanelKindAdapter(kind).supportsTabs || !tabBinding) {
-        return undefined;
-      }
-      const tabIds = unique(
-        (tabBinding.tabIds || []).filter(
-          (tabId): tabId is string =>
-            typeof tabId === "string" && tabId.length > 0,
-        ),
-      );
-      const activeTabId =
-        typeof tabBinding.activeTabId === "string" &&
-        tabIds.includes(tabBinding.activeTabId)
-          ? tabBinding.activeTabId
-          : tabIds[0];
-      return {
-        tabIds,
-        ...(activeTabId ? { activeTabId } : {}),
-      };
-    })();
+    const normalizedTabBinding =
+      getPanelKindAdapter(kind).supportsTabs && tabBinding
+        ? normalizePanelTabBinding(kind, tabBinding)
+        : undefined;
 
     const baseTree =
       normalizedTabBinding && normalizedTabBinding.tabIds.length > 0
@@ -902,11 +887,19 @@ export class LayoutStore {
   }
 
   startTabDragging(payload: TabDragPayload, x: number, y: number) {
+    const sourcePanelId = readOpaqueNonBlankString(payload.sourcePanelId);
+    const sourceKind = sourcePanelId
+      ? this.getPanelKindById(sourcePanelId)
+      : null;
+    const tabId = readWindowingTabId(payload.kind, payload.tabId);
+    if (!sourcePanelId || (sourceKind && sourceKind !== payload.kind) || !tabId) {
+      return;
+    }
     this.isDragging = true;
     this.dragType = "tab";
     this.draggingPanelId = null;
     this.draggingExternalPanelKind = null;
-    this.draggingTab = payload;
+    this.draggingTab = { ...payload, tabId, sourcePanelId };
     this.dragX = x;
     this.dragY = y;
     this.dropTargetPanelId = null;
@@ -1377,9 +1370,7 @@ export class LayoutStore {
       return tree;
     }
     const removalSet = new Set(
-      tabIdsToRemove
-        .map((tabId) => String(tabId || "").trim())
-        .filter((tabId) => tabId.length > 0),
+      normalizeWindowingTabIds(kind, tabIdsToRemove),
     );
     if (removalSet.size === 0) {
       return tree;
@@ -1439,7 +1430,10 @@ export class LayoutStore {
       position?: "before" | "after";
     },
   ): LayoutTree | null {
-    if (!getPanelKindAdapter(kind).supportsTabs) {
+    if (
+      !getPanelKindAdapter(kind).supportsTabs ||
+      readWindowingTabId(kind, tabId) !== tabId
+    ) {
       return null;
     }
     const panelIds = listPanels(tree)

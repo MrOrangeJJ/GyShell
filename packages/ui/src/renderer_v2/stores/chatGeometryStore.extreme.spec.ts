@@ -169,11 +169,12 @@ const run = async (): Promise<void> => {
           )
         },
         getFullUiMessages: async (
-          _sessionId: string,
+          sessionId: string,
           messageIds: string[],
         ) => {
           fullRequests.push([...messageIds])
           return {
+            sessionId,
             messages: messageIds.map((id) =>
               createFullMessage(Number(id.replace('geometry-message-', ''))),
             ),

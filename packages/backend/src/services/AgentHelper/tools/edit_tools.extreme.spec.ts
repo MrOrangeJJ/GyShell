@@ -41,8 +41,12 @@ class FakeTerminalService {
     }
   }
 
-  resolveTerminal() {
-    return { found: [this.terminal], bestMatch: this.terminal }
+  getTerminalById(terminalId: string): TerminalTab | undefined {
+    return terminalId === this.terminal.id ? this.terminal : undefined
+  }
+
+  getDisplayTerminals(): TerminalTab[] {
+    return [this.terminal]
   }
 
   getTerminalRuntimeSnapshot(): TerminalRuntimeSnapshot {
@@ -94,7 +98,7 @@ const runCase = async (name: string, fn: () => Promise<void> | void): Promise<vo
 async function run(): Promise<void> {
   await runCase('writeAndEditSchema tolerates empty legacy edit fields for write mode', () => {
     const result = writeAndEditSchema.safeParse({
-      tabIdOrName: 'local-main',
+      terminalId: 'local-main',
       filePath: '/tmp/write.txt',
       content: 'alpha\n',
       oldString: '',
@@ -106,7 +110,7 @@ async function run(): Promise<void> {
 
   await runCase('writeAndEditSchema rejects non-empty mixed write and edit fields', () => {
     const result = writeAndEditSchema.safeParse({
-      tabIdOrName: 'local-main',
+      terminalId: 'local-main',
       filePath: '/tmp/write.txt',
       content: 'alpha\n',
       oldString: 'old',
@@ -117,7 +121,7 @@ async function run(): Promise<void> {
 
   await runCase('editFileSchema rejects empty oldString for model-visible edit_file', () => {
     const result = editFileSchema.safeParse({
-      tabIdOrName: 'local-main',
+      terminalId: 'local-main',
       filePath: '/tmp/edit.txt',
       oldString: '',
       newString: 'full replacement\n'
@@ -129,7 +133,7 @@ async function run(): Promise<void> {
     const service = new FakeTerminalService()
     const events: any[] = []
     const output = await writeFile(
-      { tabIdOrName: 'local-main', filePath: '/tmp/write.txt', content: 'alpha\nbeta\n' },
+      { terminalId: 'local-main', filePath: '/tmp/write.txt', content: 'alpha\nbeta\n' },
       createContext(service, events)
     )
     assertIncludes(output, 'Created file: /tmp/write.txt', 'write_file should report creation')
@@ -144,7 +148,7 @@ async function run(): Promise<void> {
     const events: any[] = []
     const output = await editFile(
       {
-        tabIdOrName: 'local-main',
+        terminalId: 'local-main',
         filePath: '/tmp/edit.txt',
         oldString: 'beta',
         newString: 'BETA'
@@ -162,7 +166,7 @@ async function run(): Promise<void> {
     const events: any[] = []
     await editFile(
       {
-        tabIdOrName: 'local-main',
+        terminalId: 'local-main',
         filePath: '/tmp/edit-all.txt',
         oldString: 'foo',
         newString: 'bar',
@@ -174,12 +178,12 @@ async function run(): Promise<void> {
     assertEqual(events[0]?.event.action, 'edited', 'replaceAll should emit edited action')
   })
 
-  await runCase('edit_file rejects empty oldString without creating a file', async () => {
+  await runCase('edit_file rejects empty oldString before events or file I/O', async () => {
     const service = new FakeTerminalService()
     const events: any[] = []
     const output = await editFile(
       {
-        tabIdOrName: 'local-main',
+        terminalId: 'local-main',
         filePath: '/tmp/should-not-create.txt',
         oldString: '',
         newString: 'full replacement\n'
@@ -188,8 +192,7 @@ async function run(): Promise<void> {
     )
     assertIncludes(output, 'oldString must not be empty', 'edit_file should reject empty oldString')
     assertEqual(service.files.has('/tmp/should-not-create.txt'), false, 'edit_file should not create files')
-    assertEqual(events[0]?.event.toolName, 'edit_file', 'edit_file event should keep concrete tool name')
-    assertEqual(events[0]?.event.action, 'error', 'empty oldString should emit an error action')
+    assertEqual(events.length, 0, 'strict direct-entry validation should reject before publishing execution events')
   })
 
   await runCase('legacy create_or_edit writes when edit fields are empty', async () => {
@@ -197,7 +200,7 @@ async function run(): Promise<void> {
     const events: any[] = []
     await writeAndEdit(
       {
-        tabIdOrName: 'local-main',
+        terminalId: 'local-main',
         filePath: '/tmp/legacy-write.txt',
         content: 'legacy\n',
         oldString: '',
@@ -215,7 +218,7 @@ async function run(): Promise<void> {
     const events: any[] = []
     await writeAndEdit(
       {
-        tabIdOrName: 'local-main',
+        terminalId: 'local-main',
         filePath: '/tmp/legacy-empty-old-write.txt',
         oldString: '',
         newString: 'legacy full write\n'
@@ -236,7 +239,7 @@ async function run(): Promise<void> {
     const events: any[] = []
     await writeAndEdit(
       {
-        tabIdOrName: 'local-main',
+        terminalId: 'local-main',
         filePath: '/tmp/legacy-edit.txt',
         content: '',
         oldString: 'beta',

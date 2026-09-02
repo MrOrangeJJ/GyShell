@@ -9,6 +9,7 @@ import {
   type ChatBannerUiStateMap,
   getChatBannerUiStateKey,
   mergeChatBannerUiState,
+  parseChatBannerUiStateKey,
   pruneChatBannerUiStateForSession,
 } from "./chatBannerUiState";
 import {
@@ -241,11 +242,11 @@ export const ChatMessageList: React.FC<ChatMessageListProps> = observer(
     const lastMessageStreaming = lastMessage?.streaming === true;
     const expandedSeamlessGroupIds = React.useMemo(() => {
       const expandedIds = new Set<string>();
-      const sessionKeyPrefix = sessionId ? `${sessionId}::` : null;
-      if (!sessionKeyPrefix) return expandedIds;
+      if (!sessionId) return expandedIds;
       Object.entries(bannerUiStateByKey).forEach(([key, state]) => {
-        if (state.expanded && key.startsWith(sessionKeyPrefix)) {
-          expandedIds.add(key.slice(sessionKeyPrefix.length));
+        const parsedKey = parseChatBannerUiStateKey(key);
+        if (state.expanded && parsedKey?.sessionId === sessionId) {
+          expandedIds.add(parsedKey.messageId);
         }
       });
       return expandedIds;

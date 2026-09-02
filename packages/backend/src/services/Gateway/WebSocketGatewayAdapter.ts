@@ -1,3 +1,4 @@
+import { readOpaqueNonBlankWellFormedString } from "@gyshell/shared";
 import type {
   IGatewayRuntime,
   StartTaskInput,
@@ -871,7 +872,7 @@ export class WebSocketGatewayAdapter {
         };
       }
       case "session:get": {
-        const sessionId = this.readStringParam(params, "sessionId");
+        const sessionId = this.readSessionIdParam(params, "sessionId");
         const session = this.gateway.getSessionSnapshot(sessionId);
         if (!session) {
           throw new WebSocketRpcError(
@@ -889,7 +890,7 @@ export class WebSocketGatewayAdapter {
             "agent:exportHistory is not available on this websocket gateway.",
           );
         }
-        const sessionId = this.readStringParam(params, "sessionId");
+        const sessionId = this.readSessionIdParam(params, "sessionId");
         const mode = params.mode;
         const normalizedMode =
           mode === "simple" || mode === "detailed" ? mode : "detailed";
@@ -913,7 +914,7 @@ export class WebSocketGatewayAdapter {
             "agent:loadChatSession is not available on this websocket gateway.",
           );
         }
-        const id = this.readStringParam(params, "id");
+        const id = this.readSessionIdParam(params, "id");
         return await bridge.loadChatSession(id);
       }
       case "agent:getUiMessages": {
@@ -924,7 +925,7 @@ export class WebSocketGatewayAdapter {
             "agent:getUiMessages is not available on this websocket gateway.",
           );
         }
-        const id = this.readStringParam(params, "id");
+        const id = this.readSessionIdParam(params, "id");
         return await bridge.getUiMessages(id);
       }
       case "terminal:list": {
@@ -1330,14 +1331,10 @@ export class WebSocketGatewayAdapter {
           params,
           "chunkSize",
         );
-        const sessionId =
-          params.sessionId === undefined ? undefined : params.sessionId;
-        if (sessionId !== undefined && typeof sessionId !== "string") {
-          throw new WebSocketRpcError(
-            "BAD_REQUEST",
-            "sessionId must be string when provided.",
-          );
-        }
+        const sessionId = this.readOptionalSessionIdParam(
+          params,
+          "sessionId",
+        );
         const agentRunId =
           params.agentRunId === undefined ? undefined : params.agentRunId;
         if (agentRunId !== undefined && typeof agentRunId !== "string") {
@@ -1416,13 +1413,10 @@ export class WebSocketGatewayAdapter {
             "terminalId must be string when provided.",
           );
         }
-        const sessionId = params.sessionId;
-        if (sessionId !== undefined && typeof sessionId !== "string") {
-          throw new WebSocketRpcError(
-            "BAD_REQUEST",
-            "sessionId must be string when provided.",
-          );
-        }
+        const sessionId = this.readOptionalSessionIdParam(
+          params,
+          "sessionId",
+        );
         const agentRunId = params.agentRunId;
         if (agentRunId !== undefined && typeof agentRunId !== "string") {
           throw new WebSocketRpcError(
@@ -1846,14 +1840,14 @@ export class WebSocketGatewayAdapter {
         );
       }
       case "agent:startTask": {
-        const sessionId = this.readStringParam(params, "sessionId");
+        const sessionId = this.readSessionIdParam(params, "sessionId");
         const userInput = this.readStartTaskInput(params);
         const options = this.readStartTaskOptions(params.options);
         await this.gateway.dispatchTask(sessionId, userInput, options);
         return { ok: true };
       }
       case "agent:startTaskAsync": {
-        const sessionId = this.readStringParam(params, "sessionId");
+        const sessionId = this.readSessionIdParam(params, "sessionId");
         const userInput = this.readStartTaskInput(params);
         const options = this.readStartTaskOptions(params.options);
         void this.gateway
@@ -1867,7 +1861,7 @@ export class WebSocketGatewayAdapter {
         return { ok: true };
       }
       case "agent:stopTask": {
-        const sessionId = this.readStringParam(params, "sessionId");
+        const sessionId = this.readSessionIdParam(params, "sessionId");
         await this.gateway.stopTask(sessionId);
         return { ok: true };
       }
@@ -1888,33 +1882,38 @@ export class WebSocketGatewayAdapter {
         return this.gateway.submitFeedback(approvalId, { decision });
       }
       case "agent:deleteChatSession": {
-        const sessionId = this.readStringParam(params, "sessionId");
+        const sessionId = this.readSessionIdParam(params, "sessionId");
         await this.gateway.deleteChatSession(sessionId);
         return { ok: true };
       }
       case "agent:deleteChatSessions": {
-        const sessionIds = Array.isArray(params.sessionIds)
-          ? params.sessionIds.filter(
-              (value) => typeof value === "string" && value.length > 0,
-            )
-          : [];
-        if (sessionIds.length === 0) {
+        if (!Array.isArray(params.sessionIds) || params.sessionIds.length === 0) {
           throw new WebSocketRpcError(
             "BAD_REQUEST",
             "sessionIds must be a non-empty string array.",
           );
         }
+        const sessionIds = params.sessionIds.map((value) => {
+          const sessionId = readOpaqueNonBlankWellFormedString(value);
+          if (sessionId === undefined) {
+            throw new WebSocketRpcError(
+              "BAD_REQUEST",
+              "sessionIds must be a non-empty string array.",
+            );
+          }
+          return sessionId;
+        });
         await this.gateway.deleteChatSessions(sessionIds);
         return { ok: true };
       }
       case "agent:renameSession": {
-        const sessionId = this.readStringParam(params, "sessionId");
+        const sessionId = this.readSessionIdParam(params, "sessionId");
         const newTitle = this.readStringParam(params, "newTitle");
         this.gateway.renameSession(sessionId, newTitle);
         return { ok: true };
       }
       case "agent:branchFromMessage": {
-        const sessionId = this.readStringParam(params, "sessionId");
+        const sessionId = this.readSessionIdParam(params, "sessionId");
         const messageId = this.readStringParam(params, "messageId");
         return await this.gateway.branchSessionFromMessage(
           sessionId,
@@ -1922,7 +1921,7 @@ export class WebSocketGatewayAdapter {
         );
       }
       case "agent:rollbackToMessage": {
-        const sessionId = this.readStringParam(params, "sessionId");
+        const sessionId = this.readSessionIdParam(params, "sessionId");
         const messageId = this.readStringParam(params, "messageId");
         return await this.gateway.rollbackSessionToMessage(
           sessionId,
@@ -1935,6 +1934,37 @@ export class WebSocketGatewayAdapter {
           `Unsupported websocket method: ${request.method}`,
         );
     }
+  }
+
+  private readSessionIdParam(
+    params: Record<string, any>,
+    name: string,
+  ): string {
+    const sessionId = readOpaqueNonBlankWellFormedString(params[name]);
+    if (sessionId === undefined) {
+      throw new WebSocketRpcError(
+        "BAD_REQUEST",
+        `Missing or invalid parameter: ${name}`,
+      );
+    }
+    return sessionId;
+  }
+
+  private readOptionalSessionIdParam(
+    params: Record<string, any>,
+    name: string,
+  ): string | undefined {
+    if (!Object.prototype.hasOwnProperty.call(params, name)) {
+      return undefined;
+    }
+    const sessionId = readOpaqueNonBlankWellFormedString(params[name]);
+    if (sessionId === undefined) {
+      throw new WebSocketRpcError(
+        "BAD_REQUEST",
+        `${name} must be a non-blank, well-formed string when provided.`,
+      );
+    }
+    return sessionId;
   }
 
   private readStringParam(params: Record<string, any>, name: string): string {

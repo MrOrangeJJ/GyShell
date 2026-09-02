@@ -12,8 +12,10 @@ import type { InputImageAttachment, UserInputPayload } from "../lib/userInput";
 import { WINDOW_CONTEXT } from "../lib/windowing";
 import {
   createChatTextGeometryShape,
+  encodeOpaqueStringPair,
   extractCommandOutputDisplayText,
   parseCommandOutputContractV1,
+  readOpaqueNonBlankWellFormedString,
   type ChatMessageGeometry,
   type CommandOutputContractV1,
   type UiMessageGeometryIndex,
@@ -55,6 +57,28 @@ const isSessionRegistrationHandlerUnavailable = (error: unknown): boolean =>
 
 const waitForSessionRegistrationRetry = (delayMs: number): Promise<void> =>
   new Promise((resolve) => setTimeout(resolve, delayMs));
+
+const readChatSessionId = (value: unknown): string | undefined =>
+  readOpaqueNonBlankWellFormedString(value);
+
+const readChatMessageId = (value: unknown): string | undefined =>
+  readOpaqueNonBlankWellFormedString(value);
+
+const normalizeChatSessionIds = (value: unknown): string[] => {
+  if (!Array.isArray(value)) return [];
+  const ids: string[] = [];
+  for (const candidate of value) {
+    const id = readChatSessionId(candidate);
+    if (id === undefined) return [];
+    ids.push(id);
+  }
+  return Array.from(new Set(ids));
+};
+
+const createChatRuntimePairKey = (
+  sessionId: string,
+  component: string,
+): string | undefined => encodeOpaqueStringPair(sessionId, component);
 
 const buildAutoSessionTitle = (content: string): string => {
   const normalized = String(content || "")
@@ -437,6 +461,9 @@ export class ChatStore {
   }
 
   private registerSessionWithBackend(sessionId: string): void {
+    const exactSessionId = readChatSessionId(sessionId);
+    if (exactSessionId === undefined) return;
+    sessionId = exactSessionId;
     if (
       typeof window === "undefined" ||
       typeof window.gyshell?.agent?.registerSession !== "function"
@@ -470,6 +497,9 @@ export class ChatStore {
   }
 
   private unregisterSessionWithBackend(sessionId: string): void {
+    const exactSessionId = readChatSessionId(sessionId);
+    if (exactSessionId === undefined) return;
+    sessionId = exactSessionId;
     if (!this.ownedBackendSessionIds.delete(sessionId)) {
       return;
     }
@@ -509,6 +539,9 @@ export class ChatStore {
   private async ensureSessionOwnershipRegistered(
     sessionId: string,
   ): Promise<boolean> {
+    const exactSessionId = readChatSessionId(sessionId);
+    if (exactSessionId === undefined) return false;
+    sessionId = exactSessionId;
     let failedStableRegistrations = 0;
     while (failedStableRegistrations < 2) {
       this.registerSessionWithBackend(sessionId);
@@ -568,8 +601,11 @@ export class ChatStore {
   }
 
   getSessionById(sessionId: string | null): ChatSession | null {
-    if (!sessionId) return null;
-    return this.sessions.find((session) => session.id === sessionId) || null;
+    const exactSessionId = readChatSessionId(sessionId);
+    if (exactSessionId === undefined) return null;
+    return (
+      this.sessions.find((session) => session.id === exactSessionId) || null
+    );
   }
 
   setSessionsChangedListener(listener?: (sessionIds: string[]) => void): void {
@@ -584,13 +620,7 @@ export class ChatStore {
     sessionIds: string[],
     preferredActiveSessionId?: string | null,
   ): void {
-    const ids = Array.from(
-      new Set(
-        (sessionIds || []).filter(
-          (id) => typeof id === "string" && id.length > 0,
-        ),
-      ),
-    );
+    const ids = normalizeChatSessionIds(sessionIds);
     if (ids.length === 0) {
       this.sessionInventoryHydrated = true;
       return;
@@ -615,10 +645,7 @@ export class ChatStore {
     );
     this.sessions = nextSessions;
     const normalizedPreferredActiveId =
-      typeof preferredActiveSessionId === "string" &&
-      preferredActiveSessionId.length > 0
-        ? preferredActiveSessionId
-        : null;
+      readChatSessionId(preferredActiveSessionId) || null;
     const preferredActiveExists =
       !!normalizedPreferredActiveId &&
       nextSessions.some(
@@ -1360,28 +1387,53 @@ export class ChatStore {
     this.pendingUiUpdatesBySession.set(sessionId, pending);
   }
 
+  private normalizeSessionMetadata(
+    raw: unknown,
+    sessionId: string,
+  ): SessionMetadataPayload | null {
+    if (!raw || typeof raw !== "object") return null;
+    const value = raw as Record<string, unknown>;
+    if (readChatSessionId(value.id) !== sessionId) return null;
+    return {
+      ...(value as unknown as SessionMetadataPayload),
+      id: sessionId,
+      revisionPresent: Object.prototype.hasOwnProperty.call(
+        value,
+        "uiRevision",
+      ),
+    };
+  }
+
   private normalizeUiMessagePage(
     raw: unknown,
     sessionId: string,
   ): UiMessagePagePayload | null {
     if (!raw || typeof raw !== "object") return null;
     const value = raw as any;
-    if (!Array.isArray(value.entries)) return null;
+    if (
+      readChatSessionId(value.sessionId) !== sessionId ||
+      !Array.isArray(value.entries)
+    ) {
+      return null;
+    }
+    const metadata =
+      value.metadata === null || value.metadata === undefined
+        ? null
+        : this.normalizeSessionMetadata(value.metadata, sessionId);
+    if (value.metadata !== null && value.metadata !== undefined && !metadata) {
+      return null;
+    }
     const entries = value.entries
       .map((entry: any) => {
         const position = Number(entry?.position);
         const message = entry?.message;
-        if (
-          !Number.isFinite(position) ||
-          !message ||
-          typeof message.id !== "string" ||
-          message.id.length === 0
-        ) {
+        const messageId = readChatMessageId(message?.id);
+        if (!Number.isFinite(position) || messageId === undefined) {
           return null;
         }
         return {
           position: Math.floor(position),
-          message: message as ChatMessage,
+          message: { ...(message as ChatMessage), id: messageId },
         };
       })
       .filter(
@@ -1419,16 +1471,7 @@ export class ChatStore {
         this.normalizeUiRevision(value.uiRevision),
         this.normalizeUiRevision(value.metadata?.uiRevision),
       ),
-      metadata:
-        value.metadata && typeof value.metadata === "object"
-          ? {
-              ...(value.metadata as SessionMetadataPayload),
-              revisionPresent: Object.prototype.hasOwnProperty.call(
-                value.metadata,
-                "uiRevision",
-              ),
-            }
-          : null,
+      metadata,
       revisionPresent:
         Object.prototype.hasOwnProperty.call(value, "uiRevision") ||
         (value.metadata &&
@@ -1646,7 +1689,10 @@ export class ChatStore {
     const getMetadata = window.gyshell.agent.getSessionMetadata;
     if (typeof getMetadata === "function") {
       try {
-        metadata = await getMetadata(sessionId);
+        metadata = this.normalizeSessionMetadata(
+          await getMetadata(sessionId),
+          sessionId,
+        );
       } catch (error) {
         console.warn(`Failed to read chat metadata for ${sessionId}:`, error);
       }
@@ -1657,8 +1703,12 @@ export class ChatStore {
     // path once the metadata API is available.
     if (!metadata) {
       try {
-        legacySnapshot =
+        const snapshot =
           await window.gyshell.agent.getSessionSnapshot(sessionId);
+        legacySnapshot =
+          snapshot && readChatSessionId(snapshot.id) === sessionId
+            ? snapshot
+            : null;
       } catch (error) {
         console.warn(
           `Failed to read legacy session snapshot for ${sessionId}:`,
@@ -1776,16 +1826,10 @@ export class ChatStore {
     sessionIds: string[],
     preferredActiveSessionId?: string | null,
   ): Promise<void> {
-    const ids = Array.from(
-      new Set(
-        (sessionIds || []).filter(
-          (id) => typeof id === "string" && id.length > 0,
-        ),
-      ),
-    );
+    const ids = normalizeChatSessionIds(sessionIds);
     if (ids.length === 0) return;
 
-    let summaries: any[] = [];
+    let summaries: unknown = [];
     if (typeof window.gyshell.agent.listSessionSummaries === "function") {
       try {
         summaries = await window.gyshell.agent.listSessionSummaries();
@@ -1793,14 +1837,18 @@ export class ChatStore {
         console.warn("Failed to load session summaries:", error);
       }
     }
-    if (summaries.length === 0) {
+    if (!Array.isArray(summaries) || summaries.length === 0) {
       summaries = await this.getAllChatHistory();
     }
     const summaryById = new Map<string, SessionMetadataPayload>();
-    summaries.forEach((item) => {
-      if (!item || typeof item.id !== "string") return;
-      summaryById.set(item.id, item as SessionMetadataPayload);
-    });
+    if (Array.isArray(summaries)) {
+      summaries.forEach((item) => {
+        const id = readChatSessionId((item as any)?.id);
+        if (id === undefined) return;
+        const metadata = this.normalizeSessionMetadata(item, id);
+        if (metadata) summaryById.set(id, metadata);
+      });
+    }
 
     // A layout can legitimately contain a session created by this renderer
     // before the backend inventory has flushed. Keep those ids as candidates;
@@ -1821,7 +1869,11 @@ export class ChatStore {
           }),
         );
         metadataResults.forEach(([id, metadata]) => {
-          if (metadata) summaryById.set(id, metadata);
+          const normalizedMetadata = this.normalizeSessionMetadata(
+            metadata,
+            id,
+          );
+          if (normalizedMetadata) summaryById.set(id, normalizedMetadata);
         });
       }
     }
@@ -1852,10 +1904,7 @@ export class ChatStore {
       .forEach((session) => this.unregisterSessionWithBackend(session.id));
 
     const normalizedPreferredActiveId =
-      typeof preferredActiveSessionId === "string" &&
-      preferredActiveSessionId.length > 0
-        ? preferredActiveSessionId
-        : null;
+      readChatSessionId(preferredActiveSessionId) || null;
     const existingActiveId =
       this.activeSessionId && validIds.includes(this.activeSessionId)
         ? this.activeSessionId
@@ -1932,41 +1981,39 @@ export class ChatStore {
   }
 
   ensureSession(id: string, title: string = "New Chat"): void {
-    const normalizedId = String(id || "").trim();
-    if (!normalizedId) {
-      return;
-    }
-    if (this.getSessionById(normalizedId)) {
-      this.registerSessionWithBackend(normalizedId);
+    const exactId = readChatSessionId(id);
+    if (exactId === undefined) return;
+    if (this.getSessionById(exactId)) {
+      this.registerSessionWithBackend(exactId);
       return;
     }
     const normalizedTitle = String(title || "").trim() || "New Chat";
-    const session = this.createEmptySession(normalizedId, normalizedTitle);
+    const session = this.createEmptySession(exactId, normalizedTitle);
     runInAction(() => {
       this.sessions.push(session);
     });
-    this.registerSessionWithBackend(normalizedId);
+    this.registerSessionWithBackend(exactId);
     this.emitSessionsChanged();
   }
 
   setActiveSession(id: string): void {
-    const normalizedId = String(id || "").trim();
-    if (!normalizedId) return;
-    this.activeSessionId = normalizedId;
-    const session = this.getSessionById(normalizedId);
+    const exactId = readChatSessionId(id);
+    if (exactId === undefined) return;
+    this.activeSessionId = exactId;
+    const session = this.getSessionById(exactId);
     if (
       !session ||
       session.hasLoadedMessagePage ||
-      this.sessionLoadPromises.has(normalizedId)
+      this.sessionLoadPromises.has(exactId)
     ) {
       return;
     }
-    void this.hydrateSessionFromBackend(normalizedId, {
+    void this.hydrateSessionFromBackend(exactId, {
       activate: false,
       loadAgentContext: true,
     }).catch((error) => {
       console.warn(
-        `Failed to hydrate active chat session ${normalizedId}:`,
+        `Failed to hydrate active chat session ${exactId}:`,
         error,
       );
     });
@@ -2186,8 +2233,8 @@ export class ChatStore {
   }
 
   handleUiUpdate(update: any): void {
-    const sessionId = String(update?.sessionId || "").trim();
-    if (!sessionId) return;
+    const sessionId = readChatSessionId(update?.sessionId);
+    if (sessionId === undefined) return;
     const session = this.sessions.find(
       (candidate) => candidate.id === sessionId,
     );
@@ -2210,7 +2257,9 @@ export class ChatStore {
   }
 
   private applyUiUpdateNow(update: any): void {
-    const { type, sessionId } = update;
+    const type = update?.type;
+    const sessionId = readChatSessionId(update?.sessionId);
+    if (sessionId === undefined) return;
     const session = this.sessions.find((s) => s.id === sessionId);
     if (!session) {
       // Do not create a synthetic session from live updates.
@@ -2241,28 +2290,28 @@ export class ChatStore {
         }
         case "ADD_MESSAGE": {
           const msg = update.message;
-          if (!msg || typeof msg.id !== "string" || msg.id.length === 0) {
-            break;
-          }
-          const previous = session.messagesById.get(msg.id);
+          const messageId = readChatMessageId(msg?.id);
+          if (messageId === undefined) break;
+          const normalizedMessage = { ...msg, id: messageId };
+          const previous = session.messagesById.get(messageId);
           const existed = !!previous;
           const nextMessage = session.geometryLoaded
-            ? this.mergeLiveMessage(session, previous, msg)
-            : msg;
-          session.messagesById.set(msg.id, nextMessage);
+            ? this.mergeLiveMessage(session, previous, normalizedMessage)
+            : normalizedMessage;
+          session.messagesById.set(messageId, nextMessage);
           if (!existed) {
             const previousTotal = Math.max(
               session.totalMessageCount || 0,
               session.messageIds.length,
             );
-            session.messageIds.push(msg.id);
+            session.messageIds.push(messageId);
             session.totalMessageCount = previousTotal + 1;
             if (session.hasNewerMessages !== true) {
               session.loadedEndPosition = previousTotal;
               session.hasNewerMessages = false;
             }
             this.rebuildGeometryPositionMap(session);
-            const nextPosition = session.messagePositionById?.get(msg.id);
+            const nextPosition = session.messagePositionById?.get(messageId);
             if (
               typeof nextPosition === "number" &&
               !nextMessage.deferredPayload
@@ -2274,7 +2323,7 @@ export class ChatStore {
               nextMessage,
             );
             if (renderedMessage !== nextMessage) {
-              session.messagesById.set(msg.id, renderedMessage);
+              session.messagesById.set(messageId, renderedMessage);
             }
             this.trackGeometryMessagePayload(session, renderedMessage, {
               protect: true,
@@ -2287,7 +2336,7 @@ export class ChatStore {
               nextMessage,
             );
             if (renderedMessage !== nextMessage) {
-              session.messagesById.set(msg.id, renderedMessage);
+              session.messagesById.set(messageId, renderedMessage);
             }
             this.trackGeometryMessagePayload(session, renderedMessage, {
               protect: true,
@@ -2312,22 +2361,26 @@ export class ChatStore {
         }
         case "INSERT_MESSAGE": {
           const msg = update.message;
-          if (!msg || typeof msg.id !== "string" || msg.id.length === 0) {
-            break;
-          }
+          const messageId = readChatMessageId(msg?.id);
+          if (messageId === undefined) break;
+          const normalizedMessage = { ...msg, id: messageId };
           const anchorIndex = this.resolveInsertAnchorIndex(session, update);
           if (anchorIndex < 0) {
             break;
           }
 
-          const existingIndex = session.messageIds.indexOf(msg.id);
+          const existingIndex = session.messageIds.indexOf(messageId);
           if (existingIndex >= 0) {
             session.messageIds.splice(existingIndex, 1);
           }
           const nextMessage = session.geometryLoaded
-            ? this.mergeLiveMessage(session, session.messagesById.get(msg.id), msg)
-            : msg;
-          session.messagesById.set(msg.id, nextMessage);
+            ? this.mergeLiveMessage(
+                session,
+                session.messagesById.get(messageId),
+                normalizedMessage,
+              )
+            : normalizedMessage;
+          session.messagesById.set(messageId, nextMessage);
 
           const adjustedAnchorIndex =
             existingIndex >= 0 && existingIndex < anchorIndex
@@ -2337,7 +2390,7 @@ export class ChatStore {
             update.placement === "after"
               ? adjustedAnchorIndex + 1
               : adjustedAnchorIndex;
-          session.messageIds.splice(insertIndex, 0, msg.id);
+          session.messageIds.splice(insertIndex, 0, messageId);
           if (existingIndex < 0) {
             session.totalMessageCount =
               Math.max(
@@ -2352,13 +2405,14 @@ export class ChatStore {
           this.rebuildGeometryPositionMap(session, {
             clearLoadedPayloadPositions: true,
           });
-          const insertedMessage = session.messagesById.get(msg.id) || msg;
+          const insertedMessage =
+            session.messagesById.get(messageId) || normalizedMessage;
           const renderedMessage = this.refreshLiveMessageGeometry(
             session,
             insertedMessage,
           );
           if (renderedMessage !== insertedMessage) {
-            session.messagesById.set(msg.id, renderedMessage);
+            session.messagesById.set(messageId, renderedMessage);
           }
           this.trackGeometryMessagePayload(session, renderedMessage, {
             protect: true,
@@ -2659,34 +2713,35 @@ export class ChatStore {
       loadAgentContext?: boolean;
     },
   ): Promise<void> {
-    const normalizedSessionId = String(sessionId || "").trim();
-    if (!normalizedSessionId) return;
+    const exactSessionId = readChatSessionId(sessionId);
+    if (exactSessionId === undefined) return;
+    sessionId = exactSessionId;
     if (options?.activate !== false) {
-      this.activeSessionId = normalizedSessionId;
+      this.activeSessionId = sessionId;
     }
-    const existingLoad = this.sessionLoadPromises.get(normalizedSessionId);
+    const existingLoad = this.sessionLoadPromises.get(sessionId);
     if (existingLoad) {
       await existingLoad;
       return;
     }
 
-    const current = this.getSessionById(normalizedSessionId);
+    const current = this.getSessionById(sessionId);
     if (current && !current.hasLoadedMessagePage) {
       current.isLoadingInitialHistory = true;
     }
     const loadPromise = this.hydrateSessionFromBackendInternal(
-      normalizedSessionId,
+      sessionId,
       options,
     );
-    this.sessionLoadPromises.set(normalizedSessionId, loadPromise);
+    this.sessionLoadPromises.set(sessionId, loadPromise);
     try {
       await loadPromise;
     } finally {
-      if (this.sessionLoadPromises.get(normalizedSessionId) === loadPromise) {
-        this.sessionLoadPromises.delete(normalizedSessionId);
+      if (this.sessionLoadPromises.get(sessionId) === loadPromise) {
+        this.sessionLoadPromises.delete(sessionId);
       }
       runInAction(() => {
-        const latest = this.getSessionById(normalizedSessionId);
+        const latest = this.getSessionById(sessionId);
         if (latest) latest.isLoadingInitialHistory = false;
       });
     }
@@ -2699,6 +2754,7 @@ export class ChatStore {
   ): Promise<boolean> {
     const session = this.getSessionById(sessionId);
     if (!session || !session.geometryLoaded) return false;
+    sessionId = session.id;
     const start = Math.max(0, Math.floor(startPosition));
     const end = Math.min(
       Math.max(start, Math.floor(endPosition)),
@@ -2733,7 +2789,8 @@ export class ChatStore {
     });
 
     const loadChunk = (chunkStart: number): Promise<boolean> => {
-      const key = `${sessionId}:${chunkStart}`;
+      const key = createChatRuntimePairKey(sessionId, String(chunkStart));
+      if (!key) return Promise.resolve(false);
       const existing = this.messageRangeLoadPromises.get(key);
       if (existing) return existing;
       const promise = (async () => {
@@ -2787,6 +2844,7 @@ export class ChatStore {
 
   async loadOlderMessages(sessionId: string, limit = 300): Promise<boolean> {
     const session = this.getSessionById(sessionId);
+    if (session) sessionId = session.id;
     if (session?.geometryLoaded) {
       return false;
     }
@@ -2828,6 +2886,7 @@ export class ChatStore {
 
   async loadNewerMessages(sessionId: string, limit = 300): Promise<boolean> {
     const session = this.getSessionById(sessionId);
+    if (session) sessionId = session.id;
     if (session?.geometryLoaded) {
       return false;
     }
@@ -2872,6 +2931,9 @@ export class ChatStore {
     position: number,
     limit = 300,
   ): Promise<boolean> {
+    const session = this.getSessionById(sessionId);
+    if (!session) return false;
+    sessionId = session.id;
     const page = this.normalizeUiMessagePage(
       await window.gyshell.agent.getUiMessagePage(sessionId, {
         aroundPosition: Math.max(0, Math.floor(position)),
@@ -3033,7 +3095,8 @@ export class ChatStore {
     ids: string[],
   ): Promise<ChatMessage[]> {
     if (ids.length === 0) return [];
-    const loadKey = `${sessionId}:${ids.join(":")}`;
+    const loadKey = createChatRuntimePairKey(sessionId, JSON.stringify(ids));
+    if (!loadKey) return [];
     const existingLoad = this.fullMessageLoadPromises.get(loadKey);
     if (existingLoad) return existingLoad;
     const requestSequence = this.uiUpdateSequence;
@@ -3044,13 +3107,20 @@ export class ChatStore {
         typeof getFullMessages === "function"
           ? await getFullMessages(sessionId, ids)
           : await window.gyshell.agent.getUiMessages(sessionId);
-      const rawMessages = Array.isArray(full)
+      const isLegacyMessageArray = Array.isArray(full);
+      if (
+        !isLegacyMessageArray &&
+        readChatSessionId((full as any)?.sessionId) !== sessionId
+      ) {
+        return [];
+      }
+      const rawMessages = isLegacyMessageArray
         ? full
         : Array.isArray((full as any)?.messages)
           ? (full as any).messages
           : [];
       const responseRevisionPresent =
-        !Array.isArray(full) &&
+        !isLegacyMessageArray &&
         Object.prototype.hasOwnProperty.call(full, "uiRevision");
       const responseRevision = this.normalizeUiRevision(
         responseRevisionPresent ? (full as any)?.uiRevision : 0,
@@ -3135,13 +3205,17 @@ export class ChatStore {
   ): Promise<ChatMessage[]> {
     const session = this.getSessionById(sessionId);
     if (!session) return [];
+    sessionId = session.id;
     const ids = Array.from(
       new Set(
-        messageIds.filter(
-          (messageId) =>
-            !!messageId &&
-            session.messagesById.get(messageId)?.deferredPayload !== undefined,
-        ),
+        (Array.isArray(messageIds) ? messageIds : [])
+          .map((messageId) => readChatMessageId(messageId))
+          .filter(
+            (messageId): messageId is string =>
+              messageId !== undefined &&
+              session.messagesById.get(messageId)?.deferredPayload !==
+                undefined,
+          ),
       ),
     );
     if (ids.length === 0) return [];
@@ -3149,7 +3223,8 @@ export class ChatStore {
     const promiseById = new Map<string, Promise<ChatMessage | undefined>>();
     const missingIds: string[] = [];
     ids.forEach((messageId) => {
-      const key = `${sessionId}:${messageId}`;
+      const key = createChatRuntimePairKey(sessionId, messageId);
+      if (!key) return;
       const existing = this.fullMessageLoadByIdPromises.get(key);
       if (existing) {
         promiseById.set(messageId, existing);
@@ -3176,7 +3251,8 @@ export class ChatStore {
         () => undefined,
       );
       batchIds.forEach((messageId) => {
-        const key = `${sessionId}:${messageId}`;
+        const key = createChatRuntimePairKey(sessionId, messageId);
+        if (!key) return;
         const messagePromise = batchPromise.then((messages) =>
           messages.find((message) => message.id === messageId),
         );
@@ -3289,9 +3365,7 @@ export class ChatStore {
   }
 
   async deleteChatSessions(sessionIds: string[]): Promise<void> {
-    const ids = Array.from(
-      new Set(sessionIds.filter((id) => id.trim().length > 0)),
-    );
+    const ids = normalizeChatSessionIds(sessionIds);
     if (ids.length === 0) {
       return;
     }

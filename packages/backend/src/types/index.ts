@@ -518,6 +518,7 @@ export type AgentEventType =
   | 'error'
   | 'debug_history'
   | 'user_input'
+  | 'rollback'
   | 'compaction_boundary'
   | 'tokens_count'
 

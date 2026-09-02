@@ -170,14 +170,13 @@ export function buildExecCommandNowaitCompletedInsertion(params: {
     params.command,
     EXEC_COMMAND_NOTIFICATION_COMMAND_JSON_BYTES,
   )
-  const terminalRef = terminalId.value || terminalName.value
   const outcomeUnknown =
     params.runtimeBoundary === true ||
     params.executionState === 'outcome_unknown'
   const aborted = params.executionState === 'aborted'
   const readInstruction = params.terminalAvailable === false
-    ? `The terminal tab is closed, but retention-bounded read-only command history remains available in this GyShell process until it is evicted. Use read_command_output with tabIdOrName=${JSON.stringify(terminalId.value)} and history_command_match_id=${JSON.stringify(historyCommandMatchId.value)}; do not use the old terminal name.`
-    : `Use read_command_output with tabIdOrName=${JSON.stringify(terminalRef)} and history_command_match_id=${JSON.stringify(historyCommandMatchId.value)} if you need to inspect the result.`
+    ? `The terminal tab is closed. read_command_output may still inspect its bounded process-local transcript using the exact historical terminalId=${JSON.stringify(terminalId.value)} and history_command_match_id=${JSON.stringify(historyCommandMatchId.value)} until retention eviction; no other terminal tool accepts the closed ID. Do not replay a side-effecting command merely to recover output.`
+    : `Use read_command_output with terminalId=${JSON.stringify(terminalId.value)} and history_command_match_id=${JSON.stringify(historyCommandMatchId.value)} if you need to inspect the result.`
   const instruction = aborted
     ? 'The background exec_command was aborted. It did not produce a trustworthy successful outcome; do not assume success or automatically replay a command with side effects. ' +
       readInstruction
@@ -294,21 +293,20 @@ export function buildUnfinishedExecCommandContinueInstruction(commands: RunBackg
       command.historyCommandMatchId,
       EXEC_COMMAND_NOTIFICATION_IDENTIFIER_JSON_BYTES,
     ).value
-    const terminalRef = terminalId || terminalName
     return [
       `${index + 1}. command_preview=${JSON.stringify(commandPreview.value)}`,
       `   command_utf8_bytes=${commandPreview.originalUtf8Bytes}, command_truncated=${commandPreview.truncated}`,
       `   terminalId=${JSON.stringify(terminalId)}`,
       `   terminalName=${JSON.stringify(terminalName)}`,
       `   history_command_match_id=${JSON.stringify(historyCommandMatchId)}`,
-      `   suggested read_command_output args: tabIdOrName=${JSON.stringify(terminalRef)}, history_command_match_id=${JSON.stringify(historyCommandMatchId)}`
+      `   suggested read_command_output args: terminalId=${JSON.stringify(terminalId)}, history_command_match_id=${JSON.stringify(historyCommandMatchId)}`
     ].join('\n')
   })
 
   return [
     'You previously started one or more exec_command tasks in background/nowait mode, and they have not finished yet.',
     'Before ending this turn, inspect their current progress and decide whether you should wait longer, take another action, or explicitly proceed without waiting.',
-    'Use read_command_output with the provided history_command_match_id and terminal id/name. Do not assume the command output or final status.',
+    'Use read_command_output with the provided history_command_match_id and exact terminalId. Do not assume the command output or final status.',
     '',
     'Unfinished background exec_command tasks:',
     ...commandLines

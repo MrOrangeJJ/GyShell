@@ -1,4 +1,12 @@
 import fs from "fs/promises";
+import {
+  encodeOpaqueStringPair,
+  extractPassChatMentionReferences,
+  isValidTerminalRuntimeId,
+} from "@gyshell/shared";
+import type {
+  PassChatMentionReference,
+} from "@gyshell/shared";
 import type { ISkillRuntime } from "../runtimeContracts";
 import { TerminalService } from "../TerminalService";
 import {
@@ -12,12 +20,12 @@ import { detectFileKind, readImageFile } from "./tools/read_tools";
 import { formatTerminalStatusHeader } from "./tools/terminal_runtime_guard";
 import type { InputImageAttachment, UserInputPayload } from "../../types";
 import { ImageAttachmentService } from "../ImageAttachmentService";
-import { parseTerminalScopedFilePath } from "./terminalScopedFilePath";
+import {
+  hasTerminalScopedFilePathPrefix,
+  parseTerminalScopedFilePath,
+} from "./terminalScopedFilePath";
 
-export interface PassChatMentionReference {
-  sessionId: string;
-  title?: string;
-}
+export type { PassChatMentionReference };
 
 export type PassChatMentionResolver = (
   references: PassChatMentionReference[],
@@ -44,11 +52,6 @@ export class InputParseHelper {
    * Regex to match mentioned files: [MENTION_FILE:#path#] or [MENTION_FILE:#path##name#]
    */
   private static FILE_REGEX = /\[MENTION_FILE:#(.+?)(?:##.+?)?#\]/g;
-
-  /**
-   * Regex to match pass-chat labels: [MENTION_PASS_CHAT:#sessionId##encodedTitle#]
-   */
-  private static PASS_CHAT_REGEX = /\[MENTION_PASS_CHAT:#(.+?)(?:##(.+?))?#\]/g;
 
   /**
    * Parses the input, fetches skill and file contents, and returns enriched
@@ -112,6 +115,9 @@ export class InputParseHelper {
       const tabMatches = Array.from(normalized.text.matchAll(this.TAB_REGEX));
       const tabIds = Array.from(new Set(tabMatches.map((m) => m[2])));
       for (const id of tabIds) {
+        if (!isValidTerminalRuntimeId(id)) {
+          continue;
+        }
         try {
           const tab = terminalService
             .getDisplayTerminals()
@@ -148,13 +154,16 @@ ${recentOutput}
         terminalId: string | null,
         filePath: string,
       ): void => {
-        const normalizedTerminalId = terminalId ? terminalId.trim() : null;
+        const normalizedTerminalId = isValidTerminalRuntimeId(terminalId)
+          ? terminalId
+          : null;
         const normalizedPath = String(filePath || "").trim();
         if (!normalizedPath) return;
-        const key = normalizedTerminalId
-          ? `${normalizedTerminalId}::${normalizedPath}`
-          : normalizedPath;
-        if (seenReferences.has(key)) return;
+        const key = encodeOpaqueStringPair(
+          normalizedTerminalId ?? "",
+          normalizedPath,
+        );
+        if (!key || seenReferences.has(key)) return;
         seenReferences.add(key);
         referencedFiles.push({
           terminalId: normalizedTerminalId,
@@ -165,12 +174,20 @@ ${recentOutput}
 
       const fileMatches = Array.from(normalized.text.matchAll(this.FILE_REGEX));
       fileMatches.forEach((match) => {
-        const resolved = parseTerminalScopedFilePath(match[1]);
+        const rawPath = match[1];
+        const resolved = parseTerminalScopedFilePath(rawPath);
         if (resolved) {
-          pushUniqueReference(resolved.terminalId, resolved.filePath);
+          if (isValidTerminalRuntimeId(resolved.terminalId)) {
+            pushUniqueReference(resolved.terminalId, resolved.filePath);
+          }
           return;
         }
-        pushUniqueReference(null, match[1]);
+        // Scoped metadata is never an alternative local path. Malformed or
+        // invalid terminal scope fails closed before any filesystem access.
+        if (hasTerminalScopedFilePathPrefix(rawPath)) {
+          return;
+        }
+        pushUniqueReference(null, rawPath);
       });
 
       for (const reference of referencedFiles) {
@@ -191,20 +208,15 @@ ${recentOutput}
 
     let passChatDetails = "";
     if (includeContextDetails && options?.passChatMentionResolver) {
-      const passChatMatches = Array.from(
-        normalized.text.matchAll(this.PASS_CHAT_REGEX),
-      );
       const seenPassChats = new Set<string>();
       const references: PassChatMentionReference[] = [];
-      passChatMatches.forEach((match) => {
-        const sessionId = String(match[1] || "").trim();
-        if (!sessionId || seenPassChats.has(sessionId)) return;
-        seenPassChats.add(sessionId);
-        references.push({
-          sessionId,
-          ...(match[2] ? { title: this.decodeMentionComponent(match[2]) } : {}),
-        });
-      });
+      for (const reference of extractPassChatMentionReferences(
+        normalized.text,
+      )) {
+        if (seenPassChats.has(reference.sessionId)) continue;
+        seenPassChats.add(reference.sessionId);
+        references.push(reference);
+      }
       if (references.length > 0) {
         try {
           passChatDetails = await options.passChatMentionResolver(references);
@@ -217,7 +229,6 @@ ${recentOutput}
         }
       }
     }
-    this.PASS_CHAT_REGEX.lastIndex = 0; // Reset regex state
 
     const preparedImages = await this.prepareImagesForInput(normalized.images, {
       modelSupportsImage,
@@ -288,14 +299,6 @@ ${recentOutput}
         err,
       );
       return null;
-    }
-  }
-
-  private static decodeMentionComponent(value: string): string {
-    try {
-      return decodeURIComponent(value);
-    } catch {
-      return value;
     }
   }
 

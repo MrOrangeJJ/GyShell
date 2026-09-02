@@ -1,9 +1,13 @@
 import { z } from 'zod'
 import { createTwoFilesPatch } from 'diff'
-import type { TerminalService } from '../../TerminalService'
+import type {
+  TerminalRuntimeGuard,
+  TerminalService
+} from '../../TerminalService'
 import type { TerminalTab } from '../../../types'
 import type { ToolExecutionContext } from '../types'
-import { parseTerminalScopedFilePath } from '../terminalScopedFilePath'
+import { resolveTerminalScopedFileTarget } from '../terminalScopedFilePath'
+import { terminalIdSchema } from '../terminalIdContract'
 import {
   formatTerminalUnavailableForTool,
   resolveTerminalForTool
@@ -15,7 +19,7 @@ import {
 } from '../tool_capabilities'
 
 export const editFileSchema = z.object({
-  tabIdOrName: z.string().describe('The ID or Name of the terminal tab'),
+  terminalId: terminalIdSchema,
   filePath: z
     .string()
     .describe(
@@ -34,21 +38,21 @@ export const editFileSchema = z.object({
     .boolean()
     .optional()
     .describe('Replace all occurrences of oldString (default false). Use for safe bulk renames.')
-})
+}).strict()
 
 export const writeFileSchema = z.object({
-  tabIdOrName: z.string().describe('The ID or Name of the terminal tab'),
+  terminalId: terminalIdSchema,
   filePath: z
     .string()
     .describe(
       'File path to write. Use an absolute path when possible. If a relative path is provided, it will be resolved from the terminal tab working directory.'
     ),
   content: z.string().describe('The full content to write to the file (overwrites existing content).')
-})
+}).strict()
 
 export const writeAndEditSchema = z
   .object({
-    tabIdOrName: z.string().describe('The ID or Name of the terminal tab'),
+    terminalId: terminalIdSchema,
     filePath: z
       .string()
       .describe(
@@ -59,6 +63,7 @@ export const writeAndEditSchema = z
     newString: z.string().optional().describe('Replacement text (edit mode).'),
     replaceAll: z.boolean().optional().describe('Replace all occurrences when in edit mode.')
   })
+  .strict()
   .superRefine((val, ctx) => {
     const hasContent = typeof val.content === 'string'
     const hasOld = typeof val.oldString === 'string'
@@ -100,54 +105,71 @@ export interface EditToolResult {
 
 export async function runEditTool(
   args: z.infer<typeof editFileSchema>,
-  opts: { terminalService: TerminalService; terminal: TerminalTab; signal?: AbortSignal }
+  opts: {
+    terminalService: TerminalService
+    terminal: TerminalTab
+    runtimeGuard?: TerminalRuntimeGuard
+    signal?: AbortSignal
+  }
 ): Promise<EditToolResult> {
-  if (!args.filePath) {
-    throw new Error('filePath is required')
+  const validation = editFileSchema.safeParse(args)
+  if (!validation.success) {
+    throw new Error(`Parameter validation error for edit_file: ${validation.error.message}`)
   }
-
-  if (args.oldString === '') {
-    throw new Error('oldString must not be empty; use write_file to create or overwrite full files.')
-  }
-
-  if (args.oldString === args.newString) {
+  const validatedArgs = validation.data
+  if (validatedArgs.oldString === validatedArgs.newString) {
     throw new Error('oldString and newString must be different')
   }
 
-  const { terminalService, terminal, signal } = opts
-  const filePath = args.filePath
+  const { terminalService, terminal, runtimeGuard, signal } = opts
+  const filePath = validatedArgs.filePath
 
   if (signal?.aborted) throw new Error('AbortError')
-  const stat = await terminalService.statFile(terminal.id, filePath)
+  const stat = await terminalService.statFile(
+    terminal.id,
+    filePath,
+    runtimeGuard
+  )
   if (signal?.aborted) throw new Error('AbortError')
-  
+
   if (!stat.exists) {
     throw new Error(`File not found: ${filePath}`)
   }
-  if (stat.exists && stat.isDirectory) {
+  if (stat.isDirectory) {
     throw new Error(`Path is a directory, not a file: ${filePath}`)
   }
 
-  let diff = ''
-  let contentOld = ''
-  let contentNew = ''
-  const action: EditToolResult['action'] = 'edited'
+  if (signal?.aborted) throw new Error('AbortError')
+  const contentOld = (
+    await terminalService.readFile(terminal.id, filePath, runtimeGuard)
+  ).toString('utf8')
+  if (signal?.aborted) throw new Error('AbortError')
 
-  if (signal?.aborted) throw new Error('AbortError')
-  contentOld = (await terminalService.readFile(terminal.id, filePath)).toString('utf8')
-  if (signal?.aborted) throw new Error('AbortError')
-  
-  contentNew = replace(contentOld, args.oldString, args.newString, args.replaceAll)
-  diff = trimDiff(
-    createTwoFilesPatch(filePath, filePath, normalizeLineEndings(contentOld), normalizeLineEndings(contentNew))
+  const contentNew = replace(
+    contentOld,
+    validatedArgs.oldString,
+    validatedArgs.newString,
+    validatedArgs.replaceAll
   )
   if (signal?.aborted) throw new Error('AbortError')
-  await terminalService.writeFile(terminal.id, filePath, contentNew)
+  await terminalService.writeFile(
+    terminal.id,
+    filePath,
+    contentNew,
+    runtimeGuard
+  )
   if (signal?.aborted) throw new Error('AbortError')
-  const contentAfter = (await terminalService.readFile(terminal.id, filePath)).toString('utf8')
+  const contentAfter = (
+    await terminalService.readFile(terminal.id, filePath, runtimeGuard)
+  ).toString('utf8')
   if (signal?.aborted) throw new Error('AbortError')
-  
-  diff = trimDiff(
+  if (contentAfter !== contentNew) {
+    throw new Error(
+      'File verification failed after edit; the stored content does not match the intended replacement.'
+    )
+  }
+
+  const diff = trimDiff(
     createTwoFilesPatch(
       filePath,
       filePath,
@@ -157,10 +179,10 @@ export async function runEditTool(
   )
 
   return {
-    output: 'Edit applied successfully.',
+    output: 'Edit applied and verified successfully.',
     diff,
-    action,
-    filePath: filePath
+    action: 'edited',
+    filePath
   }
 }
 
@@ -173,36 +195,69 @@ export interface WriteToolResult {
 
 export async function runWriteTool(
   args: z.infer<typeof writeFileSchema>,
-  opts: { terminalService: TerminalService; terminal: TerminalTab; signal?: AbortSignal }
-): Promise<WriteToolResult> {
-  if (!args.filePath) {
-    throw new Error('filePath is required')
+  opts: {
+    terminalService: TerminalService
+    terminal: TerminalTab
+    runtimeGuard?: TerminalRuntimeGuard
+    signal?: AbortSignal
   }
+): Promise<WriteToolResult> {
+  const validation = writeFileSchema.safeParse(args)
+  if (!validation.success) {
+    throw new Error(`Parameter validation error for write_file: ${validation.error.message}`)
+  }
+  const validatedArgs = validation.data
+  const { terminalService, terminal, runtimeGuard, signal } = opts
+  const filePath = validatedArgs.filePath
+  if (signal?.aborted) throw new Error('AbortError')
+  const stat = await terminalService.statFile(
+    terminal.id,
+    filePath,
+    runtimeGuard
+  )
+  if (signal?.aborted) throw new Error('AbortError')
 
-  const { terminalService, terminal, signal } = opts
-  const filePath = args.filePath
-  if (signal?.aborted) throw new Error('AbortError')
-  const stat = await terminalService.statFile(terminal.id, filePath)
-  if (signal?.aborted) throw new Error('AbortError')
-  
   if (stat.exists && stat.isDirectory) {
     throw new Error(`Path is a directory, not a file: ${filePath}`)
   }
 
   if (signal?.aborted) throw new Error('AbortError')
-  const contentOld = stat.exists ? (await terminalService.readFile(terminal.id, filePath)).toString('utf8') : ''
-  if (signal?.aborted) throw new Error('AbortError')
-  
-  const diff = trimDiff(createTwoFilesPatch(filePath, filePath, contentOld, args.content))
-  if (signal?.aborted) throw new Error('AbortError')
-  await terminalService.writeFile(terminal.id, filePath, args.content)
+  const contentOld = stat.exists
+    ? (
+        await terminalService.readFile(
+          terminal.id,
+          filePath,
+          runtimeGuard
+        )
+      ).toString('utf8')
+    : ''
   if (signal?.aborted) throw new Error('AbortError')
 
+  await terminalService.writeFile(
+    terminal.id,
+    filePath,
+    validatedArgs.content,
+    runtimeGuard
+  )
+  if (signal?.aborted) throw new Error('AbortError')
+  const contentAfter = (
+    await terminalService.readFile(terminal.id, filePath, runtimeGuard)
+  ).toString('utf8')
+  if (signal?.aborted) throw new Error('AbortError')
+  if (contentAfter !== validatedArgs.content) {
+    throw new Error(
+      'File verification failed after write; the stored content does not match the requested content.'
+    )
+  }
+  const diff = trimDiff(
+    createTwoFilesPatch(filePath, filePath, contentOld, contentAfter)
+  )
+
   return {
-    output: 'Wrote file successfully.',
+    output: 'Wrote file successfully. The stored content was verified after writing.',
     diff,
     action: stat.exists ? 'edited' : 'created',
-    filePath: filePath
+    filePath
   }
 }
 
@@ -677,7 +732,7 @@ export function replace(content: string, oldString: string, newString: string, r
 }
 
 type FileMutationArgs = {
-  tabIdOrName: string
+  terminalId: string
   filePath: string
 }
 
@@ -695,21 +750,35 @@ async function runFileMutationTool(
   toolName: string,
   unavailableOperation: string,
   runner: (params: {
-    tabIdOrName: string
+    terminalId: string
     filePath: string
     terminalService: TerminalService
     terminal: TerminalTab
+    runtimeGuard?: TerminalRuntimeGuard
     signal?: AbortSignal
   }) => Promise<FileMutationResult>
 ): Promise<string> {
-  const scopedReference = parseTerminalScopedFilePath(String(args.filePath || ''))
-  const tabIdOrName = scopedReference?.terminalId || args.tabIdOrName
-  const filePathInput = scopedReference?.filePath || args.filePath
+  const target = resolveTerminalScopedFileTarget(
+    args.terminalId,
+    args.filePath
+  )
+  const filePathInput = target.ok ? target.filePath : args.filePath
   const { terminalService, sessionId, messageId, sendEvent } = context
   
   if (context.signal?.aborted) throw new Error('AbortError')
 
-  const resolved = resolveTerminalForTool(context, tabIdOrName)
+  if (!target.ok) {
+    sendEvent(sessionId, {
+      messageId,
+      type: 'tool_call',
+      toolName,
+      input: JSON.stringify(args),
+      output: target.message
+    })
+    return target.message
+  }
+
+  const resolved = resolveTerminalForTool(context, target.terminalId)
   if (!resolved.ok) {
     const errorText = resolved.message
     sendEvent(sessionId, {
@@ -750,10 +819,11 @@ async function runFileMutationTool(
   let filePath = filePathInput
   try {
     const result = await runner({
-      tabIdOrName,
+      terminalId: target.terminalId,
       filePath: filePathInput,
       terminalService,
       terminal: bestMatch,
+      runtimeGuard: resolved.runtimeGuard,
       signal: context.signal
     })
     outputText = formatFileMutationOutput(result)
@@ -797,15 +867,27 @@ export async function writeFile(
   context: ToolExecutionContext,
   toolName = WRITE_FILE_TOOL_NAME
 ): Promise<string> {
+  const validation = writeFileSchema.safeParse(args)
+  if (!validation.success) {
+    return `Parameter validation error for ${toolName}: ${validation.error.message}`
+  }
+  const validatedArgs = validation.data
   return await runFileMutationTool(
-    args,
+    validatedArgs,
     context,
     toolName,
     'write files through this terminal',
-    async ({ tabIdOrName, filePath, terminalService, terminal, signal }) =>
+    async ({
+      terminalId,
+      filePath,
+      terminalService,
+      terminal,
+      runtimeGuard,
+      signal
+    }) =>
       await runWriteTool(
-        { tabIdOrName, filePath, content: args.content },
-        { terminalService, terminal, signal }
+        { terminalId, filePath, content: validatedArgs.content },
+        { terminalService, terminal, runtimeGuard, signal }
       )
   )
 }
@@ -815,21 +897,33 @@ export async function editFile(
   context: ToolExecutionContext,
   toolName = EDIT_FILE_TOOL_NAME
 ): Promise<string> {
+  const validation = editFileSchema.safeParse(args)
+  if (!validation.success) {
+    return `Parameter validation error for ${toolName}: ${validation.error.message}`
+  }
+  const validatedArgs = validation.data
   return await runFileMutationTool(
-    args,
+    validatedArgs,
     context,
     toolName,
     'edit files through this terminal',
-    async ({ tabIdOrName, filePath, terminalService, terminal, signal }) =>
+    async ({
+      terminalId,
+      filePath,
+      terminalService,
+      terminal,
+      runtimeGuard,
+      signal
+    }) =>
       await runEditTool(
         {
-          tabIdOrName,
+          terminalId,
           filePath,
-          oldString: args.oldString,
-          newString: args.newString,
-          replaceAll: args.replaceAll
+          oldString: validatedArgs.oldString,
+          newString: validatedArgs.newString,
+          replaceAll: validatedArgs.replaceAll
         },
-        { terminalService, terminal, signal }
+        { terminalService, terminal, runtimeGuard, signal }
       )
   )
 }
@@ -847,7 +941,7 @@ function normalizeLegacyWriteAndEditArgs(args: any):
     return {
       mode: 'write',
       args: {
-        tabIdOrName: args.tabIdOrName,
+        terminalId: args.terminalId,
         filePath: args.filePath,
         content: args.content
       }
@@ -861,7 +955,7 @@ function normalizeLegacyWriteAndEditArgs(args: any):
     return {
       mode: 'write',
       args: {
-        tabIdOrName: args.tabIdOrName,
+        terminalId: args.terminalId,
         filePath: args.filePath,
         content: args.newString
       }
@@ -872,7 +966,7 @@ function normalizeLegacyWriteAndEditArgs(args: any):
     return {
       mode: 'edit',
       args: {
-        tabIdOrName: args.tabIdOrName,
+        terminalId: args.terminalId,
         filePath: args.filePath,
         oldString: args.oldString,
         newString: args.newString,
@@ -885,7 +979,11 @@ function normalizeLegacyWriteAndEditArgs(args: any):
 }
 
 export async function writeAndEdit(args: any, context: ToolExecutionContext): Promise<string> {
-  const normalized = normalizeLegacyWriteAndEditArgs(args)
+  const validation = writeAndEditSchema.safeParse(args)
+  if (!validation.success) {
+    return `Parameter validation error for ${LEGACY_CREATE_OR_EDIT_TOOL_NAME}: ${validation.error.message}`
+  }
+  const normalized = normalizeLegacyWriteAndEditArgs(validation.data)
   if (normalized.mode === 'write') {
     return await writeFile(normalized.args, context, LEGACY_CREATE_OR_EDIT_TOOL_NAME)
   }

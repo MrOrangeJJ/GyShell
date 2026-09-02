@@ -1,4 +1,8 @@
 import path from "node:path";
+import {
+  isValidTerminalRuntimeId,
+  readOpaqueNonBlankWellFormedString,
+} from "@gyshell/shared";
 import { ChatOpenAI } from "@langchain/openai";
 import {
   HumanMessage,
@@ -16,7 +20,6 @@ import {
   START,
   END,
   Annotation,
-  MemorySaver,
 } from "@langchain/langgraph";
 import { RunnableLambda } from "@langchain/core/runnables";
 import type { ChatSession, BackendSettings, TerminalTab } from "../types";
@@ -53,6 +56,8 @@ import {
   readFileTransferStatusSchema,
   toolImplementations,
   buildSkillToolDescription,
+  skillToolSchema,
+  createSkillSchema,
   buildCreateTerminalTabDescription,
   buildTerminalConfigFromSavedConnection,
 } from "./AgentHelper/tools";
@@ -106,6 +111,8 @@ import {
   createSyntheticToolOutcomeContent,
   deferTerminalMutationsAfterRuntimeBoundary,
   getParallelToolCallPrefix,
+  getToolCallRuntimeBindingDriftReason,
+  getToolCallExecutionMetadata,
   isParallelToolCallPrefixStillSafe,
   normalizeToolCallIds,
   normalizeToolCallNames,
@@ -148,7 +155,13 @@ import {
   hasAnyNormalUserInputTag,
   WHAT_HAVE_DONE_IN_THE_PAST_TAG,
 } from "./AgentHelper/prompts";
-import { runSkillTool } from "./AgentHelper/tools/skill_tools";
+import {
+  runSkillTool,
+} from "./AgentHelper/tools/skill_tools";
+import {
+  NonPersistedLastValueChannel,
+  TransientStateMemorySaver,
+} from "./AgentHelper/transientState";
 import { TokenManager } from "./AgentHelper/TokenManager";
 import {
   InputParseHelper,
@@ -172,6 +185,22 @@ import {
   type UnfinishedRunBackgroundExecCommandProvider,
   type UnfinishedRunBackgroundFileTransferProvider,
 } from "./AgentHelper/queuedInsertions";
+
+const readAgentSessionId = (value: unknown): string | undefined =>
+  readOpaqueNonBlankWellFormedString(value);
+
+const requireAgentSessionId = (value: unknown): string => {
+  const sessionId = readAgentSessionId(value);
+  if (sessionId === undefined) throw new Error("Session id is required.");
+  return sessionId;
+};
+
+const requireAgentSessionIds = (value: unknown): string[] => {
+  if (!Array.isArray(value)) throw new Error("Session ids must be an array.");
+  return Array.from(
+    new Set(value.map((candidate) => requireAgentSessionId(candidate))),
+  );
+};
 
 const Ann: any = Annotation;
 type StartupInputState = StartTaskInput | undefined;
@@ -206,10 +235,10 @@ const StateAnnotation = Ann.Root({
     reducer: (x: string, y?: string) => y ?? x,
     default: () => "",
   }),
-  physicalRunId: Ann({
-    reducer: (x: string, y?: string) => y ?? x,
-    default: () => "",
-  }),
+  // A physical run ID exists only for one process-local graph invocation.
+  // It must remain readable while that invocation is live but never resume
+  // from a checkpoint into a later invocation.
+  physicalRunId: new NonPersistedLastValueChannel<string>(() => ""),
   startup_input: Ann({
     reducer: (x: StartupInputState, y?: StartTaskInput) => y ?? x,
     default: (): StartupInputState => undefined,
@@ -218,14 +247,9 @@ const StateAnnotation = Ann.Root({
     reducer: (x: StartupModeState, y?: StartupModeState) => y ?? x,
     default: () => "normal",
   }),
-  pendingToolCalls: Ann({
-    reducer: (x: any[], y?: any[] | any) => {
-      if (!y) return x;
-      if (Array.isArray(y)) return y;
-      return x;
-    },
-    default: () => [],
-  }),
+  // Tool queues carry process-local execution metadata and runtime leases.
+  // The channel and saver intentionally keep them out of checkpoints.
+  pendingToolCalls: new NonPersistedLastValueChannel<any[]>(() => []),
   pendingToolSupplementMessages: Ann({
     reducer: (x: BaseMessage[], y?: BaseMessage[]) =>
       Array.isArray(y) ? y : x,
@@ -515,7 +539,7 @@ export class AgentService_v2 {
 
   private graph: any = null;
   private helpers: AgentHelpers;
-  private checkpointer: MemorySaver;
+  private checkpointer: TransientStateMemorySaver;
   private builtInToolEnabled: Record<string, boolean> = {};
   private abortedMessagesByRunId: Map<string, BaseMessage[]> = new Map();
   private committedCompactionByPhysicalRunId: Map<
@@ -552,6 +576,12 @@ export class AgentService_v2 {
   private fallbackCompactionHistoryExportService: PassChatTempExportService | null =
     null;
   private activeAgentRunIdsBySession: Map<string, string> = new Map();
+  private terminalReferenceMigrationResolver = {
+    resolveExactTerminalId: (reference: string): string | null =>
+      this.terminalService.getTerminalById(reference)?.id || null,
+    resolveLegacyTerminalReference: (reference: string): string | null =>
+      this.terminalService.resolveTerminal(reference).bestMatch?.id || null,
+  };
 
   private getCommandOutputBackingSource = (
     terminalId: string,
@@ -766,13 +796,21 @@ export class AgentService_v2 {
     }
   }
 
+  private readActivePhysicalRunId(value: unknown): string | undefined {
+    const physicalRunId = readOpaqueNonBlankWellFormedString(value);
+    return physicalRunId && this.activePhysicalRunIds.has(physicalRunId)
+      ? physicalRunId
+      : undefined;
+  }
+
   private captureAbortedMessageForActiveRun(
-    physicalRunId: string,
+    physicalRunId: unknown,
     messages: BaseMessage | BaseMessage[],
   ): boolean {
-    if (!this.activePhysicalRunIds.has(physicalRunId)) return false;
+    const activePhysicalRunId = this.readActivePhysicalRunId(physicalRunId);
+    if (!activePhysicalRunId) return false;
     this.abortedMessagesByRunId.set(
-      physicalRunId,
+      activePhysicalRunId,
       Array.isArray(messages) ? messages : [messages],
     );
     return true;
@@ -850,7 +888,7 @@ export class AgentService_v2 {
     this.imageAttachmentService = imageAttachmentService || null;
     this.fileTransferService = fileTransferService || null;
     this.helpers = new AgentHelpers();
-    this.checkpointer = new MemorySaver();
+    this.checkpointer = new TransientStateMemorySaver();
     this.initializeGraph();
   }
 
@@ -1249,6 +1287,9 @@ export class AgentService_v2 {
 
   private createTokenManagerNode() {
     return RunnableLambda.from(async (state: any, config: any) => {
+      const physicalRunId = this.readActivePhysicalRunId(
+        state.physicalRunId,
+      );
       if (
         (Array.isArray(state.pendingToolCalls) &&
           state.pendingToolCalls.length > 0) ||
@@ -1308,7 +1349,7 @@ export class AgentService_v2 {
           config?.signal,
           {
             maxTokens,
-            physicalRunId: state.physicalRunId,
+            physicalRunId,
           },
         );
         if (compactionResult.changed) {
@@ -1568,7 +1609,7 @@ export class AgentService_v2 {
     return [
       `Local Path Scope: ${PASS_CHAT_LOCAL_PATH_SCOPE}`,
       `Recommended Local Terminal Tab: ${this.formatPassChatTerminalLabel(localTerminal)}`,
-      `Recommended read_file args: tabIdOrName="${localTerminal.id}", filePath="${filePath}"`,
+      `Recommended read_file args: terminalId="${localTerminal.id}", filePath="${filePath}"`,
       "Shell Fallback: If you use a shell command, run it only in the recommended local terminal tab above. Do not use an SSH/remote tab or the current working terminal tab unless it is the same local tab.",
     ];
   }
@@ -1599,8 +1640,8 @@ export class AgentService_v2 {
   private async resolveSinglePassChatMentionDetail(
     reference: PassChatMentionReference,
   ): Promise<string> {
-    const sessionId = String(reference.sessionId || "").trim();
-    if (!sessionId) return "";
+    const sessionId = readAgentSessionId(reference.sessionId);
+    if (sessionId === undefined) return "";
 
     try {
       const uiSession = this.uiHistoryService.getSession(sessionId);
@@ -1706,6 +1747,9 @@ export class AgentService_v2 {
     return RunnableLambda.from(async (state: any, config: any) => {
       const sessionId = state.sessionId;
       if (!sessionId) throw new Error("No session ID in state");
+      const physicalRunId = this.readActivePhysicalRunId(
+        state.physicalRunId,
+      );
       this.ackQueuedInsertionMessagesInState(
         sessionId,
         state.messages as BaseMessage[],
@@ -1875,8 +1919,8 @@ export class AgentService_v2 {
                   ];
                 }
               }
-              const physicalRunId = String(state.physicalRunId || sessionId);
               if (
+                physicalRunId &&
                 abortedMessages.length > 0 &&
                 this.captureAbortedMessageForActiveRun(
                   physicalRunId,
@@ -1995,6 +2039,8 @@ export class AgentService_v2 {
                     modelSupportsImage: sessionBinding.readFileSupport.image,
                     getCommandOutputBackingSource:
                       this.getCommandOutputBackingSource,
+                    terminalReferenceMigrationResolver:
+                      this.terminalReferenceMigrationResolver,
                   });
                 invokeResponse = await modelWithTools.invoke(
                   invokeInputMessages,
@@ -2069,6 +2115,8 @@ export class AgentService_v2 {
           maxRetries: MODEL_RETRY_MAX,
           delaysMs: MODEL_RETRY_DELAYS_MS,
           getCommandOutputBackingSource: this.getCommandOutputBackingSource,
+          terminalReferenceMigrationResolver:
+            this.terminalReferenceMigrationResolver,
         });
 
       const mainModelResult = await this.invokeMainModelWithContextRecovery({
@@ -2076,7 +2124,7 @@ export class AgentService_v2 {
         historyMessages: fullHistoryMessages,
         modelSupportsImage: sessionBinding.readFileSupport.image,
         maxTokens: mainRequestMaxTokens,
-        physicalRunId: state.physicalRunId,
+        physicalRunId,
         signal: config?.signal,
         canRecover: () => !modelRequestProducedChunk,
         request: requestMainModel,
@@ -2087,9 +2135,9 @@ export class AgentService_v2 {
       // A successful attempt supersedes any interrupted attempt captured under
       // the same physical run. Keeping the stale bundle would let a later stop
       // append obsolete assistant/tool messages to the accepted checkpoint.
-      this.abortedMessagesByRunId.delete(
-        String(state.physicalRunId || sessionId),
-      );
+      if (physicalRunId) {
+        this.abortedMessagesByRunId.delete(physicalRunId);
+      }
 
       fullResponse.additional_kwargs = {
         ...(fullResponse.additional_kwargs || {}),
@@ -2276,6 +2324,7 @@ export class AgentService_v2 {
         sessionId,
         toolMessage.additional_kwargs._gyshellMessageId as string,
         config,
+        toolCall,
       );
       const messageHistory: BaseMessage[] = state.messages;
       const rethrowIfAborted = (error: unknown): void => {
@@ -2297,6 +2346,16 @@ export class AgentService_v2 {
           `Tool "${toolCall.name}" was disabled before execution.`,
         );
       }
+      const runtimeBindingDriftReason =
+        this.getRuntimeBindingDriftReason(toolCall);
+      if (runtimeBindingDriftReason) {
+        return this.completeToolCallWithoutExecution(
+          state,
+          queue,
+          toolCall,
+          runtimeBindingDriftReason,
+        );
+      }
       switch (toolCall.name) {
         case "skill": {
           let args: any = toolCall.args || {};
@@ -2307,13 +2366,19 @@ export class AgentService_v2 {
               args = {};
             }
           }
+          const validatedArgs = skillToolSchema.safeParse(args);
+          if (!validatedArgs.success) {
+            result = `Parameter validation error for skill: ${validatedArgs.error.message}`;
+            break;
+          }
+          args = validatedArgs.data;
           const messageId = toolMessage.additional_kwargs
             ._gyshellMessageId as string;
           this.helpers.sendEvent(sessionId, {
             messageId,
             type: "sub_tool_started",
             title: "Skill",
-            hint: `${args.name || "unknown"}...`,
+            hint: `${args.name}...`,
             input: JSON.stringify(args),
           });
           const outcome = await runSkillTool(
@@ -2350,6 +2415,12 @@ export class AgentService_v2 {
               args = {};
             }
           }
+          const validatedArgs = createSkillSchema.safeParse(args);
+          if (!validatedArgs.success) {
+            result = `Parameter validation error for create_skill: ${validatedArgs.error.message}`;
+            break;
+          }
+          args = validatedArgs.data;
           const messageId = toolMessage.additional_kwargs
             ._gyshellMessageId as string;
           const outcome = await toolImplementations.runCreateSkillTool(
@@ -2364,13 +2435,15 @@ export class AgentService_v2 {
           // though the dynamic fetching in model_request node should handle it.
           // But we must ensure the local toolsForModel is updated if we use it elsewhere.
 
-          this.helpers.sendEvent(sessionId, {
-            messageId,
-            type: "tool_call",
-            toolName: "create_skill",
-            input: JSON.stringify(args),
-            output: result,
-          });
+          if (validatedArgs.success) {
+            this.helpers.sendEvent(sessionId, {
+              messageId,
+              type: "tool_call",
+              toolName: "create_skill",
+              input: JSON.stringify(args),
+              output: result,
+            });
+          }
           break;
         }
         case "read_terminal_tab": {
@@ -2418,7 +2491,7 @@ export class AgentService_v2 {
             };
             const resolvedTerminal = resolveTerminalForTool(
               executionContext,
-              validatedArgs.tabIdOrName,
+              validatedArgs.terminalId,
             );
             if (!resolvedTerminal.ok) {
               result = resolvedTerminal.message;
@@ -2631,6 +2704,9 @@ export class AgentService_v2 {
     return RunnableLambda.from(async (state: any, config: any) => {
       const sessionId = state.sessionId;
       if (!sessionId) throw new Error("No session ID in state");
+      const physicalRunId = this.readActivePhysicalRunId(
+        state.physicalRunId,
+      );
       this.throwIfAborted(config?.signal);
 
       const queue: any[] = Array.isArray(state.pendingToolCalls)
@@ -2652,6 +2728,17 @@ export class AgentService_v2 {
         );
       }
 
+      const runtimeBindingDriftReason =
+        this.getRuntimeBindingDriftReason(toolCall);
+      if (runtimeBindingDriftReason) {
+        return this.completeToolCallWithoutExecution(
+          state,
+          queue,
+          toolCall,
+          runtimeBindingDriftReason,
+        );
+      }
+
       const toolMessage = this.createToolMessage(toolCall);
       let latestCommandResultText: string | undefined;
       let latestCommandResultContract: ReturnType<
@@ -2661,6 +2748,7 @@ export class AgentService_v2 {
         sessionId,
         toolMessage.additional_kwargs._gyshellMessageId as string,
         config,
+        toolCall,
       );
       const messageHistory: BaseMessage[] = state.messages;
       let runtimeTerminalBoundaryId: string | null = null;
@@ -2681,7 +2769,7 @@ export class AgentService_v2 {
 
       const resolvedTerminal = resolveTerminalForTool(
         executionContext,
-        validated.tabIdOrName,
+        validated.terminalId,
       );
       if (!resolvedTerminal.ok) {
         toolMessage.content = resolvedTerminal.message;
@@ -2858,10 +2946,10 @@ export class AgentService_v2 {
         if (
           this.helpers.isAbortError(error) &&
           latestCommandResultContract &&
-          typeof state.physicalRunId === "string"
+          physicalRunId
         ) {
           this.captureAbortedMessageForActiveRun(
-            state.physicalRunId,
+            physicalRunId,
             toolMessage,
           );
         }
@@ -2929,12 +3017,23 @@ export class AgentService_v2 {
             `Tool "${toolCall.name}" was disabled before execution.`,
           );
         }
+        const runtimeBindingDriftReason =
+          this.getRuntimeBindingDriftReason(toolCall);
+        if (runtimeBindingDriftReason) {
+          return this.completeToolCallWithoutExecution(
+            state,
+            queue,
+            toolCall,
+            runtimeBindingDriftReason,
+          );
+        }
 
         const toolMessage = this.createToolMessage(toolCall);
         const executionContext = this.createExecutionContext(
           sessionId,
           toolMessage.additional_kwargs._gyshellMessageId as string,
           config,
+          toolCall,
         );
         const messageHistory: BaseMessage[] = state.messages;
 
@@ -3002,6 +3101,16 @@ export class AgentService_v2 {
           `Tool "${toolCall.name}" was disabled before execution.`,
         );
       }
+      const runtimeBindingDriftReason =
+        this.getRuntimeBindingDriftReason(toolCall);
+      if (runtimeBindingDriftReason) {
+        return this.completeToolCallWithoutExecution(
+          state,
+          queue,
+          toolCall,
+          runtimeBindingDriftReason,
+        );
+      }
       const sessionBinding = this.getSessionModelBinding(sessionId);
 
       const toolMessage = this.createToolMessage(toolCall);
@@ -3011,6 +3120,7 @@ export class AgentService_v2 {
         sessionId,
         messageId,
         config,
+        toolCall,
       );
       const messageHistory: BaseMessage[] = state.messages;
 
@@ -3140,6 +3250,15 @@ export class AgentService_v2 {
     });
   }
 
+  private getRuntimeBindingDriftReason(
+    toolCall: PlannedToolCall,
+  ): string | null {
+    return getToolCallRuntimeBindingDriftReason(
+      toolCall,
+      this.createToolBatchPlanningEnvironment(),
+    );
+  }
+
   private isMcpToolExplicitlyReadOnly(toolName: string): boolean {
     const tool = this.mcpToolService
       .getActiveTools()
@@ -3150,7 +3269,7 @@ export class AgentService_v2 {
 
   private createToolBatchPlanningEnvironment(): ToolBatchPlanningEnvironment {
     const resolveTerminalId = (reference: string): string | null =>
-      this.terminalService.resolveTerminal(reference).bestMatch?.id || null;
+      this.terminalService.getTerminalById(reference)?.id || null;
     return {
       isToolEnabled: (toolName) => {
         if (this.mcpToolService.isMcpToolName(toolName)) return true;
@@ -3163,6 +3282,15 @@ export class AgentService_v2 {
       isMcpToolReadOnly: (toolName) =>
         this.isMcpToolExplicitlyReadOnly(toolName),
       resolveTerminalId,
+      resolveTerminalRuntimeGeneration: (reference) => {
+        const terminalId = resolveTerminalId(reference);
+        if (!terminalId) return undefined;
+        const getRuntimeGeneration = (this.terminalService as any)
+          .getTerminalRuntimeGeneration;
+        return typeof getRuntimeGeneration === "function"
+          ? getRuntimeGeneration.call(this.terminalService, terminalId)
+          : undefined;
+      },
       resolveMachineId: (reference) => {
         const terminalId = resolveTerminalId(reference);
         return terminalId
@@ -3222,6 +3350,19 @@ export class AgentService_v2 {
         parallelCalls.map(async (toolCall) => {
           // A final per-call check keeps a settings change from crossing the
           // dispatch boundary between group validation and Runnable startup.
+          const runtimeBindingDriftReason =
+            getToolCallRuntimeBindingDriftReason(
+              toolCall,
+              planningEnvironment,
+            );
+          if (runtimeBindingDriftReason) {
+            const toolMessage = this.createSyntheticToolMessage(toolCall, {
+              status: "not_executed",
+              reason: runtimeBindingDriftReason,
+              retryable: true,
+            });
+            return { toolCall, toolMessage, supplementalMessages: [] };
+          }
           if (!planningEnvironment.isToolEnabled(toolCall.name)) {
             const toolMessage = this.createSyntheticToolMessage(toolCall, {
               status: "not_executed",
@@ -3828,19 +3969,31 @@ export class AgentService_v2 {
     sessionId: string,
     messageId: string,
     config: any,
+    toolCall?: PlannedToolCall,
   ): ToolExecutionContext {
     const agentRunId = this.activeAgentRunIdsBySession.get(sessionId);
     return {
       sessionId,
       messageId,
       terminalService: this.terminalService,
+      expectedTerminalRuntimeBindings:
+        toolCall &&
+        getToolCallExecutionMetadata(toolCall)?.terminalRuntimeBindings
+          ? new Map(
+              getToolCallExecutionMetadata(toolCall)!.terminalRuntimeBindings!.map(
+                (binding) => [binding.terminalId, binding.runtimeGeneration],
+              ),
+            )
+          : undefined,
       createTerminalFromSavedConnection: async (connectionId) => {
         const terminalConfig = buildTerminalConfigFromSavedConnection(
           this.settings,
           connectionId,
         );
         if (!terminalConfig) return null;
-        return await this.terminalService.createTerminal(terminalConfig);
+        return await this.terminalService.createTerminalWithRuntimeGuard(
+          terminalConfig,
+        );
       },
       fileTransferService: this.fileTransferService ?? undefined,
       sendEvent: this.helpers.sendEvent.bind(this.helpers),
@@ -4341,8 +4494,9 @@ export class AgentService_v2 {
       summaryMessageId: candidate.summaryMessageBackendId,
       protectedNormalRounds: candidate.protectedNormalRounds,
     });
-    if (physicalRunId && this.activePhysicalRunIds.has(physicalRunId)) {
-      this.committedCompactionByPhysicalRunId.set(physicalRunId, {
+    const activePhysicalRunId = this.readActivePhysicalRunId(physicalRunId);
+    if (activePhysicalRunId) {
+      this.committedCompactionByPhysicalRunId.set(activePhysicalRunId, {
         sessionId,
         summaryMessageBackendId: candidate.summaryMessageBackendId,
         messages: [...runtimeMessages],
@@ -4587,14 +4741,20 @@ export class AgentService_v2 {
     if (!filePath || verifiedMarkdown === null) return null;
 
     const currentLocalTerminal = this.getPassChatLocalTerminalForRead();
-    const metadataTerminalId =
-      typeof kwargs[ZERO_RETENTION_LOCAL_TERMINAL_ID_KEY] === "string"
-        ? kwargs[ZERO_RETENTION_LOCAL_TERMINAL_ID_KEY].trim()
-        : "";
-    const localTerminalId =
-      metadataTerminalId || currentLocalTerminal?.id || "";
+    const hasMetadataTerminalId = Object.prototype.hasOwnProperty.call(
+      kwargs,
+      ZERO_RETENTION_LOCAL_TERMINAL_ID_KEY,
+    );
+    const rawMetadataTerminalId =
+      kwargs[ZERO_RETENTION_LOCAL_TERMINAL_ID_KEY];
+    const metadataTerminalId = isValidTerminalRuntimeId(rawMetadataTerminalId)
+      ? rawMetadataTerminalId
+      : undefined;
+    if (hasMetadataTerminalId && metadataTerminalId === undefined) return null;
+
+    const localTerminalId = metadataTerminalId ?? currentLocalTerminal?.id;
     if (
-      !localTerminalId ||
+      localTerminalId === undefined ||
       !currentLocalTerminal ||
       currentLocalTerminal.id !== localTerminalId
     ) {
@@ -4675,7 +4835,7 @@ export class AgentService_v2 {
         const requestedPath =
           typeof args?.filePath === "string" ? args.filePath.trim() : "";
         const requestedTerminal =
-          typeof args?.tabIdOrName === "string" ? args.tabIdOrName.trim() : "";
+          typeof args?.terminalId === "string" ? args.terminalId : "";
         const requestedOffset = args?.offset;
         const requestedLimit = args?.limit;
         if (
@@ -5012,7 +5172,7 @@ export class AgentService_v2 {
         const filePath =
           typeof args?.filePath === "string" ? args.filePath.trim() : "";
         const localTerminalId =
-          typeof args?.tabIdOrName === "string" ? args.tabIdOrName.trim() : "";
+          typeof args?.terminalId === "string" ? args.terminalId : "";
         const offset =
           Number.isSafeInteger(args?.offset) && Number(args?.offset) >= 0
             ? Math.floor(Number(args?.offset))
@@ -5826,6 +5986,8 @@ export class AgentService_v2 {
         maxRetries: MODEL_RETRY_MAX,
         delaysMs: MODEL_RETRY_DELAYS_MS,
         getCommandOutputBackingSource: this.getCommandOutputBackingSource,
+        terminalReferenceMigrationResolver:
+          this.terminalReferenceMigrationResolver,
       });
     }
 
@@ -5881,6 +6043,8 @@ export class AgentService_v2 {
       maxRetries: MODEL_RETRY_MAX,
       delaysMs: MODEL_RETRY_DELAYS_MS,
       getCommandOutputBackingSource: this.getCommandOutputBackingSource,
+      terminalReferenceMigrationResolver:
+        this.terminalReferenceMigrationResolver,
     });
     return result as z.infer<T>;
   }
@@ -5920,6 +6084,8 @@ export class AgentService_v2 {
         maxRetries: MODEL_RETRY_MAX,
         delaysMs: MODEL_RETRY_DELAYS_MS,
         getCommandOutputBackingSource: this.getCommandOutputBackingSource,
+        terminalReferenceMigrationResolver:
+          this.terminalReferenceMigrationResolver,
       });
     }
 
@@ -5945,6 +6111,8 @@ export class AgentService_v2 {
         maxRetries: MODEL_RETRY_MAX,
         delaysMs: MODEL_RETRY_DELAYS_MS,
         getCommandOutputBackingSource: this.getCommandOutputBackingSource,
+        terminalReferenceMigrationResolver:
+          this.terminalReferenceMigrationResolver,
       });
     }
 
@@ -5993,6 +6161,8 @@ export class AgentService_v2 {
         maxRetries: MODEL_RETRY_MAX,
         delaysMs: MODEL_RETRY_DELAYS_MS,
         getCommandOutputBackingSource: this.getCommandOutputBackingSource,
+        terminalReferenceMigrationResolver:
+          this.terminalReferenceMigrationResolver,
       });
     }
 
@@ -6018,6 +6188,8 @@ export class AgentService_v2 {
         maxRetries: MODEL_RETRY_MAX,
         delaysMs: MODEL_RETRY_DELAYS_MS,
         getCommandOutputBackingSource: this.getCommandOutputBackingSource,
+        terminalReferenceMigrationResolver:
+          this.terminalReferenceMigrationResolver,
       });
     }
 
@@ -6131,6 +6303,8 @@ export class AgentService_v2 {
       maxRetries: MODEL_RETRY_MAX,
       delaysMs: MODEL_RETRY_DELAYS_MS,
       getCommandOutputBackingSource: this.getCommandOutputBackingSource,
+      terminalReferenceMigrationResolver:
+        this.terminalReferenceMigrationResolver,
     });
   }
 
@@ -6144,7 +6318,7 @@ export class AgentService_v2 {
   ): Promise<void> {
     if (!this.graph) throw new Error("Graph not initialized");
 
-    const { sessionId } = context;
+    const sessionId = requireAgentSessionId(context?.sessionId);
     const runId =
       typeof context?.metadata?.runId === "string"
         ? context.metadata.runId
@@ -6301,11 +6475,14 @@ export class AgentService_v2 {
 
   private async trySaveSessionFromCheckpoint(
     sessionId: string,
-    physicalRunId: string = sessionId,
+    physicalRunId: unknown,
   ): Promise<void> {
     if (!this.graph) return;
-    const committedCompaction =
-      this.committedCompactionByPhysicalRunId.get(physicalRunId);
+    const exactPhysicalRunId =
+      readOpaqueNonBlankWellFormedString(physicalRunId);
+    const committedCompaction = exactPhysicalRunId
+      ? this.committedCompactionByPhysicalRunId.get(exactPhysicalRunId)
+      : undefined;
     try {
       let snapshot: any = null;
       try {
@@ -6348,7 +6525,9 @@ export class AgentService_v2 {
         messages = [...messages, ...pendingToolSupplementMessages];
       }
 
-      const abortedMessages = this.abortedMessagesByRunId.get(physicalRunId);
+      const abortedMessages = exactPhysicalRunId
+        ? this.abortedMessagesByRunId.get(exactPhysicalRunId)
+        : undefined;
       if (abortedMessages && abortedMessages.length > 0) {
         console.log(
           `[AgentService_v2] Appending ${abortedMessages.length} interrupted message(s) for this physical run to history.`,
@@ -6376,8 +6555,10 @@ export class AgentService_v2 {
         this.getPrimaryModelMaxTokensForSession(sessionId),
       );
       this.saveRuntimeChatSession(session, rawSession);
-      this.abortedMessagesByRunId.delete(physicalRunId);
-      this.committedCompactionByPhysicalRunId.delete(physicalRunId);
+      if (exactPhysicalRunId) {
+        this.abortedMessagesByRunId.delete(exactPhysicalRunId);
+        this.committedCompactionByPhysicalRunId.delete(exactPhysicalRunId);
+      }
     } catch (error) {
       console.warn(
         "[AgentService_v2] Failed to save session from checkpoint:",
@@ -6502,7 +6683,10 @@ export class AgentService_v2 {
   }
 
   loadChatSession(sessionId: string): ChatSession | null {
-    return this.chatHistoryService.loadSession(sessionId);
+    const exactSessionId = readAgentSessionId(sessionId);
+    return exactSessionId === undefined
+      ? null
+      : this.chatHistoryService.loadSession(exactSessionId);
   }
 
   /**
@@ -6511,7 +6695,10 @@ export class AgentService_v2 {
    * post-compaction context needed to resume an agent run.
    */
   loadChatRuntimeSession(sessionId: string): ChatSession | null {
-    return this.loadRuntimeChatSession(sessionId);
+    const exactSessionId = readAgentSessionId(sessionId);
+    return exactSessionId === undefined
+      ? null
+      : this.loadRuntimeChatSession(exactSessionId);
   }
 
   listStoredChatSessions(): StoredChatSession[] {
@@ -6523,10 +6710,14 @@ export class AgentService_v2 {
   }
 
   getStoredChatSessionSummary(sessionId: string) {
-    return this.chatHistoryService.getSessionSummary(sessionId);
+    const exactSessionId = readAgentSessionId(sessionId);
+    return exactSessionId === undefined
+      ? null
+      : this.chatHistoryService.getSessionSummary(exactSessionId);
   }
 
   deleteChatSession(sessionId: string): void {
+    sessionId = requireAgentSessionId(sessionId);
     this.releaseSessionModelBinding(sessionId);
     this.getFallbackCompactionHistoryExportService().deleteExportsForSession(
       sessionId,
@@ -6536,9 +6727,7 @@ export class AgentService_v2 {
   }
 
   deleteChatSessions(sessionIds: string[]): void {
-    const ids = Array.from(
-      new Set(sessionIds.filter((id) => id.trim().length > 0)),
-    );
+    const ids = requireAgentSessionIds(sessionIds);
     if (ids.length === 0) {
       return;
     }
@@ -6553,12 +6742,16 @@ export class AgentService_v2 {
   }
 
   renameChatSession(sessionId: string, newTitle: string): void {
+    sessionId = requireAgentSessionId(sessionId);
     this.chatHistoryService.renameSession(sessionId, newTitle);
     this.uiHistoryService.renameSession(sessionId, newTitle);
   }
 
   exportChatSession(sessionId: string): any | null {
-    return this.chatHistoryService.exportSession(sessionId);
+    const exactSessionId = readAgentSessionId(sessionId);
+    return exactSessionId === undefined
+      ? null
+      : this.chatHistoryService.exportSession(exactSessionId);
   }
 
   private findStoredMessageIndex(

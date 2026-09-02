@@ -1,3 +1,5 @@
+import { readOpaqueNonBlankWellFormedString } from "@gyshell/shared";
+
 export type RendererSessionRegistrationOperation = "register" | "unregister";
 
 export type RendererSessionRegistrationHandler<TEvent> = (
@@ -34,22 +36,22 @@ export class RendererSessionRegistrationGate<TEvent> {
     operation: RendererSessionRegistrationOperation,
     sessionId: string,
   ): Promise<void> {
-    const normalizedSessionId = String(sessionId || "").trim();
-    if (!normalizedSessionId) {
+    const exactSessionId = readOpaqueNonBlankWellFormedString(sessionId);
+    if (exactSessionId === undefined) {
       return Promise.reject(new Error("Session id is required."));
     }
     if (this.failure) {
       return Promise.reject(this.failure);
     }
     if (this.handler) {
-      return this.enqueue({ event, operation, sessionId: normalizedSessionId });
+      return this.enqueue({ event, operation, sessionId: exactSessionId });
     }
 
     return new Promise<void>((resolve, reject) => {
       this.pending.push({
         event,
         operation,
-        sessionId: normalizedSessionId,
+        sessionId: exactSessionId,
         resolve,
         reject,
       });

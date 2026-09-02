@@ -1,4 +1,5 @@
 import React from "react";
+import { parsePassChatMentionToken } from "@gyshell/shared";
 import { getFileMentionDisplayName } from "./filesystemDragDrop";
 import { truncateMentionDisplayText } from "./mentionDisplay";
 
@@ -8,18 +9,10 @@ import { truncateMentionDisplayText } from "./mentionDisplay";
  * 2) Session-title text normalization (`lib/sessionTitleDisplay.ts`)
  */
 const MENTION_TOKEN_REGEX =
-  /(\[MENTION_(?:SKILL|TAB|FILE|IMAGE|PASS_CHAT):#.+?#(?:#.+?#)?\])/g;
+  /(\[MENTION_(?:(?:SKILL|TAB|FILE|IMAGE|PASS_CHAT):#.+?#(?:#.+?#)?|PASS_CHAT_V2:#[^#\r\n]+#)\])/g;
 
 const getFileDisplayName = (path: string): string => {
   return getFileMentionDisplayName(path) || path;
-};
-
-const decodeMentionComponent = (value: string): string => {
-  try {
-    return decodeURIComponent(value);
-  } catch {
-    return value;
-  }
 };
 
 const mentionTokenToText = (token: string): string | null => {
@@ -44,17 +37,35 @@ const mentionTokenToText = (token: string): string | null => {
     return explicitName || getFileDisplayName(imageMatch[1]);
   }
 
-  const passChatMatch = token.match(
-    /^\[MENTION_PASS_CHAT:#(.+?)(?:##(.+?))?#\]$/,
-  );
-  if (passChatMatch) {
-    const title = passChatMatch[2]
-      ? decodeMentionComponent(passChatMatch[2])
-      : "Chat";
-    return `@Pass Chat: ${title}`;
+  const passChat = parsePassChatMentionToken(token);
+  if (passChat) {
+    return `@Pass Chat: ${passChat.title || "Chat"}`;
   }
 
   return null;
+};
+
+/**
+ * Split only validated mention tokens. A regex match that looks like a token
+ * but fails the shared parser stays inside the surrounding literal text, so a
+ * malformed canonical pass-chat token cannot be cosmetically reclassified.
+ */
+const splitMentionTokens = (content: string): string[] => {
+  const parts: string[] = [];
+  let cursor = 0;
+
+  for (const match of content.matchAll(MENTION_TOKEN_REGEX)) {
+    const index = match.index;
+    const token = match[1] ?? match[0];
+    if (index === undefined || mentionTokenToText(token) === null) continue;
+
+    parts.push(content.slice(cursor, index));
+    parts.push(token);
+    cursor = index + match[0].length;
+  }
+
+  parts.push(content.slice(cursor));
+  return parts;
 };
 
 /**
@@ -65,8 +76,7 @@ const mentionTokenToText = (token: string): string | null => {
 export const renderMentionText = (content: string): string => {
   if (!content) return "";
 
-  let text = content
-    .split(MENTION_TOKEN_REGEX)
+  let text = splitMentionTokens(content)
     .map((part) => mentionTokenToText(part) ?? part)
     .join("");
 
@@ -89,11 +99,6 @@ export const renderMentionText = (content: string): string => {
       /\[MENTION_IMAGE:#([^#\]\r\n]+)(?:##([^#\]\r\n]+))?(?:#\])?/g,
       (_m, path: string, name: string) =>
         String(name || "").trim() || getFileDisplayName(path),
-    )
-    .replace(
-      /\[MENTION_PASS_CHAT:#([^#\]\r\n]+)(?:##([^#\]\r\n]+))?(?:#\])?/g,
-      (_m, _sessionId: string, title: string) =>
-        `@Pass Chat: ${title ? decodeMentionComponent(title) : "Chat"}`,
     );
 
   return text;
@@ -108,7 +113,7 @@ export const renderMentionContent = (
 ): (string | React.ReactElement)[] => {
   if (!content) return [];
 
-  const parts = content.split(MENTION_TOKEN_REGEX);
+  const parts = splitMentionTokens(content);
 
   return parts.map((part, i) => {
     const mentionText = mentionTokenToText(part);
@@ -121,7 +126,8 @@ export const renderMentionContent = (
         ? "terminal"
         : part.startsWith("[MENTION_SKILL:")
           ? "skill"
-          : part.startsWith("[MENTION_PASS_CHAT:")
+          : part.startsWith("[MENTION_PASS_CHAT:") ||
+              part.startsWith("[MENTION_PASS_CHAT_V2:")
             ? "pass-chat"
             : "terminal";
       return (

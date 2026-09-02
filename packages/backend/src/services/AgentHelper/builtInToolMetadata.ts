@@ -61,7 +61,7 @@ export const WRITE_FILE_TOOL_DESCRIPTION = [
   '- Use absolute paths when possible; relative paths resolve from the tab working directory.',
   '',
   'Inputs:',
-  '- tabIdOrName: ID or name of the terminal tab.',
+  '- terminalId: exact, complete, case-sensitive ID of the terminal tab.',
   '- filePath: file path to create or overwrite.',
   '- content: full file contents to write.'
 ].join('\n')
@@ -78,7 +78,7 @@ export const EDIT_FILE_TOOL_DESCRIPTION = [
   '- Use absolute paths when possible; relative paths resolve from the tab working directory.',
   '',
   'Inputs:',
-  '- tabIdOrName: ID or name of the terminal tab.',
+  '- terminalId: exact, complete, case-sensitive ID of the terminal tab.',
   '- filePath: file path to edit.',
   '- oldString: exact text to replace.',
   '- newString: replacement text.',
@@ -95,7 +95,7 @@ export const EXEC_COMMAND_DESCRIPTION =
 export const READ_TERMINAL_TAB_DESCRIPTION =
   'Read the recent visible output and runtime status of a specific terminal tab. If the tab is disconnected, the output is retained history and may be stale.'
 export const READ_COMMAND_OUTPUT_DESCRIPTION =
-  'Read retained captured output for one command. Prefer the opaque cursor returned in gyshell_command_result and pass it back unchanged; cursor paging can continue inside an arbitrarily long line. Legacy line offset/limit remains available but cannot be combined with cursor. presentation.state=none means this snapshot returned no retained text. Reaching the current tail while executionState is running is only a snapshot; use pollCursor later. For an interactive running command, its live prompt may be visible through read_terminal_tab before it enters this retained record. capture.state=complete means the retained transcript is complete, while incomplete/unknown is an explicit warning that pagination cannot recover missing process output.'
+  'Read retained captured output for one command. Use the exact terminalId and history_command_match_id from that command result. As a read-only exception, an exact historical terminal ID may continue to address its detached process-local command record after the tab closes, until retention eviction; this never rebinds the record to a new live tab with the same ID. Prefer the opaque cursor returned in gyshell_command_result and pass it back unchanged; cursor paging can continue inside an arbitrarily long line. Legacy line offset/limit remains available but cannot be combined with cursor. presentation.state=none means this snapshot returned no retained text. Reaching the current tail while executionState is running is only a snapshot; use pollCursor later. For an interactive running command, its live prompt may be visible through read_terminal_tab before it enters this retained record. capture.state=complete means the retained transcript is complete, while incomplete/unknown is an explicit warning that pagination cannot recover missing process output.'
 export const READ_FILE_DESCRIPTION =
   'Read a file from a specific terminal tab. If the terminal is disconnected or not ready, the tool returns an explicit terminal_status instead of a raw backend session error.'
 export const WAIT_TOOL_DESCRIPTION =
@@ -118,7 +118,7 @@ export const CLOSE_TERMINAL_TAB_DESCRIPTION = [
   'Close an existing terminal tab and terminate its backend session.',
   'This can stop running commands, disconnect SSH, cancel terminal-scoped transfers, and close port forwards. The visual tab and terminal scrollback are removed. Bounded read-only exec_command transcripts may remain in process-local history until retention eviction so an Agent can inspect the outcome without replaying side effects.',
   'This is an experimental, destructive tool. Its availability means the user already enabled and accepted the risk, so do not request another approval before calling it.',
-  'Use the exact terminal tab id or an unambiguous tab name.'
+  'Use the exact, complete terminal tab ID from the latest Available Terminal Tabs inventory. Names, shortened IDs, and reconstructed IDs are not accepted.'
 ].join('\n')
 export const COPY_BETWEEN_TABS_DESCRIPTION = [
   'Start an asynchronous file copy between two different terminal tabs on different machines. Use this only for cross-terminal-tab file transfer; do not use it for copying within one tab or between two tabs connected to the same machine.',

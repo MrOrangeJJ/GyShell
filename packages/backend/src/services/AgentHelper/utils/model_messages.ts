@@ -11,6 +11,10 @@ import {
   type CommandOutputSource,
 } from '../tools/command_output_contract'
 import { cloneMessageWithPatch } from './message_clone'
+import {
+  migrateLegacyTerminalToolCallsForModelInput,
+  type TerminalReferenceMigrationResolver,
+} from './legacy_terminal_tool_calls'
 
 type RetryCapableHelpers = {
   invokeWithRetry: <T>(
@@ -218,6 +222,7 @@ export async function invokeWithRetryAndSanitizedInput<T>(opts: {
   maxRetries: number
   delaysMs: number[]
   getCommandOutputBackingSource?: CommandOutputBackingSourceResolver
+  terminalReferenceMigrationResolver?: TerminalReferenceMigrationResolver
 }): Promise<T> {
   return await opts.helpers.invokeWithRetry(
     async (attempt) => {
@@ -230,6 +235,8 @@ export async function invokeWithRetryAndSanitizedInput<T>(opts: {
           modelSupportsImage: opts.modelSupportsImage,
           getCommandOutputBackingSource:
             opts.getCommandOutputBackingSource,
+          terminalReferenceMigrationResolver:
+            opts.terminalReferenceMigrationResolver,
         }
       )
       return await opts.operation(sanitizedMessages)
@@ -250,6 +257,7 @@ export function prepareModelInputMessagesForInvocation(
   options?: {
     modelSupportsImage?: boolean
     getCommandOutputBackingSource?: CommandOutputBackingSourceResolver
+    terminalReferenceMigrationResolver?: TerminalReferenceMigrationResolver
   }
 ): BaseMessage[] {
   let currentMessages = messages
@@ -263,6 +271,12 @@ export function prepareModelInputMessagesForInvocation(
     ) {
       currentMessages = mapStoredMessagesToChatMessages(stored)
     }
+  }
+  if (options?.terminalReferenceMigrationResolver) {
+    currentMessages = migrateLegacyTerminalToolCallsForModelInput(
+      currentMessages,
+      options.terminalReferenceMigrationResolver,
+    )
   }
   return sanitizeModelInputMessages(
     stripRawResponseForModelInput(currentMessages),

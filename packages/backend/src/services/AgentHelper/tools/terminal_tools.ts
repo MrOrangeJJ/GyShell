@@ -20,21 +20,9 @@ import {
   formatInitialCommandOutput,
   type CommandOutputSource,
 } from './command_output_contract'
+import { terminalIdSchema } from '../terminalIdContract'
 
 // --- Schemas ---
-
-const boundedTerminalReferenceSchema = z
-  .string()
-  .min(1)
-  .max(COMMAND_OUTPUT_IDENTIFIER_MAX_UTF8_BYTES)
-  .refine(
-    (value) =>
-      Buffer.byteLength(value, 'utf8') <=
-      COMMAND_OUTPUT_IDENTIFIER_MAX_UTF8_BYTES,
-    {
-      message: `terminal reference cannot exceed ${COMMAND_OUTPUT_IDENTIFIER_MAX_UTF8_BYTES} UTF-8 bytes.`,
-    }
-  )
 
 const boundedCommandHistoryIdSchema = z
   .string()
@@ -50,7 +38,7 @@ const boundedCommandHistoryIdSchema = z
   )
 
 export const execCommandSchema = z.object({
-  tabIdOrName: boundedTerminalReferenceSchema.describe('The ID or Name of the terminal tab'),
+  terminalId: terminalIdSchema,
   command: z
     .string()
     .min(1, 'command cannot be empty.')
@@ -65,16 +53,16 @@ export const execCommandSchema = z.object({
     .optional()
     .default('wait')
     .describe('Execution mode: "wait" runs synchronously and waits for completion; "nowait" runs asynchronously and returns immediately.')
-})
+}).strict()
 
 export const readTerminalTabSchema = z.object({
-  tabIdOrName: boundedTerminalReferenceSchema.describe('The ID or Name of the terminal tab'),
+  terminalId: terminalIdSchema,
   lines: z.number().optional().default(100).describe('Number of lines to read')
-})
+}).strict()
 
 export const readCommandOutputSchema = z
   .object({
-    tabIdOrName: boundedTerminalReferenceSchema.describe('The ID or Name of the terminal tab'),
+    terminalId: terminalIdSchema,
     history_command_match_id: boundedCommandHistoryIdSchema.describe('The unique command ID to read output from'),
     cursor: z
       .string()
@@ -103,25 +91,27 @@ export const readCommandOutputSchema = z
       .optional()
       .describe('Maximum UTF-8 content bytes for this page.'),
   })
+  .strict()
   .refine((value) => value.cursor === undefined || value.offset === undefined, {
     message: 'cursor and offset are mutually exclusive.',
   })
 
 export const writeStdinSchema = z
   .object({
-    tabIdOrName: boundedTerminalReferenceSchema.describe('The ID or Name of the terminal tab'),
+    terminalId: terminalIdSchema,
     sequence: z
       .array(z.string())
       .optional()
       .describe('List of strings; CTRL_C and exact C0 names are resolved to their control characters.')
   })
+  .strict()
   .refine((val) => !!val.sequence && val.sequence.length > 0, {
     message: 'Provide a non-empty sequence list.'
   })
 
 export const reconnectTerminalTabSchema = z.object({
-  tabIdOrName: boundedTerminalReferenceSchema.describe('The ID or Name of the disconnected SSH terminal tab to reconnect')
-})
+  terminalId: terminalIdSchema
+}).strict()
 
 // --- Constants ---
 
@@ -194,8 +184,8 @@ const formatRunningCommandConflict = (params: {
 }): string => {
   const boundedError = String(params.error || '').slice(0, 4096)
   const inspection = params.activeTaskId
-    ? `Use read_command_output with tabIdOrName=${JSON.stringify(params.terminalId)} and history_command_match_id=${JSON.stringify(params.activeTaskId)} to inspect its bounded transcript.`
-    : `Use read_terminal_tab with tabIdOrName=${JSON.stringify(params.terminalId)} to inspect the current rendered screen.`
+    ? `Use read_command_output with terminalId=${JSON.stringify(params.terminalId)} and history_command_match_id=${JSON.stringify(params.activeTaskId)} to inspect its bounded transcript.`
+    : `Use read_terminal_tab with terminalId=${JSON.stringify(params.terminalId)} to inspect the current rendered screen.`
   return [
     `Error: ${boundedError}`,
     '',
@@ -254,6 +244,9 @@ function enqueueNowaitCompletionNotification(params: {
   terminalName: string
   command: string
   historyCommandMatchId: string
+  runtimeGuard?: Parameters<
+    ToolExecutionContext['terminalService']['getTerminalRuntimeSnapshot']
+  >[1]
   output?: string
   exitCode?: number
   executionState?: CommandExecutionState
@@ -302,6 +295,17 @@ function enqueueNowaitCompletionNotification(params: {
     exitCode: params.exitCode
   })
   if (!params.context.enqueueQueuedInsertion) return
+  let terminalAvailable = false
+  if (params.runtimeGuard) {
+    terminalAvailable =
+      params.context.terminalService.getTerminalById(params.terminalId) ===
+      params.runtimeGuard.expectedTerminal
+  } else {
+    terminalAvailable =
+      params.context.terminalService.getTerminalRuntimeSnapshot(
+        params.terminalId
+      ) != null
+  }
   params.context.enqueueQueuedInsertion(
     buildExecCommandNowaitCompletedInsertion({
       terminalId: params.terminalId,
@@ -311,10 +315,7 @@ function enqueueNowaitCompletionNotification(params: {
       exitCode: params.exitCode,
       runtimeBoundary: params.runtimeBoundary,
       executionState: source.executionState,
-      terminalAvailable:
-        params.context.terminalService.getTerminalRuntimeSnapshot(
-          params.terminalId
-        ) != null,
+      terminalAvailable,
     })
   )
 }
@@ -328,11 +329,11 @@ export async function runCommand(
   if (!validation.success) {
     return `Parameter validation error for exec_command: ${validation.error.message}`
   }
-  const { tabIdOrName, command } = validation.data
+  const { terminalId, command } = validation.data
   const { terminalService, sessionId, messageId } = context
   
   abortIfNeeded(context.signal)
-  const resolved = resolveTerminalForTool(context, tabIdOrName)
+  const resolved = resolveTerminalForTool(context, terminalId)
   if (!resolved.ok) {
     return resolved.message
   }
@@ -393,6 +394,7 @@ export async function runCommand(
       capture: finished.capture,
       runtimeBoundary: finished.runtimeBoundary,
       terminalStatus: finished.terminalStatus,
+      runtimeGuard: resolved.runtimeGuard,
     })
   }
   try {
@@ -424,7 +426,8 @@ export async function runCommand(
           return
         }
         publishAsyncCompletion(finished)
-      }
+      },
+      runtimeGuard: resolved.runtimeGuard,
     })
     const historyCommandMatchId = result.history_command_match_id
     let executionState: CommandExecutionState =
@@ -577,6 +580,7 @@ export async function runCommand(
             capture: task.capture,
             runtimeBoundary: task.runtimeBoundary,
             terminalStatus: task.terminalStatus,
+            runtimeGuard: resolved.runtimeGuard,
           })
         }
       }
@@ -613,11 +617,11 @@ export async function runCommandNowait(args: z.infer<typeof execCommandSchema>, 
   if (!validation.success) {
     return `Parameter validation error for exec_command: ${validation.error.message}`
   }
-  const { tabIdOrName, command } = validation.data
+  const { terminalId, command } = validation.data
   const { terminalService, sessionId, messageId } = context
   
   abortIfNeeded(context.signal)
-  const resolved = resolveTerminalForTool(context, tabIdOrName)
+  const resolved = resolveTerminalForTool(context, terminalId)
   if (!resolved.ok) {
     return resolved.message
   }
@@ -678,6 +682,7 @@ export async function runCommandNowait(args: z.infer<typeof execCommandSchema>, 
         capture: finished.capture,
         runtimeBoundary: finished.runtimeBoundary,
         terminalStatus: finished.terminalStatus,
+        runtimeGuard: resolved.runtimeGuard,
       })
     }
     const historyCommandMatchId = await terminalService.runCommandNoWait(
@@ -690,7 +695,8 @@ export async function runCommandNowait(args: z.infer<typeof execCommandSchema>, 
         }
         publishAsyncCompletion(finished)
       },
-      context.signal
+      context.signal,
+      resolved.runtimeGuard
     )
     const source = resolveCommandOutputSource({
       context,
@@ -764,11 +770,15 @@ export async function runCommandNowait(args: z.infer<typeof execCommandSchema>, 
 }
 
 export async function readTerminalTab(args: z.infer<typeof readTerminalTabSchema>, context: ToolExecutionContext): Promise<string> {
-  const { tabIdOrName, lines = 100 } = args
+  const validation = readTerminalTabSchema.safeParse(args)
+  if (!validation.success) {
+    return `Parameter validation error for read_terminal_tab: ${validation.error.message}`
+  }
+  const { terminalId, lines = 100 } = validation.data
   const { terminalService, sessionId, messageId, sendEvent } = context
   
   abortIfNeeded(context.signal)
-  const resolved = resolveTerminalForTool(context, tabIdOrName)
+  const resolved = resolveTerminalForTool(context, terminalId)
   if (!resolved.ok) {
     return resolved.message
   }
@@ -783,12 +793,27 @@ export async function readTerminalTab(args: z.infer<typeof readTerminalTabSchema
   })
 
   const output = args.lines === undefined 
-    ? terminalService.getRecentOutput(bestMatch.id) 
-    : terminalService.getRecentOutput(bestMatch.id, lines)
+    ? terminalService.getRecentOutput(
+        bestMatch.id,
+        undefined,
+        resolved.runtimeGuard
+      )
+    : terminalService.getRecentOutput(
+        bestMatch.id,
+        lines,
+        resolved.runtimeGuard
+      )
   const terminalContent =
     output && output !== 'No output available.' ? output : '(No output available.)'
   
-  const finalResult = `${formatTerminalStatusHeader(resolved.snapshot)}
+  const finalSnapshot = terminalService.getTerminalRuntimeSnapshot(
+    bestMatch.id,
+    resolved.runtimeGuard
+  )
+  if (!finalSnapshot) {
+    return `Error: Terminal tab ${JSON.stringify(bestMatch.id)} was closed while it was being read.`
+  }
+  const finalResult = `${formatTerminalStatusHeader(finalSnapshot)}
 The following is the current visible state of the terminal tab "${bestMatch.title || bestMatch.id}":
 <terminal_content>
 ${terminalContent}
@@ -825,26 +850,22 @@ export async function readCommandOutput(
     })
     return errorText
   }
-  const { tabIdOrName, history_command_match_id, cursor, offset, limit, maxBytes } = validation.data
+  const { terminalId, history_command_match_id, cursor, offset, limit, maxBytes } = validation.data
 
   abortIfNeeded(context.signal)
-  const getSnapshot = (terminalService as any).getCommandOutputSnapshot
-  const getRecordLocation = (terminalService as any).getCommandRecordLocation
-  const exactHistoricalSnapshot =
-    typeof getSnapshot === 'function'
-      ? getSnapshot.call(
-          terminalService,
-          tabIdOrName,
-          history_command_match_id
-        )
-      : undefined
-  const exactHistoricalTasks = terminalService.getCommandTasks(tabIdOrName)
-  const terminalResolution = resolveTerminalForTool(context, tabIdOrName)
-  if (
-    !terminalResolution.ok &&
-    !exactHistoricalSnapshot &&
-    exactHistoricalTasks.length === 0
-  ) {
+  const snapshot = terminalService.getCommandOutputSnapshot(
+    terminalId,
+    history_command_match_id
+  )
+  const recordLocation = snapshot
+    ? terminalService.getCommandRecordLocation(
+        terminalId,
+        history_command_match_id
+      )
+    : undefined
+  const recordIsDetached = recordLocation === 'detached'
+  const terminalResolution = resolveTerminalForTool(context, terminalId)
+  if (!terminalResolution.ok && !recordIsDetached) {
     const errorText = terminalResolution.message
     sendEvent(sessionId, {
       messageId,
@@ -855,40 +876,10 @@ export async function readCommandOutput(
     })
     return errorText
   }
-  const exactLocation = exactHistoricalSnapshot && typeof getRecordLocation === 'function'
-    ? getRecordLocation.call(
-        terminalService,
-        tabIdOrName,
-        history_command_match_id
-      )
-    : undefined
-  const exactBelongsToDetachedHistory = Boolean(
-    exactHistoricalSnapshot &&
-      (exactLocation === 'detached' ||
-        (terminalResolution.ok &&
-          terminalResolution.terminal.id !== tabIdOrName))
-  )
-  const terminalId = exactHistoricalSnapshot
-    ? tabIdOrName
+
+  const terminalName = recordIsDetached
+    ? terminalId
     : terminalResolution.ok
-      ? terminalResolution.terminal.id
-      : tabIdOrName
-  const resolvedSnapshot =
-    !exactHistoricalSnapshot && typeof getSnapshot === 'function'
-      ? getSnapshot.call(terminalService, terminalId, history_command_match_id)
-      : undefined
-  const resolvedLocation = resolvedSnapshot && typeof getRecordLocation === 'function'
-    ? getRecordLocation.call(
-        terminalService,
-        terminalId,
-        history_command_match_id
-      )
-    : undefined
-  const snapshot = exactHistoricalSnapshot || resolvedSnapshot
-  const recordIsDetached =
-    exactBelongsToDetachedHistory || resolvedLocation === 'detached'
-  const terminalName =
-    terminalResolution.ok && !recordIsDetached
       ? terminalResolution.terminal.title || terminalResolution.terminal.id
       : terminalId
   const task = terminalService.getCommandTask(terminalId, history_command_match_id)
@@ -950,9 +941,10 @@ export async function readCommandOutput(
       source,
       options: { cursor, offset, limit, maxBytes },
       command: task?.command || snapshot?.command || '',
-      terminalStatus: terminalResolution.ok && !recordIsDetached
-        ? formatTerminalStatusHeader(terminalResolution.snapshot)
-        : formatClosedTerminalCommandHistoryHeader(terminalId),
+      terminalStatus:
+        !recordIsDetached && terminalResolution.ok
+          ? formatTerminalStatusHeader(terminalResolution.snapshot)
+          : formatClosedTerminalCommandHistoryHeader(terminalId),
     })
   } catch (error) {
     const errorText = `Parameter validation error for read_command_output: ${
@@ -982,11 +974,15 @@ export async function readCommandOutput(
 }
 
 export async function writeStdin(args: z.infer<typeof writeStdinSchema>, context: ToolExecutionContext): Promise<string> {
-  const { tabIdOrName, sequence } = args
+  const validation = writeStdinSchema.safeParse(args)
+  if (!validation.success) {
+    return `Parameter validation error for write_stdin: ${validation.error.message}`
+  }
+  const { terminalId, sequence } = validation.data
   const { terminalService, sessionId, messageId, sendEvent } = context
 
   abortIfNeeded(context.signal)
-  const terminalResolution = resolveTerminalForTool(context, tabIdOrName)
+  const terminalResolution = resolveTerminalForTool(context, terminalId)
   if (!terminalResolution.ok) {
     const errorText = terminalResolution.message
     sendEvent(sessionId, {
@@ -1043,12 +1039,18 @@ export async function writeStdin(args: z.infer<typeof writeStdinSchema>, context
   await terminalService.writeInputSequence(bestMatch.id, resolvedSequence, {
     intervalMs: resolvedSequence.length > 1 ? 100 : 0,
     signal: context.signal,
-    inputOwner: 'active-task'
+    inputOwner: 'active-task',
+    runtimeGuard: terminalResolution.runtimeGuard,
   })
 
   await waitWithSignal(1000, context.signal)
   abortIfNeeded(context.signal)
-  const output = terminalService.getRecentOutput(bestMatch.id) || 'No output available.'
+  const output =
+    terminalService.getRecentOutput(
+      bestMatch.id,
+      undefined,
+      terminalResolution.runtimeGuard
+    ) || 'No output available.'
   const resultHint = `Sent sequence: ${sequence?.join(', ')}. The following is the current visible state of the terminal tab "${bestMatch.title || bestMatch.id}" 1s after the sequence was sent:
 <terminal_content>
 ${output}
@@ -1069,11 +1071,15 @@ export async function reconnectTerminalTab(
   args: z.infer<typeof reconnectTerminalTabSchema>,
   context: ToolExecutionContext
 ): Promise<string> {
-  const { tabIdOrName } = args
+  const validation = reconnectTerminalTabSchema.safeParse(args)
+  if (!validation.success) {
+    return `Parameter validation error for reconnect_terminal_tab: ${validation.error.message}`
+  }
+  const { terminalId } = validation.data
   const { terminalService, sessionId, messageId, sendEvent } = context
 
   abortIfNeeded(context.signal)
-  const resolved = resolveTerminalForTool(context, tabIdOrName)
+  const resolved = resolveTerminalForTool(context, terminalId)
   if (!resolved.ok) {
     sendEvent(sessionId, {
       messageId,
@@ -1131,7 +1137,10 @@ Cannot reconnect this tab. Only disconnected SSH tabs with a saved SSH config ar
   }
 
   try {
-    await terminalService.reconnectTerminal(terminal.id)
+    await terminalService.reconnectTerminal(
+      terminal.id,
+      resolved.runtimeGuard
+    )
     const finalSnapshot = await waitForReconnectTerminalState(
       terminalService,
       terminal.id,

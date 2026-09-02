@@ -1,11 +1,17 @@
 import { z } from 'zod'
-import type { BackendSettings } from '../../../types'
+import type { BackendSettings, TerminalTab } from '../../../types'
+import type {
+  TerminalCreationRuntime,
+  TerminalRuntimeGuard,
+  TerminalRuntimeSnapshot
+} from '../../TerminalService'
 import {
   buildSavedSshConnectionSelector,
   getSavedSshConnectionDisplayName
 } from '../../terminal/terminalConnectionSupport'
 import { CREATE_TERMINAL_TAB_DESCRIPTION } from '../builtInToolMetadata'
 import type { ToolExecutionContext } from '../types'
+import { terminalIdSchema } from '../terminalIdContract'
 import { resolveTerminalForTool } from './terminal_runtime_guard'
 
 const LOCAL_CONNECTION_ID = 'local'
@@ -18,14 +24,11 @@ export const createTerminalTabSchema = z.object({
     .string()
     .min(1)
     .describe('The exact saved connection ID from this tool description')
-})
+}).strict()
 
 export const closeTerminalTabSchema = z.object({
-  tabIdOrName: z
-    .string()
-    .min(1)
-    .describe('The ID or unambiguous Name of the terminal tab to close')
-})
+  terminalId: terminalIdSchema
+}).strict()
 
 export interface SavedTerminalConnectionOption {
   connectionId: string
@@ -95,7 +98,12 @@ export async function createTerminalTab(
   args: z.infer<typeof createTerminalTabSchema>,
   context: ToolExecutionContext
 ): Promise<string> {
-  const { connectionId } = args
+  const validation = createTerminalTabSchema.safeParse(args)
+  if (!validation.success) {
+    return `Parameter validation error for create_terminal_tab: ${validation.error.message}`
+  }
+  const validatedArgs = validation.data
+  const { connectionId } = validatedArgs
   const { sessionId, messageId, sendEvent } = context
 
   abortIfNeeded(context.signal)
@@ -105,7 +113,7 @@ export async function createTerminalTab(
     toolName: 'create_terminal_tab',
     title: 'Create terminal tab',
     hint: connectionId,
-    input: JSON.stringify(args)
+    input: JSON.stringify(validatedArgs)
   })
 
   const finish = (
@@ -133,27 +141,52 @@ export async function createTerminalTab(
   }
 
   try {
-    const terminal =
+    const created =
       await context.createTerminalFromSavedConnection(connectionId)
     abortIfNeeded(context.signal)
-    if (!terminal) {
+    if (!created) {
       return finish(
         `Saved connection ${formatModelFacingValue(connectionId)} was not found or changed after the tool catalog was generated. Re-read the current create_terminal_tab description and use an exact connectionId.`,
         'error'
       )
     }
 
-    const snapshot = await waitForTerminalReadyState(context, terminal.id)
-    if (!snapshot) {
+    const terminal = isTerminalCreationRuntime(created)
+      ? created.terminal
+      : created
+    const runtimeGuard = isTerminalCreationRuntime(created)
+      ? created.runtimeGuard
+      : context.terminalService.createTerminalRuntimeGuard(terminal.id)
+    if (
+      runtimeGuard.expectedTerminal !== terminal ||
+      runtimeGuard.expectedPtyId !== terminal.ptyId
+    ) {
       return finish(
         `Terminal tab ${formatModelFacingValue(
           terminal.title || terminal.id
         )} was created with id=${formatModelFacingValue(
           terminal.id
-        )}, but it was closed before readiness could be confirmed.`,
+        )}, but that exact runtime was replaced before readiness could be confirmed.`,
         'error'
       )
     }
+
+    const readiness = await waitForTerminalReadyState(
+      context,
+      terminal,
+      runtimeGuard
+    )
+    if (readiness.status === 'changed') {
+      return finish(
+        `Terminal tab ${formatModelFacingValue(
+          terminal.title || terminal.id
+        )} was created with id=${formatModelFacingValue(
+          terminal.id
+        )}, but that exact runtime was closed or replaced before readiness could be confirmed.`,
+        'error'
+      )
+    }
+    const snapshot = readiness.snapshot
     const title = formatModelFacingValue(snapshot.title || snapshot.id)
     const terminalId = formatModelFacingValue(snapshot.id)
     const terminalType = formatModelFacingValue(snapshot.type)
@@ -188,17 +221,22 @@ export async function closeTerminalTab(
   args: z.infer<typeof closeTerminalTabSchema>,
   context: ToolExecutionContext
 ): Promise<string> {
-  const { tabIdOrName } = args
+  const validation = closeTerminalTabSchema.safeParse(args)
+  if (!validation.success) {
+    return `Parameter validation error for close_terminal_tab: ${validation.error.message}`
+  }
+  const validatedArgs = validation.data
+  const { terminalId } = validatedArgs
   const { terminalService, sessionId, messageId, sendEvent } = context
 
   abortIfNeeded(context.signal)
-  const resolved = resolveTerminalForTool(context, tabIdOrName)
+  const resolved = resolveTerminalForTool(context, terminalId)
   if (!resolved.ok) {
     sendEvent(sessionId, {
       messageId,
       type: 'tool_call',
       toolName: 'close_terminal_tab',
-      input: JSON.stringify(args),
+      input: JSON.stringify(validatedArgs),
       output: resolved.message
     })
     return resolved.message
@@ -212,7 +250,7 @@ export async function closeTerminalTab(
     toolName: 'close_terminal_tab',
     title: `Close ${terminal.title || terminal.id}`,
     hint: terminal.type,
-    input: JSON.stringify(args)
+    input: JSON.stringify(validatedArgs)
   })
 
   const finish = (output: string): string => {
@@ -229,7 +267,7 @@ export async function closeTerminalTab(
   }
 
   try {
-    terminalService.kill(terminal.id)
+    terminalService.kill(terminal.id, resolved.runtimeGuard)
     const taskSummary = activeTaskId
       ? ` Running command ${formatModelFacingValue(
           activeTaskId
@@ -284,25 +322,72 @@ function sanitizeDescriptionValue(value: string): string {
     .slice(0, DESCRIPTION_VALUE_MAX_LENGTH)
 }
 
+function isTerminalCreationRuntime(
+  value: TerminalTab | TerminalCreationRuntime
+): value is TerminalCreationRuntime {
+  return (
+    'terminal' in value &&
+    'runtimeGuard' in value &&
+    value.terminal !== undefined &&
+    value.runtimeGuard !== undefined
+  )
+}
+
+type TerminalReadyWaitResult =
+  | { status: 'snapshot'; snapshot: TerminalRuntimeSnapshot }
+  | { status: 'changed' }
+
 async function waitForTerminalReadyState(
   context: ToolExecutionContext,
-  terminalId: string
-) {
+  terminal: TerminalTab,
+  runtimeGuard: TerminalRuntimeGuard
+): Promise<TerminalReadyWaitResult> {
+  const readSnapshot = (): TerminalReadyWaitResult => {
+    const current = context.terminalService.getTerminalById(terminal.id)
+    if (
+      current !== terminal ||
+      current !== runtimeGuard.expectedTerminal ||
+      current.ptyId !== runtimeGuard.expectedPtyId
+    ) {
+      return { status: 'changed' }
+    }
+
+    if (current.runtimeState === 'exited') {
+      const snapshot = context.terminalService.getTerminalRuntimeSnapshot(
+        terminal.id
+      )
+      return snapshot
+        ? { status: 'snapshot', snapshot }
+        : { status: 'changed' }
+    }
+
+    try {
+      const snapshot = context.terminalService.getTerminalRuntimeSnapshot(
+        terminal.id,
+        runtimeGuard
+      )
+      return snapshot
+        ? { status: 'snapshot', snapshot }
+        : { status: 'changed' }
+    } catch {
+      return { status: 'changed' }
+    }
+  }
+
   const deadline = Date.now() + TERMINAL_READY_TIMEOUT_MS
   while (Date.now() < deadline) {
     abortIfNeeded(context.signal)
-    const snapshot =
-      context.terminalService.getTerminalRuntimeSnapshot(terminalId)
+    const result = readSnapshot()
     if (
-      !snapshot ||
-      snapshot.runtimeState === 'ready' ||
-      snapshot.runtimeState === 'exited'
+      result.status === 'changed' ||
+      result.snapshot.runtimeState === 'ready' ||
+      result.snapshot.runtimeState === 'exited'
     ) {
-      return snapshot
+      return result
     }
     await waitWithSignal(TERMINAL_READY_POLL_MS, context.signal)
   }
-  return context.terminalService.getTerminalRuntimeSnapshot(terminalId)
+  return readSnapshot()
 }
 
 function abortIfNeeded(signal?: AbortSignal): void {

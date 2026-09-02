@@ -53,6 +53,9 @@ const TERMINAL_OUTPUT_RETIRE_TIMEOUT_MS = 10_000
 const TERMINAL_HEADLESS_REPLAY_CHUNK_SIZE = 64 * 1024
 const PERSIST_FLUSH_DELAY_MS = 120
 const PRIVATE_UNIX_ECHO_SCAN_SIZE = 4096
+const COMMAND_TASK_ID_ALLOCATION_MAX_ATTEMPTS = 32
+const UUID_V4_PATTERN =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i
 const UNIX_INTERACTIVE_SUBMISSION_BOUNDARY = '\x1b[?2004l'
 // Shell hooks provide normal interactive boundaries. Agent commands use a
 // top-level eval bookended by runtime-private helpers, which preserves native
@@ -132,6 +135,44 @@ export interface TerminalRenderMetadata {
   windowsRelease?: string
 }
 
+export interface TerminalRuntimeGuard {
+  readonly terminalId: string
+  readonly expectedTerminal: TerminalTab
+  readonly expectedPtyId: string
+  readonly expectedRuntimeGeneration: number
+}
+
+export interface TerminalFilesystemRuntime {
+  readonly terminal: TerminalTab
+  readonly backend: TerminalBackend & TerminalFileSystemBackend
+  readonly runtimeGuard: TerminalRuntimeGuard
+}
+
+export interface TerminalCreationRuntime {
+  readonly terminal: TerminalTab
+  readonly runtimeGuard: TerminalRuntimeGuard
+}
+
+export class TerminalRuntimeChangedError extends Error {
+  readonly code = 'GYSHELL_TERMINAL_RUNTIME_CHANGED'
+
+  constructor(
+    readonly terminalId: string,
+    readonly outcomeUnknown: boolean,
+    operation: string,
+    options?: { operationWasDispatched?: boolean }
+  ) {
+    super(
+      outcomeUnknown
+        ? `Terminal ${JSON.stringify(terminalId)} changed after ${operation} was dispatched. The operation outcome is unknown and the target may have been modified. Verify the target before retrying.`
+        : options?.operationWasDispatched
+          ? `Terminal ${JSON.stringify(terminalId)} changed while the read-only ${operation} was in flight. No terminal mutation was requested; re-read from the latest terminal inventory.`
+          : `Terminal ${JSON.stringify(terminalId)} changed before ${operation} could be dispatched. No side effect was executed by this operation.`
+    )
+    this.name = 'TerminalRuntimeChangedError'
+  }
+}
+
 type RawEventPublisher = (channel: string, data: unknown) => void
 type TerminalClosedListener = (terminalId: string) => void
 type PendingTaskFinish = {
@@ -161,6 +202,21 @@ interface TerminalServiceOptions {
 interface TerminalResizeTarget {
   cols: number
   rows: number
+}
+
+export interface TerminalMetadataAccessOptions {
+  /** Require an active filesystem-capable runtime before reading metadata. */
+  filesystem?: boolean
+}
+
+export interface TerminalIdentityAccessOptions {
+  /** Require an active filesystem-capable runtime before resolving identity. */
+  requireActive?: boolean
+}
+
+interface PendingUnboundRuntimeCleanup {
+  terminalType: ConnectionType
+  ptyId: string
 }
 
 interface CommandStartReservation {
@@ -205,6 +261,7 @@ interface TerminalInputSequenceOptions {
   intervalMs?: number
   signal?: AbortSignal
   inputOwner?: 'active-task'
+  runtimeGuard?: TerminalRuntimeGuard
 }
 
 const createTerminalAbortError = (): Error => {
@@ -344,6 +401,9 @@ export class TerminalService {
   private commandStreamProtocolByTerminal: Map<string, CommandStreamProtocol> = new Map()
   private commandProtocolTokenByTerminal: Map<string, string | undefined> = new Map()
   private captureByTaskId: Map<string, CommandTranscriptCapture> = new Map()
+  private readonly issuedCommandTaskIds = new Set<string>()
+  private commandTaskIdFactory: () => string = uuidv4
+  private runtimeGuardByTaskId: Map<string, TerminalRuntimeGuard> = new Map()
   /**
    * Bytes observed after dispatch but before a trustworthy capture boundary.
    * Unix discards this echo-prefixed staging capture once preexec is verified;
@@ -372,8 +432,17 @@ export class TerminalService {
   private terminalOutputFailureGenerationByTerminal: Map<string, number> = new Map()
   private pendingTaskFinishByTerminal: Map<string, PendingTaskFinish> = new Map()
   private backendRuntimeGenerationByTerminal: Map<string, number> = new Map()
+  private backendRuntimeActiveGenerationByTerminal: Map<string, number> =
+    new Map()
   private nextBackendRuntimeGeneration = 0
   private commandTrackingWatcherByTaskId: Map<string, { cancelled: boolean }> = new Map()
+  private terminalLifecycleTailByTerminal: Map<string, Promise<void>> = new Map()
+  private terminalLifecycleEpochByTerminal: Map<string, number> = new Map()
+  private terminalRuntimeSpawnTokenByTerminal: Map<string, symbol> = new Map()
+  private pendingUnboundRuntimeCleanupByTerminal: Map<
+    string,
+    PendingUnboundRuntimeCleanup
+  > = new Map()
   private windowsPromptBaselineByTerminal: Map<
     string,
     TerminalCommandTrackingToken
@@ -477,44 +546,153 @@ export class TerminalService {
     return undefined
   }
 
-  private hydrateTerminalRuntimeMetadata(terminalId: string): boolean {
-    const terminal = this.terminals.get(terminalId)
+  private hydrateTerminalRuntimeMetadata(
+    terminalId: string,
+    guard?: TerminalRuntimeGuard,
+    options?: TerminalMetadataAccessOptions
+  ): boolean {
+    const filesystemRuntime = options?.filesystem
+      ? this.getTerminalFilesystemRuntime(
+        terminalId,
+        guard,
+        'filesystem runtime metadata hydration'
+      )
+      : undefined
+    const terminal = filesystemRuntime?.terminal
+      ?? (guard
+        ? this.getTerminalOrThrow(terminalId, guard)
+        : this.terminals.get(terminalId))
     if (!terminal) return false
 
-    const backend = this.getBackend(terminal.type)
+    const backend = filesystemRuntime?.backend ?? this.getBackend(terminal.type)
+    const metadataGuard = filesystemRuntime?.runtimeGuard ?? guard
+    const metadataPtyId = metadataGuard?.expectedPtyId ?? terminal.ptyId
     let shouldPublishTabsChanged = false
 
-    const remoteOs = backend.getRemoteOs(terminal.ptyId) ?? this.inferRemoteOsFromSystemInfo(terminal.systemInfo)
+    const backendRemoteOs = filesystemRuntime
+      ? this.readGuardedFilesystemMetadata(
+        filesystemRuntime,
+        'filesystem runtime OS metadata read',
+        () => backend.getRemoteOs(metadataPtyId)
+      )
+      : (() => {
+        if (metadataGuard) {
+          this.assertTerminalRuntimeGuard(
+            metadataGuard,
+            'runtime OS metadata read'
+          )
+        }
+        const value = backend.getRemoteOs(metadataPtyId)
+        if (metadataGuard) {
+          this.assertTerminalRuntimeGuard(
+            metadataGuard,
+            'runtime OS metadata read'
+          )
+        }
+        return value
+      })()
+    const remoteOs =
+      backendRemoteOs ?? this.inferRemoteOsFromSystemInfo(terminal.systemInfo)
     if (remoteOs && terminal.remoteOs !== remoteOs) {
+      if (filesystemRuntime) {
+        this.assertTerminalFilesystemRuntimeGuard(
+          filesystemRuntime.runtimeGuard,
+          'filesystem runtime OS metadata commit'
+        )
+      } else if (metadataGuard) {
+        this.assertTerminalRuntimeGuard(
+          metadataGuard,
+          'runtime OS metadata commit'
+        )
+      }
       terminal.remoteOs = remoteOs
       shouldPublishTabsChanged = true
     }
 
     if (!terminal.systemInfo) {
-      const metadataPtyId = terminal.ptyId
       const metadataRuntimeGeneration =
         this.backendRuntimeGenerationByTerminal.get(terminalId) ?? 0
-      void backend.getSystemInfo(metadataPtyId).then((info) => {
+      const systemInfoRead = filesystemRuntime
+        ? this.dispatchGuardedFileOperation({
+          guard: filesystemRuntime.runtimeGuard,
+          operation: 'filesystem system-information read',
+          mutation: false,
+          dispatch: () => backend.getSystemInfo(metadataPtyId)
+        })
+        : (async () => {
+          if (metadataGuard) {
+            this.assertTerminalRuntimeGuard(
+              metadataGuard,
+              'system-information read'
+            )
+          }
+          const info = await backend.getSystemInfo(metadataPtyId)
+          if (metadataGuard) {
+            this.assertTerminalRuntimeGuard(
+              metadataGuard,
+              'system-information read',
+              { operationWasDispatched: true }
+            )
+          }
+          return info
+        })()
+      void systemInfoRead.then((info) => {
         if (!info) return
 
+        if (filesystemRuntime) {
+          this.assertTerminalFilesystemRuntimeGuard(
+            filesystemRuntime.runtimeGuard,
+            'filesystem system-information metadata commit'
+          )
+        } else if (metadataGuard) {
+          this.assertTerminalRuntimeGuard(
+            metadataGuard,
+            'system-information metadata commit'
+          )
+        }
         const latest = this.terminals.get(terminalId)
         if (
           !latest ||
+          latest !== terminal ||
           latest.ptyId !== metadataPtyId ||
           this.backendRuntimeGenerationByTerminal.get(terminalId) !==
             metadataRuntimeGeneration
         ) return
+
+        const nextBackendRemoteOs = filesystemRuntime
+          ? this.readGuardedFilesystemMetadata(
+            filesystemRuntime,
+            'filesystem runtime OS metadata refresh',
+            () => backend.getRemoteOs(metadataPtyId)
+          )
+          : backend.getRemoteOs(metadataPtyId)
+        if (metadataGuard && !filesystemRuntime) {
+          this.assertTerminalRuntimeGuard(
+            metadataGuard,
+            'runtime OS metadata refresh'
+          )
+        }
+        const nextRemoteOs =
+          latest.remoteOs ??
+          nextBackendRemoteOs ??
+          this.inferRemoteOsFromSystemInfo(info)
+        if (filesystemRuntime) {
+          this.assertTerminalFilesystemRuntimeGuard(
+            filesystemRuntime.runtimeGuard,
+            'filesystem runtime metadata commit'
+          )
+        } else if (metadataGuard) {
+          this.assertTerminalRuntimeGuard(
+            metadataGuard,
+            'runtime metadata commit'
+          )
+        }
 
         let shouldPublishLatest = false
         if (!latest.systemInfo) {
           latest.systemInfo = info
           shouldPublishLatest = true
         }
-
-        const nextRemoteOs =
-          latest.remoteOs ??
-          backend.getRemoteOs(latest.ptyId) ??
-          this.inferRemoteOsFromSystemInfo(info)
         if (nextRemoteOs && latest.remoteOs !== nextRemoteOs) {
           latest.remoteOs = nextRemoteOs
           shouldPublishLatest = true
@@ -524,7 +702,8 @@ export class TerminalService {
           this.publishTerminalTabsChanged()
         }
       }).catch(() => {
-        // Runtime metadata discovery is best-effort.
+        // Runtime metadata discovery is best-effort; guarded commits above
+        // prevent a stale read from mutating a replacement runtime.
       })
     }
 
@@ -611,7 +790,12 @@ export class TerminalService {
 
   private getFileSystemBackend(
     terminal: TerminalTab,
-  ): TerminalFileSystemBackend {
+  ): TerminalBackend & TerminalFileSystemBackend {
+    if (terminal.capabilities?.supportsFilesystem !== true) {
+      throw new Error(
+        `Connection type ${terminal.type} does not support filesystem operations.`,
+      )
+    }
     const backend = this.getBackend(terminal.type)
     if (!isTerminalFileSystemBackend(backend)) {
       throw new Error(
@@ -619,6 +803,54 @@ export class TerminalService {
       )
     }
     return backend
+  }
+
+  assertTerminalFilesystemRuntimeGuard(
+    guard: TerminalRuntimeGuard,
+    operation: string,
+    options?: {
+      mutation?: boolean
+      operationWasDispatched?: boolean
+    }
+  ): TerminalTab {
+    const operationWasDispatched = options?.operationWasDispatched === true
+    const terminal = this.assertTerminalRuntimeGuard(guard, operation, {
+      outcomeUnknown:
+        options?.mutation === true && operationWasDispatched,
+      operationWasDispatched
+    })
+    if (terminal.capabilities?.supportsFilesystem !== true) {
+      throw new Error(
+        `Connection type ${terminal.type} does not support filesystem operations.`
+      )
+    }
+    if (!this.canUseFilesystemForTerminal(terminal)) {
+      throw new TerminalRuntimeChangedError(
+        guard.terminalId,
+        options?.mutation === true && operationWasDispatched,
+        operation,
+        { operationWasDispatched }
+      )
+    }
+    return terminal
+  }
+
+  /**
+   * Acquire an ownership-layer lease for a filesystem operation. The backend
+   * lookup deliberately happens only after terminal identity, capability, and
+   * active-generation admission have succeeded; callers must still pass the
+   * returned lease to every asynchronous path-resolution and dispatch step.
+   */
+  getTerminalFilesystemRuntime(
+    terminalId: string,
+    guard?: TerminalRuntimeGuard,
+    operation = 'filesystem operation'
+  ): TerminalFilesystemRuntime {
+    const runtimeGuard = guard ?? this.createTerminalRuntimeGuard(terminalId)
+    const terminal = this.getTerminalOrThrow(terminalId, runtimeGuard)
+    this.assertTerminalFilesystemRuntimeGuard(runtimeGuard, operation)
+    const backend = this.getFileSystemBackend(terminal)
+    return Object.freeze({ terminal, backend, runtimeGuard })
   }
 
   private mergeTerminalConfigForIdempotent(existing: TerminalConfig, incoming: TerminalConfig): TerminalConfig {
@@ -724,23 +956,179 @@ export class TerminalService {
     this.persistTerminalStateNow()
   }
 
+  private getTerminalLifecycleEpoch(terminalId: string): number {
+    return this.terminalLifecycleEpochByTerminal.get(terminalId) ?? 0
+  }
+
+  private tryReleaseTerminalLifecycleEpoch(terminalId: string): void {
+    if (
+      this.terminals.has(terminalId) ||
+      this.terminalLifecycleTailByTerminal.has(terminalId) ||
+      this.terminalRuntimeSpawnTokenByTerminal.has(terminalId) ||
+      this.pendingUnboundRuntimeCleanupByTerminal.has(terminalId)
+    ) {
+      return
+    }
+    this.terminalLifecycleEpochByTerminal.delete(terminalId)
+  }
+
+  private invalidateTerminalLifecycle(terminalId: string): void {
+    this.terminalLifecycleEpochByTerminal.set(
+      terminalId,
+      this.getTerminalLifecycleEpoch(terminalId) + 1
+    )
+  }
+
+  private isTerminalLifecycleCurrent(
+    terminalId: string,
+    expectedEpoch: number
+  ): boolean {
+    return this.getTerminalLifecycleEpoch(terminalId) === expectedEpoch
+  }
+
+  private ensurePendingUnboundRuntimeStopped(terminalId: string): void {
+    const pending = this.pendingUnboundRuntimeCleanupByTerminal.get(terminalId)
+    if (!pending) return
+    try {
+      this.getBackend(pending.terminalType).kill(pending.ptyId)
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error)
+      throw new Error(
+        `Terminal ${JSON.stringify(terminalId)} cannot start another backend runtime because cleanup of the previous unbound runtime failed: ${detail}`
+      )
+    }
+    if (
+      this.pendingUnboundRuntimeCleanupByTerminal.get(terminalId) === pending
+    ) {
+      this.pendingUnboundRuntimeCleanupByTerminal.delete(terminalId)
+    }
+  }
+
+  private runTerminalLifecycleOperation<T>(
+    terminalId: string,
+    operation: (expectedEpoch: number) => Promise<T>
+  ): Promise<T> {
+    const expectedEpoch = this.getTerminalLifecycleEpoch(terminalId)
+    const predecessor =
+      this.terminalLifecycleTailByTerminal.get(terminalId) ?? Promise.resolve()
+    const result = predecessor
+      .catch(() => {})
+      .then(() => {
+        this.ensurePendingUnboundRuntimeStopped(terminalId)
+        return operation(expectedEpoch)
+      })
+    const settledTail = result.then(
+      () => undefined,
+      () => undefined
+    )
+    this.terminalLifecycleTailByTerminal.set(terminalId, settledTail)
+    void settledTail.finally(() => {
+      if (
+        this.terminalLifecycleTailByTerminal.get(terminalId) === settledTail
+      ) {
+        this.terminalLifecycleTailByTerminal.delete(terminalId)
+        this.tryReleaseTerminalLifecycleEpoch(terminalId)
+      }
+    })
+    return result
+  }
+
+  private beginTerminalRuntimeSpawn(terminalId: string): symbol {
+    if (this.terminalRuntimeSpawnTokenByTerminal.has(terminalId)) {
+      throw new Error(
+        `Terminal ${JSON.stringify(terminalId)} already has a backend spawn in progress.`
+      )
+    }
+    const token = Symbol(terminalId)
+    this.terminalRuntimeSpawnTokenByTerminal.set(terminalId, token)
+    return token
+  }
+
+  private finishTerminalRuntimeSpawn(terminalId: string, token: symbol): void {
+    if (this.terminalRuntimeSpawnTokenByTerminal.get(terminalId) === token) {
+      this.terminalRuntimeSpawnTokenByTerminal.delete(terminalId)
+      this.tryReleaseTerminalLifecycleEpoch(terminalId)
+    }
+  }
+
+  private clearPendingUnboundRuntimeCleanup(
+    terminalId: string,
+    terminalType: ConnectionType,
+    ptyId: string
+  ): void {
+    const pending = this.pendingUnboundRuntimeCleanupByTerminal.get(terminalId)
+    if (
+      pending?.terminalType === terminalType &&
+      pending.ptyId === ptyId
+    ) {
+      this.pendingUnboundRuntimeCleanupByTerminal.delete(terminalId)
+    }
+  }
+
+  private stopUnboundBackendRuntime(
+    terminalId: string,
+    terminalType: ConnectionType,
+    ptyId: string
+  ): void {
+    const pending: PendingUnboundRuntimeCleanup = { terminalType, ptyId }
+    this.pendingUnboundRuntimeCleanupByTerminal.set(terminalId, pending)
+    try {
+      this.getBackend(terminalType).kill(ptyId)
+      if (
+        this.pendingUnboundRuntimeCleanupByTerminal.get(terminalId) === pending
+      ) {
+        this.pendingUnboundRuntimeCleanupByTerminal.delete(terminalId)
+      }
+    } catch (error) {
+      console.warn(
+        `[TerminalService] Failed to stop unbound terminal runtime ${ptyId}.`,
+        error
+      )
+    }
+  }
+
+  private applyPendingResizeToSpawnedRuntime(
+    terminalId: string,
+    terminalType: ConnectionType,
+    ptyId: string,
+    config: TerminalConfig,
+    expectedEpoch: number,
+    operation: string
+  ): TerminalConfig {
+    let nextConfig = config
+    while (true) {
+      if (!this.isTerminalLifecycleCurrent(terminalId, expectedEpoch)) {
+        throw new TerminalRuntimeChangedError(terminalId, false, operation)
+      }
+      const pendingResize = this.pendingResizeByTerminal.get(terminalId)
+      if (!pendingResize) return nextConfig
+      this.pendingResizeByTerminal.delete(terminalId)
+      try {
+        this.getBackend(terminalType).resize(
+          ptyId,
+          pendingResize.cols,
+          pendingResize.rows
+        )
+      } catch (error) {
+        if (!this.pendingResizeByTerminal.has(terminalId)) {
+          this.pendingResizeByTerminal.set(terminalId, pendingResize)
+        }
+        throw error
+      }
+      nextConfig = normalizeTerminalConfigForRuntime({
+        ...nextConfig,
+        cols: pendingResize.cols,
+        rows: pendingResize.rows
+      } as TerminalConfig)
+    }
+  }
+
   private async spawnBackendRuntime(
     initialConfig: TerminalConfig
   ): Promise<{ config: TerminalConfig; ptyId: string }> {
-    let config = initialConfig
-    const backend = this.getBackend(config.type)
-    const ptyId = await backend.spawn(config)
-    const pendingResizeAfterSpawn = this.pendingResizeByTerminal.get(config.id)
-    if (pendingResizeAfterSpawn) {
-      this.pendingResizeByTerminal.delete(config.id)
-      config = normalizeTerminalConfigForRuntime({
-        ...config,
-        cols: pendingResizeAfterSpawn.cols,
-        rows: pendingResizeAfterSpawn.rows
-      } as TerminalConfig)
-      backend.resize(ptyId, config.cols, config.rows)
-    }
-    return { config, ptyId }
+    const backend = this.getBackend(initialConfig.type)
+    const ptyId = await backend.spawn(initialConfig)
+    return { config: initialConfig, ptyId }
   }
 
   private clearWindowsPromptRuntimeState(terminalId: string): void {
@@ -825,6 +1213,13 @@ export class TerminalService {
     }
   }
 
+  private advanceTerminalRuntimeGeneration(terminalId: string): number {
+    this.nextBackendRuntimeGeneration += 1
+    const runtimeGeneration = this.nextBackendRuntimeGeneration
+    this.backendRuntimeGenerationByTerminal.set(terminalId, runtimeGeneration)
+    return runtimeGeneration
+  }
+
   private registerBackendRuntimeHandlers(
     terminalId: string,
     terminalType: ConnectionType,
@@ -832,9 +1227,9 @@ export class TerminalService {
   ): void {
     this.clearWindowsPromptRuntimeState(terminalId)
     this.pendingUnixCommandDisplayByTerminal.delete(terminalId)
-    this.nextBackendRuntimeGeneration += 1
-    const runtimeGeneration = this.nextBackendRuntimeGeneration
-    this.backendRuntimeGenerationByTerminal.set(
+    const runtimeGeneration =
+      this.advanceTerminalRuntimeGeneration(terminalId)
+    this.backendRuntimeActiveGenerationByTerminal.set(
       terminalId,
       runtimeGeneration
     )
@@ -912,7 +1307,10 @@ export class TerminalService {
     backend.onExit(ptyId, (code: number) => {
       if (!isCurrentRuntime()) return
       runtimeExited = true
-      this.handleExit(terminalId, code)
+      this.handleExit(terminalId, code, {
+        expectedPtyId: ptyId,
+        expectedRuntimeGeneration: runtimeGeneration
+      })
     })
   }
 
@@ -972,13 +1370,22 @@ export class TerminalService {
     return { restored, failed }
   }
 
-  private async printBanner(terminalId: string): Promise<void> {
+  private printBanner(
+    terminalId: string,
+    runtimeGuard: TerminalRuntimeGuard
+  ): void {
     // ANSI Shadow font for "GyShell"
     // Using \x1b[36m for Cyan color
     const banner = `\r\n\x1b[36m  ____         ____  _          _ _ \r\n / ___|_   _  / ___|| |__   ___| | |\r\n| |  _| | | | \\___ \\| '_ \\ / _ \\ | |\r\n| |_| | |_| |  ___) | | | |  __/ | |\r\n \\____|\\__, | |____/|_| |_|\\___|_|_|\r\n       |___/                        \x1b[0m\r\n`
 
-    // Small delay to ensure shell is ready
+    // Small delay to ensure shell is ready. The timer is runtime-bound so an
+    // old first-tab callback cannot write into a same-ID replacement.
     setTimeout(() => {
+      try {
+        this.assertTerminalRuntimeGuard(runtimeGuard, 'terminal banner write')
+      } catch {
+        return
+      }
       // Inject the banner directly into the local display state without
       // routing it through command-output capture.
       this.appendSyntheticDisplayData(terminalId, banner)
@@ -986,7 +1393,56 @@ export class TerminalService {
   }
 
   async createTerminal(rawConfig: TerminalConfig): Promise<TerminalTab> {
+    const normalizedConfig = normalizeTerminalConfigForRuntime(rawConfig)
+    return await this.runTerminalLifecycleOperation(
+      normalizedConfig.id,
+      async (expectedEpoch) =>
+        await this.createTerminalWithinLifecycle(
+          normalizedConfig,
+          expectedEpoch
+        )
+    )
+  }
+
+  async createTerminalWithRuntimeGuard(
+    rawConfig: TerminalConfig
+  ): Promise<TerminalCreationRuntime> {
+    const normalizedConfig = normalizeTerminalConfigForRuntime(rawConfig)
+    return await this.runTerminalLifecycleOperation(
+      normalizedConfig.id,
+      async (expectedEpoch) => {
+        const terminal = await this.createTerminalWithinLifecycle(
+          normalizedConfig,
+          expectedEpoch
+        )
+        const runtimeGuard = this.createTerminalRuntimeGuard(terminal.id)
+        if (
+          runtimeGuard.expectedTerminal !== terminal ||
+          runtimeGuard.expectedPtyId !== terminal.ptyId
+        ) {
+          throw new TerminalRuntimeChangedError(
+            terminal.id,
+            false,
+            'terminal creation lease capture'
+          )
+        }
+        return Object.freeze({ terminal, runtimeGuard })
+      }
+    )
+  }
+
+  private async createTerminalWithinLifecycle(
+    rawConfig: TerminalConfig,
+    expectedEpoch: number
+  ): Promise<TerminalTab> {
     let config = normalizeTerminalConfigForRuntime(rawConfig)
+    if (!this.isTerminalLifecycleCurrent(config.id, expectedEpoch)) {
+      throw new TerminalRuntimeChangedError(
+        config.id,
+        false,
+        'terminal creation admission'
+      )
+    }
     const pendingResizeBeforeCreate = this.pendingResizeByTerminal.get(config.id)
     if (pendingResizeBeforeCreate) {
       config = normalizeTerminalConfigForRuntime({
@@ -1012,23 +1468,33 @@ export class TerminalService {
         existing.rows !== mergedConfig.rows ||
         Boolean(pendingResizeBeforeCreate)
 
-      // Keep size updated
-      existing.cols = mergedConfig.cols
-      existing.rows = mergedConfig.rows
-      // Keep title updated (required)
-      existing.title = mergedConfig.title
-      existing.capabilities = resolveTerminalConnectionCapabilities(mergedConfig)
-      
+      if (shouldResizeBackend) {
+        const backend = this.getBackend(existing.type)
+        backend.resize(existing.ptyId, mergedConfig.cols, mergedConfig.rows)
+      }
+      if (
+        !this.isTerminalLifecycleCurrent(config.id, expectedEpoch) ||
+        this.terminals.get(config.id) !== existing
+      ) {
+        throw new TerminalRuntimeChangedError(
+          config.id,
+          shouldResizeBackend,
+          'terminal remount update',
+          { operationWasDispatched: shouldResizeBackend }
+        )
+      }
+
       const headless = this.headlessPtys.get(config.id)
       if (headless) {
         headless.resize(mergedConfig.cols, mergedConfig.rows)
       }
 
-      if (shouldResizeBackend) {
-        const backend = this.getBackend(existing.type)
-        backend.resize(existing.ptyId, mergedConfig.cols, mergedConfig.rows)
-      }
-
+      // Commit visible metadata only after the backend resize remains bound to
+      // the same lifecycle epoch and terminal object.
+      existing.cols = mergedConfig.cols
+      existing.rows = mergedConfig.rows
+      existing.title = mergedConfig.title
+      existing.capabilities = resolveTerminalConnectionCapabilities(mergedConfig)
       this.terminalConfigs.set(config.id, mergedConfig)
       this.schedulePersistTerminalState()
 
@@ -1045,12 +1511,39 @@ export class TerminalService {
       title: reservedTitle
     } as TerminalConfig)
 
-    let runtime: { config: TerminalConfig; ptyId: string }
+    let runtime: { config: TerminalConfig; ptyId: string } | undefined
+    const spawnToken = this.beginTerminalRuntimeSpawn(config.id)
     try {
       runtime = await this.spawnBackendRuntime(config)
+      try {
+        runtime.config = this.applyPendingResizeToSpawnedRuntime(
+          config.id,
+          config.type,
+          runtime.ptyId,
+          runtime.config,
+          expectedEpoch,
+          'terminal creation binding'
+        )
+        if (!this.isTerminalLifecycleCurrent(config.id, expectedEpoch)) {
+          throw new TerminalRuntimeChangedError(
+            config.id,
+            false,
+            'terminal creation binding'
+          )
+        }
+      } catch (error) {
+        this.stopUnboundBackendRuntime(
+          config.id,
+          config.type,
+          runtime.ptyId
+        )
+        throw error
+      }
     } catch (error) {
       this.releaseReservedTitleForTerminal(config.id, reservedTitle)
       throw error
+    } finally {
+      this.finishTerminalRuntimeSpawn(config.id, spawnToken)
     }
     config = runtime.config
 
@@ -1089,9 +1582,12 @@ export class TerminalService {
 
     this.hydrateTerminalRuntimeMetadata(config.id)
 
-    // Print banner for the first local terminal
+    // Print banner for the first local terminal.
     if (config.type === 'local' && this.primaryLocalTerminalId === config.id) {
-      this.printBanner(config.id)
+      this.printBanner(
+        config.id,
+        this.createTerminalRuntimeGuard(config.id)
+      )
     }
 
     this.publishTerminalTabsChanged()
@@ -1100,8 +1596,36 @@ export class TerminalService {
     return tab
   }
 
-  async reconnectTerminal(terminalId: string): Promise<TerminalTab> {
-    const tab = this.terminals.get(terminalId)
+  async reconnectTerminal(
+    terminalId: string,
+    runtimeGuard?: TerminalRuntimeGuard
+  ): Promise<TerminalTab> {
+    return await this.runTerminalLifecycleOperation(
+      terminalId,
+      async (expectedEpoch) =>
+        await this.reconnectTerminalWithinLifecycle(
+          terminalId,
+          expectedEpoch,
+          runtimeGuard
+        )
+    )
+  }
+
+  private async reconnectTerminalWithinLifecycle(
+    terminalId: string,
+    expectedEpoch: number,
+    runtimeGuard?: TerminalRuntimeGuard
+  ): Promise<TerminalTab> {
+    if (!this.isTerminalLifecycleCurrent(terminalId, expectedEpoch)) {
+      throw new TerminalRuntimeChangedError(
+        terminalId,
+        false,
+        'terminal reconnect admission'
+      )
+    }
+    const tab = runtimeGuard
+      ? this.getTerminalOrThrow(terminalId, runtimeGuard)
+      : this.terminals.get(terminalId)
     if (!tab) {
       throw new Error(`Terminal ${terminalId} not found`)
     }
@@ -1120,8 +1644,21 @@ export class TerminalService {
     }
 
     const backend = this.getBackend(tab.type)
+    if (runtimeGuard) {
+      this.assertTerminalRuntimeGuard(
+        runtimeGuard,
+        'terminal reconnect admission'
+      )
+    }
     await this.retiringOutputDrainByTerminal.get(terminalId)
+    if (runtimeGuard) {
+      this.assertTerminalRuntimeGuard(
+        runtimeGuard,
+        'terminal reconnect preparation'
+      )
+    }
     if (
+      !this.isTerminalLifecycleCurrent(terminalId, expectedEpoch) ||
       this.terminals.get(terminalId) !== tab ||
       tab.runtimeState !== 'exited'
     ) {
@@ -1131,6 +1668,17 @@ export class TerminalService {
       backend.kill(tab.ptyId)
     } catch {
       // The previous SSH runtime is normally already gone after exit.
+    }
+    if (
+      !this.isTerminalLifecycleCurrent(terminalId, expectedEpoch) ||
+      this.terminals.get(terminalId) !== tab ||
+      tab.runtimeState !== 'exited'
+    ) {
+      throw new TerminalRuntimeChangedError(
+        terminalId,
+        false,
+        'terminal reconnect preparation'
+      )
     }
 
     const previousLastExitCode = tab.lastExitCode
@@ -1149,8 +1697,39 @@ export class TerminalService {
     this.terminalConfigs.set(terminalId, reconnectConfig)
     this.publishTerminalTabsChanged()
 
+    const spawnToken = this.beginTerminalRuntimeSpawn(terminalId)
+    let spawnedRuntime: { config: TerminalConfig; ptyId: string } | undefined
     try {
-      const runtime = await this.spawnBackendRuntime(reconnectConfig)
+      spawnedRuntime = await this.spawnBackendRuntime(reconnectConfig)
+      try {
+        spawnedRuntime.config = this.applyPendingResizeToSpawnedRuntime(
+          terminalId,
+          reconnectConfig.type,
+          spawnedRuntime.ptyId,
+          spawnedRuntime.config,
+          expectedEpoch,
+          'terminal reconnect binding'
+        )
+        if (
+          !this.isTerminalLifecycleCurrent(terminalId, expectedEpoch) ||
+          this.terminals.get(terminalId) !== tab ||
+          tab.runtimeState !== 'initializing'
+        ) {
+          throw new TerminalRuntimeChangedError(
+            terminalId,
+            false,
+            'terminal reconnect binding'
+          )
+        }
+      } catch (error) {
+        this.stopUnboundBackendRuntime(
+          terminalId,
+          reconnectConfig.type,
+          spawnedRuntime.ptyId
+        )
+        throw error
+      }
+      const runtime = spawnedRuntime
       const nextConfig = runtime.config
       tab.ptyId = runtime.ptyId
       tab.title = nextConfig.title
@@ -1191,17 +1770,24 @@ export class TerminalService {
 
       return tab
     } catch (error) {
-      tab.isInitializing = false
-      tab.runtimeState = 'exited'
-      tab.lastExitCode =
-        typeof previousLastExitCode === 'number' ? previousLastExitCode : -1
-      this.publishTerminalTabsChanged()
-      this.schedulePersistTerminalState()
+      if (
+        this.isTerminalLifecycleCurrent(terminalId, expectedEpoch) &&
+        this.terminals.get(terminalId) === tab
+      ) {
+        tab.isInitializing = false
+        tab.runtimeState = 'exited'
+        tab.lastExitCode =
+          typeof previousLastExitCode === 'number' ? previousLastExitCode : -1
+        this.publishTerminalTabsChanged()
+        this.schedulePersistTerminalState()
+      }
       throw error
+    } finally {
+      this.finishTerminalRuntimeSpawn(terminalId, spawnToken)
     }
   }
 
-  private async restartLocalTerminalAfterExit(
+  private restartLocalTerminalAfterExit(
     terminalId: string,
     code: number,
     outputDrain?: Promise<void>
@@ -1209,7 +1795,7 @@ export class TerminalService {
     const tab = this.terminals.get(terminalId)
     const existingConfig = this.terminalConfigs.get(terminalId)
     if (!tab || !existingConfig || !isLocalConnectionConfig(existingConfig)) {
-      return
+      return Promise.resolve()
     }
 
     const restartConfig = normalizeTerminalConfigForRuntime({
@@ -1220,9 +1806,8 @@ export class TerminalService {
       rows: tab.rows
     } as TerminalConfig)
 
-    // The old PTY has exited and no replacement exists yet. Keep every local
-    // shell non-writable until spawn returns and the tab is bound to that exact
-    // runtime; otherwise a synchronous caller can dispatch into the dead PTY.
+    // Enter the non-writable state synchronously. The spawn itself is queued
+    // with all create/reconnect operations for this public terminal ID.
     tab.isInitializing = true
     tab.runtimeState = 'initializing'
     tab.lastExitCode = undefined
@@ -1230,44 +1815,95 @@ export class TerminalService {
     this.terminalConfigs.set(terminalId, restartConfig)
     this.publishTerminalTabsChanged()
 
-    await outputDrain
-    if (this.terminals.get(terminalId) !== tab) {
-      return
-    }
+    return this.runTerminalLifecycleOperation(
+      terminalId,
+      async (expectedEpoch) => {
+        await outputDrain
+        if (
+          !this.isTerminalLifecycleCurrent(terminalId, expectedEpoch) ||
+          this.terminals.get(terminalId) !== tab ||
+          tab.runtimeState !== 'initializing'
+        ) {
+          return
+        }
 
-    try {
-      const runtime = await this.spawnBackendRuntime(restartConfig)
-      const nextConfig = runtime.config
-      tab.ptyId = runtime.ptyId
-      tab.title = nextConfig.title
-      tab.cols = nextConfig.cols
-      tab.rows = nextConfig.rows
-      tab.type = nextConfig.type
-      tab.capabilities = resolveTerminalConnectionCapabilities(nextConfig)
-      tab.isInitializing = this.runtimeNeedsInitializationSilence(
-        nextConfig,
-        runtime.ptyId
-      )
-      tab.runtimeState = tab.isInitializing ? 'initializing' : 'ready'
-      tab.lastExitCode = undefined
-      this.terminalConfigs.set(terminalId, nextConfig)
+        const spawnToken = this.beginTerminalRuntimeSpawn(terminalId)
+        let spawnedRuntime: { config: TerminalConfig; ptyId: string } | undefined
+        try {
+          spawnedRuntime = await this.spawnBackendRuntime(restartConfig)
+          try {
+            spawnedRuntime.config = this.applyPendingResizeToSpawnedRuntime(
+              terminalId,
+              restartConfig.type,
+              spawnedRuntime.ptyId,
+              spawnedRuntime.config,
+              expectedEpoch,
+              'terminal restart binding'
+            )
+            if (
+              !this.isTerminalLifecycleCurrent(terminalId, expectedEpoch) ||
+              this.terminals.get(terminalId) !== tab ||
+              tab.runtimeState !== 'initializing'
+            ) {
+              throw new TerminalRuntimeChangedError(
+                terminalId,
+                false,
+                'terminal restart binding'
+              )
+            }
+          } catch (error) {
+            this.stopUnboundBackendRuntime(
+              terminalId,
+              restartConfig.type,
+              spawnedRuntime.ptyId
+            )
+            throw error
+          }
+          const runtime = spawnedRuntime
+          const nextConfig = runtime.config
+          tab.ptyId = runtime.ptyId
+          tab.title = nextConfig.title
+          tab.cols = nextConfig.cols
+          tab.rows = nextConfig.rows
+          tab.type = nextConfig.type
+          tab.capabilities = resolveTerminalConnectionCapabilities(nextConfig)
+          tab.isInitializing = this.runtimeNeedsInitializationSilence(
+            nextConfig,
+            runtime.ptyId
+          )
+          tab.runtimeState = tab.isInitializing ? 'initializing' : 'ready'
+          tab.lastExitCode = undefined
+          this.terminalConfigs.set(terminalId, nextConfig)
 
-      const headless = this.headlessPtys.get(terminalId)
-      if (headless) {
-        headless.resize(nextConfig.cols, nextConfig.rows)
+          const headless = this.headlessPtys.get(terminalId)
+          if (headless) {
+            headless.resize(nextConfig.cols, nextConfig.rows)
+          }
+
+          this.registerBackendRuntimeHandlers(
+            terminalId,
+            nextConfig.type,
+            runtime.ptyId
+          )
+          this.hydrateTerminalRuntimeMetadata(terminalId)
+          this.publishTerminalTabsChanged()
+          this.schedulePersistTerminalState()
+        } catch {
+          if (
+            this.isTerminalLifecycleCurrent(terminalId, expectedEpoch) &&
+            this.terminals.get(terminalId) === tab
+          ) {
+            tab.isInitializing = false
+            tab.runtimeState = 'exited'
+            tab.lastExitCode = typeof code === 'number' ? code : -1
+            this.publishTerminalTabsChanged()
+            this.schedulePersistTerminalState()
+          }
+        } finally {
+          this.finishTerminalRuntimeSpawn(terminalId, spawnToken)
+        }
       }
-
-      this.registerBackendRuntimeHandlers(terminalId, nextConfig.type, runtime.ptyId)
-      this.hydrateTerminalRuntimeMetadata(terminalId)
-      this.publishTerminalTabsChanged()
-      this.schedulePersistTerminalState()
-    } catch {
-      tab.isInitializing = false
-      tab.runtimeState = 'exited'
-      tab.lastExitCode = typeof code === 'number' ? code : -1
-      this.publishTerminalTabsChanged()
-      this.schedulePersistTerminalState()
-    }
+    )
   }
 
   private handleData(
@@ -2344,7 +2980,34 @@ export class TerminalService {
     retiringHeadless?.dispose()
   }
 
-  private handleExit(terminalId: string, code: number): void {
+  private handleExit(
+    terminalId: string,
+    code: number,
+    runtime: {
+      expectedPtyId: string
+      expectedRuntimeGeneration: number
+    }
+  ): void {
+    const terminalAtExit = this.terminals.get(terminalId)
+    if (
+      terminalAtExit?.ptyId !== runtime.expectedPtyId ||
+      this.backendRuntimeGenerationByTerminal.get(terminalId) !==
+        runtime.expectedRuntimeGeneration
+    ) {
+      return
+    }
+    // Retire the live generation before any asynchronous drain or restart.
+    // Leases captured for the exited process must fail immediately, while a
+    // newly captured lease can still authorize close/reconnect on the retained
+    // disconnected tab.
+    if (
+      this.backendRuntimeActiveGenerationByTerminal.get(terminalId) ===
+      runtime.expectedRuntimeGeneration
+    ) {
+      this.backendRuntimeActiveGenerationByTerminal.delete(terminalId)
+    }
+    this.advanceTerminalRuntimeGeneration(terminalId)
+
     // A command still preparing against this runtime must not block a
     // replacement runtime that reuses the same terminal id. Its generation
     // check will prevent any late dispatch.
@@ -2431,6 +3094,7 @@ export class TerminalService {
         }
       }
       this.stopCommandTrackingWatcher(activeTaskId)
+      this.runtimeGuardByTaskId.delete(activeTaskId)
       this.activeTaskByTerminal.delete(terminalId)
       this.deferredWritesUntilTaskFinishByTaskId.delete(activeTaskId)
       if (callback && exitResult) {
@@ -2549,7 +3213,10 @@ export class TerminalService {
         `[TerminalService] Failed to stop output-corrupted runtime ${terminalId}:`,
         killError
       )
-      this.handleExit(terminalId, -1)
+      this.handleExit(terminalId, -1, {
+        expectedPtyId: ptyId,
+        expectedRuntimeGeneration: runtimeGeneration
+      })
     }
   }
 
@@ -2559,6 +3226,21 @@ export class TerminalService {
 
   private canUseFilesystemForTerminal(terminal: TerminalTab): boolean {
     if (terminal.capabilities?.supportsFilesystem !== true) {
+      return false
+    }
+    const backend = this.backends.get(terminal.type)
+    if (!backend || !isTerminalFileSystemBackend(backend)) {
+      return false
+    }
+    const runtimeGeneration =
+      this.backendRuntimeGenerationByTerminal.get(terminal.id)
+    if (
+      typeof runtimeGeneration !== 'number' ||
+      !Number.isSafeInteger(runtimeGeneration) ||
+      runtimeGeneration < 1 ||
+      this.backendRuntimeActiveGenerationByTerminal.get(terminal.id) !==
+        runtimeGeneration
+    ) {
       return false
     }
     if (terminal.type === 'local') {
@@ -2575,6 +3257,8 @@ export class TerminalService {
       signal?: AbortSignal
       rejectOnRuntimeChange?: boolean
       inputOwner?: 'active-task'
+      onDispatchStarted?: () => void
+      onDispatchCompleted?: () => void
     }
   ): Promise<void> | undefined {
     const runtimePtyId = terminal.ptyId
@@ -2613,9 +3297,11 @@ export class TerminalService {
           return
         }
         const backend = this.getBackend(currentTerminal.type)
+        options?.onDispatchStarted?.()
         this.deliverTerminalInput(terminalId, backend, runtimePtyId, data, {
           inputOwner: options?.inputOwner,
         })
+        options?.onDispatchCompleted?.()
       } finally {
         promptFileIo.release()
       }
@@ -2723,7 +3409,10 @@ export class TerminalService {
     // Bind queued input to the runtime that accepted it. A predecessor may
     // outlive an exit/reconnect, and stale input must never spill into the
     // replacement shell when that predecessor releases the queue.
-    const terminal = this.terminals.get(terminalId)
+    const runtimeGuard = options?.runtimeGuard
+    const terminal = runtimeGuard
+      ? this.getTerminalOrThrow(terminalId, runtimeGuard)
+      : this.terminals.get(terminalId)
     if (!terminal || !this.canWriteToTerminal(terminal)) {
       throw new Error(`Terminal ${terminalId} is not available for input.`)
     }
@@ -2735,6 +3424,32 @@ export class TerminalService {
     const runtimePtyId = terminal.ptyId
     const runtimeGeneration =
       this.backendRuntimeGenerationByTerminal.get(terminalId)
+    if (runtimeGuard) {
+      this.assertTerminalRuntimeGuard(runtimeGuard, 'terminal input admission')
+    }
+    let inputWasDispatched = false
+    const assertInputRuntime = (operation: string): void => {
+      if (runtimeGuard) {
+        this.assertTerminalRuntimeGuard(runtimeGuard, operation, {
+          outcomeUnknown: inputWasDispatched,
+          operationWasDispatched: inputWasDispatched
+        })
+      }
+      if (
+        !this.isCurrentTerminalRuntime(
+          terminalId,
+          runtimePtyId,
+          runtimeGeneration
+        )
+      ) {
+        throw new TerminalRuntimeChangedError(
+          terminalId,
+          inputWasDispatched,
+          operation,
+          { operationWasDispatched: inputWasDispatched }
+        )
+      }
+    }
     const startupReservation =
       this.commandStartReservationByTerminal.get(terminalId)
 
@@ -2759,17 +3474,9 @@ export class TerminalService {
         if (startedTaskId) {
           while (this.activeTaskByTerminal.get(terminalId) === startedTaskId) {
             throwIfTerminalOperationAborted(options?.signal)
-            if (
-              !this.isCurrentTerminalRuntime(
-                terminalId,
-                runtimePtyId,
-                runtimeGeneration
-              )
-            ) {
-              throw new Error(
-                `Terminal ${terminalId} changed while input was deferred behind command startup.`
-              )
-            }
+            assertInputRuntime(
+              'terminal input deferred behind command startup'
+            )
             await waitForTerminalDelay(10, options?.signal)
           }
           const startedTask = this.tasksByTerminal.get(terminalId)?.[startedTaskId]
@@ -2785,17 +3492,7 @@ export class TerminalService {
         }
       }
 
-      if (
-        !this.isCurrentTerminalRuntime(
-          terminalId,
-          runtimePtyId,
-          runtimeGeneration
-        )
-      ) {
-        throw new Error(
-          `Terminal ${terminalId} changed while the input sequence was waiting to start.`
-        )
-      }
+      assertInputRuntime('terminal input sequence start')
       const shouldObserveManualWindowsPrompt =
         this.canObserveManualPowerShellPrompt(terminalId, terminal)
       // Human input is the in-band event that can produce the next prompt.
@@ -2869,10 +3566,12 @@ export class TerminalService {
             this.backendRuntimeGenerationByTerminal.get(terminalId) !==
               runtimeGeneration
           ) {
+            assertInputRuntime('terminal input sequence write')
             throw new Error(
-              `Terminal ${terminalId} changed while the input sequence was being written.`
+              `Terminal ${terminalId} is no longer writable.`
             )
           }
+          assertInputRuntime('terminal input sequence write')
           const commandStartReservation =
             this.commandStartReservationByTerminal.get(terminalId)
           if (commandStartReservation) {
@@ -2882,28 +3581,61 @@ export class TerminalService {
             )
             continue
           }
-          const queuedWrite = this.queueWriteAfterPromptFileIo(
-            terminalId,
-            currentTerminal,
-            sequence[index],
-            {
-              signal: options?.signal,
-              rejectOnRuntimeChange: true,
-              inputOwner: options?.inputOwner,
-            }
-          )
-          if (queuedWrite) {
-            await queuedWrite
-          } else {
-            const backend = this.getBackend(currentTerminal.type)
-            this.deliverTerminalInput(
-              terminalId,
-              backend,
-              runtimePtyId,
-              sequence[index],
-              { inputOwner: options?.inputOwner }
-            )
+          let inputDispatchStarted = false
+          const markInputDispatchStarted = (): void => {
+            inputDispatchStarted = true
           }
+          const markInputDispatched = (): void => {
+            inputWasDispatched = true
+          }
+          try {
+            const queuedWrite = this.queueWriteAfterPromptFileIo(
+              terminalId,
+              currentTerminal,
+              sequence[index],
+              {
+                signal: options?.signal,
+                rejectOnRuntimeChange: true,
+                inputOwner: options?.inputOwner,
+                onDispatchStarted: markInputDispatchStarted,
+                onDispatchCompleted: markInputDispatched,
+              }
+            )
+            if (queuedWrite) {
+              await queuedWrite
+            } else {
+              const backend = this.getBackend(currentTerminal.type)
+              markInputDispatchStarted()
+              this.deliverTerminalInput(
+                terminalId,
+                backend,
+                runtimePtyId,
+                sequence[index],
+                { inputOwner: options?.inputOwner }
+              )
+              markInputDispatched()
+            }
+          } catch (error) {
+            const inputDispatchMayHaveReachedBackend =
+              inputWasDispatched || inputDispatchStarted
+            if (
+              inputDispatchMayHaveReachedBackend &&
+              !this.isCurrentTerminalRuntime(
+                terminalId,
+                runtimePtyId,
+                runtimeGeneration
+              )
+            ) {
+              throw new TerminalRuntimeChangedError(
+                terminalId,
+                true,
+                'terminal input sequence write',
+                { operationWasDispatched: true }
+              )
+            }
+            throw error
+          }
+          assertInputRuntime('terminal input sequence write')
           break
         }
         observePromptAfterInput(index)
@@ -2970,9 +3702,25 @@ export class TerminalService {
     }
   }
 
-  kill(terminalId: string): void {
+  kill(
+    terminalId: string,
+    runtimeGuard?: TerminalRuntimeGuard
+  ): void {
+    const terminal = runtimeGuard
+      ? this.getTerminalOrThrow(terminalId, runtimeGuard)
+      : this.terminals.get(terminalId)
+    if (runtimeGuard) {
+      this.assertTerminalRuntimeGuard(
+        runtimeGuard,
+        'terminal close admission'
+      )
+    }
+    // Guard admission must precede every state mutation. A stale Agent close
+    // must not erase pending geometry or fence a same-ID replacement.
     this.pendingResizeByTerminal.delete(terminalId)
-    const terminal = this.terminals.get(terminalId)
+    // Synchronously fence every queued or in-flight spawn for this public ID.
+    // A stale spawn is stopped before any later create/reconnect can run.
+    this.invalidateTerminalLifecycle(terminalId)
     if (terminal) {
       const backend = this.getBackend(terminal.type)
       const activeTaskId = this.activeTaskByTerminal.get(terminalId)
@@ -2985,9 +3733,21 @@ export class TerminalService {
       if (activeTaskId) {
         this.onTaskFinishedCallbacks.delete(activeTaskId)
       }
+      if (runtimeGuard) {
+        this.assertTerminalRuntimeGuard(
+          runtimeGuard,
+          'terminal close dispatch'
+        )
+      }
       this.terminalIdsBeingKilled.add(terminalId)
+      const runtimePtyId = runtimeGuard?.expectedPtyId ?? terminal.ptyId
       try {
-        backend.kill(terminal.ptyId)
+        backend.kill(runtimePtyId)
+        this.clearPendingUnboundRuntimeCleanup(
+          terminalId,
+          terminal.type,
+          runtimePtyId
+        )
       } catch (error) {
         if (
           activeTaskId &&
@@ -3026,6 +3786,7 @@ export class TerminalService {
       this.lastShellSequenceByTerminal.delete(terminalId)
       this.activeShellBoundaryByTerminal.delete(terminalId)
       this.backendRuntimeGenerationByTerminal.delete(terminalId)
+      this.backendRuntimeActiveGenerationByTerminal.delete(terminalId)
       this.clearWindowsPromptRuntimeState(terminalId)
       if (activeTaskId) {
         if (activeTask && activeTask.status !== 'finished') {
@@ -3075,6 +3836,7 @@ export class TerminalService {
       this.tasksByTerminal.delete(terminalId)
       for (const taskId of closedTaskIds) {
         this.unverifiedCaptureByTaskId.delete(taskId)
+        this.runtimeGuardByTaskId.delete(taskId)
         this.deferredWritesUntilTaskFinishByTaskId.delete(taskId)
       }
       this.headlessWriteSeqByTerminal.delete(terminalId)
@@ -3107,6 +3869,7 @@ export class TerminalService {
     }
     this.publishTerminalTabsChanged()
     this.schedulePersistTerminalState()
+    this.tryReleaseTerminalLifecycleEpoch(terminalId)
   }
 
   private notifyTerminalClosed(terminalId: string): void {
@@ -3119,42 +3882,161 @@ export class TerminalService {
     }
   }
 
-  interrupt(terminalId: string): void {
-    const terminal = this.terminals.get(terminalId)
-    if (!terminal) return
+  interrupt(
+    terminalId: string,
+    runtimeGuard?: TerminalRuntimeGuard
+  ): void {
+    if (!runtimeGuard && !this.terminals.has(terminalId)) return
+    const effectiveGuard =
+      runtimeGuard ?? this.createTerminalRuntimeGuard(terminalId)
+    const terminal = this.getTerminalOrThrow(terminalId, effectiveGuard)
+    if (
+      terminal.runtimeState !== 'ready' ||
+      this.backendRuntimeActiveGenerationByTerminal.get(terminalId) !==
+        effectiveGuard.expectedRuntimeGeneration
+    ) {
+      return
+    }
+
     const backend = this.getBackend(terminal.type)
-    // Send Ctrl+C to interrupt current foreground command.
-    backend.write(terminal.ptyId, '\x03')
+    this.assertTerminalRuntimeGuard(effectiveGuard, 'terminal interrupt')
+    let operationWasDispatched = false
+    try {
+      // Send Ctrl+C only to the active runtime frozen by this lease.
+      operationWasDispatched = true
+      backend.write(effectiveGuard.expectedPtyId, '\x03')
+      this.assertTerminalRuntimeGuard(effectiveGuard, 'terminal interrupt', {
+        outcomeUnknown: true,
+        operationWasDispatched: true,
+      })
+    } catch (error) {
+      if (operationWasDispatched) {
+        try {
+          this.assertTerminalRuntimeGuard(
+            effectiveGuard,
+            'terminal interrupt',
+            {
+              outcomeUnknown: true,
+              operationWasDispatched: true,
+            }
+          )
+        } catch (runtimeError) {
+          throw runtimeError
+        }
+      }
+      throw error
+    }
   }
 
-  getCwd(terminalId: string): string | undefined {
-    const terminal = this.terminals.get(terminalId)
+  getCwd(
+    terminalId: string,
+    guard?: TerminalRuntimeGuard,
+    options?: TerminalMetadataAccessOptions
+  ): string | undefined {
+    if (options?.filesystem) {
+      const runtime = this.getTerminalFilesystemRuntime(
+        terminalId,
+        guard,
+        'filesystem working-directory read'
+      )
+      return this.readGuardedFilesystemMetadata(
+        runtime,
+        'filesystem working-directory read',
+        () => runtime.backend.getCwd(runtime.runtimeGuard.expectedPtyId)
+      )
+    }
+
+    const terminal = guard
+      ? this.getTerminalOrThrow(terminalId, guard)
+      : this.terminals.get(terminalId)
     if (!terminal) return undefined
+    if (guard) this.assertTerminalRuntimeGuard(guard, 'working-directory read')
     const backend = this.getBackend(terminal.type)
-    return backend.getCwd(terminal.ptyId)
+    const cwd = backend.getCwd(guard?.expectedPtyId ?? terminal.ptyId)
+    if (guard) this.assertTerminalRuntimeGuard(guard, 'working-directory read')
+    return cwd
   }
 
-  async getHomeDir(terminalId: string): Promise<string | undefined> {
-    const terminal = this.terminals.get(terminalId)
+  async getHomeDir(
+    terminalId: string,
+    guard?: TerminalRuntimeGuard,
+    options?: TerminalMetadataAccessOptions
+  ): Promise<string | undefined> {
+    if (options?.filesystem) {
+      const runtime = this.getTerminalFilesystemRuntime(
+        terminalId,
+        guard,
+        'filesystem home-directory read'
+      )
+      return await this.dispatchGuardedFileOperation({
+        guard: runtime.runtimeGuard,
+        operation: 'filesystem home-directory read',
+        mutation: false,
+        dispatch: () =>
+          runtime.backend.getHomeDir(runtime.runtimeGuard.expectedPtyId)
+      })
+    }
+
+    const terminal = guard
+      ? this.getTerminalOrThrow(terminalId, guard)
+      : this.terminals.get(terminalId)
     if (!terminal) return undefined
+    if (guard) this.assertTerminalRuntimeGuard(guard, 'home-directory read')
     const backend = this.getBackend(terminal.type)
-    return backend.getHomeDir(terminal.ptyId)
+    const homeDir = await backend.getHomeDir(
+      guard?.expectedPtyId ?? terminal.ptyId
+    )
+    if (guard) this.assertTerminalRuntimeGuard(guard, 'home-directory read')
+    return homeDir
   }
 
-  getRemoteOs(terminalId: string): 'unix' | 'windows' | undefined {
-    const terminal = this.terminals.get(terminalId)
+  getRemoteOs(
+    terminalId: string,
+    guard?: TerminalRuntimeGuard,
+    options?: TerminalMetadataAccessOptions
+  ): 'unix' | 'windows' | undefined {
+    if (options?.filesystem) {
+      const runtime = this.getTerminalFilesystemRuntime(
+        terminalId,
+        guard,
+        'filesystem remote OS read'
+      )
+      const osType = runtime.terminal.remoteOs
+        ?? this.readGuardedFilesystemMetadata(
+          runtime,
+          'filesystem remote OS read',
+          () => runtime.backend.getRemoteOs(runtime.runtimeGuard.expectedPtyId)
+        )
+      if (osType) {
+        this.assertTerminalFilesystemRuntimeGuard(
+          runtime.runtimeGuard,
+          'filesystem remote OS metadata commit'
+        )
+        runtime.terminal.remoteOs = osType
+      }
+      return osType
+    }
+
+    const terminal = guard
+      ? this.getTerminalOrThrow(terminalId, guard)
+      : this.terminals.get(terminalId)
     if (!terminal) return undefined
+    if (guard) this.assertTerminalRuntimeGuard(guard, 'remote OS read')
     if (terminal.remoteOs) return terminal.remoteOs
     const backend = this.getBackend(terminal.type)
-    const osType = backend.getRemoteOs(terminal.ptyId)
+    const osType = backend.getRemoteOs(guard?.expectedPtyId ?? terminal.ptyId)
+    if (guard) this.assertTerminalRuntimeGuard(guard, 'remote OS read')
     if (osType) {
       terminal.remoteOs = osType
     }
     return osType
   }
 
-  getTerminalType(terminalId: string): TerminalConfig['type'] {
-    const terminal = this.getTerminalOrThrow(terminalId)
+  getTerminalType(
+    terminalId: string,
+    guard?: TerminalRuntimeGuard
+  ): TerminalConfig['type'] {
+    const terminal = this.getTerminalOrThrow(terminalId, guard)
     return terminal.type
   }
 
@@ -3178,8 +4060,18 @@ export class TerminalService {
     return `ssh://${username}@${host}:${port}`
   }
 
-  getFileSystemIdentity(terminalId: string): string | null {
-    const terminal = this.getTerminalOrThrow(terminalId)
+  getFileSystemIdentity(
+    terminalId: string,
+    guard?: TerminalRuntimeGuard,
+    options?: TerminalIdentityAccessOptions
+  ): string | null {
+    const terminal = options?.requireActive
+      ? this.getTerminalFilesystemRuntime(
+        terminalId,
+        guard,
+        'filesystem identity read'
+      ).terminal
+      : this.getTerminalOrThrow(terminalId, guard)
     if (!terminal.capabilities.supportsFilesystem) {
       return null
     }
@@ -3200,12 +4092,88 @@ export class TerminalService {
     return this.getSshConnectionIdentity(terminalId, { includeUsername: true })
   }
 
-  async resolvePathForFileSystem(terminalId: string, filePath: string): Promise<string> {
-    this.getTerminalOrThrow(terminalId)
-    return await this.resolvePath(terminalId, filePath)
+  async resolvePathForFileSystem(
+    terminalId: string,
+    filePath: string,
+    guard?: TerminalRuntimeGuard
+  ): Promise<string> {
+    const runtime = this.getTerminalFilesystemRuntime(
+      terminalId,
+      guard,
+      'filesystem path resolution'
+    )
+    return await this.resolvePath(terminalId, filePath, runtime)
   }
 
-  private getTerminalOrThrow(terminalId: string): TerminalTab {
+  createTerminalRuntimeGuard(
+    terminalId: string,
+    expectedRuntimeGeneration?: number
+  ): TerminalRuntimeGuard {
+    const terminal = this.terminals.get(terminalId)
+    const runtimeGeneration =
+      this.backendRuntimeGenerationByTerminal.get(terminalId)
+    if (
+      !terminal ||
+      !Number.isSafeInteger(runtimeGeneration) ||
+      runtimeGeneration! < 1 ||
+      (expectedRuntimeGeneration !== undefined &&
+        runtimeGeneration !== expectedRuntimeGeneration)
+    ) {
+      throw new TerminalRuntimeChangedError(
+        terminalId,
+        false,
+        'terminal runtime lease creation'
+      )
+    }
+    return Object.freeze({
+      terminalId,
+      expectedTerminal: terminal,
+      expectedPtyId: terminal.ptyId,
+      expectedRuntimeGeneration: runtimeGeneration!
+    })
+  }
+
+  assertTerminalRuntimeGuard(
+    guard: TerminalRuntimeGuard,
+    operation = 'terminal operation',
+    options?: {
+      outcomeUnknown?: boolean
+      operationWasDispatched?: boolean
+    }
+  ): TerminalTab {
+    const terminal = this.terminals.get(guard.terminalId)
+    if (
+      !terminal ||
+      terminal !== guard.expectedTerminal ||
+      terminal.ptyId !== guard.expectedPtyId ||
+      this.backendRuntimeGenerationByTerminal.get(guard.terminalId) !==
+        guard.expectedRuntimeGeneration
+    ) {
+      throw new TerminalRuntimeChangedError(
+        guard.terminalId,
+        options?.outcomeUnknown === true,
+        operation,
+        {
+          operationWasDispatched:
+            options?.operationWasDispatched === true
+        }
+      )
+    }
+    return terminal
+  }
+
+  private getTerminalOrThrow(
+    terminalId: string,
+    guard?: TerminalRuntimeGuard
+  ): TerminalTab {
+    if (guard) {
+      if (guard.terminalId !== terminalId) {
+        throw new Error(
+          `Terminal runtime guard ${JSON.stringify(guard.terminalId)} cannot authorize terminal ${JSON.stringify(terminalId)}.`
+        )
+      }
+      return this.assertTerminalRuntimeGuard(guard)
+    }
     const terminal = this.terminals.get(terminalId)
     if (!terminal) {
       throw new Error(`Terminal ${terminalId} not found`)
@@ -3213,11 +4181,104 @@ export class TerminalService {
     return terminal
   }
 
-  async readFile(terminalId: string, filePath: string): Promise<Buffer> {
-    const terminal = this.getTerminalOrThrow(terminalId)
-    const resolvedPath = await this.resolvePath(terminalId, filePath)
-    const backend = this.getFileSystemBackend(terminal)
-    return backend.readFile(terminal.ptyId, resolvedPath)
+  private readGuardedFilesystemMetadata<T>(
+    runtime: TerminalFilesystemRuntime,
+    operation: string,
+    read: () => T
+  ): T {
+    this.assertTerminalFilesystemRuntimeGuard(
+      runtime.runtimeGuard,
+      operation
+    )
+    let operationWasDispatched = false
+    try {
+      operationWasDispatched = true
+      const result = read()
+      this.assertTerminalFilesystemRuntimeGuard(
+        runtime.runtimeGuard,
+        operation,
+        { operationWasDispatched: true }
+      )
+      return result
+    } catch (error) {
+      if (operationWasDispatched) {
+        try {
+          this.assertTerminalFilesystemRuntimeGuard(
+            runtime.runtimeGuard,
+            operation,
+            { operationWasDispatched: true }
+          )
+        } catch (runtimeError) {
+          throw runtimeError
+        }
+      }
+      throw error
+    }
+  }
+
+  private async dispatchGuardedFileOperation<T>(params: {
+    guard: TerminalRuntimeGuard
+    operation: string
+    mutation: boolean
+    dispatch: () => Promise<T>
+  }): Promise<T> {
+    this.assertTerminalFilesystemRuntimeGuard(
+      params.guard,
+      params.operation
+    )
+    let operationWasDispatched = false
+    try {
+      operationWasDispatched = true
+      const result = await params.dispatch()
+      this.assertTerminalFilesystemRuntimeGuard(
+        params.guard,
+        params.operation,
+        {
+          mutation: params.mutation,
+          operationWasDispatched: true
+        }
+      )
+      return result
+    } catch (error) {
+      if (operationWasDispatched) {
+        try {
+          this.assertTerminalFilesystemRuntimeGuard(
+            params.guard,
+            params.operation,
+            {
+              mutation: params.mutation,
+              operationWasDispatched: true
+            }
+          )
+        } catch (runtimeError) {
+          throw runtimeError
+        }
+      }
+      throw error
+    }
+  }
+
+  async readFile(
+    terminalId: string,
+    filePath: string,
+    guard?: TerminalRuntimeGuard
+  ): Promise<Buffer> {
+    const runtime = this.getTerminalFilesystemRuntime(
+      terminalId,
+      guard,
+      'file read admission'
+    )
+    const resolvedPath = await this.resolvePath(terminalId, filePath, runtime)
+    return await this.dispatchGuardedFileOperation({
+      guard: runtime.runtimeGuard,
+      operation: 'file read',
+      mutation: false,
+      dispatch: () =>
+        runtime.backend.readFile(
+          runtime.runtimeGuard.expectedPtyId,
+          resolvedPath
+        )
+    })
   }
 
   async readFileChunk(
@@ -3225,19 +4286,53 @@ export class TerminalService {
     filePath: string,
     offset: number,
     chunkSize: number,
-    options?: { totalSizeHint?: number }
+    options?: { totalSizeHint?: number },
+    guard?: TerminalRuntimeGuard
   ): Promise<{ chunk: Buffer; bytesRead: number; totalSize: number; nextOffset: number; eof: boolean }> {
-    const terminal = this.getTerminalOrThrow(terminalId)
-    const resolvedPath = await this.resolvePath(terminalId, filePath)
-    const backend = this.getFileSystemBackend(terminal)
-    return await backend.readFileChunk(terminal.ptyId, resolvedPath, offset, chunkSize, options)
+    const runtime = this.getTerminalFilesystemRuntime(
+      terminalId,
+      guard,
+      'file chunk read admission'
+    )
+    const resolvedPath = await this.resolvePath(terminalId, filePath, runtime)
+    return await this.dispatchGuardedFileOperation({
+      guard: runtime.runtimeGuard,
+      operation: 'file chunk read',
+      mutation: false,
+      dispatch: () =>
+        runtime.backend.readFileChunk(
+          runtime.runtimeGuard.expectedPtyId,
+          resolvedPath,
+          offset,
+          chunkSize,
+          options
+        )
+    })
   }
 
-  async writeFile(terminalId: string, filePath: string, content: string): Promise<void> {
-    const terminal = this.getTerminalOrThrow(terminalId)
-    const resolvedPath = await this.resolvePath(terminalId, filePath)
-    const backend = this.getFileSystemBackend(terminal)
-    return backend.writeFile(terminal.ptyId, resolvedPath, content)
+  async writeFile(
+    terminalId: string,
+    filePath: string,
+    content: string,
+    guard?: TerminalRuntimeGuard
+  ): Promise<void> {
+    const runtime = this.getTerminalFilesystemRuntime(
+      terminalId,
+      guard,
+      'file write admission'
+    )
+    const resolvedPath = await this.resolvePath(terminalId, filePath, runtime)
+    await this.dispatchGuardedFileOperation({
+      guard: runtime.runtimeGuard,
+      operation: 'file write',
+      mutation: true,
+      dispatch: () =>
+        runtime.backend.writeFile(
+          runtime.runtimeGuard.expectedPtyId,
+          resolvedPath,
+          content
+        )
+    })
   }
 
   async writeFileChunk(
@@ -3245,12 +4340,28 @@ export class TerminalService {
     filePath: string,
     offset: number,
     content: Buffer,
-    options?: { truncate?: boolean; close?: boolean }
+    options?: { truncate?: boolean; close?: boolean },
+    guard?: TerminalRuntimeGuard
   ): Promise<{ writtenBytes: number; nextOffset: number }> {
-    const terminal = this.getTerminalOrThrow(terminalId)
-    const resolvedPath = await this.resolvePath(terminalId, filePath)
-    const backend = this.getFileSystemBackend(terminal)
-    return await backend.writeFileChunk(terminal.ptyId, resolvedPath, offset, content, options)
+    const runtime = this.getTerminalFilesystemRuntime(
+      terminalId,
+      guard,
+      'file chunk write admission'
+    )
+    const resolvedPath = await this.resolvePath(terminalId, filePath, runtime)
+    return await this.dispatchGuardedFileOperation({
+      guard: runtime.runtimeGuard,
+      operation: 'file chunk write',
+      mutation: true,
+      dispatch: () =>
+        runtime.backend.writeFileChunk(
+          runtime.runtimeGuard.expectedPtyId,
+          resolvedPath,
+          offset,
+          content,
+          options
+        )
+    })
   }
 
   async downloadFileToLocalPath(
@@ -3260,15 +4371,30 @@ export class TerminalService {
     options?: {
       onProgress?: (progress: { bytesTransferred: number; totalBytes: number; eof: boolean }) => void
       signal?: AbortSignal
-    }
+    },
+    guard?: TerminalRuntimeGuard
   ): Promise<{ totalBytes: number } | null> {
-    const terminal = this.getTerminalOrThrow(terminalId)
-    const resolvedPath = await this.resolvePath(terminalId, sourcePath)
-    const backend = this.getFileSystemBackend(terminal)
-    if (typeof backend.downloadFileToLocalPath !== 'function') {
+    const runtime = this.getTerminalFilesystemRuntime(
+      terminalId,
+      guard,
+      'file download admission'
+    )
+    const resolvedPath = await this.resolvePath(terminalId, sourcePath, runtime)
+    if (typeof runtime.backend.downloadFileToLocalPath !== 'function') {
       return null
     }
-    return await backend.downloadFileToLocalPath(terminal.ptyId, resolvedPath, targetLocalPath, options)
+    return await this.dispatchGuardedFileOperation({
+      guard: runtime.runtimeGuard,
+      operation: 'file download',
+      mutation: true,
+      dispatch: () =>
+        runtime.backend.downloadFileToLocalPath!(
+          runtime.runtimeGuard.expectedPtyId,
+          resolvedPath,
+          targetLocalPath,
+          options
+        )
+    })
   }
 
   async uploadFileFromLocalPath(
@@ -3278,60 +4404,132 @@ export class TerminalService {
     options?: {
       onProgress?: (progress: { bytesTransferred: number; totalBytes: number; eof: boolean }) => void
       signal?: AbortSignal
-    }
+    },
+    guard?: TerminalRuntimeGuard
   ): Promise<{ totalBytes: number } | null> {
-    const terminal = this.getTerminalOrThrow(terminalId)
-    const resolvedTargetPath = await this.resolvePath(terminalId, targetPath)
-    const backend = this.getFileSystemBackend(terminal)
-    if (typeof backend.uploadFileFromLocalPath !== 'function') {
+    const runtime = this.getTerminalFilesystemRuntime(
+      terminalId,
+      guard,
+      'file upload admission'
+    )
+    const resolvedTargetPath = await this.resolvePath(
+      terminalId,
+      targetPath,
+      runtime
+    )
+    if (typeof runtime.backend.uploadFileFromLocalPath !== 'function') {
       return null
     }
-    return await backend.uploadFileFromLocalPath(terminal.ptyId, sourceLocalPath, resolvedTargetPath, options)
+    return await this.dispatchGuardedFileOperation({
+      guard: runtime.runtimeGuard,
+      operation: 'file upload',
+      mutation: true,
+      dispatch: () =>
+        runtime.backend.uploadFileFromLocalPath!(
+          runtime.runtimeGuard.expectedPtyId,
+          sourceLocalPath,
+          resolvedTargetPath,
+          options
+        )
+    })
   }
 
-  async statFile(terminalId: string, filePath: string): Promise<FileStatInfo> {
-    const terminal = this.getTerminalOrThrow(terminalId)
-    const resolvedPath = await this.resolvePath(terminalId, filePath)
-    const backend = this.getFileSystemBackend(terminal)
-    return backend.statFile(terminal.ptyId, resolvedPath)
+  async statFile(
+    terminalId: string,
+    filePath: string,
+    guard?: TerminalRuntimeGuard
+  ): Promise<FileStatInfo> {
+    const runtime = this.getTerminalFilesystemRuntime(
+      terminalId,
+      guard,
+      'file metadata admission'
+    )
+    const resolvedPath = await this.resolvePath(terminalId, filePath, runtime)
+    return await this.dispatchGuardedFileOperation({
+      guard: runtime.runtimeGuard,
+      operation: 'file metadata read',
+      mutation: false,
+      dispatch: () =>
+        runtime.backend.statFile(
+          runtime.runtimeGuard.expectedPtyId,
+          resolvedPath
+        )
+    })
   }
 
   async listDirectory(
     terminalId: string,
-    dirPath?: string
+    dirPath?: string,
+    guard?: TerminalRuntimeGuard
   ): Promise<{ path: string; entries: FileSystemEntry[] }> {
-    const terminal = this.getTerminalOrThrow(terminalId)
-    const backend = this.getFileSystemBackend(terminal)
+    const runtime = this.getTerminalFilesystemRuntime(
+      terminalId,
+      guard,
+      'directory listing admission'
+    )
     const hasExplicitPath = typeof dirPath === 'string' && dirPath.trim().length > 0
     if (!hasExplicitPath) {
-      await this.refreshTerminalSessionState(terminalId)
+      await this.refreshTerminalSessionState(terminalId, runtime)
     }
     const requestedPath = hasExplicitPath
       ? dirPath!.trim()
-      : this.getCwd(terminalId) || (await this.getHomeDir(terminalId)) || '.'
-    const resolvedPath = await this.resolvePath(terminalId, requestedPath)
+      : this.getCwd(terminalId, runtime.runtimeGuard, { filesystem: true }) ||
+        (await this.getHomeDir(
+          terminalId,
+          runtime.runtimeGuard,
+          { filesystem: true }
+        )) ||
+        '.'
+    const resolvedPath = await this.resolvePath(
+      terminalId,
+      requestedPath,
+      runtime
+    )
     try {
-      const entries = await backend.listDirectory(terminal.ptyId, resolvedPath)
-      return {
-        path: resolvedPath,
-        entries
-      }
+      const entries = await this.dispatchGuardedFileOperation({
+        guard: runtime.runtimeGuard,
+        operation: 'directory listing',
+        mutation: false,
+        dispatch: () =>
+          runtime.backend.listDirectory(
+            runtime.runtimeGuard.expectedPtyId,
+            resolvedPath
+          )
+      })
+      return { path: resolvedPath, entries }
     } catch (error) {
-      if (hasExplicitPath || !this.isPathMissingError(error)) {
+      if (
+        error instanceof TerminalRuntimeChangedError ||
+        hasExplicitPath ||
+        !this.isPathMissingError(error)
+      ) {
         throw error
       }
 
-      const fallbackPaths = await this.getDirectoryFallbackPaths(terminalId, terminal.remoteOs)
+      const fallbackPaths = await this.getDirectoryFallbackPaths(
+        terminalId,
+        runtime.terminal.remoteOs,
+        runtime
+      )
       for (const fallbackPath of fallbackPaths) {
         if (!fallbackPath || fallbackPath === resolvedPath) continue
         try {
-          const entries = await backend.listDirectory(terminal.ptyId, fallbackPath)
-      return {
-        path: fallbackPath,
-        entries
-          }
+          const entries = await this.dispatchGuardedFileOperation({
+            guard: runtime.runtimeGuard,
+            operation: 'fallback directory listing',
+            mutation: false,
+            dispatch: () =>
+              runtime.backend.listDirectory(
+                runtime.runtimeGuard.expectedPtyId,
+                fallbackPath
+              )
+          })
+          return { path: fallbackPath, entries }
         } catch (fallbackError) {
-          if (!this.isPathMissingError(fallbackError)) {
+          if (
+            fallbackError instanceof TerminalRuntimeChangedError ||
+            !this.isPathMissingError(fallbackError)
+          ) {
             throw fallbackError
           }
         }
@@ -3340,40 +4538,134 @@ export class TerminalService {
     }
   }
 
-  async createDirectory(terminalId: string, dirPath: string): Promise<void> {
-    const terminal = this.getTerminalOrThrow(terminalId)
-    const resolvedPath = await this.resolvePath(terminalId, dirPath)
-    const backend = this.getFileSystemBackend(terminal)
-    await backend.createDirectory(terminal.ptyId, resolvedPath)
+  async createDirectory(
+    terminalId: string,
+    dirPath: string,
+    guard?: TerminalRuntimeGuard
+  ): Promise<void> {
+    const runtime = this.getTerminalFilesystemRuntime(
+      terminalId,
+      guard,
+      'directory creation admission'
+    )
+    const resolvedPath = await this.resolvePath(terminalId, dirPath, runtime)
+    await this.dispatchGuardedFileOperation({
+      guard: runtime.runtimeGuard,
+      operation: 'directory creation',
+      mutation: true,
+      dispatch: () =>
+        runtime.backend.createDirectory(
+          runtime.runtimeGuard.expectedPtyId,
+          resolvedPath
+        )
+    })
   }
 
-  async createFile(terminalId: string, filePath: string): Promise<void> {
-    const terminal = this.getTerminalOrThrow(terminalId)
-    const resolvedPath = await this.resolvePath(terminalId, filePath)
-    const backend = this.getFileSystemBackend(terminal)
-    await backend.createFile(terminal.ptyId, resolvedPath)
+  async createFile(
+    terminalId: string,
+    filePath: string,
+    guard?: TerminalRuntimeGuard
+  ): Promise<void> {
+    const runtime = this.getTerminalFilesystemRuntime(
+      terminalId,
+      guard,
+      'file creation admission'
+    )
+    const resolvedPath = await this.resolvePath(terminalId, filePath, runtime)
+    await this.dispatchGuardedFileOperation({
+      guard: runtime.runtimeGuard,
+      operation: 'file creation',
+      mutation: true,
+      dispatch: () =>
+        runtime.backend.createFile(
+          runtime.runtimeGuard.expectedPtyId,
+          resolvedPath
+        )
+    })
   }
 
-  async deletePath(terminalId: string, targetPath: string, options?: { recursive?: boolean }): Promise<void> {
-    const terminal = this.getTerminalOrThrow(terminalId)
-    const resolvedPath = await this.resolvePath(terminalId, targetPath)
-    const backend = this.getFileSystemBackend(terminal)
-    await backend.deletePath(terminal.ptyId, resolvedPath, options)
+  async deletePath(
+    terminalId: string,
+    targetPath: string,
+    options?: { recursive?: boolean },
+    guard?: TerminalRuntimeGuard
+  ): Promise<void> {
+    const runtime = this.getTerminalFilesystemRuntime(
+      terminalId,
+      guard,
+      'path deletion admission'
+    )
+    const resolvedPath = await this.resolvePath(terminalId, targetPath, runtime)
+    await this.dispatchGuardedFileOperation({
+      guard: runtime.runtimeGuard,
+      operation: 'path deletion',
+      mutation: true,
+      dispatch: () =>
+        runtime.backend.deletePath(
+          runtime.runtimeGuard.expectedPtyId,
+          resolvedPath,
+          options
+        )
+    })
   }
 
-  async renamePath(terminalId: string, sourcePath: string, targetPath: string): Promise<void> {
-    const terminal = this.getTerminalOrThrow(terminalId)
-    const resolvedSource = await this.resolvePath(terminalId, sourcePath)
-    const resolvedTarget = await this.resolvePath(terminalId, targetPath)
-    const backend = this.getFileSystemBackend(terminal)
-    await backend.renamePath(terminal.ptyId, resolvedSource, resolvedTarget)
+  async renamePath(
+    terminalId: string,
+    sourcePath: string,
+    targetPath: string,
+    guard?: TerminalRuntimeGuard
+  ): Promise<void> {
+    const runtime = this.getTerminalFilesystemRuntime(
+      terminalId,
+      guard,
+      'path rename admission'
+    )
+    const resolvedSource = await this.resolvePath(
+      terminalId,
+      sourcePath,
+      runtime
+    )
+    const resolvedTarget = await this.resolvePath(
+      terminalId,
+      targetPath,
+      runtime
+    )
+    await this.dispatchGuardedFileOperation({
+      guard: runtime.runtimeGuard,
+      operation: 'path rename',
+      mutation: true,
+      dispatch: () =>
+        runtime.backend.renamePath(
+          runtime.runtimeGuard.expectedPtyId,
+          resolvedSource,
+          resolvedTarget
+        )
+    })
   }
 
-  async writeFileBytes(terminalId: string, filePath: string, content: Buffer): Promise<void> {
-    const terminal = this.getTerminalOrThrow(terminalId)
-    const resolvedPath = await this.resolvePath(terminalId, filePath)
-    const backend = this.getFileSystemBackend(terminal)
-    await backend.writeFileBytes(terminal.ptyId, resolvedPath, content)
+  async writeFileBytes(
+    terminalId: string,
+    filePath: string,
+    content: Buffer,
+    guard?: TerminalRuntimeGuard
+  ): Promise<void> {
+    const runtime = this.getTerminalFilesystemRuntime(
+      terminalId,
+      guard,
+      'binary file write admission'
+    )
+    const resolvedPath = await this.resolvePath(terminalId, filePath, runtime)
+    await this.dispatchGuardedFileOperation({
+      guard: runtime.runtimeGuard,
+      operation: 'binary file write',
+      mutation: true,
+      dispatch: () =>
+        runtime.backend.writeFileBytes(
+          runtime.runtimeGuard.expectedPtyId,
+          resolvedPath,
+          content
+        )
+    })
   }
 
   /**
@@ -3382,23 +4674,42 @@ export class TerminalService {
    * 2. Relative paths (resolves from current CWD)
    * 3. Platform specific separators (uses remoteOs if available)
    */
-  private async resolvePath(terminalId: string, filePath: string): Promise<string> {
-    const terminal = this.terminals.get(terminalId)
-    if (!terminal) return filePath
+  private async resolvePath(
+    terminalId: string,
+    filePath: string,
+    runtime: TerminalFilesystemRuntime
+  ): Promise<string> {
+    this.assertTerminalFilesystemRuntimeGuard(
+      runtime.runtimeGuard,
+      'filesystem path resolution'
+    )
 
-    const isWindows = terminal.remoteOs === 'windows'
-    const pathUtil = isWindows ? path.win32 : path.posix
-
+    let remoteOs = this.getRemoteOs(
+      terminalId,
+      runtime.runtimeGuard,
+      { filesystem: true }
+    )
+    let pathUtil = remoteOs === 'windows' ? path.win32 : path.posix
     let targetPath = filePath
     const needsRuntimePathState =
       targetPath.startsWith('~') || !pathUtil.isAbsolute(targetPath)
     if (needsRuntimePathState) {
-      await this.refreshTerminalSessionState(terminalId)
+      await this.refreshTerminalSessionState(terminalId, runtime)
+      remoteOs = this.getRemoteOs(
+        terminalId,
+        runtime.runtimeGuard,
+        { filesystem: true }
+      )
+      pathUtil = remoteOs === 'windows' ? path.win32 : path.posix
     }
 
     // 1. Expand ~
     if (targetPath.startsWith('~')) {
-      const homeDir = await this.getHomeDir(terminalId)
+      const homeDir = await this.getHomeDir(
+        terminalId,
+        runtime.runtimeGuard,
+        { filesystem: true }
+      )
       if (homeDir) {
         if (targetPath === '~') {
           targetPath = homeDir
@@ -3410,38 +4721,69 @@ export class TerminalService {
 
     // 2. Resolve relative paths
     if (!pathUtil.isAbsolute(targetPath)) {
-      const cwd = this.getCwd(terminalId)
+      const cwd = this.getCwd(
+        terminalId,
+        runtime.runtimeGuard,
+        { filesystem: true }
+      )
       if (cwd) {
         targetPath = pathUtil.resolve(cwd, targetPath)
       }
     }
 
+    this.assertTerminalFilesystemRuntimeGuard(
+      runtime.runtimeGuard,
+      'filesystem path resolution'
+    )
     return targetPath
   }
 
-  private async refreshTerminalSessionState(terminalId: string): Promise<void> {
-    const terminal = this.terminals.get(terminalId)
-    if (!terminal) {
-      return
+  private async refreshTerminalSessionState(
+    terminalId: string,
+    runtime: TerminalFilesystemRuntime
+  ): Promise<void> {
+    this.assertTerminalFilesystemRuntimeGuard(
+      runtime.runtimeGuard,
+      'terminal session-state refresh'
+    )
+    if (typeof runtime.backend.refreshSessionState === 'function') {
+      try {
+        await this.dispatchGuardedFileOperation({
+          guard: runtime.runtimeGuard,
+          operation: 'terminal session-state refresh',
+          mutation: false,
+          dispatch: () =>
+            runtime.backend.refreshSessionState!(
+              runtime.runtimeGuard.expectedPtyId
+            )
+        })
+      } catch (error) {
+        if (error instanceof TerminalRuntimeChangedError) throw error
+        // Best-effort: file operations should degrade to cached cwd/home state.
+      }
     }
-    const backend = this.getBackend(terminal.type)
-    if (typeof backend.refreshSessionState !== 'function') {
-      return
-    }
-    try {
-      await backend.refreshSessionState(terminal.ptyId)
-    } catch {
-      // Best-effort: file operations should degrade to cached cwd/home state.
-    }
-    this.hydrateTerminalRuntimeMetadata(terminalId)
+    this.assertTerminalFilesystemRuntimeGuard(
+      runtime.runtimeGuard,
+      'runtime metadata refresh'
+    )
+    this.hydrateTerminalRuntimeMetadata(
+      terminalId,
+      runtime.runtimeGuard,
+      { filesystem: true }
+    )
   }
 
   private async getDirectoryFallbackPaths(
     terminalId: string,
-    remoteOs: 'unix' | 'windows' | undefined
+    remoteOs: 'unix' | 'windows' | undefined,
+    runtime: TerminalFilesystemRuntime
   ): Promise<string[]> {
     const candidates: string[] = []
-    const homeDir = await this.getHomeDir(terminalId)
+    const homeDir = await this.getHomeDir(
+      terminalId,
+      runtime.runtimeGuard,
+      { filesystem: true }
+    )
     if (homeDir) {
       candidates.push(homeDir)
       if (remoteOs === 'windows') {
@@ -3461,7 +4803,7 @@ export class TerminalService {
     const seen = new Set<string>()
     const resolvedCandidates: string[] = []
     for (const candidate of candidates) {
-      const resolved = await this.resolvePath(terminalId, candidate)
+      const resolved = await this.resolvePath(terminalId, candidate, runtime)
       if (!resolved || seen.has(resolved)) continue
       seen.add(resolved)
       resolvedCandidates.push(resolved)
@@ -3597,8 +4939,14 @@ export class TerminalService {
    * Get the recent output of the terminal.
    * If lines is not provided, it dynamically uses the current visible rows.
    */
-  getRecentOutput(terminalId: string, lines?: number): string {
-    const tab = this.terminals.get(terminalId)
+  getRecentOutput(
+    terminalId: string,
+    lines?: number,
+    runtimeGuard?: TerminalRuntimeGuard
+  ): string {
+    const tab = runtimeGuard
+      ? this.getTerminalOrThrow(terminalId, runtimeGuard)
+      : this.terminals.get(terminalId)
     const headless = this.headlessPtys.get(terminalId)
     
     // If lines is not provided, use the synchronized rows from frontend, fallback to 24
@@ -3610,7 +4958,11 @@ export class TerminalService {
       if (!buffer) return ''
       const allLines = buffer.content.split('\n')
       const start = Math.max(0, allLines.length - finalLines)
-      return allLines.slice(start).join('\n')
+      const output = allLines.slice(start).join('\n')
+      if (runtimeGuard) {
+        this.assertTerminalRuntimeGuard(runtimeGuard, 'terminal output read')
+      }
+      return output
     }
     
     // Use xterm headless buffer for clean, rendered text
@@ -3626,11 +4978,19 @@ export class TerminalService {
       }
     }
     
-    return result.join('\n')
+    const output = result.join('\n')
+    if (runtimeGuard) {
+      this.assertTerminalRuntimeGuard(runtimeGuard, 'terminal output read')
+    }
+    return output
   }
 
   getTerminalById(terminalId: string): TerminalTab | undefined {
     return this.terminals.get(terminalId)
+  }
+
+  getTerminalRuntimeGeneration(terminalId: string): number | undefined {
+    return this.backendRuntimeGenerationByTerminal.get(terminalId)
   }
 
   isTerminalReconnectable(terminalId: string): boolean {
@@ -3644,8 +5004,13 @@ export class TerminalService {
     )
   }
 
-  getTerminalRuntimeSnapshot(terminalId: string): TerminalRuntimeSnapshot | null {
-    const terminal = this.terminals.get(terminalId)
+  getTerminalRuntimeSnapshot(
+    terminalId: string,
+    runtimeGuard?: TerminalRuntimeGuard
+  ): TerminalRuntimeSnapshot | null {
+    const terminal = runtimeGuard
+      ? this.getTerminalOrThrow(terminalId, runtimeGuard)
+      : this.terminals.get(terminalId)
     if (!terminal) return null
 
     const runtimeState: TerminalRuntimeSnapshot['runtimeState'] =
@@ -3736,34 +5101,100 @@ export class TerminalService {
     sourcePath: string,
     targetTerminalId: string,
     targetPath: string,
-    options: PeerFileTransferOptions
+    options: PeerFileTransferOptions,
+    sourceGuard?: TerminalRuntimeGuard,
+    targetGuard?: TerminalRuntimeGuard
   ): Promise<PeerFileTransferResult> {
-    const source = this.terminals.get(sourceTerminalId)
-    const target = this.terminals.get(targetTerminalId)
-    if (!source || !target || sourceTerminalId === targetTerminalId) {
+    if (sourceTerminalId === targetTerminalId) {
       return { status: 'fallback', reason: 'unavailable' }
     }
-    if (source.type !== 'ssh' || target.type !== 'ssh') {
+    const sourceRuntime = this.getTerminalFilesystemRuntime(
+      sourceTerminalId,
+      sourceGuard,
+      'source peer file transfer admission'
+    )
+    const targetRuntime = this.getTerminalFilesystemRuntime(
+      targetTerminalId,
+      targetGuard,
+      'target peer file transfer admission'
+    )
+    if (
+      sourceRuntime.terminal.type !== 'ssh' ||
+      targetRuntime.terminal.type !== 'ssh'
+    ) {
       return { status: 'fallback', reason: 'unavailable' }
     }
     if (
-      this.getRemoteOs(sourceTerminalId) !== 'unix' ||
-      this.getRemoteOs(targetTerminalId) !== 'unix'
+      this.getRemoteOs(
+        sourceTerminalId,
+        sourceRuntime.runtimeGuard,
+        { filesystem: true }
+      ) !== 'unix' ||
+      this.getRemoteOs(
+        targetTerminalId,
+        targetRuntime.runtimeGuard,
+        { filesystem: true }
+      ) !== 'unix'
     ) {
       return { status: 'fallback', reason: 'unsupported-os' }
     }
 
-    const backend = this.getBackend('ssh')
-    if (typeof backend.tryPeerFileTransfer !== 'function') {
+    const backend = sourceRuntime.backend
+    if (
+      backend !== targetRuntime.backend ||
+      typeof backend.tryPeerFileTransfer !== 'function'
+    ) {
       return { status: 'fallback', reason: 'unavailable' }
     }
-    return await backend.tryPeerFileTransfer(
-      source.ptyId,
-      sourcePath,
-      target.ptyId,
-      targetPath,
-      options
+
+    this.assertTerminalFilesystemRuntimeGuard(
+      sourceRuntime.runtimeGuard,
+      'source peer file transfer'
     )
+    this.assertTerminalFilesystemRuntimeGuard(
+      targetRuntime.runtimeGuard,
+      'target peer file transfer'
+    )
+    let operationWasDispatched = false
+    try {
+      operationWasDispatched = true
+      const result = await backend.tryPeerFileTransfer(
+        sourceRuntime.runtimeGuard.expectedPtyId,
+        sourcePath,
+        targetRuntime.runtimeGuard.expectedPtyId,
+        targetPath,
+        options
+      )
+      this.assertTerminalFilesystemRuntimeGuard(
+        sourceRuntime.runtimeGuard,
+        'source peer file transfer',
+        { mutation: true, operationWasDispatched: true }
+      )
+      this.assertTerminalFilesystemRuntimeGuard(
+        targetRuntime.runtimeGuard,
+        'target peer file transfer',
+        { mutation: true, operationWasDispatched: true }
+      )
+      return result
+    } catch (error) {
+      if (operationWasDispatched) {
+        try {
+          this.assertTerminalFilesystemRuntimeGuard(
+            sourceRuntime.runtimeGuard,
+            'source peer file transfer',
+            { mutation: true, operationWasDispatched: true }
+          )
+          this.assertTerminalFilesystemRuntimeGuard(
+            targetRuntime.runtimeGuard,
+            'target peer file transfer',
+            { mutation: true, operationWasDispatched: true }
+          )
+        } catch (runtimeError) {
+          throw runtimeError
+        }
+      }
+      throw error
+    }
   }
 
   getDisplayTerminals(): TerminalTab[] {
@@ -3774,8 +5205,20 @@ export class TerminalService {
     return Array.from(this.terminals.values()).filter((t) => !t.isInitializing && t.runtimeState === 'ready')
   }
 
-  getTransferMachineIdentity(terminalId: string): string | null {
-    const terminal = this.terminals.get(terminalId)
+  getTransferMachineIdentity(
+    terminalId: string,
+    guard?: TerminalRuntimeGuard,
+    options?: TerminalIdentityAccessOptions
+  ): string | null {
+    const terminal = options?.requireActive
+      ? this.getTerminalFilesystemRuntime(
+        terminalId,
+        guard,
+        'transfer machine identity read'
+      ).terminal
+      : guard
+        ? this.getTerminalOrThrow(terminalId, guard)
+        : this.terminals.get(terminalId)
     const config = this.terminalConfigs.get(terminalId)
     if (!terminal || !config) {
       return null
@@ -3914,14 +5357,16 @@ export class TerminalService {
     terminalId: string,
     command: string,
     onFinished?: (result: CommandResult) => void,
-    signal?: AbortSignal
+    signal?: AbortSignal,
+    runtimeGuard?: TerminalRuntimeGuard
   ): Promise<string> {
     const taskId = await this.executeCommandInternal(
       terminalId,
       command,
       'nowait',
       onFinished,
-      signal
+      signal,
+      runtimeGuard
     )
     return taskId
   }
@@ -4053,6 +5498,9 @@ export class TerminalService {
     runtimeGeneration: number | undefined
   ): boolean {
     if (
+      typeof runtimeGeneration !== 'number' ||
+      !Number.isSafeInteger(runtimeGeneration) ||
+      runtimeGeneration < 1 ||
       !this.isCurrentTerminalRuntime(
         terminalId,
         ptyId,
@@ -4064,21 +5512,27 @@ export class TerminalService {
     const terminal = this.terminals.get(terminalId)
     if (!terminal) return false
 
-    this.deferredWritesDuringCommandStartByTerminal.delete(terminalId)
+    // Make the tab non-writable before any cleanup callback can fail. Then
+    // retire and clean the runtime synchronously before asking the backend to
+    // stop it. Exit callbacks may be delayed, omitted, or triggered
+    // reentrantly by kill(); none of those cases may leave the old lease or
+    // its prompt/input reservations active.
     terminal.isInitializing = false
     terminal.runtimeState = 'exited'
     terminal.lastExitCode = -1
     this.terminalIdsBeingKilled.add(terminalId)
     try {
-      this.getBackend(terminal.type).kill(terminal.ptyId)
+      this.handleExit(terminalId, -1, {
+        expectedPtyId: ptyId,
+        expectedRuntimeGeneration: runtimeGeneration
+      })
+      this.getBackend(terminal.type).kill(ptyId)
     } catch {
-      // The runtime remains non-writable even if termination cannot be
-      // confirmed. A reconnect receives a new generation and private paths.
+      // handleExit has already retired the runtime. It remains non-writable
+      // even if backend termination cannot be confirmed.
     } finally {
       this.terminalIdsBeingKilled.delete(terminalId)
     }
-    this.publishTerminalTabsChanged()
-    this.schedulePersistTerminalState()
     return true
   }
 
@@ -4639,6 +6093,7 @@ export class TerminalService {
       onFinished?: (result: CommandResult) => void;
       shouldSkip?: () => boolean;
       suppressFinishCallback?: boolean;
+      runtimeGuard?: TerminalRuntimeGuard;
     }
   ): Promise<CommandResult> {
     const taskId = await this.executeCommandInternal(
@@ -4646,7 +6101,8 @@ export class TerminalService {
       command,
       'wait',
       opts?.onFinished,
-      opts?.signal
+      opts?.signal,
+      opts?.runtimeGuard
     )
     return this.waitForTask(terminalId, taskId, opts)
   }
@@ -4659,6 +6115,7 @@ export class TerminalService {
       interruptOnAbort?: boolean;
       shouldSkip?: () => boolean;
       suppressFinishCallback?: boolean;
+      runtimeGuard?: TerminalRuntimeGuard;
     }
   ): Promise<CommandResult> {
     const startTime = Date.now()
@@ -4668,6 +6125,8 @@ export class TerminalService {
     if (!task) {
       throw new Error(`Task ${taskId} not found.`)
     }
+    const taskRuntimeGuard =
+      this.runtimeGuardByTaskId.get(taskId) ?? opts?.runtimeGuard
     if (opts?.suppressFinishCallback && task.status === 'running') {
       task.suppressFinishCallback = true
       suppressionApplied = true
@@ -4703,8 +6162,18 @@ export class TerminalService {
             task.status === 'running' &&
             this.activeTaskByTerminal.get(terminalId) === taskId
           ) {
-            this.interrupt(terminalId)
-            this.markTaskAborted(terminalId, taskId)
+            try {
+              this.interrupt(terminalId, taskRuntimeGuard)
+              this.markTaskAborted(terminalId, taskId)
+            } catch (error) {
+              this.finalizeAmbiguousCommandDispatch(
+                terminalId,
+                taskRuntimeGuard?.expectedTerminal ??
+                  this.terminals.get(terminalId),
+                task,
+                error instanceof Error ? error.message : String(error)
+              )
+            }
           }
         } else {
           clearSuppressionIfStillRunning()
@@ -4730,7 +6199,9 @@ export class TerminalService {
       if (task.status === 'aborted') {
         return {
           stdoutDelta: currentTaskOutput(),
-          exitCode: task.exitCode ?? (task.runtimeBoundary ? -1 : -2),
+          ...(!task.outcomeUnknown
+            ? { exitCode: task.exitCode ?? (task.runtimeBoundary ? -1 : -2) }
+            : {}),
           history_command_match_id: taskId,
           executionState: task.runtimeBoundary ? 'outcome_unknown' : 'aborted',
           ...(task.capture ? { capture: { ...task.capture } } : {}),
@@ -4770,10 +6241,13 @@ export class TerminalService {
     command: string,
     type: 'wait' | 'nowait',
     onFinished?: (result: CommandResult) => void,
-    signal?: AbortSignal
+    signal?: AbortSignal,
+    runtimeGuard?: TerminalRuntimeGuard
   ): Promise<string> {
     throwIfTerminalOperationAborted(signal)
-    const terminal = this.terminals.get(terminalId)
+    const terminal = runtimeGuard
+      ? this.getTerminalOrThrow(terminalId, runtimeGuard)
+      : this.terminals.get(terminalId)
     if (!terminal) {
       throw new Error(`Terminal ${terminalId} not found`)
     }
@@ -4813,7 +6287,8 @@ export class TerminalService {
         type,
         onFinished,
         signal,
-        reservationToken
+        reservationToken,
+        runtimeGuard
       )
       return startedTaskId
     } finally {
@@ -4938,7 +6413,11 @@ export class TerminalService {
       const startedTask = startedTaskId
         ? this.tasksByTerminal.get(terminalId)?.[startedTaskId]
         : undefined
-      if (
+      if (startedTask?.runtimeBoundary === true) {
+        // Input queued behind an ambiguously dispatched command belongs to
+        // neither a replacement runtime nor a shell whose prompt state is
+        // unknown. Discard it instead of replaying it by public terminal ID.
+      } else if (
         deferred.length > 0 &&
         startedTask?.status === 'running' &&
         startedTask.displayMode === 'synthetic-transcript'
@@ -5033,7 +6512,8 @@ export class TerminalService {
     type: 'wait' | 'nowait',
     onFinished: ((result: CommandResult) => void) | undefined,
     signal: AbortSignal | undefined,
-    reservationToken: symbol
+    reservationToken: symbol,
+    runtimeGuard?: TerminalRuntimeGuard
   ): Promise<string> {
     const terminalId = terminal.id
     const runtimePtyId = terminal.ptyId
@@ -5045,8 +6525,28 @@ export class TerminalService {
       terminal.runtimeState === 'ready' &&
       this.backendRuntimeGenerationByTerminal.get(terminalId) ===
         runtimeGeneration
+    const assertPlannedRuntime = (
+      operation: string,
+      outcomeUnknown = false
+    ): void => {
+      if (runtimeGuard) {
+        this.assertTerminalRuntimeGuard(runtimeGuard, operation, {
+          outcomeUnknown,
+          operationWasDispatched: outcomeUnknown
+        })
+      }
+      if (!runtimeIsCurrent()) {
+        throw new TerminalRuntimeChangedError(
+          terminalId,
+          outcomeUnknown,
+          operation,
+          { operationWasDispatched: outcomeUnknown }
+        )
+      }
+    }
 
-    const taskId = uuidv4()
+    assertPlannedRuntime('command preparation')
+    const taskId = this.createUniqueCommandTaskId()
     const startOffset = this.getCurrentOffset(terminalId)
     // Preparation can mutate shared prompt-marker state and is not
     // cancellable. Keep the start reservation until it settles, then honor
@@ -5067,11 +6567,13 @@ export class TerminalService {
       throw error
     }
     throwIfTerminalOperationAborted(signal)
+    assertPlannedRuntime('command tracking preparation')
     const isolateUnixCommand =
       terminal.type === 'ssh' &&
       this.getCommandShellFamily(terminal) === 'unix' &&
       await shouldIsolateUnixAgentCommand(command)
     throwIfTerminalOperationAborted(signal)
+    assertPlannedRuntime('command isolation preparation')
     const wireCommand = this.buildDispatchedCommand(
       terminal,
       command,
@@ -5147,11 +6649,7 @@ export class TerminalService {
       // cannot freeze or later overwrite a replacement runtime.
       await waitForPromiseOrAbort(promptFileIo.waitForTurn, signal)
       throwIfTerminalOperationAborted(signal)
-      if (!runtimeIsCurrent()) {
-        throw new Error(
-          `Terminal ${terminalId} changed before the prompt-file command could be prepared.`
-        )
-      }
+      assertPlannedRuntime('prompt-file command preparation')
     }
     if (
       usesPromptFileDispatch &&
@@ -5236,11 +6734,11 @@ export class TerminalService {
     }
 
     throwIfTerminalOperationAborted(signal)
-    if (!runtimeIsCurrent()) {
+    try {
+      assertPlannedRuntime('command dispatch')
+    } catch (error) {
       await clearPendingPromptRequest()
-      throw new Error(
-        `Terminal ${terminalId} changed before the command could be dispatched.`
-      )
+      throw error
     }
 
     const usesPowerShellLifecycle =
@@ -5281,9 +6779,13 @@ export class TerminalService {
         : {})
     }
     const taskMap = this.getTaskMap(terminalId)
+    const commandRuntimeGuard =
+      runtimeGuard ??
+      this.createTerminalRuntimeGuard(terminalId, runtimeGeneration)
     taskMap[taskId] = task
     this.captureByTaskId.set(taskId, capture)
     this.unverifiedCaptureByTaskId.set(taskId, unverifiedCapture)
+    this.runtimeGuardByTaskId.set(taskId, commandRuntimeGuard)
     this.activeTaskByTerminal.set(terminalId, taskId)
     if (usesSyntheticCommandEcho && lastShellSequence !== undefined) {
       const privateDispatcherName = wireCommand.split(' ', 1)[0] || wireCommand
@@ -5313,6 +6815,9 @@ export class TerminalService {
       )
     }
 
+    let commandWriteStarted = false
+    let commandWasDispatched = false
+    let commandRuntimeChangedDuringWrite = false
     try {
       const dispatchedInput = usedPromptFileDispatch
         ? `${completionTracking!.dispatchInput}${eol}`
@@ -5323,7 +6828,11 @@ export class TerminalService {
         completionTracking.dispatchedAtMs = Date.now()
       }
       try {
+        assertPlannedRuntime('command dispatch')
+        commandWriteStarted = true
         backend.write(runtimePtyId, dispatchedInput)
+        commandWasDispatched = true
+        assertPlannedRuntime('command dispatch', true)
         if (completionTracking) {
           this.reserveWindowsPromptSequence(
             terminalId,
@@ -5331,17 +6840,44 @@ export class TerminalService {
           )
         }
       } catch (error) {
-        if (previousShellInputState) {
-          this.shellInputStateByTerminal.set(terminalId, previousShellInputState)
-        } else {
-          this.shellInputStateByTerminal.delete(terminalId)
+        commandRuntimeChangedDuringWrite =
+          commandWriteStarted && !runtimeIsCurrent()
+        if (!commandWasDispatched && runtimeIsCurrent()) {
+          if (previousShellInputState) {
+            this.shellInputStateByTerminal.set(
+              terminalId,
+              previousShellInputState
+            )
+          } else {
+            this.shellInputStateByTerminal.delete(terminalId)
+          }
+        } else if (commandWasDispatched && runtimeIsCurrent()) {
+          this.shellInputStateByTerminal.set(terminalId, 'unknown')
         }
         throw error
       }
     } catch (error) {
+      await clearPendingPromptRequest()
+      if (commandWasDispatched || commandRuntimeChangedDuringWrite) {
+        const detail = error instanceof Error ? error.message : String(error)
+        this.finalizeAmbiguousCommandDispatch(
+          terminalId,
+          terminal,
+          task,
+          `Command dispatch outcome is unknown: ${detail}`
+        )
+        this.quarantineTerminalRuntime(
+          terminalId,
+          runtimePtyId,
+          runtimeGeneration
+        )
+        return taskId
+      }
+
       delete taskMap[taskId]
       this.captureByTaskId.delete(taskId)
       this.unverifiedCaptureByTaskId.delete(taskId)
+      this.runtimeGuardByTaskId.delete(taskId)
       if (this.activeTaskByTerminal.get(terminalId) === taskId) {
         this.activeTaskByTerminal.delete(terminalId)
       }
@@ -5352,7 +6888,6 @@ export class TerminalService {
       ) {
         this.pendingUnixCommandDisplayByTerminal.delete(terminalId)
       }
-      await clearPendingPromptRequest()
       throw error
     }
 
@@ -5398,12 +6933,130 @@ export class TerminalService {
     return this.activeTaskByTerminal.get(terminalId)
   }
 
+  private isCommandTaskIdAllocated(taskId: string): boolean {
+    if (
+      this.issuedCommandTaskIds.has(taskId) ||
+      this.captureByTaskId.has(taskId) ||
+      this.unverifiedCaptureByTaskId.has(taskId) ||
+      this.runtimeGuardByTaskId.has(taskId) ||
+      this.deferredWritesUntilTaskFinishByTaskId.has(taskId) ||
+      this.commandTrackingWatcherByTaskId.has(taskId) ||
+      this.onTaskFinishedCallbacks.has(taskId)
+    ) {
+      return true
+    }
+    if (
+      Array.from(this.activeTaskByTerminal.values()).includes(taskId) ||
+      Array.from(this.pendingTaskFinishByTerminal.values()).some(
+        (pending) => pending.taskId === taskId
+      ) ||
+      Array.from(this.pendingUnixCommandDisplayByTerminal.values()).some(
+        (pending) => pending.taskId === taskId
+      ) ||
+      Array.from(this.commandStartReservationByTerminal.values()).some(
+        (reservation) => reservation.startedTaskId === taskId
+      )
+    ) {
+      return true
+    }
+    const taskStores = [
+      ...this.tasksByTerminal.values(),
+      ...this.detachedTasksByTerminal.values(),
+    ]
+    return taskStores.some((tasks) =>
+      Object.prototype.hasOwnProperty.call(tasks, taskId)
+    )
+  }
+
+  private createUniqueCommandTaskId(): string {
+    for (
+      let attempt = 0;
+      attempt < COMMAND_TASK_ID_ALLOCATION_MAX_ATTEMPTS;
+      attempt += 1
+    ) {
+      const candidate = this.commandTaskIdFactory()
+      if (
+        typeof candidate !== 'string' ||
+        !UUID_V4_PATTERN.test(candidate) ||
+        this.isCommandTaskIdAllocated(candidate)
+      ) {
+        continue
+      }
+      // Never reuse an issued ID during this process, even after bounded
+      // transcript retention evicts its record. Otherwise an old external
+      // reference could silently bind to an unrelated future command.
+      this.issuedCommandTaskIds.add(candidate)
+      return candidate
+    }
+    throw new Error(
+      `Unable to allocate a globally unique command task ID after ${COMMAND_TASK_ID_ALLOCATION_MAX_ATTEMPTS} attempts.`
+    )
+  }
+
   private getTaskMap(terminalId: string): Record<string, CommandTask> {
     const existing = this.tasksByTerminal.get(terminalId)
     if (existing) return existing
     const next: Record<string, CommandTask> = {}
     this.tasksByTerminal.set(terminalId, next)
     return next
+  }
+
+  private finalizeAmbiguousCommandDispatch(
+    terminalId: string,
+    terminal: TerminalTab | undefined,
+    task: CommandTask,
+    terminalStatus: string
+  ): void {
+    if (task.status === 'running' || task.status === 'timeout') {
+      this.finalizeTaskCapture(terminalId, task, terminal, {
+        runtimeBoundary: true,
+      })
+      task.output = this.getTaskCapture(task.id)?.getText() ?? task.output ?? ''
+      task.status = 'aborted'
+      task.endTime = Date.now()
+      delete task.exitCode
+      task.endOffset = task.startOffset + task.output.length
+    }
+    task.runtimeBoundary = true
+    task.outcomeUnknown = true
+    task.terminalStatus = terminalStatus
+
+    this.stopCommandTrackingWatcher(task.id)
+    this.unverifiedCaptureByTaskId.delete(task.id)
+    this.runtimeGuardByTaskId.delete(task.id)
+    if (this.activeTaskByTerminal.get(terminalId) === task.id) {
+      this.activeTaskByTerminal.delete(terminalId)
+    }
+    this.pendingTaskFinishByTerminal.delete(terminalId)
+    this.deferredWritesUntilTaskFinishByTaskId.delete(task.id)
+    if (
+      this.pendingUnixCommandDisplayByTerminal.get(terminalId)?.taskId ===
+      task.id
+    ) {
+      this.pendingUnixCommandDisplayByTerminal.delete(terminalId)
+    }
+
+    const callback = this.onTaskFinishedCallbacks.get(task.id)
+    this.onTaskFinishedCallbacks.delete(task.id)
+    if (callback && !task.suppressFinishCallback) {
+      try {
+        callback({
+          stdoutDelta: task.output || '',
+          history_command_match_id: task.id,
+          executionState: 'outcome_unknown',
+          ...(task.capture ? { capture: { ...task.capture } } : {}),
+          terminalStatus,
+          runtimeBoundary: true,
+        })
+      } catch (error) {
+        console.warn(
+          `[TerminalService] Command completion callback failed after ambiguous dispatch for ${terminalId}.`,
+          error
+        )
+      }
+    }
+    this.compactFinalizedTask(task)
+    this.enforceCommandCaptureRetention()
   }
 
   private appendActiveTaskOutput(terminalId: string, chunk: string): void {
@@ -5542,6 +7195,7 @@ export class TerminalService {
 
     this.stopCommandTrackingWatcher(taskId)
     this.unverifiedCaptureByTaskId.delete(taskId)
+    this.runtimeGuardByTaskId.delete(taskId)
     this.activeTaskByTerminal.delete(terminalId)
     this.pendingTaskFinishByTerminal.delete(terminalId)
     const deferredWrites =
@@ -5801,6 +7455,7 @@ export class TerminalService {
     task.endOffset = task.startOffset + (task.output?.length || 0)
     this.stopCommandTrackingWatcher(taskId)
     this.unverifiedCaptureByTaskId.delete(taskId)
+    this.runtimeGuardByTaskId.delete(taskId)
     this.activeTaskByTerminal.delete(terminalId)
     this.tryCompleteWindowsManualPromptWatcher(terminalId)
     this.pendingTaskFinishByTerminal.delete(terminalId)

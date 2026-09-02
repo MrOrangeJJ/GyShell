@@ -1,3 +1,4 @@
+import assert from 'node:assert/strict'
 import {
   FILESYSTEM_PANEL_DRAG_MIME,
   decodeTerminalScopedFilePath,
@@ -9,6 +10,7 @@ import {
   hasNativeFileDragType,
   getFileMentionDisplayName,
   getNativeFilePathResolver,
+  normalizeFileSystemPanelDragPayload,
   parseFileSystemPanelDragPayload,
   resolveNativeFilePath,
   resolveTerminalDropPaths,
@@ -83,6 +85,211 @@ const run = async (): Promise<void> => {
       getData: () => '{"version":2}'
     } as unknown as Pick<DataTransfer, 'types' | 'getData'>)
     assertEqual(parsed, null, 'unsupported payload version should be rejected')
+  })
+
+  await runCase('filesystem payload admission is strict, presence-sensitive, and atomic', () => {
+    const validEntry = {
+      name: 'report.txt',
+      path: '/srv/report.txt',
+      isDirectory: false,
+      size: 12
+    }
+    const validPayload = {
+      version: 1,
+      sourceTerminalId: '  source::A  ',
+      sourceBasePath: '/srv',
+      entries: [validEntry]
+    }
+
+    assertCondition(
+      normalizeFileSystemPanelDragPayload(validPayload) !== null,
+      'a valid payload should be admitted'
+    )
+    const nullPrototypePayload = Object.assign(Object.create(null), validPayload)
+    assertCondition(
+      normalizeFileSystemPanelDragPayload(nullPrototypePayload) !== null,
+      'null-prototype JSON records should be admitted'
+    )
+
+    const invalidPayloads: unknown[] = [
+      { ...validPayload, version: 2 },
+      { ...validPayload, sourceTerminalId: 17 },
+      { ...validPayload, sourceTerminalId: '   ' },
+      { ...validPayload, sourceTerminalId: 'source\nA' },
+      { ...validPayload, sourceTerminalId: '\ud800' },
+      { ...validPayload, sourceTerminalId: 'x'.repeat(1025) },
+      { ...validPayload, sourceBasePath: undefined },
+      { ...validPayload, sourceBasePath: null },
+      { ...validPayload, entries: undefined },
+      { ...validPayload, entries: [] },
+      { ...validPayload, entries: [validEntry, null] },
+      {
+        ...validPayload,
+        entries: [{ ...validEntry, size: undefined }]
+      },
+      {
+        ...validPayload,
+        entries: [{ ...validEntry, size: -1 }]
+      },
+      {
+        ...validPayload,
+        entries: [{ ...validEntry, size: 1.5 }]
+      },
+      {
+        ...validPayload,
+        entries: [{ ...validEntry, isDirectory: 'false' }]
+      },
+      {
+        ...validPayload,
+        entries: [{ ...validEntry, name: '   ' }]
+      },
+      {
+        ...validPayload,
+        entries: [{ ...validEntry, path: '\ud800' }]
+      }
+    ]
+    for (const invalid of invalidPayloads) {
+      assertEqual(
+        normalizeFileSystemPanelDragPayload(invalid),
+        null,
+        `malformed payload must be rejected: ${String(invalid)}`
+      )
+    }
+
+    const unknownKeyPayload = { ...validPayload, unexpected: true } as Record<
+      string,
+      unknown
+    >
+    assertEqual(
+      normalizeFileSystemPanelDragPayload(unknownKeyPayload),
+      null,
+      'unknown payload keys must not be silently stripped'
+    )
+
+    const symbolKeyPayload = { ...validPayload }
+    Object.defineProperty(symbolKeyPayload, Symbol('unexpected'), {
+      value: true,
+      enumerable: true
+    })
+    assertEqual(
+      normalizeFileSystemPanelDragPayload(symbolKeyPayload),
+      null,
+      'symbol payload keys must be rejected'
+    )
+
+    const prototypePayload = Object.create({ inherited: true })
+    Object.assign(prototypePayload, validPayload)
+    assertEqual(
+      normalizeFileSystemPanelDragPayload(prototypePayload),
+      null,
+      'prototype-bearing payload records must be rejected'
+    )
+
+    const ownProtoPayload = { ...validPayload }
+    Object.defineProperty(ownProtoPayload, '__proto__', {
+      value: 'literal-key',
+      enumerable: true,
+      configurable: true
+    })
+    assertEqual(
+      normalizeFileSystemPanelDragPayload(ownProtoPayload),
+      null,
+      'unknown __proto__ payload keys must be rejected without prototype mutation'
+    )
+  })
+
+  await runCase('declared custom MIME is authoritative over native Files fallback', () => {
+    let nativeFilesRead = false
+    const malformedTransfer = {
+      types: [FILESYSTEM_PANEL_DRAG_MIME, 'Files'],
+      getData: () => '{"version":1,"sourceTerminalId":"source","entries":[]}',
+      get files(): FileList {
+        nativeFilesRead = true
+        return [{ path: '/native/should-not-be-used' }] as unknown as FileList
+      }
+    }
+    assert.deepEqual(
+      resolveTerminalDropPaths(
+        malformedTransfer as unknown as Pick<DataTransfer, 'types' | 'getData' | 'files'>
+      ),
+      [],
+      'malformed custom payload must produce no terminal paths'
+    )
+    assert.deepEqual(
+      resolveTerminalDropPathsForTarget(
+        malformedTransfer as unknown as Pick<DataTransfer, 'types' | 'getData' | 'files'>,
+        'source'
+      ),
+      [],
+      'malformed custom payload must not be accepted by a target terminal'
+    )
+    assertEqual(nativeFilesRead, false, 'native Files must not be read after custom MIME admission')
+  })
+
+  await runCase('terminal scoped codec preserves exact identities and rejects non-canonical forms', () => {
+    const terminalIds = ['  A  ', 'a', 'A::B', '__proto__', '终端🙂']
+    for (const terminalId of terminalIds) {
+      const encoded = encodeTerminalScopedFilePath(terminalId, ' /tmp/report )%/file.txt ')
+      const decoded = decodeTerminalScopedFilePath(encoded)
+      assertCondition(!!decoded, `encoded scope should decode: ${terminalId}`)
+      assertEqual(decoded?.terminalId, terminalId, 'terminal identity must remain byte-for-byte exact')
+      assertEqual(decoded?.filePath, ' /tmp/report )%/file.txt ', 'path bytes must remain exact')
+    }
+
+    for (const malformed of [
+      '@terminal():/tmp/a',
+      '@terminal(id):',
+      '@terminal(id%2fpart):/tmp/a',
+      '@terminal(%E0%A4%A):/tmp/a',
+      '@terminal(%00):/tmp/a',
+      `@terminal(id):/tmp/${String.fromCharCode(0xd800)}`
+    ]) {
+      assertEqual(decodeTerminalScopedFilePath(malformed), null, `malformed scope must be rejected: ${malformed}`)
+    }
+
+    for (const invalidId of ['   ', 'id\n', '\ud800', 'x'.repeat(1025), 42]) {
+      let threw = false
+      try {
+        encodeTerminalScopedFilePath(invalidId as any, '/tmp/a')
+      } catch {
+        threw = true
+      }
+      assertEqual(threw, true, 'invalid non-empty terminal IDs must not be encoded')
+    }
+    assertEqual(encodeTerminalScopedFilePath('', '/legacy/path'), '/legacy/path', 'terminal-less legacy paths remain raw')
+  })
+
+  await runCase('exact terminal identity controls scoped drop admission', () => {
+    const payload = {
+      version: 1 as const,
+      sourceTerminalId: '  Source  ',
+      sourceBasePath: '/tmp',
+      entries: [{ name: 'a.txt', path: '/tmp/a.txt', isDirectory: false }]
+    }
+    const encoded = encodeFileSystemPanelDragPayload(payload)
+    const dataTransfer = {
+      types: [FILESYSTEM_PANEL_DRAG_MIME],
+      getData: () => encoded,
+      files: [] as unknown as FileList
+    }
+    for (const lookalike of ['Source', '  source  ', 'source::']) {
+      assert.deepEqual(
+        resolveTerminalDropPathsForTarget(
+          dataTransfer as unknown as Pick<DataTransfer, 'types' | 'getData' | 'files'>,
+          lookalike
+        ),
+        [],
+        `lookalike target must be rejected: ${lookalike}`
+      )
+    }
+    assert.deepEqual(
+      resolveTerminalDropPathsForTarget(
+        dataTransfer as unknown as Pick<DataTransfer, 'types' | 'getData' | 'files'>,
+        '  Source  '
+      ),
+      ['/tmp/a.txt'],
+      'exact target identity must be accepted'
+    )
   })
 
   await runCase('drag type detection works without reading payload body', () => {

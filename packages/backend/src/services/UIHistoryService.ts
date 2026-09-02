@@ -2,6 +2,7 @@ import { v4 as uuidv4 } from "uuid";
 import {
   extractCommandOutputDisplayText,
   parseCommandOutputContractV1,
+  readOpaqueNonBlankWellFormedString,
   type CommandOutputContractV1,
 } from "@gyshell/shared";
 import type { AgentEvent, AgentEventType } from "../types";
@@ -49,6 +50,27 @@ interface CachedUiSession {
 const UI_HISTORY_LIVE_TAIL_LIMIT = 500;
 const UI_HISTORY_MAX_CACHED_SESSIONS = 4;
 const UI_HISTORY_FULL_MESSAGE_REQUEST_LIMIT = 16;
+
+const readUiHistorySessionId = (value: unknown): string | undefined =>
+  readOpaqueNonBlankWellFormedString(value);
+
+const requireUiHistorySessionId = (value: unknown): string => {
+  const sessionId = readUiHistorySessionId(value);
+  if (sessionId === undefined) throw new Error("Session id is required.");
+  return sessionId;
+};
+
+const requireUiHistorySessionIds = (value: unknown): string[] => {
+  if (!Array.isArray(value)) throw new Error("Session ids must be an array.");
+  const sessionIds = value.map((candidate) =>
+    requireUiHistorySessionId(candidate),
+  );
+  return Array.from(new Set(sessionIds));
+};
+
+const createSessionRecord = <T>(): Record<string, T> =>
+  Object.create(null) as Record<string, T>;
+
 const UI_HISTORY_STRUCTURAL_METADATA_STRING_FIELDS = [
   "tabName",
   "commandId",
@@ -66,8 +88,10 @@ const UI_HISTORY_STRUCTURAL_METADATA_STRING_FIELDS = [
 
 export class UIHistoryService {
   private readonly store: HistorySqliteStore;
-  private sessionsCache: Record<string, CachedUiSession> = {};
-  private sessionSummaryCache: Record<string, UISessionSummary> = {};
+  private sessionsCache: Record<string, CachedUiSession> =
+    createSessionRecord<CachedUiSession>();
+  private sessionSummaryCache: Record<string, UISessionSummary> =
+    createSessionRecord<UISessionSummary>();
   private dirtySessions: Set<string> = new Set();
   private revisionDirtySessions: Set<string> = new Set();
   private sessionUiRevisionById: Map<string, number> = new Map();
@@ -85,10 +109,13 @@ export class UIHistoryService {
   private buildSessionSummaryCache(
     summaries: UISessionSummary[],
   ): Record<string, UISessionSummary> {
-    const cache: Record<string, UISessionSummary> = {};
+    const cache = createSessionRecord<UISessionSummary>();
     for (const summary of summaries) {
-      cache[summary.id] = {
+      const sessionId = readUiHistorySessionId(summary?.id);
+      if (sessionId === undefined) continue;
+      cache[sessionId] = {
         ...summary,
+        id: sessionId,
         uiRevision: Math.max(0, Math.floor(summary.uiRevision || 0)),
         lastMessagePreview: extractCommandOutputDisplayText(
           summary.lastMessagePreview || "",
@@ -204,33 +231,35 @@ export class UIHistoryService {
   }
 
   getUiRevision(sessionId: string): number {
+    const exactSessionId = readUiHistorySessionId(sessionId);
+    if (exactSessionId === undefined) return 0;
     return Math.max(
       0,
       Math.floor(
-        this.sessionUiRevisionById.get(sessionId) ||
-          this.sessionsCache[sessionId]?.session.uiRevision ||
-          this.sessionSummaryCache[sessionId]?.uiRevision ||
+        this.sessionUiRevisionById.get(exactSessionId) ||
+          this.sessionsCache[exactSessionId]?.session.uiRevision ||
+          this.sessionSummaryCache[exactSessionId]?.uiRevision ||
           0,
       ),
     );
   }
 
   noteUiRevision(sessionId: string, uiRevision: number): void {
-    const normalizedSessionId = String(sessionId || "").trim();
+    const exactSessionId = readUiHistorySessionId(sessionId);
     const normalizedRevision = Math.max(0, Math.floor(uiRevision));
     if (
-      !normalizedSessionId ||
+      exactSessionId === undefined ||
       !Number.isSafeInteger(normalizedRevision) ||
-      normalizedRevision <= this.getUiRevision(normalizedSessionId)
+      normalizedRevision <= this.getUiRevision(exactSessionId)
     ) {
       return;
     }
-    this.sessionUiRevisionById.set(normalizedSessionId, normalizedRevision);
-    const entry = this.sessionsCache[normalizedSessionId];
+    this.sessionUiRevisionById.set(exactSessionId, normalizedRevision);
+    const entry = this.sessionsCache[exactSessionId];
     if (entry) entry.session.uiRevision = normalizedRevision;
-    const summary = this.sessionSummaryCache[normalizedSessionId];
+    const summary = this.sessionSummaryCache[exactSessionId];
     if (summary) {
-      this.sessionSummaryCache[normalizedSessionId] = {
+      this.sessionSummaryCache[exactSessionId] = {
         ...summary,
         uiRevision: normalizedRevision,
       };
@@ -245,12 +274,12 @@ export class UIHistoryService {
     if (
       !entry &&
       typeof updateRevision === "function" &&
-      updateRevision.call(this.store, normalizedSessionId, normalizedRevision)
+      updateRevision.call(this.store, exactSessionId, normalizedRevision)
     ) {
-      this.revisionDirtySessions.delete(normalizedSessionId);
+      this.revisionDirtySessions.delete(exactSessionId);
       return;
     }
-    this.revisionDirtySessions.add(normalizedSessionId);
+    this.revisionDirtySessions.add(exactSessionId);
   }
 
   private hydrateProjectedMessagesForEvent(
@@ -321,6 +350,9 @@ export class UIHistoryService {
   }
 
   recordEvent(sessionId: string, event: AgentEvent): UIUpdateAction[] {
+    const exactSessionId = readUiHistorySessionId(sessionId);
+    if (exactSessionId === undefined) return [];
+    sessionId = exactSessionId;
     let session = this.getOrLoadSession(sessionId);
     if (!session) {
       session = {
@@ -410,15 +442,19 @@ export class UIHistoryService {
     sessionId?: string,
     options?: { preserveLiveTransientState?: boolean },
   ): void {
+    const exactSessionId =
+      sessionId === undefined ? undefined : readUiHistorySessionId(sessionId);
+    if (sessionId !== undefined && exactSessionId === undefined) return;
     const pendingSessionIds = new Set([
       ...this.dirtySessions,
       ...this.revisionDirtySessions,
     ]);
-    const sessionIds = sessionId
-      ? pendingSessionIds.has(sessionId)
-        ? [sessionId]
-        : []
-      : Array.from(pendingSessionIds);
+    const sessionIds =
+      exactSessionId !== undefined
+        ? pendingSessionIds.has(exactSessionId)
+          ? [exactSessionId]
+          : []
+        : Array.from(pendingSessionIds);
     if (sessionIds.length === 0) {
       return;
     }
@@ -1263,13 +1299,16 @@ export class UIHistoryService {
     sessionId: string,
     request?: UiMessagePageRequest,
   ): UiMessagePage | null {
+    const exactSessionId = readUiHistorySessionId(sessionId);
+    if (exactSessionId === undefined) return null;
+    sessionId = exactSessionId;
     // Initialize the bounded live tail before reading a page. This applies the
     // same interrupted-command recovery that the legacy full-session path used,
     // while later live events can still replace recovered rows in the cache.
     this.getOrLoadSession(sessionId);
     this.flush(sessionId, { preserveLiveTransientState: true });
     const page = this.store.loadUiMessagePage(sessionId, request);
-    if (!page) return null;
+    if (!page || page.sessionId !== sessionId) return null;
 
     const entry = this.getCachedSessionEntry(sessionId);
     const cachedById = new Map(
@@ -1335,6 +1374,9 @@ export class UIHistoryService {
   }
 
   getMessageGeometryIndex(sessionId: string): UiMessageGeometryIndex | null {
+    const exactSessionId = readUiHistorySessionId(sessionId);
+    if (exactSessionId === undefined) return null;
+    sessionId = exactSessionId;
     // Materialize the bounded live tail first so persisted process-local
     // running/cursor state receives the same restart recovery as page reads.
     this.getOrLoadSession(sessionId);
@@ -1345,7 +1387,7 @@ export class UIHistoryService {
       this.store,
       sessionId,
     ) as UiMessageGeometryIndex | null;
-    if (!index) return null;
+    if (!index || index.sessionId !== sessionId) return null;
 
     const cachedById = new Map(
       (this.getCachedSessionEntry(sessionId)?.session.messages || []).map(
@@ -1396,6 +1438,7 @@ export class UIHistoryService {
     sessionId: string,
     messageIds: string[],
   ): UiFullMessagesResult {
+    sessionId = requireUiHistorySessionId(sessionId);
     this.flush(sessionId, { preserveLiveTransientState: true });
     const ids = new Set(
       Array.from(new Set(messageIds.filter(Boolean))).slice(
@@ -1442,6 +1485,7 @@ export class UIHistoryService {
     query: string,
     limit?: number,
   ): UiMessageSearchResult {
+    sessionId = requireUiHistorySessionId(sessionId);
     this.flush(sessionId, { preserveLiveTransientState: true });
     return {
       ...this.store.searchUiMessages(sessionId, query, limit),
@@ -1454,15 +1498,19 @@ export class UIHistoryService {
   }
 
   getSession(sessionId: string): UIChatSession | null {
+    const exactSessionId = readUiHistorySessionId(sessionId);
+    if (exactSessionId === undefined) return null;
+    sessionId = exactSessionId;
     const cached = this.getCachedSessionEntry(sessionId);
     if (!cached) {
       const loaded = this.store.loadUiSession(sessionId);
-      return loaded ? sanitizeUiSession(loaded) : null;
+      return loaded?.id === sessionId ? sanitizeUiSession(loaded) : null;
     }
 
     cached.lastAccessedAt = Date.now();
     const loaded = this.store.loadUiSession(sessionId);
     if (!loaded) return cached.session;
+    if (loaded.id !== sessionId) return null;
 
     const durableById = new Map(
       loaded.messages.map((message) => [message.id, message] as const),
@@ -1551,7 +1599,14 @@ export class UIHistoryService {
     const stored = findStoredFeedback.call(this.store, normalizedId) as
       | { sessionId: string; message: ChatMessage }
       | null;
-    if (!stored || stored.message.metadata?.decision === decision) return null;
+    const storedSessionId = readUiHistorySessionId(stored?.sessionId);
+    if (
+      !stored ||
+      storedSessionId === undefined ||
+      stored.message.metadata?.decision === decision
+    ) {
+      return null;
+    }
     stored.message.metadata = {
       ...(stored.message.metadata || {}),
       decision,
@@ -1562,20 +1617,20 @@ export class UIHistoryService {
       typeof updateStoredMessage !== "function" ||
       !updateStoredMessage.call(
         this.store,
-        stored.sessionId,
+        storedSessionId,
         stored.message,
         updatedAt,
       )
     ) {
       return null;
     }
-    const summary = this.sessionSummaryCache[stored.sessionId];
+    const summary = this.sessionSummaryCache[storedSessionId];
     if (summary) {
-      this.sessionSummaryCache[stored.sessionId] = { ...summary, updatedAt };
+      this.sessionSummaryCache[storedSessionId] = { ...summary, updatedAt };
     }
     return {
       type: "UPDATE_MESSAGE",
-      sessionId: stored.sessionId,
+      sessionId: storedSessionId,
       messageId: stored.message.id,
       patch: { metadata: { ...stored.message.metadata } },
     };
@@ -1586,9 +1641,7 @@ export class UIHistoryService {
   }
 
   deleteSessions(sessionIds: string[]): void {
-    const ids = Array.from(
-      new Set(sessionIds.filter((id) => id.trim().length > 0)),
-    );
+    const ids = requireUiHistorySessionIds(sessionIds);
     if (ids.length === 0) {
       return;
     }
@@ -1603,6 +1656,7 @@ export class UIHistoryService {
   }
 
   renameSession(sessionId: string, newTitle: string): void {
+    sessionId = requireUiHistorySessionId(sessionId);
     const updatedAt = Date.now();
     const session = this.getOrLoadSession(sessionId);
     if (session) {
@@ -1644,6 +1698,9 @@ export class UIHistoryService {
   }
 
   rollbackToMessage(sessionId: string, backendMessageId: string): number {
+    const exactSessionId = readUiHistorySessionId(sessionId);
+    if (exactSessionId === undefined) return 0;
+    sessionId = exactSessionId;
     const result = this.store.truncateUiSessionBeforeBackendMessage(
       sessionId,
       backendMessageId,
@@ -1669,6 +1726,11 @@ export class UIHistoryService {
     sourceSessionId: string,
     backendMessageId: string,
   ): { ok: boolean; reason?: string } {
+    const exactSourceSessionId = readUiHistorySessionId(sourceSessionId);
+    if (exactSourceSessionId === undefined) {
+      return { ok: false, reason: "Source UI session not found." };
+    }
+    sourceSessionId = exactSourceSessionId;
     const source = this.getSession(sourceSessionId);
     if (!source) {
       return { ok: false, reason: "Source UI session not found." };
@@ -1714,6 +1776,16 @@ export class UIHistoryService {
     messageCount?: number;
     reason?: string;
   } {
+    const exactSourceSessionId = readUiHistorySessionId(sourceSessionId);
+    const exactBranchSessionId = readUiHistorySessionId(branchSessionId);
+    if (
+      exactSourceSessionId === undefined ||
+      exactBranchSessionId === undefined
+    ) {
+      return { ok: false, reason: "Invalid UI session id." };
+    }
+    sourceSessionId = exactSourceSessionId;
+    branchSessionId = exactBranchSessionId;
     const validation = this.validateBranchFromMessage(
       sourceSessionId,
       backendMessageId,
@@ -1801,7 +1873,12 @@ export class UIHistoryService {
     sessionId: string,
     messageIds: string[],
   ): string {
-    const selected = this.store.loadUiMessagesByIds(sessionId, messageIds);
+    const exactSessionId = readUiHistorySessionId(sessionId);
+    if (exactSessionId === undefined) return "";
+    const selected = this.store.loadUiMessagesByIds(
+      exactSessionId,
+      messageIds,
+    );
     return this.toReadableMarkdownFragment(selected);
   }
 

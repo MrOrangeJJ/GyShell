@@ -14,7 +14,7 @@ files:
   - from: .
     filter:
       - out/**/*
-      - apps/gybackend/dist/**/*
+      - apps/gybackend/dist/index.js
       - apps/gybackend/package.json
       - package.json
       - "!**/*.map"

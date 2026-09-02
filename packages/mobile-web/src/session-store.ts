@@ -1,5 +1,14 @@
-import type { ChatMessage, UIUpdateAction } from "./types";
-import { extractCommandOutputDisplayText } from "@gyshell/shared";
+import type {
+  ChatMessage,
+  GatewaySessionSnapshot,
+  GatewaySessionSummary,
+  UIUpdateAction,
+} from "./types";
+import {
+  extractCommandOutputDisplayText,
+  readOpaqueNonBlankWellFormedString,
+  transformPassChatMentionText,
+} from "@gyshell/shared";
 
 export interface SessionState {
   id: string;
@@ -19,6 +28,52 @@ export interface SessionMeta {
   loaded: boolean;
   uiRevision?: number;
 }
+
+export const readMobileSessionId = (value: unknown): string | undefined =>
+  readOpaqueNonBlankWellFormedString(value);
+
+export const requireMobileSessionId = (value: unknown): string => {
+  const sessionId = readMobileSessionId(value);
+  if (sessionId === undefined) throw new Error("Session id is required.");
+  return sessionId;
+};
+
+export const createSessionRecord = <T>(): Record<string, T> =>
+  Object.create(null) as Record<string, T>;
+
+export const cloneSessionRecord = <T>(
+  source: Readonly<Record<string, T>>,
+): Record<string, T> => Object.assign(createSessionRecord<T>(), source);
+
+export const normalizeMobileSessionSummaries = (
+  value: unknown,
+): GatewaySessionSummary[] | undefined => {
+  if (!Array.isArray(value)) return undefined;
+  const seen = new Set<string>();
+  const summaries: GatewaySessionSummary[] = [];
+  for (const candidate of value) {
+    if (!candidate || typeof candidate !== "object") return undefined;
+    const sessionId = readMobileSessionId(
+      (candidate as { id?: unknown }).id,
+    );
+    if (sessionId === undefined) return undefined;
+    if (seen.has(sessionId)) continue;
+    seen.add(sessionId);
+    summaries.push({ ...(candidate as GatewaySessionSummary), id: sessionId });
+  }
+  return summaries;
+};
+
+export const readMatchingMobileSessionSnapshot = (
+  value: unknown,
+  expectedSessionId: unknown,
+): GatewaySessionSnapshot | undefined => {
+  const expected = readMobileSessionId(expectedSessionId);
+  if (!expected || !value || typeof value !== "object") return undefined;
+  const actual = readMobileSessionId((value as { id?: unknown }).id);
+  if (actual !== expected) return undefined;
+  return { ...(value as GatewaySessionSnapshot), id: actual };
+};
 
 const isCommandOutputLifecycleUpdate = (update: UIUpdateAction): boolean =>
   update.type === "UPDATE_MESSAGE" &&
@@ -59,6 +114,7 @@ export class UiUpdateBootstrapBuffer {
     update: UIUpdateAction,
     apply: (pendingUpdate: UIUpdateAction) => void,
   ): void {
+    if (readMobileSessionId(update?.sessionId) === undefined) return;
     if (this.buffering) {
       this.pending.push({ sequence: this.nextSequence, update });
       this.nextSequence += 1;
@@ -72,13 +128,14 @@ export class UiUpdateBootstrapBuffer {
       typeof uiRevision === "number" && Number.isFinite(uiRevision)
         ? uiRevision
         : null;
-    const normalizedSessionId = String(sessionId || "").trim();
+    const hasSessionSelector = sessionId !== undefined;
+    const exactSessionId = hasSessionSelector
+      ? readMobileSessionId(sessionId)
+      : undefined;
+    if (hasSessionSelector && exactSessionId === undefined) return;
     const retained: typeof this.pending = [];
     this.pending.forEach((entry) => {
-      if (
-        normalizedSessionId &&
-        entry.update.sessionId !== normalizedSessionId
-      ) {
+      if (exactSessionId !== undefined && entry.update.sessionId !== exactSessionId) {
         retained.push(entry);
         return;
       }
@@ -117,8 +174,9 @@ export function createSessionState(
   id: string,
   title = "New Chat",
 ): SessionState {
+  const exactSessionId = requireMobileSessionId(id);
   return {
-    id,
+    id: exactSessionId,
     title,
     messages: [],
     isThinking: false,
@@ -469,39 +527,28 @@ export function autoTitle(content: string): string {
 }
 
 export function normalizeDisplayText(input: string): string {
-  return String(input || "")
-    .replace(/\u001b\[[0-9;]*m/g, "")
-    .replace(
-      /\[MENTION_TAB:#([^#\]\r\n]+)(?:##[^#\]\r\n]*)?(?:#\])?/g,
-      (_m, name: string) => `@${name}`,
-    )
-    .replace(
-      /\[MENTION_SKILL:#([^#\]\r\n]+)(?:#\])?/g,
-      (_m, name: string) => `@${name}`,
-    )
-    .replace(
-      /\[MENTION_FILE:#([^#\]\r\n]+)(?:##[^#\]\r\n]*)?(?:#\])?/g,
-      (_m, path: string) => path.split(/[/\\]/).pop() || path,
-    )
-    .replace(
-      /\[MENTION_IMAGE:#([^#\]\r\n]+)(?:##([^#\]\r\n]+))?(?:#\])?/g,
-      (_m, path: string, name: string) =>
-        String(name || "").trim() || path.split(/[/\\]/).pop() || path,
-    )
-    .replace(
-      /\[MENTION_PASS_CHAT:#([^#\]\r\n]+)(?:##([^#\]\r\n]+))?(?:#\])?/g,
-      (_m, _sessionId: string, title: string) =>
-        `@Pass Chat: ${decodeMentionComponent(title || "Chat")}`,
-    )
-    .replace(/\s+$/g, "");
-}
-
-function decodeMentionComponent(value: string): string {
-  try {
-    return decodeURIComponent(value);
-  } catch {
-    return value;
-  }
+  return transformPassChatMentionText(String(input || ""), (value) =>
+    value
+      .replace(/\u001b\[[0-9;]*m/g, "")
+      .replace(
+        /\[MENTION_TAB:#([^#\]\r\n]+)(?:##[^#\]\r\n]*)?(?:#\])?/g,
+        (_m, name: string) => `@${name}`,
+      )
+      .replace(
+        /\[MENTION_SKILL:#([^#\]\r\n]+)(?:#\])?/g,
+        (_m, name: string) => `@${name}`,
+      )
+      .replace(
+        /\[MENTION_FILE:#([^#\]\r\n]+)(?:##[^#\]\r\n]*)?(?:#\])?/g,
+        (_m, path: string) => path.split(/[/\\]/).pop() || path,
+      )
+      .replace(
+        /\[MENTION_IMAGE:#([^#\]\r\n]+)(?:##([^#\]\r\n]+))?(?:#\])?/g,
+        (_m, path: string, name: string) =>
+          String(name || "").trim() || path.split(/[/\\]/).pop() || path,
+      )
+      .replace(/\s+$/g, ""),
+  );
 }
 
 export function trimOuterBlankLines(input: string): string {

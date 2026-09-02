@@ -115,8 +115,8 @@ runCase('blank tool names are repaired without changing ids or dropping calls', 
 runCase('cross-machine safety is revalidated after terminal rebinding', () => {
   const planned = planToolCallBatch(
     [
-      call('a', 'exec_command', { tabIdOrName: 'one', command: 'one' }),
-      call('b', 'exec_command', { tabIdOrName: 'two', command: 'two' })
+      call('a', 'exec_command', { terminalId: 'one', command: 'one' }),
+      call('b', 'exec_command', { terminalId: 'two', command: 'two' })
     ],
     createEnvironment({
       machineByReference: { one: 'machine-a', two: 'machine-b' }
@@ -166,8 +166,8 @@ runCase('same-terminal commands stay ordered and sequential', () => {
   })
   const planned = planToolCallBatch(
     [
-      call('a', 'exec_command', { tabIdOrName: 'shell', command: 'one' }),
-      call('b', 'exec_command', { tabIdOrName: 'shell', command: 'two' })
+      call('a', 'exec_command', { terminalId: 'shell', command: 'one' }),
+      call('b', 'exec_command', { terminalId: 'shell', command: 'two' })
     ],
     environment
   )
@@ -183,8 +183,8 @@ runCase('same-terminal commands stay ordered and sequential', () => {
 runCase('commands on distinct machines can execute in the same parallel wave', () => {
   const planned = planToolCallBatch(
     [
-      call('a', 'exec_command', { tabIdOrName: 'local', command: 'one' }),
-      call('b', 'exec_command', { tabIdOrName: 'remote', command: 'two' })
+      call('a', 'exec_command', { terminalId: 'local', command: 'one' }),
+      call('b', 'exec_command', { terminalId: 'remote', command: 'two' })
     ],
     createEnvironment({
       terminalByReference: { local: 'terminal-1', remote: 'terminal-2' },
@@ -240,9 +240,9 @@ runCase('a later terminal lifecycle call preserves ordinal zero and every call i
 runCase('a leading close terminal call defers its entire preserved tail', () => {
   const planned = planToolCallBatch(
     [
-      call('close-tab', 'close_terminal_tab', { tabIdOrName: 'shell' }),
-      call('exec', 'exec_command', { tabIdOrName: 'shell', command: 'after' }),
-      call('read', 'read_terminal_tab', { tabIdOrName: 'shell' })
+      call('close-tab', 'close_terminal_tab', { terminalId: 'shell' }),
+      call('exec', 'exec_command', { terminalId: 'shell', command: 'after' }),
+      call('read', 'read_terminal_tab', { terminalId: 'shell' })
     ],
     createEnvironment({ terminalByReference: { shell: 'terminal-1' } })
   )
@@ -279,12 +279,12 @@ runCase(
     const planned = planToolCallBatch(
       [
         call('exec', 'exec_command', {
-          tabIdOrName: 'shell',
+          terminalId: 'shell',
           command: 'interactive',
           waitMode: 'wait'
         }),
         call('stdin', 'write_stdin', {
-          tabIdOrName: 'shell',
+          terminalId: 'shell',
           sequence: ['yes', 'LF']
         })
       ],
@@ -311,13 +311,13 @@ runCase(
     const planned = planToolCallBatch(
       [
         call('exec', 'exec_command', {
-          tabIdOrName: 'shell',
+          terminalId: 'shell',
           command: 'server',
           waitMode: 'nowait'
         }),
-        call('read', 'read_terminal_tab', { tabIdOrName: 'shell' }),
+        call('read', 'read_terminal_tab', { terminalId: 'shell' }),
         call('stdin', 'write_stdin', {
-          tabIdOrName: 'shell',
+          terminalId: 'shell',
           sequence: ['LF']
         })
       ],
@@ -342,13 +342,13 @@ runCase('terminal boundaries cover file writes and propagate after a rejected mu
   const planned = planToolCallBatch(
     [
       call('exec', 'exec_command', {
-        tabIdOrName: 'shell',
+        terminalId: 'shell',
         command: 'interactive',
         waitMode: 'wait'
       }),
-      call('stdin', 'write_stdin', { tabIdOrName: 'shell', sequence: ['yes', 'LF'] }),
-      call('edit', 'edit_file', { tabIdOrName: 'shell', filePath: '/tmp/a' }),
-      call('later-exec', 'exec_command', { tabIdOrName: 'shell', command: 'after' })
+      call('stdin', 'write_stdin', { terminalId: 'shell', sequence: ['yes', 'LF'] }),
+      call('edit', 'edit_file', { terminalId: 'shell', filePath: '/tmp/a' }),
+      call('later-exec', 'exec_command', { terminalId: 'shell', command: 'after' })
     ],
     environment
   )
@@ -366,11 +366,11 @@ runCase('background file transfer blocks mutations on both source and target ter
   const planned = planToolCallBatch(
     [
       call('copy', 'copy_between_tabs', {
-        sourceTabIdOrName: 'source',
-        targetTabIdOrName: 'target'
+        sourceTerminalId: 'source',
+        targetTerminalId: 'target'
       }),
-      call('source-edit', 'edit_file', { tabIdOrName: 'source' }),
-      call('target-edit', 'write_file', { tabIdOrName: 'target' })
+      call('source-edit', 'edit_file', { terminalId: 'source' }),
+      call('target-edit', 'write_file', { terminalId: 'target' })
     ],
     environment
   )
@@ -387,11 +387,11 @@ runCase('background transfer defers target file reads but permits source and sta
   const planned = planToolCallBatch(
     [
       call('copy', 'copy_between_tabs', {
-        sourceTabIdOrName: 'source',
-        targetTabIdOrName: 'target'
+        sourceTerminalId: 'source',
+        targetTerminalId: 'target'
       }),
-      call('source-read', 'read_file', { tabIdOrName: 'source', filePath: '/tmp/a' }),
-      call('target-read', 'read_file', { tabIdOrName: 'target', filePath: '/tmp/a' }),
+      call('source-read', 'read_file', { terminalId: 'source', filePath: '/tmp/a' }),
+      call('target-read', 'read_file', { terminalId: 'target', filePath: '/tmp/a' }),
       call('status', 'read_file_transfer_status', { transferId: 'copy' })
     ],
     environment
@@ -402,7 +402,7 @@ runCase('background transfer defers target file reads but permits source and sta
   )
 })
 
-runCase('terminal-scoped file paths override mismatched tab args for barriers', () => {
+runCase('planner uses only canonical terminal IDs and ignores scoped-path transport metadata', () => {
   const environment = createEnvironment({
     terminalByReference: {
       A: 'terminal-a',
@@ -414,26 +414,26 @@ runCase('terminal-scoped file paths override mismatched tab args for barriers', 
   const planned = planToolCallBatch(
     [
       call('run', 'exec_command', {
-        tabIdOrName: 'A',
+        terminalId: 'A',
         command: 'server',
         waitMode: 'nowait',
         filePath: '@terminal(B):/irrelevant-extra-arg'
       }),
       call('edit', 'edit_file', {
-        tabIdOrName: 'B',
+        terminalId: 'B',
         filePath: '@terminal(A):/tmp/out'
       }),
       call('encoded', 'read_file', {
-        tabIdOrName: 'B',
+        terminalId: 'B',
         filePath: '@terminal(encoded%20terminal):/tmp/out'
       })
     ],
     environment
   )
-  assert.equal(planned[1]._gyshellExecution.mode, 'not_executed')
-  assert.equal(
-    resolveToolCallTerminalIds(planned[2], environment)[0],
-    'terminal-encoded'
+  assert.equal(planned[1]._gyshellExecution.mode, 'execute')
+  assert.deepEqual(
+    planned.map((call) => resolveToolCallTerminalIds(call, environment)),
+    [['terminal-a'], ['terminal-b'], ['terminal-b']]
   )
 })
 
@@ -441,9 +441,9 @@ runCase('a wait command that becomes background defers every later same-terminal
   const environment = createEnvironment({ terminalByReference: { shell: 'terminal-1' } })
   const planned = planToolCallBatch(
     [
-      call('exec', 'exec_command', { tabIdOrName: 'shell', command: 'server' }),
-      call('edit', 'edit_file', { tabIdOrName: 'shell' }),
-      call('later-exec', 'exec_command', { tabIdOrName: 'shell', command: 'after' })
+      call('exec', 'exec_command', { terminalId: 'shell', command: 'server' }),
+      call('edit', 'edit_file', { terminalId: 'shell' }),
+      call('later-exec', 'exec_command', { terminalId: 'shell', command: 'after' })
     ],
     environment
   )

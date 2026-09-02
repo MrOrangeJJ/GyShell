@@ -14,10 +14,17 @@ import {
   Show,
 } from "solid-js";
 import { createStore, produce } from "solid-js/store";
+import { transformPassChatMentionText } from "@gyshell/shared";
 import {
   shouldReplayUiUpdateAfterSnapshot,
   type GatewayClient,
 } from "./gateway-client";
+import {
+  createTuiSessionRecord,
+  readMatchingTuiSessionSnapshot,
+  readTuiSessionId,
+  requireTuiSessionId,
+} from "./session-identity";
 import type {
   ChatMessage,
   GatewayProfileSummary,
@@ -450,11 +457,12 @@ function TuiApp(props: {
   });
 
   const applyLiveUpdate = (update: UIUpdateAction): void => {
+    const sessionId = readTuiSessionId(update?.sessionId);
+    if (sessionId === undefined) return;
     setState(
       produce((draft) => {
-        const current = draft.sessions[update.sessionId];
-        const installedRevision =
-          draft.sessionMeta[update.sessionId]?.uiRevision;
+        const current = draft.sessions[sessionId];
+        const installedRevision = draft.sessionMeta[sessionId]?.uiRevision;
         if (
           typeof update.uiRevision === "number" &&
           Number.isFinite(update.uiRevision) &&
@@ -465,7 +473,7 @@ function TuiApp(props: {
           return;
         }
         if (update.type === "SESSION_RENAMED") {
-          const meta = draft.sessionMeta[update.sessionId];
+          const meta = draft.sessionMeta[sessionId];
           if (
             applyRenameToUnloadedSession(
               current,
@@ -493,32 +501,32 @@ function TuiApp(props: {
           }
           if (!meta) {
             const created = createUnloadedRenamedSession(
-              update.sessionId,
+              sessionId,
               update.title,
               Date.now(),
               current,
             );
-            draft.sessions[update.sessionId] = created.session;
-            draft.sessionMeta[update.sessionId] = {
+            draft.sessions[sessionId] = created.session;
+            draft.sessionMeta[sessionId] = {
               ...created.meta,
               uiRevision: update.uiRevision,
             };
-            if (!draft.sessionOrder.includes(update.sessionId)) {
-              draft.sessionOrder.unshift(update.sessionId);
+            if (!draft.sessionOrder.includes(sessionId)) {
+              draft.sessionOrder.unshift(sessionId);
             }
             return;
           }
         }
         if (!current) {
-          draft.sessions[update.sessionId] = createSessionState(
-            update.sessionId,
+          draft.sessions[sessionId] = createSessionState(
+            sessionId,
             "New Chat",
           );
-          if (!draft.sessionOrder.includes(update.sessionId)) {
-            draft.sessionOrder.unshift(update.sessionId);
+          if (!draft.sessionOrder.includes(sessionId)) {
+            draft.sessionOrder.unshift(sessionId);
           }
-          draft.sessionMeta[update.sessionId] = {
-            id: update.sessionId,
+          draft.sessionMeta[sessionId] = {
+            id: sessionId,
             title: "New Chat",
             updatedAt: Date.now(),
             messagesCount: 0,
@@ -527,9 +535,9 @@ function TuiApp(props: {
           };
         }
 
-        const session = draft.sessions[update.sessionId];
+        const session = draft.sessions[sessionId];
         if (!session) return;
-        const meta = draft.sessionMeta[update.sessionId];
+        const meta = draft.sessionMeta[sessionId];
         if (meta && !meta.loaded) {
           applyUiUpdateToUnloadedSession(session, meta, update, Date.now());
           const nextOrder = reorderSessionIdsByUpdatedAt(
@@ -574,7 +582,9 @@ function TuiApp(props: {
   };
 
   const unsubscribeUi = props.client.on("uiUpdate", (update) => {
-    const loadBuffer = sessionLoadUpdateBuffers.get(update.sessionId);
+    const sessionId = readTuiSessionId(update?.sessionId);
+    if (sessionId === undefined) return;
+    const loadBuffer = sessionLoadUpdateBuffers.get(sessionId);
     if (loadBuffer) {
       loadBuffer.push(update);
       return;
@@ -1190,7 +1200,7 @@ function TuiApp(props: {
         "gateway:createSession",
         {},
       );
-      const sessionId = result.sessionId;
+      const sessionId = requireTuiSessionId(result?.sessionId);
 
       setState(
         produce((draft) => {
@@ -1221,6 +1231,7 @@ function TuiApp(props: {
   }
 
   async function switchSession(sessionId: string): Promise<void> {
+    sessionId = requireTuiSessionId(sessionId);
     await ensureSessionLoaded(sessionId);
     setState("activeSessionId", sessionId);
     setState(
@@ -1231,6 +1242,7 @@ function TuiApp(props: {
   }
 
   async function ensureSessionLoaded(sessionId: string): Promise<void> {
+    sessionId = requireTuiSessionId(sessionId);
     const inFlight = sessionLoadPromises.get(sessionId);
     if (inFlight) {
       await inFlight;
@@ -1248,7 +1260,13 @@ function TuiApp(props: {
         const payload = await props.client.request<{
           session: GatewaySessionSnapshot;
         }>("session:get", { sessionId });
-        const snapshot = payload.session;
+        const snapshot = readMatchingTuiSessionSnapshot(
+          payload?.session,
+          sessionId,
+        );
+        if (!snapshot) {
+          throw new Error("Gateway returned a mismatched session snapshot.");
+        }
         snapshotRevision = snapshot.uiRevision;
         setState(
           produce((draft) => {
@@ -1323,6 +1341,7 @@ function TuiApp(props: {
   }
 
   async function stopSession(sessionId: string): Promise<void> {
+    sessionId = requireTuiSessionId(sessionId);
     try {
       await props.client.request("agent:stopTask", { sessionId });
       setState("statusLine", "Stop signal sent");
@@ -1736,12 +1755,15 @@ function buildBootState(
   sessionMeta: Record<string, SessionMeta>;
   sessionOrder: string[];
 } {
-  const sessions: Record<string, SessionState> = {
-    [data.initialSessionId]: initialSession,
-  };
+  const initialSessionId = requireTuiSessionId(data.initialSessionId);
+  if (initialSession.id !== initialSessionId) {
+    throw new Error("Initial TUI session id does not match bootstrap identity.");
+  }
+  const sessions = createTuiSessionRecord<SessionState>();
+  sessions[initialSessionId] = initialSession;
 
-  const sessionMeta: Record<string, SessionMeta> = {};
-  sessionMeta[data.initialSessionId] = {
+  const sessionMeta = createTuiSessionRecord<SessionMeta>();
+  sessionMeta[initialSessionId] = {
     id: data.initialSessionId,
     title: initialSession.title,
     updatedAt: Date.now(),
@@ -1752,31 +1774,32 @@ function buildBootState(
   };
 
   for (const summary of data.recoveredSessions) {
-    const existing = sessionMeta[summary.id];
-    sessionMeta[summary.id] = {
-      id: summary.id,
+    const sessionId = requireTuiSessionId(summary?.id);
+    const existing = sessionMeta[sessionId];
+    sessionMeta[sessionId] = {
+      id: sessionId,
       title: summary.title || existing?.title || "Recovered Session",
       updatedAt: summary.updatedAt || existing?.updatedAt || Date.now(),
       messagesCount: summary.messagesCount || existing?.messagesCount || 0,
       lastMessagePreview:
         getTuiHumanDisplayText(summary.lastMessagePreview || "") ||
         existing?.lastMessagePreview,
-      loaded: summary.id === data.initialSessionId,
+      loaded: sessionId === initialSessionId,
       uiRevision:
-        summary.id === data.initialSessionId
+        sessionId === initialSessionId
           ? data.initialSessionUiRevision ?? summary.uiRevision
           : summary.uiRevision,
     };
 
-    if (summary.id !== data.initialSessionId) {
+    if (sessionId !== initialSessionId) {
       const nextSession = createSessionState(
-        summary.id,
+        sessionId,
         summary.title || "Recovered Session",
       );
       nextSession.isBusy = summary.isBusy === true;
       nextSession.isThinking = summary.isBusy === true;
       nextSession.lockedProfileId = summary.lockedProfileId || null;
-      sessions[summary.id] = nextSession;
+      sessions[sessionId] = nextSession;
     }
   }
 
@@ -1784,8 +1807,8 @@ function buildBootState(
     .sort((a, b) => b.updatedAt - a.updatedAt)
     .map((item) => item.id);
 
-  if (!sessionOrder.includes(data.initialSessionId)) {
-    sessionOrder.unshift(data.initialSessionId);
+  if (!sessionOrder.includes(initialSessionId)) {
+    sessionOrder.unshift(initialSessionId);
   }
 
   return {
@@ -2333,35 +2356,24 @@ function messagePrimaryText(message: ChatMessage): string {
 }
 
 function normalizeOutputText(input: string): string {
-  return String(input || "")
-    .replace(/\u001b\[[0-9;]*m/g, "")
-    .replace(
-      /\[MENTION_TAB:#([^#\]\r\n]+)(?:##[^#\]\r\n]*)?(?:#\])?/g,
-      (_m, name: string) => `@${name}`,
-    )
-    .replace(
-      /\[MENTION_SKILL:#([^#\]\r\n]+)(?:#\])?/g,
-      (_m, name: string) => `@${name}`,
-    )
-    .replace(
-      /\[MENTION_FILE:#([^#\]\r\n]+)(?:##[^#\]\r\n]*)?(?:#\])?/g,
-      (_m, path: string) => path.split(/[/\\]/).pop() || path,
-    )
-    .replace(
-      /\[MENTION_PASS_CHAT:#([^#\]\r\n]+)(?:##([^#\]\r\n]+))?(?:#\])?/g,
-      (_m, _sessionId: string, title: string) =>
-        `@Pass Chat: ${decodeMentionComponent(title || "Chat")}`,
-    )
-    .replace(/\r/g, "")
-    .trim();
-}
-
-function decodeMentionComponent(value: string): string {
-  try {
-    return decodeURIComponent(value);
-  } catch {
-    return value;
-  }
+  return transformPassChatMentionText(String(input || ""), (value) =>
+    value
+      .replace(/\u001b\[[0-9;]*m/g, "")
+      .replace(
+        /\[MENTION_TAB:#([^#\]\r\n]+)(?:##[^#\]\r\n]*)?(?:#\])?/g,
+        (_m, name: string) => `@${name}`,
+      )
+      .replace(
+        /\[MENTION_SKILL:#([^#\]\r\n]+)(?:#\])?/g,
+        (_m, name: string) => `@${name}`,
+      )
+      .replace(
+        /\[MENTION_FILE:#([^#\]\r\n]+)(?:##[^#\]\r\n]*)?(?:#\])?/g,
+        (_m, path: string) => path.split(/[/\\]/).pop() || path,
+      )
+      .replace(/\r/g, "")
+      .trim(),
+  );
 }
 
 function markdownToLines(text: string, limit?: number): string[] {

@@ -15,6 +15,11 @@ import {
   getTuiDisplayOutput,
 } from './state'
 import type { GatewayClient } from './gateway-client'
+import {
+  normalizeTuiSessionSummaries,
+  readMatchingTuiSessionSnapshot,
+  requireTuiSessionId,
+} from './session-identity'
 
 export async function startTuiCli(argv: string[] = process.argv.slice(2)): Promise<void> {
   const options = parseCliOptions(argv)
@@ -38,14 +43,20 @@ export async function startTuiCli(argv: string[] = process.argv.slice(2)): Promi
 
     if (options.mode === 'run') {
       const target = await resolveTaskTarget(client, options.sessionId)
-      client.discardBufferedUiUpdatesCoveredBySnapshot(target.uiRevision)
+      client.discardBufferedUiUpdatesCoveredBySnapshot(
+        target.uiRevision,
+        target.sessionId,
+      )
       await runHeadlessMode(client, target.sessionId, options.message || '')
       return
     }
 
     if (options.mode === 'hook') {
       const target = await resolveTaskTarget(client, options.sessionId)
-      client.discardBufferedUiUpdatesCoveredBySnapshot(target.uiRevision)
+      client.discardBufferedUiUpdatesCoveredBySnapshot(
+        target.uiRevision,
+        target.sessionId,
+      )
       await runHookMode(client, target.sessionId, options.message || '')
       return
     }
@@ -128,17 +139,20 @@ async function safeRequestProfiles(client: { request: <T>(method: string, params
 async function safeRequestSessionSummaries(
   client: { request: <T>(method: string, params?: Record<string, unknown>) => Promise<T> },
 ): Promise<{ sessions: GatewaySessionSummary[]; uiRevision?: number }> {
+  let payload: { sessions: GatewaySessionSummary[]; uiRevision?: number }
   try {
-    const payload = await client.request<{
+    payload = await client.request<{
       sessions: GatewaySessionSummary[]
       uiRevision?: number
     }>('session:list', {})
-    return {
-      sessions: payload.sessions ?? [],
-      uiRevision: payload.uiRevision,
-    }
   } catch {
     return { sessions: [] }
+  }
+  const sessions = normalizeTuiSessionSummaries(payload?.sessions)
+  if (!sessions) throw new Error('Gateway returned invalid session metadata.')
+  return {
+    sessions,
+    uiRevision: payload.uiRevision,
   }
 }
 
@@ -177,7 +191,8 @@ async function resolveInitialSession(
   sessions: GatewaySessionSummary[],
   preferredSessionId?: string,
 ): Promise<{ id: string; title: string; messages: ChatMessage[]; isBusy: boolean; lockedProfileId: string | null; uiRevision?: number }> {
-  if (preferredSessionId) {
+  if (preferredSessionId !== undefined) {
+    preferredSessionId = requireTuiSessionId(preferredSessionId)
     const matched = await tryLoadSessionSnapshot(client, preferredSessionId)
     if (matched) return matched
   }
@@ -214,28 +229,32 @@ async function tryLoadSessionSnapshot(
   sessionId: string,
   fallbackTitle?: string,
 ): Promise<{ id: string; title: string; messages: ChatMessage[]; isBusy: boolean; lockedProfileId: string | null; uiRevision?: number } | null> {
+  sessionId = requireTuiSessionId(sessionId)
+  let payload: { session: GatewaySessionSnapshot }
   try {
-    const payload = await client.request<{ session: GatewaySessionSnapshot }>('session:get', {
+    payload = await client.request<{ session: GatewaySessionSnapshot }>('session:get', {
       sessionId,
     })
-    const restored = payload.session
-    return {
-      id: restored.id,
-      title: restored.title || fallbackTitle || 'Recovered Session',
-      messages: restored.messages ?? [],
-      isBusy: restored.isBusy === true,
-      lockedProfileId: restored.lockedProfileId || null,
-      uiRevision: restored.uiRevision,
-    }
   } catch {
     return null
+  }
+  const restored = readMatchingTuiSessionSnapshot(payload?.session, sessionId)
+  if (!restored) throw new Error('Gateway returned a mismatched session snapshot.')
+  return {
+    id: restored.id,
+    title: restored.title || fallbackTitle || 'Recovered Session',
+    messages: restored.messages ?? [],
+    isBusy: restored.isBusy === true,
+    lockedProfileId: restored.lockedProfileId || null,
+    uiRevision: restored.uiRevision,
   }
 }
 
 async function createNewSession(
   client: { request: <T>(method: string, params?: Record<string, unknown>) => Promise<T> },
 ): Promise<{ sessionId: string }> {
-  return await client.request<{ sessionId: string }>('gateway:createSession', {})
+  const result = await client.request<{ sessionId: string }>('gateway:createSession', {})
+  return { sessionId: requireTuiSessionId(result?.sessionId) }
 }
 
 async function createInitialPromptSession(
@@ -256,7 +275,8 @@ async function resolveTaskTarget(
   client: { request: <T>(method: string, params?: Record<string, unknown>) => Promise<T> },
   preferredSessionId?: string,
 ): Promise<{ sessionId: string; uiRevision?: number }> {
-  if (preferredSessionId) {
+  if (preferredSessionId !== undefined) {
+    preferredSessionId = requireTuiSessionId(preferredSessionId)
     const matched = await tryLoadSessionSnapshot(client, preferredSessionId)
     if (!matched) {
       throw new Error(`Session not found: ${preferredSessionId}`)

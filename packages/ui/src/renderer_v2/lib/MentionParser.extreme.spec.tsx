@@ -1,4 +1,5 @@
 import React from "react";
+import { encodePassChatMentionToken } from "@gyshell/shared";
 import { renderMentionContent, renderMentionText } from "./MentionParser";
 import { truncateMentionDisplayText } from "./mentionDisplay";
 import { normalizeSessionTitleText } from "./sessionTitleDisplay";
@@ -181,6 +182,49 @@ runCase(
       "@Pass Chat: Previous Build Chat",
       "pass-chat mention should decode title text",
     );
+  },
+);
+
+runCase(
+  "canonical pass-chat mentions render with exact opaque identity and chat styling",
+  () => {
+    const sessionId = "  Session#opaque::🙂  ";
+    const title = "Canonical Plan";
+    const token = encodePassChatMentionToken(sessionId, title);
+    assertCondition(!!token, "canonical token should be produced");
+    const nodes = renderMentionContent(`before ${token} after`);
+    const elements = nodes.filter(React.isValidElement);
+    assertEqual(elements.length, 1, "canonical token should render one badge");
+    assertEqual(
+      elementAt(elements, 0).props.className,
+      "mention-badge pass-chat",
+      "canonical token should use pass-chat styling",
+    );
+    assertEqual(
+      elementAt(elements, 0).props.title,
+      `@Pass Chat: ${title}`,
+      "canonical title should remain visible",
+    );
+    assertEqual(
+      renderMentionText(token!),
+      `@Pass Chat: ${title}`,
+      "canonical token should normalize to display text",
+    );
+  },
+);
+
+runCase(
+  "malformed canonical pass-chat mentions remain literal in desktop rendering",
+  () => {
+    const malformed = "[MENTION_PASS_CHAT_V2:#broken#]";
+    assertEqual(
+      renderMentionText(`before ${malformed} after`),
+      `before ${malformed} after`,
+      "malformed canonical token must not be cosmetically repaired",
+    );
+    const nodes = renderMentionContent(malformed);
+    assertEqual(nodes.length, 1, "malformed token should remain one text node");
+    assertEqual(nodes[0], malformed, "malformed token should remain literal");
   },
 );
 

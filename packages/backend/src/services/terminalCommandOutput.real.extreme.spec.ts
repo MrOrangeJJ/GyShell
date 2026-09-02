@@ -842,7 +842,7 @@ const runShellMatrix = async (shell: string): Promise<void> => {
     assert(detachedCursor, `${shellName} detached history omitted its page cursor`)
     const detachedPage = await readCommandOutput(
       {
-        tabIdOrName: terminalId,
+        terminalId: terminalId,
         history_command_match_id: detachedTaskId,
         cursor: detachedCursor,
         maxBytes: 4096,

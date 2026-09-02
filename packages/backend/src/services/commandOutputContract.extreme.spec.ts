@@ -831,7 +831,7 @@ runCase('human display strips the model envelope without losing terminal text', 
 runCase('schemas reject ambiguous command and paging inputs before dispatch', () => {
   assert(
     !execCommandSchema.safeParse({
-      tabIdOrName: 'local',
+      terminalId: 'local',
       command: 'echo one\necho two',
       waitMode: 'wait',
     }).success,
@@ -839,7 +839,7 @@ runCase('schemas reject ambiguous command and paging inputs before dispatch', ()
   )
   assert(
     execCommandSchema.safeParse({
-      tabIdOrName: 'local',
+      terminalId: 'local',
       command: "printf 'one\\ntwo'",
       waitMode: 'wait',
     }).success,
@@ -847,7 +847,7 @@ runCase('schemas reject ambiguous command and paging inputs before dispatch', ()
   )
   assert(
     !readCommandOutputSchema.safeParse({
-      tabIdOrName: 'local',
+      terminalId: 'local',
       history_command_match_id: 'task',
       offset: 0.5,
     }).success,
@@ -855,7 +855,7 @@ runCase('schemas reject ambiguous command and paging inputs before dispatch', ()
   )
   assert(
     !readCommandOutputSchema.safeParse({
-      tabIdOrName: 'local',
+      terminalId: 'local',
       history_command_match_id: 'task',
       offset: 0,
       cursor: 'opaque',
@@ -864,7 +864,7 @@ runCase('schemas reject ambiguous command and paging inputs before dispatch', ()
   )
   assert(
     !readCommandOutputSchema.safeParse({
-      tabIdOrName: 'local',
+      terminalId: 'local',
       history_command_match_id: 'task',
       maxBytes: 1,
     }).success,

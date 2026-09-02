@@ -745,7 +745,7 @@ const run = async (): Promise<void> => {
     while (cursor) {
       const pageText = await readCommandOutput(
         {
-          tabIdOrName: config.id,
+          terminalId: config.id,
           history_command_match_id: large.result.history_command_match_id,
           cursor,
           maxBytes: 4096,

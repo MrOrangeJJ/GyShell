@@ -1,23 +1,19 @@
 import React from "react";
+import { parsePassChatMentionToken } from "@gyshell/shared";
 
 const MENTION_TOKEN_REGEX =
-  /(\[MENTION_(?:SKILL|TAB|FILE|IMAGE|PASS_CHAT):#.+?#(?:#.+?#)?\])/g;
+  /(\[MENTION_(?:(?:SKILL|TAB|FILE|IMAGE|PASS_CHAT):#.+?#(?:#.+?#)?|PASS_CHAT_V2:#[^#\r\n]+#)\])/g;
 
 function fileNameFromPath(path: string): string {
   return path.split(/[/\\]/).pop() || path;
 }
 
-function decodeMentionComponent(value: string): string {
-  try {
-    return decodeURIComponent(value);
-  } catch {
-    return value;
-  }
-}
-
 function tokenToText(
   token: string,
-): { text: string; kind: "terminal" | "skill" | "file" } | null {
+): {
+  text: string;
+  kind: "terminal" | "skill" | "file" | "pass-chat";
+} | null {
   const skillMatch = token.match(/^\[MENTION_SKILL:#(.+?)#\]$/);
   if (skillMatch) {
     return { text: `@${skillMatch[1]}`, kind: "skill" };
@@ -41,14 +37,12 @@ function tokenToText(
     };
   }
 
-  const passChatMatch = token.match(
-    /^\[MENTION_PASS_CHAT:#(.+?)(?:##(.+?))?#\]$/,
-  );
-  if (passChatMatch) {
-    const title = passChatMatch[2]
-      ? decodeMentionComponent(passChatMatch[2])
-      : "Chat";
-    return { text: `@Pass Chat: ${title}`, kind: "terminal" };
+  const passChat = parsePassChatMentionToken(token);
+  if (passChat) {
+    return {
+      text: `@Pass Chat: ${passChat.title || "Chat"}`,
+      kind: "pass-chat",
+    };
   }
 
   return null;

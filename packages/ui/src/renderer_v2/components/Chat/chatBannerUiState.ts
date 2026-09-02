@@ -1,3 +1,9 @@
+import {
+  decodeOpaqueStringPair,
+  encodeOpaqueStringPair,
+  readOpaqueNonBlankWellFormedString,
+} from '@gyshell/shared'
+
 export interface ChatBannerUiState {
   expanded?: boolean
   expandedStepIds?: string[]
@@ -22,12 +28,23 @@ export const getChatBannerUiStateKey = (
   sessionId: string | null,
   messageId: string,
 ): string | null => {
-  const normalizedSessionId = String(sessionId || '').trim()
-  const normalizedMessageId = String(messageId || '').trim()
-  if (!normalizedSessionId || !normalizedMessageId) {
+  const exactSessionId = readOpaqueNonBlankWellFormedString(sessionId)
+  const exactMessageId = readOpaqueNonBlankWellFormedString(messageId)
+  if (exactSessionId === undefined || exactMessageId === undefined) {
     return null
   }
-  return `${normalizedSessionId}::${normalizedMessageId}`
+  return encodeOpaqueStringPair(exactSessionId, exactMessageId) || null
+}
+
+export const parseChatBannerUiStateKey = (
+  key: unknown,
+): { sessionId: string; messageId: string } | null => {
+  const pair = decodeOpaqueStringPair(key)
+  if (!pair) return null
+  const sessionId = readOpaqueNonBlankWellFormedString(pair[0])
+  const messageId = readOpaqueNonBlankWellFormedString(pair[1])
+  if (sessionId === undefined || messageId === undefined) return null
+  return { sessionId, messageId }
 }
 
 export const mergeChatBannerUiState = (
@@ -69,23 +86,24 @@ export const pruneChatBannerUiStateForSession = (
   sessionId: string | null,
   validMessageIds: readonly string[],
 ): ChatBannerUiStateMap => {
-  const normalizedSessionId = String(sessionId || '').trim()
-  if (!normalizedSessionId) {
+  const exactSessionId = readOpaqueNonBlankWellFormedString(sessionId)
+  if (exactSessionId === undefined) {
     return state
   }
 
   const validKeys = new Set(
     validMessageIds
       .map((messageId) =>
-        getChatBannerUiStateKey(normalizedSessionId, messageId),
+        getChatBannerUiStateKey(exactSessionId, messageId),
       )
-      .filter((key): key is string => !!key),
+      .filter((key): key is string => key !== null),
   )
 
   let changed = false
   const nextState: ChatBannerUiStateMap = {}
   Object.entries(state).forEach(([key, value]) => {
-    const belongsToSession = key.startsWith(`${normalizedSessionId}::`)
+    const parsedKey = parseChatBannerUiStateKey(key)
+    const belongsToSession = parsedKey?.sessionId === exactSessionId
     if (belongsToSession && !validKeys.has(key)) {
       changed = true
       return

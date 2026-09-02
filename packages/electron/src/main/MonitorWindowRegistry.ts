@@ -1,3 +1,5 @@
+import { isValidTerminalRuntimeId } from '@gyshell/shared'
+
 export interface MonitorOwnerService {
   start: (terminalId: string, ownerId: string, intervalMs?: number) => void
   stop: (terminalId: string, ownerId: string) => void
@@ -16,8 +18,8 @@ interface MonitorWindowState {
   subscribedTerminalIds: Set<string>
 }
 
-const normalizeTerminalId = (terminalId: string): string =>
-  String(terminalId || '').trim()
+const readTerminalId = (terminalId: unknown): string | undefined =>
+  isValidTerminalRuntimeId(terminalId) ? terminalId : undefined
 
 const ownerIdForWindow = (windowId: number): string => `window:${windowId}`
 
@@ -27,7 +29,7 @@ export class MonitorWindowRegistry {
   constructor(private readonly service: MonitorOwnerService) {}
 
   retain(target: MonitorWindowTarget, terminalId: string, intervalMs?: number): void {
-    const normalizedTerminalId = normalizeTerminalId(terminalId)
+    const normalizedTerminalId = readTerminalId(terminalId)
     if (!normalizedTerminalId) {
       return
     }
@@ -40,7 +42,7 @@ export class MonitorWindowRegistry {
   }
 
   release(target: MonitorWindowTarget, terminalId: string): void {
-    const normalizedTerminalId = normalizeTerminalId(terminalId)
+    const normalizedTerminalId = readTerminalId(terminalId)
     if (!normalizedTerminalId) {
       return
     }
@@ -52,7 +54,7 @@ export class MonitorWindowRegistry {
   }
 
   subscribe(target: MonitorWindowTarget, terminalId: string): void {
-    const normalizedTerminalId = normalizeTerminalId(terminalId)
+    const normalizedTerminalId = readTerminalId(terminalId)
     if (!normalizedTerminalId) {
       return
     }
@@ -60,7 +62,7 @@ export class MonitorWindowRegistry {
   }
 
   unsubscribe(target: MonitorWindowTarget, terminalId: string): void {
-    const normalizedTerminalId = normalizeTerminalId(terminalId)
+    const normalizedTerminalId = readTerminalId(terminalId)
     if (!normalizedTerminalId) {
       return
     }
@@ -68,7 +70,9 @@ export class MonitorWindowRegistry {
   }
 
   publish(channel: string, data: unknown): void {
-    const terminalId = normalizeTerminalId((data as { terminalId?: string } | null)?.terminalId || '')
+    const terminalId = readTerminalId(
+      (data as { terminalId?: string } | null)?.terminalId,
+    )
     if (!terminalId) {
       return
     }

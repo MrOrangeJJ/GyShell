@@ -8,6 +8,7 @@
     ".": "./src/index.ts"
   },
   "dependencies": {
+    "@gyshell/shared": "0.1.0",
     "ws": "^8.19.0"
   },
   "scripts": {

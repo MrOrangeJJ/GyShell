@@ -3,14 +3,19 @@ import {
   applyUiUpdate,
   applyUiUpdateToUnloadedSession,
   autoTitle,
+  cloneSessionRecord,
+  createSessionRecord,
   createUnloadedRenamedSession,
   createSessionState,
+  normalizeMobileSessionSummaries,
   normalizeSessionPreview,
   normalizeDisplayText,
   previewFromSession,
+  readMatchingMobileSessionSnapshot,
   UiUpdateBootstrapBuffer,
 } from "./session-store";
 import type { ChatMessage } from "./types";
+import { encodePassChatMentionToken } from "@gyshell/shared";
 
 const assertEqual = <T>(actual: T, expected: T, message: string): void => {
   if (actual !== expected) {
@@ -169,6 +174,27 @@ runCase(
       normalizeDisplayText("[MENTION_PASS_CHAT:#s1##Previous%20Chat#]"),
       "@Pass Chat: Previous Chat",
       "pass-chat mention should normalize",
+    );
+  },
+);
+
+runCase(
+  "mobile canonical pass-chat display preserves opaque identity and rejects malformed tokens",
+  () => {
+    const sessionId = "  Session#opaque::🙂  ";
+    const title = "Canonical Plan";
+    const token = encodePassChatMentionToken(sessionId, title);
+    assertCondition(!!token, "canonical token should be produced");
+    assertEqual(
+      normalizeDisplayText(token!),
+      `@Pass Chat: ${title}`,
+      "canonical token should render its exact title",
+    );
+    const malformed = "[MENTION_PASS_CHAT_V2:#broken#]";
+    assertEqual(
+      normalizeDisplayText(malformed),
+      malformed,
+      "malformed canonical token must remain literal",
     );
   },
 );
@@ -592,5 +618,139 @@ runCase("mobile bootstrap failure replays covered updates in order", () => {
     applied.join(","),
     "ADD_MESSAGE:4,SESSION_RENAMED:5,ADD_MESSAGE:6",
     "failed bootstrap should restore every buffered update in arrival order",
+  );
+});
+
+runCase("mobile bootstrap snapshot selectors preserve exact opaque ids", () => {
+  const buffer = new UiUpdateBootstrapBuffer();
+  const applied: string[] = [];
+  const createRename = (sessionId: unknown) =>
+    ({
+      type: "SESSION_RENAMED",
+      sessionId,
+      title: "rename",
+      uiRevision: 1,
+    }) as Parameters<UiUpdateBootstrapBuffer["handle"]>[0];
+
+  buffer.begin();
+  buffer.handle(createRename(" session "), () => {});
+  buffer.handle(createRename("session"), () => {});
+  buffer.handle(createRename("Session"), () => {});
+  buffer.handle(createRename("\ud800"), () => {});
+  buffer.handle(createRename(7), () => {});
+  buffer.discardCoveredBySnapshot(1, " session ");
+  buffer.end((update) => applied.push(update.sessionId));
+
+  assertEqual(
+    applied.join("|"),
+    "session|Session",
+    "only the byte-for-byte matching session should be covered and malformed updates should be ignored",
+  );
+});
+
+runCase("mobile malformed snapshot selectors cannot widen discard scope", () => {
+  const buffer = new UiUpdateBootstrapBuffer();
+  const applied: string[] = [];
+  buffer.begin();
+  buffer.handle(
+    {
+      type: "SESSION_RENAMED",
+      sessionId: "session-a",
+      title: "A",
+      uiRevision: 1,
+    },
+    () => {},
+  );
+  buffer.handle(
+    {
+      type: "SESSION_RENAMED",
+      sessionId: "session-b",
+      title: "B",
+      uiRevision: 1,
+    },
+    () => {},
+  );
+  buffer.discardCoveredBySnapshot(1, "   ");
+  buffer.end((update) => applied.push(update.sessionId));
+
+  assertEqual(
+    applied.join(","),
+    "session-a,session-b",
+    "an invalid explicit selector must be a no-op rather than discard every session",
+  );
+});
+
+runCase("mobile session records are prototype-safe", () => {
+  const sessions = createSessionRecord<ReturnType<typeof createSessionState>>();
+  sessions.__proto__ = createSessionState("__proto__", "Prototype session");
+  sessions[" session "] = createSessionState(" session ");
+  const cloned = cloneSessionRecord(sessions);
+
+  assertCondition(
+    Object.getPrototypeOf(sessions) === null && Object.getPrototypeOf(cloned) === null,
+    "session records should have a null prototype",
+  );
+  assertEqual(cloned.__proto__?.id, "__proto__", "__proto__ should be an ordinary key");
+  assertEqual(cloned[" session "]?.id, " session ", "whitespace should survive cloning");
+});
+
+runCase("mobile metadata and snapshot ingress is exact and all-or-nothing", () => {
+  const normalized = normalizeMobileSessionSummaries([
+    {
+      id: " session ",
+      title: "spaced",
+      updatedAt: 1,
+      messagesCount: 0,
+      isBusy: false,
+      lockedProfileId: null,
+    },
+    {
+      id: "session",
+      title: "plain",
+      updatedAt: 2,
+      messagesCount: 0,
+      isBusy: false,
+      lockedProfileId: null,
+    },
+    {
+      id: "Session",
+      title: "case",
+      updatedAt: 3,
+      messagesCount: 0,
+      isBusy: false,
+      lockedProfileId: null,
+    },
+  ]);
+  assertEqual(
+    normalized?.map((summary) => summary.id).join("|"),
+    " session |session|Session",
+    "whitespace and case variants should remain distinct",
+  );
+  assertEqual(
+    normalizeMobileSessionSummaries([
+      ...(normalized || []),
+      { ...(normalized?.[0] || {}), id: "\ud800" },
+    ]),
+    undefined,
+    "one malformed summary should reject the whole metadata snapshot",
+  );
+
+  const snapshot = {
+    id: " session ",
+    title: "snapshot",
+    updatedAt: 1,
+    messages: [],
+    isBusy: false,
+    lockedProfileId: null,
+  };
+  assertEqual(
+    readMatchingMobileSessionSnapshot(snapshot, " session ")?.id,
+    " session ",
+    "an exact snapshot should preserve its identity",
+  );
+  assertEqual(
+    readMatchingMobileSessionSnapshot(snapshot, "session"),
+    undefined,
+    "a whitespace-near snapshot must not hydrate another session",
   );
 });

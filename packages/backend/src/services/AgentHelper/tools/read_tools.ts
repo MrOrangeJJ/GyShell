@@ -2,7 +2,8 @@ import { z } from 'zod'
 import path from 'path'
 import { HumanMessage, AIMessage } from '@langchain/core/messages'
 import type { ToolExecutionContext, ReadFileSupport } from '../types'
-import { parseTerminalScopedFilePath } from '../terminalScopedFilePath'
+import { resolveTerminalScopedFileTarget } from '../terminalScopedFilePath'
+import { terminalIdSchema } from '../terminalIdContract'
 import {
   formatTerminalUnavailableForTool,
   resolveTerminalForTool
@@ -19,7 +20,7 @@ export const SUPPORTED_PDF_EXTS = ['.pdf']
 
 // Schema definition moved here
 export const readFileSchema = z.object({
-  tabIdOrName: z.string().describe('The ID or Name of the terminal tab'),
+  terminalId: terminalIdSchema,
   filePath: z
     .string()
     .describe(
@@ -27,7 +28,7 @@ export const readFileSchema = z.object({
     ),
   offset: z.number().optional().describe('The line number to start reading from (0-based).'),
   limit: z.number().optional().describe('The number of lines to read (defaults to 2000).'),
-})
+}).strict()
 
 export function detectFileKind(filePath: string, bytes: Uint8Array): ReadFileKind {
   if (isPdfFile(bytes) || SUPPORTED_PDF_EXTS.includes(path.extname(filePath).toLowerCase())) {
@@ -226,12 +227,23 @@ export async function runReadFile(
   imageMessage?: HumanMessage; 
   meaningLessAIMessage?: AIMessage;
 }> {
+  const validation = readFileSchema.safeParse(args)
+  if (!validation.success) {
+    return {
+      resultText: `Parameter validation error for read_file: ${validation.error.message}`
+    }
+  }
+  const validatedArgs = validation.data
   const { terminalService, sessionId, messageId, sendEvent, signal } = context
-  const rawFilePath = String(args.filePath || 'unknown file')
-  const scopedReference = parseTerminalScopedFilePath(rawFilePath)
-  const filePath = scopedReference?.filePath || rawFilePath
-  const tabIdOrName = scopedReference?.terminalId || args.tabIdOrName
-  const resolved = resolveTerminalForTool(context, tabIdOrName)
+  const rawFilePath = validatedArgs.filePath
+  const target = resolveTerminalScopedFileTarget(
+    validatedArgs.terminalId,
+    rawFilePath
+  )
+  const filePath = target.ok ? target.filePath : rawFilePath
+  const resolved = target.ok
+    ? resolveTerminalForTool(context, target.terminalId)
+    : null
   
   let resultText = ''
   let imageMessage: HumanMessage | undefined
@@ -239,8 +251,13 @@ export async function runReadFile(
   let level: 'info' | 'warning' | 'error' = 'info'
 
   try {
-    if (!resolved.ok) {
-      resultText = resolved.message
+    if (!target.ok) {
+      resultText = target.message
+      level = 'warning'
+      return { resultText }
+    }
+    if (!resolved || !resolved.ok) {
+      resultText = resolved?.message || 'Error: Terminal ID resolution failed.'
       level = 'warning'
       return { resultText }
     }
@@ -261,7 +278,11 @@ export async function runReadFile(
 
     if (signal?.aborted) throw new Error('AbortError')
 
-    const stat = await terminalService.statFile(bestMatch.id, filePath)
+    const stat = await terminalService.statFile(
+      bestMatch.id,
+      filePath,
+      resolved.runtimeGuard
+    )
     
     if (signal?.aborted) throw new Error('AbortError')
 
@@ -272,7 +293,11 @@ export async function runReadFile(
       resultText = `Path is a directory, not a file: ${filePath}`
       level = 'warning'
     } else {
-      const bytes = await terminalService.readFile(bestMatch.id, filePath)
+      const bytes = await terminalService.readFile(
+        bestMatch.id,
+        filePath,
+        resolved.runtimeGuard
+      )
       if (signal?.aborted) throw new Error('AbortError')
       
       const kind = detectFileKind(filePath, bytes)
@@ -300,8 +325,8 @@ export async function runReadFile(
         resultText = readTextFile({
           filePath: filePath,
           bytes,
-          offset: args.offset,
-          limit: args.limit
+          offset: validatedArgs.offset,
+          limit: validatedArgs.limit
         })
       }
     }
@@ -324,7 +349,7 @@ export async function runReadFile(
         type: 'file_read',
         level,
         filePath,
-        input: JSON.stringify(args || {}),
+        input: JSON.stringify(validatedArgs),
         output: resultText
       })
     }

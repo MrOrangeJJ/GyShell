@@ -1,5 +1,6 @@
 import fs from "node:fs/promises";
 import path from "node:path";
+import { readOpaqueNonBlankWellFormedString } from "@gyshell/shared";
 import {
   assertAllowedFlags,
   enumFlag,
@@ -9,6 +10,7 @@ import {
   integerFlag,
   MAX_TIMER_DELAY_MS,
   requiredFlag,
+  sessionIdFlag,
 } from "./arguments";
 import { CliUsageError } from "./errors";
 import { readJsonSource, readTextSource } from "./io";
@@ -21,6 +23,14 @@ import type {
   ParsedArguments,
   RpcClient,
 } from "./types";
+
+const requireGatewaySessionId = (value: unknown): string => {
+  const sessionId = readOpaqueNonBlankWellFormedString(value);
+  if (sessionId === undefined) {
+    throw new Error("Gateway returned an invalid session id.");
+  }
+  return sessionId;
+};
 
 const SECRET_KEY =
   /(password|passphrase|private.?key|api.?key|access.?token|secret)$/i;
@@ -200,10 +210,15 @@ const REQUIRED_FLAGS_BY_COMMAND: Record<string, string[]> = {
 
 function validateCommandOptions(command: string, args: ParsedArguments): void {
   for (const name of REQUIRED_FLAGS_BY_COMMAND[command] || []) {
-    requiredFlag(args, name);
+    if (name === "session-id") {
+      sessionIdFlag(args, true);
+    } else {
+      requiredFlag(args, name);
+    }
   }
 
   if (command === "chat.send") {
+    sessionIdFlag(args);
     validateInputSources(args, ["message"], true, false, "Chat message");
     const hasImages = getFlags(args, "image").length > 0;
     if (!hasChatTextSource(args) && !hasImages) {
@@ -430,7 +445,7 @@ async function sessionGet(
   args: ParsedArguments,
   client: RpcClient,
 ): Promise<unknown> {
-  return await getSession(client, requiredFlag(args, "session-id"));
+  return await getSession(client, sessionIdFlag(args, true));
 }
 
 async function sessionCreate(
@@ -444,7 +459,7 @@ async function sessionRename(
   args: ParsedArguments,
   client: RpcClient,
 ): Promise<unknown> {
-  const sessionId = requiredFlag(args, "session-id");
+  const sessionId = sessionIdFlag(args, true);
   const newTitle = requiredFlag(args, "title");
   await client.request("agent:renameSession", { sessionId, newTitle });
   return await getSession(client, sessionId);
@@ -454,7 +469,7 @@ async function sessionDelete(
   args: ParsedArguments,
   client: RpcClient,
 ): Promise<unknown> {
-  const sessionId = requiredFlag(args, "session-id");
+  const sessionId = sessionIdFlag(args, true);
   await client.request("agent:deleteChatSession", { sessionId });
   return { sessionId, deleted: true };
 }
@@ -464,7 +479,7 @@ async function sessionBranch(
   client: RpcClient,
 ): Promise<unknown> {
   return await client.request("agent:branchFromMessage", {
-    sessionId: requiredFlag(args, "session-id"),
+    sessionId: sessionIdFlag(args, true),
     messageId: requiredFlag(args, "message-id"),
   });
 }
@@ -474,7 +489,7 @@ async function sessionRollback(
   client: RpcClient,
 ): Promise<unknown> {
   return await client.request("agent:rollbackToMessage", {
-    sessionId: requiredFlag(args, "session-id"),
+    sessionId: sessionIdFlag(args, true),
     messageId: requiredFlag(args, "message-id"),
   });
 }
@@ -513,13 +528,13 @@ async function chatSend(
       "Chat message text or at least one image is required.",
     );
   }
-  let sessionId = getFlag(args, "session-id")?.trim();
-  if (!sessionId) {
+  let sessionId = sessionIdFlag(args);
+  if (sessionId === undefined) {
     const created = await client.request<{ sessionId: string }>(
       "gateway:createSession",
       {},
     );
-    sessionId = created.sessionId;
+    sessionId = requireGatewaySessionId(created?.sessionId);
   }
   const before = await getSession(client, sessionId);
   const images = await uploadImages(client, preparedImages);
@@ -549,7 +564,7 @@ async function chatWait(
 ): Promise<unknown> {
   return await waitForSession(
     client,
-    requiredFlag(args, "session-id"),
+    sessionIdFlag(args, true),
     integerFlag(args, "wait-timeout", 600_000, {
       min: 1,
       max: MAX_TIMER_DELAY_MS,
@@ -561,7 +576,7 @@ async function chatStop(
   args: ParsedArguments,
   client: RpcClient,
 ): Promise<unknown> {
-  const sessionId = requiredFlag(args, "session-id");
+  const sessionId = sessionIdFlag(args, true);
   await client.request("agent:stopTask", { sessionId });
   return { sessionId, stopped: true };
 }
@@ -995,11 +1010,18 @@ async function getSession(
   client: RpcClient,
   sessionId: string,
 ): Promise<GatewaySessionSnapshot> {
+  sessionId = requireGatewaySessionId(sessionId);
   const payload = await client.request<{ session: GatewaySessionSnapshot }>(
     "session:get",
     { sessionId },
   );
-  return payload.session;
+  const responseSessionId = readOpaqueNonBlankWellFormedString(
+    payload?.session?.id,
+  );
+  if (responseSessionId !== sessionId) {
+    throw new Error("Gateway returned a mismatched session snapshot.");
+  }
+  return { ...payload.session, id: responseSessionId };
 }
 
 function pendingApproval(

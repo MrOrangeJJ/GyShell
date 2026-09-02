@@ -1,3 +1,4 @@
+import { readOpaqueNonBlankWellFormedString } from "@gyshell/shared";
 import { CliUsageError } from "./errors";
 import type {
   CliEnvironment,
@@ -182,6 +183,30 @@ export function requiredFlag(args: ParsedArguments, name: string): string {
   const value = getFlag(args, name)?.trim();
   if (!value) throw new CliUsageError(`--${name} is required.`);
   return value;
+}
+
+export function sessionIdFlag(
+  args: ParsedArguments,
+  required: true,
+): string;
+export function sessionIdFlag(
+  args: ParsedArguments,
+  required?: false,
+): string | undefined;
+export function sessionIdFlag(
+  args: ParsedArguments,
+  required = false,
+): string | undefined {
+  const raw = getFlag(args, "session-id");
+  if (raw === undefined) {
+    if (required) throw new CliUsageError("--session-id is required.");
+    return undefined;
+  }
+  const sessionId = readOpaqueNonBlankWellFormedString(raw);
+  if (sessionId === undefined) {
+    throw new CliUsageError("--session-id must be a non-blank valid string.");
+  }
+  return sessionId;
 }
 
 export function integerFlag(

@@ -251,10 +251,20 @@ const createAgentService = (
 ): AgentService_v2 =>
   new AgentService_v2(
     {
-      resolveTerminal(tabIdOrName: string) {
+      getTerminalById(terminalId: string) {
+        return {
+          id: terminalId,
+          title: terminalId,
+          type: "local",
+        };
+      },
+      getDisplayTerminals() {
+        return [];
+      },
+      resolveTerminal(terminalId: string) {
         const terminal = {
-          id: tabIdOrName,
-          title: tabIdOrName,
+          id: terminalId,
+          title: terminalId,
           type: "local",
         };
         return { found: [terminal], bestMatch: terminal };
@@ -284,7 +294,7 @@ const run = async (): Promise<void> => {
       const reconnectCall = {
         id: "call-reconnect",
         name: "reconnect_terminal_tab",
-        args: { tabIdOrName: "ssh-disconnected" },
+        args: { terminalId: "ssh-disconnected" },
       };
       const editCall = {
         id: "call-edit",
@@ -294,7 +304,7 @@ const run = async (): Promise<void> => {
       const stdinCall = {
         id: "call-stdin",
         name: "write_stdin",
-        args: { tabIdOrName: "ssh-disconnected", sequence: ["pwd\n"] },
+        args: { terminalId: "ssh-disconnected", sequence: ["pwd\n"] },
       };
       const assistantMessage = new AIMessage({
         content: "",
@@ -354,12 +364,12 @@ const run = async (): Promise<void> => {
           args:
             toolName === "create_terminal_tab"
               ? { connectionId: "local" }
-              : { tabIdOrName: "local-existing" },
+              : { terminalId: "local-existing" },
         };
         const laterCall = {
           id: `call-after-${toolName}`,
           name: "read_terminal_tab",
-          args: { tabIdOrName: "local-existing" },
+          args: { terminalId: "local-existing" },
         };
         const assistantMessage = new AIMessage({
           content: "",
@@ -470,8 +480,14 @@ const run = async (): Promise<void> => {
         type: "ssh",
       };
       const terminalService = {
-        resolveTerminal(tabIdOrName: string) {
-          return tabIdOrName === terminal.id
+        getTerminalById(terminalId: string) {
+          return terminalId === terminal.id ? terminal : undefined;
+        },
+        getDisplayTerminals() {
+          return [terminal];
+        },
+        resolveTerminal(terminalId: string) {
+          return terminalId === terminal.id
             ? { found: [terminal], bestMatch: terminal }
             : { found: [] };
         },
@@ -507,7 +523,7 @@ const run = async (): Promise<void> => {
       const writeCall = {
         id: "call-write-stdin",
         name: "write_stdin",
-        args: { tabIdOrName: terminal.id, sequence: ["ETX"] },
+        args: { terminalId: terminal.id, sequence: ["ETX"] },
       };
       const node = (agent as any).createToolsNode();
       const result = await node.invoke({
@@ -1533,7 +1549,7 @@ const run = async (): Promise<void> => {
       const trailingCall = {
         id: "call-read-terminal-tab",
         name: "read_terminal_tab",
-        args: { tabIdOrName: "Local" },
+        args: { terminalId: "Local" },
       };
       const node = (agent as any).createToolsNode();
       const result = await node.invoke({

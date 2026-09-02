@@ -4,14 +4,29 @@ import type { ISkillRuntime } from '../../runtimeContracts'
 import { USEFUL_SKILL_TAG } from '../prompts'
 
 export const skillToolSchema = z.object({
-  name: z.string().describe('The skill identifier from available_skills')
-})
+  name: z
+    .string()
+    .refine((value) => value.trim().length > 0, {
+      message: 'name must not be blank.'
+    })
+    .describe('The exact skill identifier from available_skills')
+}).strict()
 
 export const createSkillSchema = z.object({
-  name: z.string().describe('The display name of the skill (e.g. "React Component Generator")'),
-  description: z.string().describe('A clear description of what this skill does and when to use it.'),
+  name: z
+    .string()
+    .refine((value) => value.trim().length > 0, {
+      message: 'name must not be blank.'
+    })
+    .describe('The display name of the skill (e.g. "React Component Generator")'),
+  description: z
+    .string()
+    .refine((value) => value.trim().length > 0, {
+      message: 'description must not be blank.'
+    })
+    .describe('A clear description of what this skill does and when to use it.'),
   content: z.string().describe('The complete new skill content in Markdown format.')
-})
+}).strict()
 
 export function buildSkillToolDescription(skills: SkillInfo[]): string {
   const header = [
@@ -47,11 +62,18 @@ export async function runSkillTool(
   if (signal?.aborted) throw new Error('AbortError')
   
   const validated = skillToolSchema.safeParse(args)
-  const skillName = validated.success ? validated.data.name : String((args as any)?.name || 'unknown')
+  if (!validated.success) {
+    return {
+      kind: 'error',
+      message: `Error: Invalid parameters for skill: ${validated.error.message}`
+    }
+  }
+
+  const skillName = validated.data.name
   const skills = await skillService.getAll().catch(() => [])
-  
+
   if (signal?.aborted) throw new Error('AbortError')
-  
+
   const match = skills.find((s) => s.name === skillName)
 
   if (match) {

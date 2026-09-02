@@ -10,7 +10,11 @@ import {
   MAX_LAYOUT_PANELS,
   computeChildMinSizePercentages,
   determineDropDirection,
+  isPanelKind,
+  isTerminalBackedPanelKind,
   makeLayoutId,
+  normalizePanelTabBinding,
+  readWindowingTabId,
   type LayoutNode,
   type LayoutPanelTabBinding,
   type LayoutRect,
@@ -34,6 +38,9 @@ import {
   clearTabDragState,
   clearPanelDragState,
   createWindowingChannel,
+  normalizeWindowingMessage,
+  normalizeWindowingPanelDragPayload,
+  normalizeWindowingTabDragPayload,
   normalizeWindowingTerminalTabSnapshot,
   openDetachedWindowState,
   readTabDragState,
@@ -48,10 +55,7 @@ import {
   type WindowingTerminalTabSnapshot,
   type WindowingMessage,
 } from "../../lib/windowing";
-import {
-  normalizeFileEditorSnapshot,
-  type FileEditorSnapshot,
-} from "../../lib/fileEditorSnapshot";
+import type { FileEditorSnapshot } from "../../lib/fileEditorSnapshot";
 import { resolveFloatingMenuPlacement } from "../../lib/menuPlacement";
 
 interface LayoutWorkspaceProps {
@@ -106,9 +110,6 @@ interface LocalPanelDragPayload {
   kind: PanelKind;
 }
 
-const isTerminalBackedPanelKind = (kind: PanelKind): boolean =>
-  kind === "terminal" || kind === "filesystem" || kind === "monitor";
-
 const toWindowingTerminalTabSnapshot = (
   terminalTab: AppStore["terminalTabs"][number],
 ): WindowingTerminalTabSnapshot => ({
@@ -139,7 +140,7 @@ const collectWindowingTerminalTabSnapshots = (
   const seen = new Set<string>();
   const snapshots: WindowingTerminalTabSnapshot[] = [];
   tabIds.forEach((tabId) => {
-    const normalizedTabId = String(tabId || "").trim();
+    const normalizedTabId = readWindowingTabId("terminal", tabId);
     if (!normalizedTabId || seen.has(normalizedTabId)) {
       return;
     }
@@ -148,7 +149,12 @@ const collectWindowingTerminalTabSnapshots = (
     if (!terminalTab) {
       return;
     }
-    snapshots.push(toWindowingTerminalTabSnapshot(terminalTab));
+    const snapshot = normalizeWindowingTerminalTabSnapshot(
+      toWindowingTerminalTabSnapshot(terminalTab),
+    );
+    if (snapshot) {
+      snapshots.push(snapshot);
+    }
   });
   return snapshots.length > 0 ? snapshots : undefined;
 };
@@ -196,43 +202,9 @@ const parseCrossWindowTabDragPayload = (
   );
   if (!raw) return null;
   try {
-    const parsed = JSON.parse(raw) as Partial<CrossWindowTabDragPayload>;
-    const sourceClientId =
-      typeof parsed.sourceClientId === "string"
-        ? parsed.sourceClientId.trim()
-        : "";
-    const tabId = typeof parsed.tabId === "string" ? parsed.tabId.trim() : "";
-    const sourcePanelId =
-      typeof parsed.sourcePanelId === "string"
-        ? parsed.sourcePanelId.trim()
-        : "";
-    const stateToken =
-      typeof (parsed as any).stateToken === "string"
-        ? (parsed as any).stateToken.trim()
-        : "";
-    const kind = parsed.kind;
-    if (!sourceClientId || !tabId || !sourcePanelId) return null;
-    if (
-      kind !== "chat" &&
-      kind !== "terminal" &&
-      kind !== "filesystem" &&
-      kind !== "fileEditor" &&
-      kind !== "monitor" &&
-      kind !== "listPanel"
-    ) {
-      return null;
-    }
-    const terminalTab = normalizeWindowingTerminalTabSnapshot(
-      (parsed as any).terminalTab,
-    );
-    return {
-      sourceClientId,
-      tabId,
-      sourcePanelId,
-      kind,
-      ...(stateToken ? { stateToken } : {}),
-      ...(terminalTab ? { terminalTab } : {}),
-    };
+    return normalizeWindowingTabDragPayload(
+      JSON.parse(raw),
+    ) as CrossWindowTabDragPayload | null;
   } catch {
     return null;
   }
@@ -249,71 +221,7 @@ const parseCrossWindowPanelDragPayload = (
   );
   if (!raw) return null;
   try {
-    const parsed = JSON.parse(raw) as Partial<WindowingPanelDragPayload>;
-    const sourceClientId =
-      typeof parsed.sourceClientId === "string"
-        ? parsed.sourceClientId.trim()
-        : "";
-    const sourcePanelId =
-      typeof parsed.sourcePanelId === "string"
-        ? parsed.sourcePanelId.trim()
-        : "";
-    const stateToken =
-      typeof parsed.stateToken === "string" ? parsed.stateToken.trim() : "";
-    const kind = parsed.kind;
-    if (!sourceClientId || !sourcePanelId) return null;
-    if (
-      kind !== "chat" &&
-      kind !== "terminal" &&
-      kind !== "filesystem" &&
-      kind !== "fileEditor" &&
-      kind !== "monitor" &&
-      kind !== "listPanel"
-    ) {
-      return null;
-    }
-    const tabBinding = (() => {
-      if (!parsed.tabBinding || typeof parsed.tabBinding !== "object") {
-        return undefined;
-      }
-      const rawBinding = parsed.tabBinding as Partial<LayoutPanelTabBinding>;
-      const tabIds = Array.isArray(rawBinding.tabIds)
-        ? rawBinding.tabIds.filter(
-            (tabId): tabId is string =>
-              typeof tabId === "string" && tabId.trim().length > 0,
-          )
-        : [];
-      const activeTabId =
-        typeof rawBinding.activeTabId === "string" &&
-        tabIds.includes(rawBinding.activeTabId)
-          ? rawBinding.activeTabId
-          : tabIds[0];
-      return {
-        tabIds,
-        ...(activeTabId ? { activeTabId } : {}),
-      };
-    })();
-    const terminalTabs = Array.isArray((parsed as any).terminalTabs)
-      ? (parsed as any).terminalTabs
-          .map((entry: unknown) => normalizeWindowingTerminalTabSnapshot(entry))
-          .filter(
-            (
-              entry: WindowingTerminalTabSnapshot | undefined,
-            ): entry is WindowingTerminalTabSnapshot => !!entry,
-          )
-      : undefined;
-    const fileEditorSnapshot = normalizeFileEditorSnapshot(
-      parsed.fileEditorSnapshot,
-    );
-    return {
-      sourceClientId,
-      sourcePanelId,
-      kind,
-      ...(stateToken ? { stateToken } : {}),
-      ...(tabBinding ? { tabBinding } : {}),
-      ...(terminalTabs && terminalTabs.length > 0 ? { terminalTabs } : {}),
-      ...(fileEditorSnapshot ? { fileEditorSnapshot } : {}),
-    };
+    return normalizeWindowingPanelDragPayload(JSON.parse(raw));
   } catch {
     return null;
   }
@@ -945,8 +853,8 @@ export const LayoutWorkspace: React.FC<LayoutWorkspaceProps> = observer(
       }
 
       channel.onmessage = (event: { data: WindowingMessage }) => {
-        const payload = event.data;
-        if (!payload || typeof payload !== "object") return;
+        const payload = normalizeWindowingMessage(event.data);
+        if (!payload) return;
 
         if (payload.type === "tab-moved") {
           if (payload.sourceClientId !== store.windowClientId) return;
@@ -1079,18 +987,22 @@ export const LayoutWorkspace: React.FC<LayoutWorkspaceProps> = observer(
         return;
       }
       return onActivateTab((target) => {
+        const tabId = readWindowingTabId(target.kind, target.tabId);
+        if (!tabId) {
+          return;
+        }
         const panelId =
           store.layout
             .getPanelIdsByKind(target.kind)
             .find((candidatePanelId) =>
               store.layout
                 .getPanelTabIds(candidatePanelId)
-                .includes(target.tabId),
+                .includes(tabId),
             ) || null;
         if (!panelId) {
           return;
         }
-        store.layout.setPanelActiveTab(panelId, target.tabId);
+        store.layout.setPanelActiveTab(panelId, tabId);
         store.layout.setFocusedPanel(panelId);
       });
     }, [store.layout]);
@@ -1191,10 +1103,10 @@ export const LayoutWorkspace: React.FC<LayoutWorkspaceProps> = observer(
         }
         const tabIds = store.layout.getPanelTabIds(panelId);
         const activeTabId = store.layout.getPanelActiveTabId(panelId);
-        return {
+        return normalizePanelTabBinding(kind, {
           tabIds,
           ...(activeTabId ? { activeTabId } : {}),
-        };
+        });
       },
       [store.layout],
     );
@@ -1253,7 +1165,7 @@ export const LayoutWorkspace: React.FC<LayoutWorkspaceProps> = observer(
         ) {
           return;
         }
-        const tabId = String(payload.tabId || "").trim();
+        const tabId = readWindowingTabId(payload.kind, payload.tabId);
         if (!tabId) return;
 
         const detachedTree = buildDetachedLayoutTree(payload.kind, {
@@ -1699,13 +1611,13 @@ export const LayoutWorkspace: React.FC<LayoutWorkspaceProps> = observer(
         if (!stashedPayload) {
           return payload;
         }
-        return {
+        return normalizeWindowingPanelDragPayload({
           ...stashedPayload,
           sourceClientId: payload.sourceClientId,
           sourcePanelId: payload.sourcePanelId,
           kind: payload.kind,
           stateToken: token,
-        };
+        });
       };
 
       const resolveTabDragPayload = (
@@ -1722,14 +1634,14 @@ export const LayoutWorkspace: React.FC<LayoutWorkspaceProps> = observer(
         if (!stashedPayload) {
           return payload;
         }
-        return {
+        return normalizeWindowingTabDragPayload({
           ...stashedPayload,
           sourceClientId: payload.sourceClientId,
           tabId: payload.tabId,
           sourcePanelId: payload.sourcePanelId,
           kind: payload.kind,
           stateToken: token,
-        };
+        }) as CrossWindowTabDragPayload | null;
       };
 
       const readTabPayload = (
@@ -1744,23 +1656,15 @@ export const LayoutWorkspace: React.FC<LayoutWorkspaceProps> = observer(
         const sourcePanelId = tabElement.getAttribute(
           "data-layout-tab-panel-id",
         );
-        if (
-          !tabId ||
-          !sourcePanelId ||
-          (kind !== "chat" &&
-            kind !== "terminal" &&
-            kind !== "filesystem" &&
-            kind !== "fileEditor" &&
-            kind !== "monitor" &&
-            kind !== "listPanel")
-        ) {
+        if (!sourcePanelId || !isPanelKind(kind)) {
           return null;
         }
-        if (!getPanelKindAdapter(kind).supportsTabs) {
+        const normalizedTabId = readWindowingTabId(kind, tabId);
+        if (!normalizedTabId || !getPanelKindAdapter(kind).supportsTabs) {
           return null;
         }
         return {
-          tabId,
+          tabId: normalizedTabId,
           kind,
           sourcePanelId,
         };
@@ -1803,15 +1707,7 @@ export const LayoutWorkspace: React.FC<LayoutWorkspaceProps> = observer(
         const kind = panelDragSource.getAttribute(
           "data-layout-panel-kind",
         ) as PanelKind | null;
-        if (
-          !panelId ||
-          (kind !== "chat" &&
-            kind !== "terminal" &&
-            kind !== "filesystem" &&
-            kind !== "fileEditor" &&
-            kind !== "monitor" &&
-            kind !== "listPanel")
-        ) {
+        if (!panelId || !isPanelKind(kind)) {
           return null;
         }
         // A cross-window panel move removes the source panel from this window after

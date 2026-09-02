@@ -2,24 +2,25 @@ import { z } from 'zod'
 import type { ToolExecutionContext } from '../types'
 import { buildFileTransferFinishedInsertion } from '../queuedInsertions'
 import type { FileTransferTaskSnapshot } from '../../FileTransferService'
+import { terminalIdSchema } from '../terminalIdContract'
 import {
   formatTerminalUnavailableForTool,
   resolveTerminalForTool
 } from './terminal_runtime_guard'
 
 export const copyBetweenTabsSchema = z.object({
-  sourceTabIdOrName: z
-    .string()
-    .describe('The ID or exact name of the source terminal tab.'),
+  sourceTerminalId: terminalIdSchema.describe(
+    'The exact, complete source terminal ID from the current Available Terminal Tabs inventory.'
+  ),
   sourcePaths: z
     .array(z.string().min(1))
     .min(1)
     .describe(
       'One or more source file or directory paths on the source terminal tab.',
     ),
-  targetTabIdOrName: z
-    .string()
-    .describe('The ID or exact name of the target terminal tab.'),
+  targetTerminalId: terminalIdSchema.describe(
+    'The exact, complete target terminal ID from the current Available Terminal Tabs inventory.'
+  ),
   targetDirPath: z
     .string()
     .min(1)
@@ -31,7 +32,7 @@ export const copyBetweenTabsSchema = z.object({
     .describe(
       'How to handle target name conflicts. Default rename keeps both files. Use overwrite only when the user explicitly requested replacement.',
     ),
-})
+}).strict()
 
 export const readFileTransferStatusSchema = z.object({
   transferId: z
@@ -47,7 +48,7 @@ export const readFileTransferStatusSchema = z.object({
     .describe(
       'Whether completed, failed, and cancelled transfers should be included when listing transfers.',
     ),
-})
+}).strict()
 
 const summarizeTransfer = (
   task: FileTransferTaskSnapshot,
@@ -104,6 +105,11 @@ export async function copyBetweenTabs(
   args: z.infer<typeof copyBetweenTabsSchema>,
   context: ToolExecutionContext,
 ): Promise<string> {
+  const validation = copyBetweenTabsSchema.safeParse(args)
+  if (!validation.success) {
+    return `Parameter validation error for copy_between_tabs: ${validation.error.message}`
+  }
+  const validatedArgs = validation.data
   const {
     fileTransferService,
     sessionId,
@@ -116,7 +122,7 @@ export async function copyBetweenTabs(
 
   const sourceResolved = resolveTerminalForTool(
     context,
-    args.sourceTabIdOrName,
+    validatedArgs.sourceTerminalId,
     'source terminal tab',
   )
   if (!sourceResolved.ok) {
@@ -134,7 +140,7 @@ export async function copyBetweenTabs(
 
   const targetResolved = resolveTerminalForTool(
     context,
-    args.targetTabIdOrName,
+    validatedArgs.targetTerminalId,
     'target terminal tab',
   )
   if (!targetResolved.ok) {
@@ -156,7 +162,7 @@ export async function copyBetweenTabs(
     toolName: 'copy_between_tabs',
     title: 'Copy between tabs',
     hint: `${sourceResolved.terminal.title || sourceResolved.terminal.id} -> ${targetResolved.terminal.title || targetResolved.terminal.id}`,
-    input: JSON.stringify(args),
+    input: JSON.stringify(validatedArgs),
   })
 
   try {
@@ -164,14 +170,16 @@ export async function copyBetweenTabs(
       origin: 'agent',
       mode: 'copy',
       sourceTerminalId: sourceResolved.terminal.id,
-      sourcePaths: args.sourcePaths,
+      sourcePaths: validatedArgs.sourcePaths,
       targetTerminalId: targetResolved.terminal.id,
-      targetDirPath: args.targetDirPath,
-      conflictStrategy: args.conflictStrategy,
+      targetDirPath: validatedArgs.targetDirPath,
+      conflictStrategy: validatedArgs.conflictStrategy,
       requireDistinctMachine: true,
       sessionId,
       agentRunId: context.agentRunId,
       toolMessageId: messageId,
+      sourceRuntimeGuard: sourceResolved.runtimeGuard,
+      targetRuntimeGuard: targetResolved.runtimeGuard,
       onSettled: (settledTask) => {
         context.completeBackgroundFileTransfer?.({
           ...buildBackgroundTransferInput(settledTask),
@@ -233,21 +241,26 @@ export async function readFileTransferStatus(
   args: z.infer<typeof readFileTransferStatusSchema>,
   context: ToolExecutionContext,
 ): Promise<string> {
+  const validation = readFileTransferStatusSchema.safeParse(args)
+  if (!validation.success) {
+    return `Parameter validation error for read_file_transfer_status: ${validation.error.message}`
+  }
+  const validatedArgs = validation.data
   const { fileTransferService } = context
   if (!fileTransferService) {
     return 'Error: File transfer service is not available.'
   }
 
-  if (args.transferId) {
-    const task = fileTransferService.getTransfer(args.transferId)
+  if (validatedArgs.transferId) {
+    const task = fileTransferService.getTransfer(validatedArgs.transferId)
     if (!task) {
-      return `Error: File transfer not found: ${args.transferId}`
+      return `Error: File transfer not found: ${validatedArgs.transferId}`
     }
     return JSON.stringify({ transfer: summarizeTransfer(task) }, null, 2)
   }
 
   const transfers = fileTransferService.listTransfers({
-    includeCompleted: args.includeCompleted,
+    includeCompleted: validatedArgs.includeCompleted,
     origin: 'agent',
     ...(context.sessionId ? { sessionId: context.sessionId } : {}),
     ...(context.agentRunId ? { agentRunId: context.agentRunId } : {}),

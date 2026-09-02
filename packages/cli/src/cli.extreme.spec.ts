@@ -147,6 +147,92 @@ await runCase(
 );
 
 await runCase(
+  "session ids preserve whitespace, case, and delimiters byte-for-byte",
+  async () => {
+    const sessionId = "  Session::opaque  ";
+    const client = new FakeClient();
+    client.responses.set("session:get", {
+      session: {
+        id: sessionId,
+        title: "Exact",
+        updatedAt: 1,
+        messages: [],
+        isBusy: false,
+        lockedProfileId: null,
+      },
+    });
+
+    await executeCommand(
+      args([
+        "session",
+        "rename",
+        "--session-id",
+        sessionId,
+        "--title",
+        "Exact",
+      ]),
+      client,
+      io().io,
+    );
+
+    assert.deepEqual(client.calls, [
+      {
+        method: "agent:renameSession",
+        params: { sessionId, newTitle: "Exact" },
+      },
+      { method: "session:get", params: { sessionId } },
+    ]);
+  },
+);
+
+await runCase(
+  "malformed session flags fail before any RPC",
+  async () => {
+    for (const sessionId of ["   ", "\ud800"]) {
+      const client = new FakeClient();
+      await assert.rejects(
+        executeCommand(
+          args(["session", "delete", "--session-id", sessionId]),
+          client,
+          io().io,
+        ),
+        /session-id must be a non-blank valid string/,
+      );
+      assert.deepEqual(client.calls, []);
+    }
+  },
+);
+
+await runCase(
+  "cross-session snapshots cannot authorize chat dispatch",
+  async () => {
+    const client = new FakeClient();
+    client.responses.set("session:get", {
+      session: {
+        id: "other-session",
+        title: "Wrong",
+        updatedAt: 1,
+        messages: [],
+        isBusy: false,
+        lockedProfileId: null,
+      },
+    });
+
+    await assert.rejects(
+      executeCommand(
+        args(["chat", "send", "work", "--session-id", "target-session"]),
+        client,
+        io().io,
+      ),
+      /mismatched session snapshot/,
+    );
+    assert.deepEqual(client.calls, [
+      { method: "session:get", params: { sessionId: "target-session" } },
+    ]);
+  },
+);
+
+await runCase(
   "chat hook creates a session and dispatches asynchronously",
   async () => {
     const client = new FakeClient();

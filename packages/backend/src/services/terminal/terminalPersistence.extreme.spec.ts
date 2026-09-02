@@ -49,6 +49,19 @@ const sleep = (ms: number): Promise<void> =>
     setTimeout(resolve, ms)
   })
 
+const waitUntil = async (
+  predicate: () => boolean,
+  message: string,
+  timeoutMs = 2_000
+): Promise<void> => {
+  const startedAt = Date.now()
+  while (Date.now() - startedAt < timeoutMs) {
+    if (predicate()) return
+    await sleep(0)
+  }
+  throw new Error(message)
+}
+
 type FakeSession = {
   id: string
   cwd: string
@@ -76,13 +89,17 @@ class FakeTerminalBackend implements TerminalBackend {
   private readonly spawnConfigs: TerminalConfig[] = []
   private readonly resizeCalls: Array<{ ptyId: string; cols: number; rows: number }> = []
   private readonly writeCalls: Array<{ ptyId: string; data: string }> = []
+  private readonly killCalls: string[] = []
   private readonly commandShellFamilyByPtyId = new Map<
     string,
     TerminalCommandShellFamily
   >()
+  private readonly deferredSpawnResolvers: Array<() => void> = []
+  private deferredSpawnCount = 0
   private spawnDelayMs = 0
   private emitExitOnKill = true
   private throwOnKill = false
+  private synchronousExitCodeOnNextRegistration: number | undefined
 
   private getPtyIdForTerminalId(terminalId: string): string {
     return `pty-${terminalId}`
@@ -177,6 +194,43 @@ class FakeTerminalBackend implements TerminalBackend {
     return this.writeCalls.slice()
   }
 
+  getKillCalls(): string[] {
+    return this.killCalls.slice()
+  }
+
+  hasSessionForTerminalId(terminalId: string): boolean {
+    return this.sessions.has(this.getPtyIdForTerminalId(terminalId))
+  }
+
+  captureExitCallbacksForTerminalId(
+    terminalId: string
+  ): Array<(code: number) => void> {
+    return [
+      ...(this.sessions.get(this.getPtyIdForTerminalId(terminalId))
+        ?.exitCallbacks ?? [])
+    ]
+  }
+
+  emitSynchronousExitOnNextRegistration(code: number): void {
+    this.synchronousExitCodeOnNextRegistration = code
+  }
+
+  deferNextSpawn(): void {
+    this.deferredSpawnCount += 1
+  }
+
+  getPendingSpawnCount(): number {
+    return this.deferredSpawnResolvers.length
+  }
+
+  releaseNextSpawn(): void {
+    const resolve = this.deferredSpawnResolvers.shift()
+    if (!resolve) {
+      throw new Error('No deferred terminal spawn is pending')
+    }
+    resolve()
+  }
+
   failSpawnForTerminalId(terminalId: string): void {
     this.spawnFailures.add(terminalId)
   }
@@ -233,6 +287,12 @@ class FakeTerminalBackend implements TerminalBackend {
       throw new Error(`intentional spawn failure for ${config.id}`)
     }
     this.spawnConfigs.push(JSON.parse(JSON.stringify(config)) as TerminalConfig)
+    if (this.deferredSpawnCount > 0) {
+      this.deferredSpawnCount -= 1
+      await new Promise<void>((resolve) => {
+        this.deferredSpawnResolvers.push(resolve)
+      })
+    }
     if (this.spawnDelayMs > 0) {
       await sleep(this.spawnDelayMs)
     }
@@ -266,6 +326,7 @@ class FakeTerminalBackend implements TerminalBackend {
   }
 
   kill(ptyId: string): void {
+    this.killCalls.push(ptyId)
     if (this.throwOnKill) {
       throw new Error('simulated backend kill failure')
     }
@@ -292,6 +353,12 @@ class FakeTerminalBackend implements TerminalBackend {
     const session = this.sessions.get(ptyId)
     if (!session) return
     session.exitCallbacks.push(callback)
+    const synchronousExitCode = this.synchronousExitCodeOnNextRegistration
+    if (synchronousExitCode === undefined) return
+    this.synchronousExitCodeOnNextRegistration = undefined
+    this.sessions.delete(ptyId)
+    this.initializationStateByPtyId.delete(ptyId)
+    callback(synchronousExitCode)
   }
 
   async readFile(_ptyId: string, _filePath: string): Promise<Buffer> {
@@ -1241,6 +1308,176 @@ const run = async (): Promise<void> => {
       assertEqual(tab?.rows, 43, 'terminal inventory should expose the pending resize rows')
     })
 
+    await runCase('kill fences an in-flight create and stale cleanup precedes same-id recreation', async () => {
+      const backend = new FakeTerminalBackend()
+      const service = createService(stateFilePath, backend)
+      const config = {
+        type: 'local' as const,
+        id: 'local-create-kill-race',
+        title: 'Create Kill Race',
+        cols: 80,
+        rows: 24
+      }
+
+      backend.deferNextSpawn()
+      const staleCreate = service.createTerminal(config)
+      const staleCreateRejected = assertRejects(
+        staleCreate,
+        /changed before terminal creation binding could be dispatched/i,
+        'a create invalidated while spawn is in flight should reject'
+      )
+      await waitUntil(
+        () => backend.getPendingSpawnCount() === 1,
+        'the first terminal spawn did not enter the deferred window'
+      )
+
+      service.kill(config.id)
+      const replacementCreate = service.createTerminal({
+        ...config,
+        title: 'Create Kill Race Replacement'
+      })
+      await sleep(0)
+      assertEqual(
+        backend.getSpawnConfigs().filter((entry) => entry.id === config.id).length,
+        1,
+        'same-id recreation must remain queued until the stale spawn is cleaned'
+      )
+
+      backend.releaseNextSpawn()
+      await staleCreateRejected
+      const replacement = await replacementCreate
+
+      assertEqual(
+        backend.getSpawnConfigs().filter((entry) => entry.id === config.id).length,
+        2,
+        'same-id recreation should spawn exactly once after stale cleanup'
+      )
+      assertEqual(
+        backend.getKillCalls().filter((ptyId) => ptyId === replacement.ptyId).length,
+        1,
+        'the stale unbound runtime must be stopped before the replacement spawn'
+      )
+      assertEqual(
+        service.getTerminalById(config.id),
+        replacement,
+        'the replacement terminal object must remain authoritative'
+      )
+
+      service.kill(config.id)
+      await sleep(0)
+      assertEqual(
+        (service as any).terminalLifecycleEpochByTerminal.has(config.id),
+        false,
+        'an idle closed terminal should release its lifecycle epoch without ABA risk'
+      )
+    })
+
+    await runCase('failed stale-runtime cleanup blocks replacement until a later retry succeeds', async () => {
+      const backend = new FakeTerminalBackend()
+      const service = createService(stateFilePath, backend)
+      const config = {
+        type: 'local' as const,
+        id: 'local-stale-cleanup-retry',
+        title: 'Stale Cleanup Retry',
+        cols: 80,
+        rows: 24
+      }
+
+      backend.deferNextSpawn()
+      const staleCreate = service.createTerminal(config)
+      const staleCreateRejected = assertRejects(
+        staleCreate,
+        /changed before terminal creation binding could be dispatched/i,
+        'the invalidated stale create should reject'
+      )
+      await waitUntil(
+        () => backend.getPendingSpawnCount() === 1,
+        'the stale cleanup test did not enter the deferred spawn window'
+      )
+
+      service.kill(config.id)
+      backend.setThrowOnKill(true)
+      const blockedReplacement = assertRejects(
+        service.createTerminal(config),
+        /cleanup of the previous unbound runtime failed/i,
+        'replacement spawn must fail closed while stale cleanup is failing'
+      )
+      backend.releaseNextSpawn()
+      await staleCreateRejected
+      await blockedReplacement
+      assertEqual(
+        backend.getSpawnConfigs().filter((entry) => entry.id === config.id).length,
+        1,
+        'cleanup failure must prevent a second backend spawn'
+      )
+      assertEqual(
+        (service as any).pendingUnboundRuntimeCleanupByTerminal.has(config.id),
+        true,
+        'failed stale cleanup should retain an explicit retry fence'
+      )
+
+      backend.setThrowOnKill(false)
+      const replacement = await service.createTerminal(config)
+      assertEqual(
+        service.getTerminalById(config.id),
+        replacement,
+        'a later lifecycle operation should retry cleanup and then bind safely'
+      )
+      assertEqual(
+        (service as any).pendingUnboundRuntimeCleanupByTerminal.has(config.id),
+        false,
+        'successful cleanup retry should release the stale-runtime fence'
+      )
+    })
+
+    await runCase('a stale guarded close cannot erase replacement resize state or cancel its spawn', async () => {
+      const backend = new FakeTerminalBackend()
+      backend.setEmitExitOnKill(false)
+      const service = createService(stateFilePath, backend)
+      const config = {
+        type: 'local' as const,
+        id: 'local-stale-guarded-close',
+        title: 'Stale Guarded Close',
+        cols: 80,
+        rows: 24
+      }
+
+      await service.createTerminal(config)
+      const staleGuard = service.createTerminalRuntimeGuard(config.id)
+      service.kill(config.id, staleGuard)
+
+      backend.deferNextSpawn()
+      const replacementCreate = service.createTerminal(config)
+      await waitUntil(
+        () => backend.getPendingSpawnCount() === 1,
+        'replacement spawn did not enter its deferred window'
+      )
+      service.resize(config.id, 177, 55)
+
+      let staleCloseMessage = ''
+      try {
+        service.kill(config.id, staleGuard)
+      } catch (error) {
+        staleCloseMessage = error instanceof Error ? error.message : String(error)
+      }
+      assertCondition(
+        /changed before terminal operation could be dispatched/i.test(
+          staleCloseMessage
+        ),
+        'the stale runtime lease should reject before close mutation'
+      )
+
+      backend.releaseNextSpawn()
+      const replacement = await replacementCreate
+      assertEqual(replacement.cols, 177, 'stale close must preserve replacement pending cols')
+      assertEqual(replacement.rows, 55, 'stale close must preserve replacement pending rows')
+      assertEqual(
+        service.getTerminalById(config.id),
+        replacement,
+        'stale guarded close must not invalidate or remove the replacement'
+      )
+    })
+
     await runCase('idempotent terminal remount forwards changed dimensions to the live backend', async () => {
       const backend = new FakeTerminalBackend()
       const service = createService(stateFilePath, backend)
@@ -1561,6 +1798,144 @@ const run = async (): Promise<void> => {
       )
     })
 
+    await runCase('kill fences a deferred local auto-restart and preserves same-id recreation', async () => {
+      const backend = new FakeTerminalBackend()
+      backend.setEmitExitOnKill(false)
+      const service = createService(stateFilePath, backend)
+      const config = {
+        type: 'local' as const,
+        id: 'local-restart-kill-race',
+        title: 'Restart Kill Race',
+        cols: 80,
+        rows: 24
+      }
+
+      await service.createTerminal(config)
+      const liveRuntimeGuard = service.createTerminalRuntimeGuard(config.id)
+      backend.deferNextSpawn()
+      backend.emitExitForTerminalId(config.id, 129)
+      await waitUntil(
+        () => backend.getPendingSpawnCount() === 1,
+        'local auto-restart did not enter the deferred spawn window'
+      )
+
+      let exitedGuardMessage = ''
+      try {
+        service.getRecentOutput(config.id, undefined, liveRuntimeGuard)
+      } catch (error) {
+        exitedGuardMessage = error instanceof Error ? error.message : String(error)
+      }
+      assertCondition(
+        /changed before terminal operation could be dispatched/i.test(
+          exitedGuardMessage
+        ),
+        'backend exit must invalidate every lease captured for the live runtime'
+      )
+      const retainedTabGuard = service.createTerminalRuntimeGuard(config.id)
+      service.kill(config.id, retainedTabGuard)
+      const replacementCreate = service.createTerminal({
+        ...config,
+        title: 'Restart Kill Race Replacement'
+      })
+      backend.releaseNextSpawn()
+      const replacement = await replacementCreate
+
+      assertEqual(
+        backend.getSpawnConfigs().filter((entry) => entry.id === config.id).length,
+        3,
+        'initial, stale restart, and explicit replacement should each spawn once'
+      )
+      assertEqual(
+        service.getTerminalById(config.id),
+        replacement,
+        'the stale auto-restart catch path must not roll back the replacement tab'
+      )
+      assertEqual(
+        replacement.runtimeState,
+        'ready',
+        'the explicit replacement should remain command-ready'
+      )
+    })
+
+    await runCase('synchronous local exit registration queues one safe auto-restart', async () => {
+      const backend = new FakeTerminalBackend()
+      const service = createService(stateFilePath, backend)
+      const terminalId = 'local-sync-registration-exit'
+      backend.emitSynchronousExitOnNextRegistration(130)
+
+      await service.createTerminal({
+        type: 'local',
+        id: terminalId,
+        title: 'Sync Registration Exit',
+        cols: 80,
+        rows: 24
+      })
+      await waitUntil(
+        () =>
+          backend.getSpawnConfigs().filter((entry) => entry.id === terminalId)
+            .length === 2 &&
+          service.getTerminalRuntimeSnapshot(terminalId)?.runtimeState === 'ready',
+        'synchronous registration exit did not settle through one queued restart'
+      )
+
+      assertEqual(
+        backend.getSpawnConfigs().filter((entry) => entry.id === terminalId).length,
+        2,
+        'a synchronous exit callback should produce exactly one replacement spawn'
+      )
+      assertEqual(
+        backend.hasSessionForTerminalId(terminalId),
+        true,
+        'the replacement backend session must survive old registration cleanup'
+      )
+    })
+
+    await runCase('a delayed old exit callback cannot erase a same-pty-id replacement', async () => {
+      const backend = new FakeTerminalBackend()
+      backend.setEmitExitOnKill(false)
+      const service = createService(stateFilePath, backend)
+      const config = {
+        type: 'local' as const,
+        id: 'local-delayed-old-exit',
+        title: 'Delayed Old Exit',
+        cols: 80,
+        rows: 24
+      }
+
+      await service.createTerminal(config)
+      const oldExitCallbacks = backend.captureExitCallbacksForTerminalId(
+        config.id
+      )
+      const oldGeneration = service.getTerminalRuntimeGeneration(config.id)
+      service.kill(config.id)
+      const replacement = await service.createTerminal(config)
+      const replacementGeneration = service.getTerminalRuntimeGeneration(
+        config.id
+      )
+
+      oldExitCallbacks.forEach((callback) => callback(137))
+      await sleep(0)
+      assertCondition(
+        replacementGeneration !== oldGeneration,
+        'same pty-id recreation must still receive a fresh runtime generation'
+      )
+      assertEqual(
+        service.getTerminalById(config.id),
+        replacement,
+        'the old generation exit callback must not remove replacement state'
+      )
+      assertEqual(
+        replacement.runtimeState,
+        'ready',
+        'the delayed old callback must not mark the replacement exited'
+      )
+      assertEqual(
+        backend.getSpawnConfigs().filter((entry) => entry.id === config.id).length,
+        2,
+        'the stale callback must not schedule an extra auto-restart'
+      )
+    })
+
     await runCase('killed local terminals are removed instead of auto-restarted', async () => {
       const backend = new FakeTerminalBackend()
       const service = createService(stateFilePath, backend)
@@ -1707,6 +2082,67 @@ const run = async (): Promise<void> => {
         service.getRenderMetadata('ssh-reconnect-same-id').windowsRelease,
         undefined,
         'reconnect should not leak the previous Windows build into a new runtime'
+      )
+    })
+
+    await runCase('kill fences a deferred reconnect before same-id recreation binds', async () => {
+      const backend = new FakeTerminalBackend()
+      backend.setEmitExitOnKill(false)
+      const service = createService(stateFilePath, backend)
+      const config = {
+        type: 'ssh' as const,
+        id: 'ssh-reconnect-kill-race',
+        title: 'Reconnect Kill Race',
+        host: '10.0.0.15',
+        port: 22,
+        username: 'root',
+        authMethod: 'password' as const,
+        password: 'secret',
+        cols: 80,
+        rows: 24
+      }
+
+      await service.createTerminal(config)
+      backend.emitExitForTerminalId(config.id, 255)
+      const exitedGuard = service.createTerminalRuntimeGuard(config.id)
+      backend.deferNextSpawn()
+      const staleReconnect = service.reconnectTerminal(
+        config.id,
+        exitedGuard
+      )
+      const staleReconnectRejected = assertRejects(
+        staleReconnect,
+        /changed before terminal reconnect binding could be dispatched/i,
+        'kill during reconnect spawn should reject the stale reconnect'
+      )
+      await waitUntil(
+        () => backend.getPendingSpawnCount() === 1,
+        'SSH reconnect did not enter the deferred spawn window'
+      )
+
+      service.kill(config.id, exitedGuard)
+      const replacementCreate = service.createTerminal({
+        ...config,
+        title: 'Reconnect Kill Race Replacement'
+      })
+      backend.releaseNextSpawn()
+      await staleReconnectRejected
+      const replacement = await replacementCreate
+
+      assertEqual(
+        service.getTerminalById(config.id),
+        replacement,
+        'stale reconnect rollback must not overwrite the replacement tab'
+      )
+      assertEqual(
+        replacement.runtimeState,
+        'initializing',
+        'the replacement SSH runtime should retain its own initialization state'
+      )
+      assertEqual(
+        backend.getSpawnConfigs().filter((entry) => entry.id === config.id).length,
+        3,
+        'initial, stale reconnect, and explicit replacement should each spawn once'
       )
     })
 
@@ -2047,6 +2483,15 @@ const run = async (): Promise<void> => {
         cols: 120,
         rows: 32
       })
+      backend.setInitializationStateForTerminalId(
+        'ssh-win-sidecar-fs',
+        'ready'
+      )
+      backend.emitDataForTerminalId(
+        'ssh-win-sidecar-fs',
+        'PowerShell ready\r\n'
+      )
+      await sleep(0)
 
       backend.setCwdForTerminalId('ssh-win-sidecar-fs', 'C:\\Users\\Administrator')
       backend.setHomeDirForTerminalId('ssh-win-sidecar-fs', 'C:\\Users\\Administrator')

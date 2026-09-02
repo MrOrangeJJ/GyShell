@@ -90,7 +90,7 @@ await runCase("rejects queued requests when startup fails", async () => {
   );
 });
 
-await runCase("normalizes session ids and rejects empty ids", async () => {
+await runCase("preserves opaque session ids and rejects malformed ids", async () => {
   const gate = new RendererSessionRegistrationGate<{ id: string }>();
   const received: Array<{
     operation: RendererSessionRegistrationOperation;
@@ -99,12 +99,24 @@ await runCase("normalizes session ids and rejects empty ids", async () => {
   gate.setHandler(async (_event, operation, sessionId) => {
     received.push({ operation, sessionId });
   });
-  await gate.dispatch({ id: "renderer-5" }, "unregister", "  session-e  ");
+  await gate.dispatch({ id: "renderer-5" }, "unregister", "  session::E  ");
   assert.deepEqual(received, [
-    { operation: "unregister", sessionId: "session-e" },
+    { operation: "unregister", sessionId: "  session::E  " },
   ]);
   await assert.rejects(
     gate.dispatch({ id: "renderer-5" }, "register", "  "),
+    /Session id is required/,
+  );
+  await assert.rejects(
+    gate.dispatch(
+      { id: "renderer-5" },
+      "register",
+      17 as unknown as string,
+    ),
+    /Session id is required/,
+  );
+  await assert.rejects(
+    gate.dispatch({ id: "renderer-5" }, "register", "\ud800"),
     /Session id is required/,
   );
 });

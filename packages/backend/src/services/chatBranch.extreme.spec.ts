@@ -587,7 +587,7 @@ const run = async (): Promise<void> => {
           type: "tool_call",
           toolName: "read_command_output",
           input: JSON.stringify({
-            tabIdOrName: running.contract.terminalId,
+            terminalId: running.contract.terminalId,
             history_command_match_id:
               running.contract.historyCommandMatchId,
           }),

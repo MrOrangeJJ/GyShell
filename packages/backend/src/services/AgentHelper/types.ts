@@ -1,4 +1,7 @@
-import type { TerminalService } from '../TerminalService'
+import type {
+  TerminalCreationRuntime,
+  TerminalService
+} from '../TerminalService'
 import type { FileTransferService } from '../FileTransferService'
 import type { CommandPolicyMode } from '../CommandPolicy/CommandPolicyService'
 import type { ICommandPolicyRuntime } from '../runtimeContracts'
@@ -13,9 +16,10 @@ export interface ToolExecutionContext {
   sessionId: string
   messageId: string
   terminalService: TerminalService
+  expectedTerminalRuntimeBindings?: ReadonlyMap<string, number>
   createTerminalFromSavedConnection?: (
     connectionId: string
-  ) => Promise<TerminalTab | null>
+  ) => Promise<TerminalTab | TerminalCreationRuntime | null>
   fileTransferService?: FileTransferService
   sendEvent: (sessionId: string, event: any) => void
   waitForFeedback?: (messageId: string, timeoutMs?: number) => Promise<any | null>

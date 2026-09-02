@@ -1,13 +1,25 @@
 import type { TerminalConfig } from './ipcTypes'
 import {
+  isValidTerminalRuntimeId,
+  readOpaqueNonBlankWellFormedString,
+} from '@gyshell/shared'
+import {
+  isPanelKind,
+  isTabbedPanelKind,
+  isTerminalBackedPanelKind,
   listPanels,
   makeLayoutId,
+  normalizePanelTabBinding,
+  parseStrictLayoutTree,
+  readWindowingTabId,
   type LayoutPanelTabBinding,
   type LayoutTree,
   type PanelKind
 } from '../layout'
+
+export { readWindowingTabId } from '../layout'
 import {
-  normalizeFileEditorSnapshot,
+  parseStrictFileEditorSnapshot,
   type FileEditorSnapshot
 } from './fileEditorSnapshot'
 import type { TerminalConnectionRef } from './terminalConnectionModel'
@@ -158,6 +170,176 @@ export type WindowingMessage =
   | WindowingDragStartMessage
   | WindowingDragEndMessage
 
+const readTransportIdentifier = (value: unknown): string | undefined => {
+  if (typeof value !== 'string') return undefined
+  return readOpaqueNonBlankWellFormedString(value.trim())
+}
+
+export const normalizeWindowingMessage = (
+  value: unknown,
+): WindowingMessage | null => {
+  if (!isWindowingRecord(value)) return null
+  const raw = value
+  const sourceClientId = readTransportIdentifier(raw.sourceClientId)
+  if (!sourceClientId) return null
+
+  if (raw.type === 'tab-moved') {
+    if (
+      !hasWindowingOnlyKeys(raw, [
+        'type',
+        'sourceClientId',
+        'targetClientId',
+        'kind',
+        'tabId',
+      ])
+    ) {
+      return null
+    }
+    const targetClientId = readTransportIdentifier(raw.targetClientId)
+    const kind = raw.kind
+    if (!targetClientId || !isTabbedPanelKind(kind as PanelKind)) return null
+    const tabId = readWindowingTabId(kind as PanelKind, raw.tabId)
+    return tabId
+      ? {
+          type: 'tab-moved',
+          sourceClientId,
+          targetClientId,
+          kind: kind as WindowingTabKind,
+          tabId
+        }
+      : null
+  }
+
+  if (raw.type === 'panel-moved') {
+    if (
+      !hasWindowingOnlyKeys(raw, [
+        'type',
+        'sourceClientId',
+        'targetClientId',
+        'sourcePanelId',
+        'kind',
+        'tabIds',
+      ])
+    ) {
+      return null
+    }
+    const targetClientId = readTransportIdentifier(raw.targetClientId)
+    const sourcePanelId = readOpaqueNonBlankWellFormedString(raw.sourcePanelId)
+    const kind = raw.kind
+    if (
+      !targetClientId ||
+      !sourcePanelId ||
+      !isPanelKind(kind) ||
+      !Array.isArray(raw.tabIds)
+    ) {
+      return null
+    }
+    const tabIds = isTabbedPanelKind(kind)
+      ? raw.tabIds
+          .map((tabId) => readWindowingTabId(kind, tabId))
+          .filter((tabId): tabId is string => !!tabId)
+      : []
+    if (
+      (isTabbedPanelKind(kind) && tabIds.length !== raw.tabIds.length) ||
+      (!isTabbedPanelKind(kind) && raw.tabIds.length > 0)
+    ) {
+      return null
+    }
+    return {
+      type: 'panel-moved',
+      sourceClientId,
+      targetClientId,
+      sourcePanelId,
+      kind,
+      tabIds: Array.from(new Set(tabIds))
+    }
+  }
+
+  if (raw.type === 'detached-closing') {
+    if (
+      !hasWindowingOnlyKeys(raw, [
+        'type',
+        'sourceClientId',
+        'tabsByKind',
+      ]) ||
+      !isWindowingRecord(raw.tabsByKind) ||
+      !hasWindowingOnlyKeys(raw.tabsByKind, [
+        'chat',
+        'terminal',
+        'filesystem',
+        'monitor',
+      ])
+    ) {
+      return null
+    }
+    const rawTabsByKind = raw.tabsByKind
+    const tabsByKind: WindowingTabOwnership = {}
+    for (const kind of ['chat', 'terminal', 'filesystem', 'monitor'] as const) {
+      const values = rawTabsByKind[kind]
+      if (values === undefined) continue
+      if (!Array.isArray(values)) return null
+      const tabIds = values.map((tabId) => readWindowingTabId(kind, tabId))
+      if (tabIds.some((tabId) => !tabId)) return null
+      tabsByKind[kind] = Array.from(new Set(tabIds as string[]))
+    }
+    return { type: 'detached-closing', sourceClientId, tabsByKind }
+  }
+
+  if (raw.type === 'drag-start') {
+    if (
+      !hasWindowingOnlyKeys(raw, [
+        'type',
+        'sourceClientId',
+        'dragKind',
+        'tabPayload',
+        'panelPayload',
+      ])
+    ) {
+      return null
+    }
+    if (raw.dragKind === 'tab') {
+      if (
+        !hasWindowingOwnKey(raw, 'tabPayload') ||
+        hasWindowingOwnKey(raw, 'panelPayload')
+      ) {
+        return null
+      }
+      const tabPayload = normalizeWindowingTabDragPayload(raw.tabPayload)
+      return tabPayload && tabPayload.sourceClientId === sourceClientId
+        ? {
+            type: 'drag-start',
+            sourceClientId,
+            dragKind: 'tab',
+            tabPayload
+          }
+        : null
+    }
+    if (raw.dragKind === 'panel') {
+      if (
+        !hasWindowingOwnKey(raw, 'panelPayload') ||
+        hasWindowingOwnKey(raw, 'tabPayload')
+      ) {
+        return null
+      }
+      const panelPayload = normalizeWindowingPanelDragPayload(raw.panelPayload)
+      return panelPayload && panelPayload.sourceClientId === sourceClientId
+        ? {
+            type: 'drag-start',
+            sourceClientId,
+            dragKind: 'panel',
+            panelPayload
+          }
+        : null
+    }
+    return null
+  }
+
+  return raw.type === 'drag-end' &&
+    hasWindowingOnlyKeys(raw, ['type', 'sourceClientId'])
+    ? { type: 'drag-end', sourceClientId }
+    : null
+}
+
 const safeRandomId = (): string => {
   if (typeof globalThis.crypto?.randomUUID === 'function') {
     return globalThis.crypto.randomUUID()
@@ -209,6 +391,7 @@ export const buildDetachedLayoutTree = (
   tabBinding?: LayoutPanelTabBinding
 ): LayoutTree => {
   const panelId = makeLayoutId(`panel-${kind}`)
+  const normalizedTabBinding = normalizePanelTabBinding(kind, tabBinding)
   return {
     schemaVersion: 2,
     root: {
@@ -220,13 +403,10 @@ export const buildDetachedLayoutTree = (
       }
     },
     focusedPanelId: panelId,
-    ...(tabBinding
+    ...(normalizedTabBinding
       ? {
           panelTabs: {
-            [panelId]: {
-              tabIds: tabBinding.tabIds || [],
-              ...(tabBinding.activeTabId ? { activeTabId: tabBinding.activeTabId } : {})
-            }
+            [panelId]: normalizedTabBinding
           }
         }
       : {})
@@ -255,7 +435,7 @@ export const collectLayoutTabOwnership = (
     }
     const tabIds = layoutTree.panelTabs?.[node.panel.id]?.tabIds || []
     tabIds.forEach((tabId) => {
-      const normalized = String(tabId || '').trim()
+      const normalized = readWindowingTabId(kind, tabId)
       if (normalized) {
         tabsByKind[kind].add(normalized)
       }
@@ -272,9 +452,10 @@ export const collectLayoutTabOwnership = (
 
 export const stashDetachedWindowState = (token: string, state: DetachedWindowState): boolean => {
   const localKey = getDetachedStateLocalKey(token)
-  if (!localKey) return false
+  const serialized = serializeDetachedWindowState(state)
+  if (!localKey || !serialized) return false
   try {
-    window.localStorage?.setItem(localKey, JSON.stringify(state))
+    window.localStorage?.setItem(localKey, serialized.raw)
     return true
   } catch {
     return false
@@ -288,9 +469,10 @@ export const stashDetachedWindowState = (token: string, state: DetachedWindowSta
  */
 export const syncDetachedWindowState = (token: string, state: DetachedWindowState): boolean => {
   const sessionKey = getDetachedStateSessionKey(token)
-  if (!sessionKey) return false
+  const serialized = serializeDetachedWindowState(state)
+  if (!sessionKey || !serialized) return false
   try {
-    window.sessionStorage?.setItem(sessionKey, JSON.stringify(state))
+    window.sessionStorage?.setItem(sessionKey, serialized.raw)
     return true
   } catch {
     return false
@@ -316,24 +498,508 @@ export const clearDetachedWindowState = (token: string): void => {
   }
 }
 
-const parseDetachedWindowState = (raw: string): DetachedWindowState | null => {
-  const parsed = JSON.parse(raw) as Partial<DetachedWindowState>
-  if (!parsed || typeof parsed !== 'object') return null
-  if (!parsed.layoutTree || typeof parsed.layoutTree !== 'object') return null
-  const sourceClientId = typeof parsed.sourceClientId === 'string' ? parsed.sourceClientId.trim() : ''
-  if (!sourceClientId) return null
-  const fileEditorSnapshot = normalizeFileEditorSnapshot((parsed as any).fileEditorSnapshot)
-  const terminalTabs = Array.isArray((parsed as any).terminalTabs)
-    ? (parsed as any).terminalTabs
-        .map((entry: unknown) => normalizeWindowingTerminalTabSnapshot(entry))
-        .filter((entry: WindowingTerminalTabSnapshot | undefined): entry is WindowingTerminalTabSnapshot => !!entry)
+const isWindowingRecord = (
+  value: unknown,
+): value is Record<string, unknown> => {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    return false
+  }
+  try {
+    const prototype = Object.getPrototypeOf(value)
+    return prototype === Object.prototype || prototype === null
+  } catch {
+    return false
+  }
+}
+
+const hasWindowingOnlyKeys = (
+  value: Record<string, unknown>,
+  allowedKeys: readonly string[],
+): boolean => {
+  const allowed = new Set(allowedKeys)
+  return Object.keys(value).every((key) => allowed.has(key))
+}
+
+const hasWindowingOwnKey = (
+  value: Record<string, unknown>,
+  key: string,
+): boolean => Object.prototype.hasOwnProperty.call(value, key)
+
+const hasWindowingOwnKeys = (
+  value: Record<string, unknown>,
+  keys: readonly string[],
+): boolean => keys.every((key) => hasWindowingOwnKey(value, key))
+
+const readWindowingTransportId = readTransportIdentifier
+
+const readPositiveInteger = (value: unknown): number | undefined =>
+  typeof value === 'number' &&
+  Number.isSafeInteger(value) &&
+  value > 0
+    ? value
     : undefined
+
+const readOptionalConfigString = (
+  record: Record<string, unknown>,
+  key: string,
+): string | undefined => {
+  if (!hasWindowingOwnKey(record, key)) return undefined
+  const value = readOpaqueNonBlankWellFormedString(record[key])
+  // Empty optional strings are legal for credentials and are handled by the
+  // caller. This helper is for fields where a non-blank value is required.
+  return value
+}
+
+const cloneWindowingJsonValue = (
+  value: unknown,
+  depth = 0,
+): unknown | undefined => {
+  if (depth > 12) return undefined
+  if (
+    value === null ||
+    typeof value === 'string' ||
+    typeof value === 'boolean' ||
+    (typeof value === 'number' && Number.isFinite(value))
+  ) {
+    return value
+  }
+  if (Array.isArray(value)) {
+    const cloned: unknown[] = []
+    for (const item of value) {
+      const next = cloneWindowingJsonValue(item, depth + 1)
+      if (next === undefined && item !== undefined) return undefined
+      if (item === undefined) return undefined
+      cloned.push(next)
+    }
+    return cloned
+  }
+  if (!isWindowingRecord(value)) return undefined
+  const cloned = Object.create(null) as Record<string, unknown>
+  for (const key of Object.keys(value)) {
+    const next = cloneWindowingJsonValue(value[key], depth + 1)
+    if (next === undefined && value[key] !== undefined) return undefined
+    if (value[key] === undefined) return undefined
+    cloned[key] = next
+  }
+  return cloned
+}
+
+const parseStrictTransferProxy = (
+  value: unknown,
+): Record<string, unknown> | undefined => {
+  if (!isWindowingRecord(value)) return undefined
+  if (
+    !hasWindowingOnlyKeys(value, [
+      'id',
+      'name',
+      'type',
+      'host',
+      'port',
+      'username',
+      'password',
+    ]) ||
+    !hasWindowingOwnKeys(value, ['id', 'name', 'type', 'host', 'port'])
+  ) {
+    return undefined
+  }
+  const id = readOptionalConfigString(value, 'id')
+  const name = readOptionalConfigString(value, 'name')
+  const host = readOptionalConfigString(value, 'host')
+  const type = value.type === 'socks5' || value.type === 'http' ? value.type : undefined
+  const port = readPositiveInteger(value.port)
+  if (!id || !name || !host || !type || port === undefined) return undefined
+  for (const key of ['username', 'password'] as const) {
+    if (
+      hasWindowingOwnKey(value, key) &&
+      (typeof value[key] !== 'string' ||
+        !readOpaqueNonBlankWellFormedString(value[key]) && value[key] !== '')
+    ) {
+      return undefined
+    }
+  }
+  const cloned = cloneWindowingJsonValue(value)
+  return isWindowingRecord(cloned) ? cloned : undefined
+}
+
+const parseStrictTransferTunnel = (
+  value: unknown,
+): Record<string, unknown> | undefined => {
+  if (!isWindowingRecord(value)) return undefined
+  if (
+    !hasWindowingOnlyKeys(value, [
+      'id',
+      'name',
+      'type',
+      'host',
+      'port',
+      'targetAddress',
+      'targetPort',
+      'viaConnectionId',
+    ]) ||
+    !hasWindowingOwnKeys(value, ['id', 'name', 'type', 'host', 'port'])
+  ) {
+    return undefined
+  }
+  const id = readOptionalConfigString(value, 'id')
+  const name = readOptionalConfigString(value, 'name')
+  const host = readOptionalConfigString(value, 'host')
+  const type =
+    value.type === 'Local' || value.type === 'Remote' || value.type === 'Dynamic'
+      ? value.type
+      : undefined
+  const port = readPositiveInteger(value.port)
+  if (!id || !name || !host || !type || port === undefined) return undefined
+  for (const key of ['targetAddress', 'viaConnectionId'] as const) {
+    if (
+      hasWindowingOwnKey(value, key) &&
+      (typeof value[key] !== 'string' ||
+        !readOpaqueNonBlankWellFormedString(value[key]))
+    ) {
+      return undefined
+    }
+  }
+  if (
+    hasWindowingOwnKey(value, 'targetPort') &&
+    readPositiveInteger(value.targetPort) === undefined
+  ) {
+    return undefined
+  }
+  const cloned = cloneWindowingJsonValue(value)
+  return isWindowingRecord(cloned) ? cloned : undefined
+}
+
+const BASE_TERMINAL_CONFIG_KEYS = [
+  'type',
+  'id',
+  'title',
+  'cols',
+  'rows',
+] as const
+
+const LOCAL_TERMINAL_CONFIG_KEYS = [
+  ...BASE_TERMINAL_CONFIG_KEYS,
+  'cwd',
+  'shell',
+] as const
+
+const SSH_TERMINAL_CONFIG_KEYS = [
+  ...BASE_TERMINAL_CONFIG_KEYS,
+  'host',
+  'port',
+  'username',
+  'authMethod',
+  'password',
+  'privateKey',
+  'privateKeyPath',
+  'passphrase',
+  'proxy',
+  'tunnels',
+  'jumpHost',
+] as const
+
+const hasValidOptionalConfigString = (
+  record: Record<string, unknown>,
+  key: string,
+): boolean => {
+  if (!hasWindowingOwnKey(record, key)) return true
+  const value = record[key]
+  return (
+    typeof value === 'string' &&
+    (value === '' || readOpaqueNonBlankWellFormedString(value) !== undefined)
+  )
+}
+
+const parseStrictTerminalConfig = (
+  value: unknown,
+  expectedId: string,
+  depth = 0,
+): TerminalConfig | undefined => {
+  if (
+    !isWindowingRecord(value) ||
+    depth > 4 ||
+    !hasWindowingOwnKeys(value, BASE_TERMINAL_CONFIG_KEYS)
+  ) {
+    return undefined
+  }
+
+  const typeValue = readOpaqueNonBlankWellFormedString(value.type)
+  const type = typeValue?.trim()
+  const id = isValidTerminalRuntimeId(value.id) ? value.id : undefined
+  const titleValue = readOpaqueNonBlankWellFormedString(value.title)
+  const title = titleValue?.trim()
+  const cols = readPositiveInteger(value.cols)
+  const rows = readPositiveInteger(value.rows)
+  if (
+    !type ||
+    !id ||
+    id !== expectedId ||
+    !title ||
+    cols === undefined ||
+    rows === undefined
+  ) {
+    return undefined
+  }
+
+  if (type === 'local') {
+    if (!hasWindowingOnlyKeys(value, LOCAL_TERMINAL_CONFIG_KEYS)) {
+      return undefined
+    }
+    if (
+      !hasValidOptionalConfigString(value, 'cwd') ||
+      !hasValidOptionalConfigString(value, 'shell')
+    ) {
+      return undefined
+    }
+  } else if (type === 'ssh') {
+    if (!hasWindowingOnlyKeys(value, SSH_TERMINAL_CONFIG_KEYS)) {
+      return undefined
+    }
+    const host = readOptionalConfigString(value, 'host')
+    const username = readOptionalConfigString(value, 'username')
+    const port = readPositiveInteger(value.port)
+    const authMethod =
+      value.authMethod === 'password' || value.authMethod === 'privateKey'
+        ? value.authMethod
+        : undefined
+    if (!host || !username || port === undefined || !authMethod) {
+      return undefined
+    }
+    for (const key of [
+      'password',
+      'privateKey',
+      'privateKeyPath',
+      'passphrase',
+    ] as const) {
+      if (!hasValidOptionalConfigString(value, key)) return undefined
+    }
+    if (
+      hasWindowingOwnKey(value, 'proxy') &&
+      !parseStrictTransferProxy(value.proxy)
+    ) {
+      return undefined
+    }
+    if (hasWindowingOwnKey(value, 'tunnels')) {
+      if (
+        !Array.isArray(value.tunnels) ||
+        value.tunnels.some((tunnel) => !parseStrictTransferTunnel(tunnel))
+      ) {
+        return undefined
+      }
+    }
+    if (hasWindowingOwnKey(value, 'jumpHost')) {
+      const jumpHost = isWindowingRecord(value.jumpHost)
+        ? value.jumpHost
+        : undefined
+      const jumpId = jumpHost && isValidTerminalRuntimeId(jumpHost.id)
+        ? jumpHost.id
+        : undefined
+      if (
+        !jumpHost ||
+        !jumpId ||
+        jumpHost.type !== 'ssh' ||
+        !parseStrictTerminalConfig(jumpHost, jumpId, depth + 1)
+      ) {
+        return undefined
+      }
+    }
+  }
+  // Generic connection configurations deliberately retain JSON extension
+  // fields. The required base fields above remain strict and identity-safe.
+
+  const cloned = cloneWindowingJsonValue(value)
+  if (!isWindowingRecord(cloned)) return undefined
+  cloned.type = type
+  cloned.id = id
+  cloned.title = title
+  cloned.cols = cols
+  cloned.rows = rows
+  return cloned as unknown as TerminalConfig
+}
+
+export const normalizeWindowingTerminalTabSnapshot = (
+  value: unknown,
+): WindowingTerminalTabSnapshot | undefined => {
+  if (!isWindowingRecord(value)) return undefined
+  if (
+    !hasWindowingOwnKeys(value, ['id', 'title', 'config']) ||
+    !hasWindowingOnlyKeys(value, [
+      'id',
+      'title',
+      'config',
+      'connectionRef',
+      'runtimeState',
+      'lastExitCode',
+    ])
+  ) {
+    return undefined
+  }
+  const id = readWindowingTabId('terminal', value.id)
+  const titleValue = readOpaqueNonBlankWellFormedString(value.title)
+  const title = titleValue?.trim()
+  if (!id || !title) return undefined
+  const config = parseStrictTerminalConfig(value.config, id)
+  if (!config) return undefined
+
+  let connectionRef: TerminalConnectionRef | undefined
+  if (hasWindowingOwnKey(value, 'connectionRef')) {
+    const rawConnectionRef = value.connectionRef
+    if (!isWindowingRecord(rawConnectionRef)) return undefined
+    const refTypeValue = readOpaqueNonBlankWellFormedString(
+      rawConnectionRef.type,
+    )
+    if (
+      !hasWindowingOnlyKeys(rawConnectionRef, ['type', 'entryId']) ||
+      !hasWindowingOwnKey(rawConnectionRef, 'type') ||
+      !refTypeValue
+    ) {
+      return undefined
+    }
+    const refType = refTypeValue.trim()
+    if (!refType) return undefined
+    let entryId: string | undefined
+    if (hasWindowingOwnKey(rawConnectionRef, 'entryId')) {
+      entryId = readOpaqueNonBlankWellFormedString(rawConnectionRef.entryId)
+      if (!entryId) return undefined
+    }
+    connectionRef = {
+      type: refType,
+      ...(entryId !== undefined ? { entryId } : {}),
+    }
+  }
+
+  let runtimeState: WindowingTerminalTabSnapshot['runtimeState']
+  if (hasWindowingOwnKey(value, 'runtimeState')) {
+    if (
+      value.runtimeState !== 'initializing' &&
+      value.runtimeState !== 'ready' &&
+      value.runtimeState !== 'exited'
+    ) {
+      return undefined
+    }
+    runtimeState = value.runtimeState
+  }
+
+  let lastExitCode: number | undefined
+  if (hasWindowingOwnKey(value, 'lastExitCode')) {
+    if (
+      typeof value.lastExitCode !== 'number' ||
+      !Number.isSafeInteger(value.lastExitCode)
+    ) {
+      return undefined
+    }
+    lastExitCode = value.lastExitCode
+  }
+
+  return {
+    id,
+    title,
+    config,
+    ...(connectionRef ? { connectionRef } : {}),
+    ...(runtimeState !== undefined ? { runtimeState } : {}),
+    ...(lastExitCode !== undefined ? { lastExitCode } : {}),
+  }
+}
+
+export const parseDetachedWindowState = (
+  raw: string,
+): DetachedWindowState | null => {
+  let parsedValue: unknown
+  try {
+    parsedValue = JSON.parse(raw)
+  } catch {
+    return null
+  }
+  if (!isWindowingRecord(parsedValue)) return null
+  if (
+    !hasWindowingOnlyKeys(parsedValue, [
+      'sourceClientId',
+      'layoutTree',
+      'createdAt',
+      'fileEditorSnapshot',
+      'terminalTabs',
+    ]) ||
+    !hasWindowingOwnKey(parsedValue, 'sourceClientId') ||
+    !hasWindowingOwnKey(parsedValue, 'layoutTree') ||
+    !hasWindowingOwnKey(parsedValue, 'createdAt')
+  ) {
+    return null
+  }
+
+  const sourceClientId = readWindowingTransportId(parsedValue.sourceClientId)
+  const layoutTree = parseStrictLayoutTree(parsedValue.layoutTree)
+  if (
+    !sourceClientId ||
+    !layoutTree ||
+    typeof parsedValue.createdAt !== 'number' ||
+    !Number.isSafeInteger(parsedValue.createdAt) ||
+    parsedValue.createdAt < 0
+  ) {
+    return null
+  }
+
+  let fileEditorSnapshot: FileEditorSnapshot | undefined
+  if (hasWindowingOwnKey(parsedValue, 'fileEditorSnapshot')) {
+    fileEditorSnapshot = parseStrictFileEditorSnapshot(
+      parsedValue.fileEditorSnapshot,
+    ) ?? undefined
+    if (!fileEditorSnapshot) return null
+    const hasFileEditorPanel = listPanels(layoutTree).some(
+      (panel) => panel.panel.kind === 'fileEditor',
+    )
+    if (fileEditorSnapshot.mode !== 'idle' && !hasFileEditorPanel) {
+      return null
+    }
+  }
+
+  const terminalBindingIds = new Set<string>()
+  listPanels(layoutTree).forEach((panel) => {
+    if (!isTerminalBackedPanelKind(panel.panel.kind)) return
+    const binding = layoutTree.panelTabs?.[panel.panel.id]
+    for (const tabId of binding?.tabIds || []) {
+      const normalized = readWindowingTabId(panel.panel.kind, tabId)
+      if (normalized) terminalBindingIds.add(normalized)
+    }
+  })
+
+  let terminalTabs: WindowingTerminalTabSnapshot[] | undefined
+  if (hasWindowingOwnKey(parsedValue, 'terminalTabs')) {
+    if (!Array.isArray(parsedValue.terminalTabs)) return null
+    const seenIds = new Set<string>()
+    const normalizedTabs: WindowingTerminalTabSnapshot[] = []
+    for (const candidate of parsedValue.terminalTabs) {
+      const snapshot = normalizeWindowingTerminalTabSnapshot(candidate)
+      if (!snapshot || seenIds.has(snapshot.id) || !terminalBindingIds.has(snapshot.id)) {
+        return null
+      }
+      seenIds.add(snapshot.id)
+      normalizedTabs.push(snapshot)
+    }
+    terminalTabs = normalizedTabs
+  }
+
   return {
     sourceClientId,
-    layoutTree: parsed.layoutTree as LayoutTree,
-    createdAt: Number.isFinite(parsed.createdAt) ? Number(parsed.createdAt) : Date.now(),
+    layoutTree,
+    createdAt: parsedValue.createdAt,
     ...(fileEditorSnapshot ? { fileEditorSnapshot } : {}),
-    ...(terminalTabs && terminalTabs.length > 0 ? { terminalTabs } : {})
+    ...(terminalTabs !== undefined ? { terminalTabs } : {}),
+  }
+}
+
+const serializeDetachedWindowState = (
+  value: unknown,
+): { state: DetachedWindowState; raw: string } | null => {
+  try {
+    const inputRaw = JSON.stringify(value)
+    if (typeof inputRaw !== 'string') return null
+    const state = parseDetachedWindowState(inputRaw)
+    if (!state) return null
+    return {
+      state,
+      raw: JSON.stringify(state),
+    }
+  } catch {
+    return null
   }
 }
 
@@ -373,17 +1039,46 @@ export const readDetachedWindowState = (token: string): DetachedWindowState | nu
   }
 }
 
+export const normalizeWindowingTabTarget = (
+  value: unknown,
+): WindowingTabTarget | null => {
+  if (
+    !isWindowingRecord(value) ||
+    !hasWindowingOnlyKeys(value, ['kind', 'tabId']) ||
+    !hasWindowingOwnKeys(value, ['kind', 'tabId']) ||
+    !isTabbedPanelKind(value.kind as PanelKind)
+  ) {
+    return null
+  }
+  const kind = value.kind as WindowingTabKind
+  const tabId = readWindowingTabId(kind, value.tabId)
+  return tabId ? { kind, tabId } : null
+}
+
 export const openDetachedWindowState = async (
   state: DetachedWindowState,
   options?: OpenDetachedWindowOptions
 ): Promise<boolean> => {
-  const sourceClientId = String(state.sourceClientId || '').trim()
-  if (!sourceClientId) {
+  const serialized = serializeDetachedWindowState(state)
+  if (!serialized) return false
+  const normalizedState = serialized.state
+  const sourceClientId = normalizedState.sourceClientId
+  const focusTarget = options?.focusTarget
+    ? normalizeWindowingTabTarget(options.focusTarget)
+    : null
+  if (options?.focusTarget && !focusTarget) {
+    return false
+  }
+  const tabOwnership = collectLayoutTabOwnership(normalizedState.layoutTree)
+  if (
+    focusTarget &&
+    !(tabOwnership[focusTarget.kind] || []).includes(focusTarget.tabId)
+  ) {
     return false
   }
 
   const token = `detached-${makeLayoutId('state')}`
-  const stashed = stashDetachedWindowState(token, state)
+  const stashed = stashDetachedWindowState(token, normalizedState)
   if (!stashed) {
     return false
   }
@@ -393,8 +1088,8 @@ export const openDetachedWindowState = async (
       token,
       sourceClientId,
       {
-        tabOwnership: collectLayoutTabOwnership(state.layoutTree),
-        ...(options?.focusTarget ? { focusTarget: options.focusTarget } : {})
+        tabOwnership,
+        ...(focusTarget ? { focusTarget } : {})
       }
     )
     if (result?.ok) {
@@ -419,126 +1114,172 @@ const readLocalStorage = (): Storage | null => {
   }
 }
 
-const normalizePanelTabBinding = (value: unknown): LayoutPanelTabBinding | undefined => {
-  if (!value || typeof value !== 'object') {
-    return undefined
-  }
-  const rawBinding = value as Partial<LayoutPanelTabBinding>
-  const tabIds = Array.isArray(rawBinding.tabIds)
-    ? rawBinding.tabIds.filter((tabId): tabId is string => typeof tabId === 'string' && tabId.trim().length > 0)
-    : []
-  const activeTabId =
-    typeof rawBinding.activeTabId === 'string' && tabIds.includes(rawBinding.activeTabId)
-      ? rawBinding.activeTabId
-      : tabIds[0]
-  return {
-    tabIds,
-    ...(activeTabId ? { activeTabId } : {})
-  }
-}
-
-export const normalizeWindowingTerminalTabSnapshot = (value: unknown): WindowingTerminalTabSnapshot | undefined => {
-  if (!value || typeof value !== 'object') {
-    return undefined
-  }
-  const raw = value as Partial<WindowingTerminalTabSnapshot>
-  const id = typeof raw.id === 'string' ? raw.id.trim() : ''
-  const title = typeof raw.title === 'string' ? raw.title.trim() : ''
-  const config = raw.config
-  if (!id || !title || !config || typeof config !== 'object') {
-    return undefined
-  }
-  const connectionRef =
-    raw.connectionRef && typeof raw.connectionRef === 'object'
-      ? (() => {
-          const refType =
-            typeof raw.connectionRef.type === 'string'
-              ? raw.connectionRef.type.trim()
-              : ''
-          if (!refType) {
-            return undefined
-          }
-          const entryId =
-            typeof raw.connectionRef.entryId === 'string' &&
-            raw.connectionRef.entryId.trim().length > 0
-              ? raw.connectionRef.entryId.trim()
-              : undefined
-          return {
-            type: refType,
-            ...(entryId ? { entryId } : {}),
-          }
-        })()
-      : undefined
-  const runtimeState =
-    raw.runtimeState === 'initializing' || raw.runtimeState === 'ready' || raw.runtimeState === 'exited'
-      ? raw.runtimeState
-      : undefined
-  const lastExitCode = typeof raw.lastExitCode === 'number' && Number.isFinite(raw.lastExitCode) ? raw.lastExitCode : undefined
-  return {
-    id,
-    title,
-    config: config as TerminalConfig,
-    ...(connectionRef ? { connectionRef } : {}),
-    ...(runtimeState ? { runtimeState } : {}),
-    ...(typeof lastExitCode === 'number' ? { lastExitCode } : {})
-  }
-}
-
-const normalizePanelDragState = (value: unknown): WindowingPanelDragPayload | null => {
-  if (!value || typeof value !== 'object') {
+export const normalizeWindowingPanelDragPayload = (
+  value: unknown,
+): WindowingPanelDragPayload | null => {
+  if (
+    !isWindowingRecord(value) ||
+    !hasWindowingOnlyKeys(value, [
+      'sourceClientId',
+      'sourcePanelId',
+      'kind',
+      'stateToken',
+      'tabBinding',
+      'terminalTabs',
+      'fileEditorSnapshot',
+    ])
+  ) {
     return null
   }
-  const parsed = value as Partial<WindowingPanelDragPayload>
-  const sourceClientId = typeof parsed.sourceClientId === 'string' ? parsed.sourceClientId.trim() : ''
-  const sourcePanelId = typeof parsed.sourcePanelId === 'string' ? parsed.sourcePanelId.trim() : ''
+  if (!hasWindowingOwnKeys(value, ['sourceClientId', 'sourcePanelId', 'kind'])) {
+    return null
+  }
+  const parsed = value as unknown as Partial<WindowingPanelDragPayload>
+  const sourceClientId = readTransportIdentifier(parsed.sourceClientId)
+  const sourcePanelId = readOpaqueNonBlankWellFormedString(parsed.sourcePanelId)
   const kind = parsed.kind
-  const stateToken = typeof parsed.stateToken === 'string' ? parsed.stateToken.trim() : ''
-  if (!sourceClientId || !sourcePanelId) {
-    return null
-  }
-  if (kind !== 'chat' && kind !== 'terminal' && kind !== 'filesystem' && kind !== 'fileEditor' && kind !== 'monitor' && kind !== 'listPanel') {
-    return null
-  }
-  const tabBinding = normalizePanelTabBinding(parsed.tabBinding)
-  const terminalTabs = Array.isArray(parsed.terminalTabs)
-    ? parsed.terminalTabs
-        .map((entry) => normalizeWindowingTerminalTabSnapshot(entry))
-        .filter((entry): entry is WindowingTerminalTabSnapshot => !!entry)
+  const hasStateToken = hasWindowingOwnKey(value, 'stateToken')
+  const stateToken = hasStateToken
+    ? readTransportIdentifier(parsed.stateToken)
     : undefined
-  const fileEditorSnapshot = normalizeFileEditorSnapshot(parsed.fileEditorSnapshot)
+  if (
+    !sourceClientId ||
+    !sourcePanelId ||
+    !isPanelKind(kind) ||
+    (hasStateToken && !stateToken)
+  ) {
+    return null
+  }
+
+  const hasTabBinding = hasWindowingOwnKey(value, 'tabBinding')
+  if (
+    hasTabBinding &&
+    (!isWindowingRecord(parsed.tabBinding) ||
+      !hasWindowingOnlyKeys(parsed.tabBinding, ['tabIds', 'activeTabId']))
+  ) {
+    return null
+  }
+  const tabBinding = hasTabBinding
+    ? normalizePanelTabBinding(kind, parsed.tabBinding)
+    : undefined
+  if (hasTabBinding && (!isTabbedPanelKind(kind) || !tabBinding)) {
+    return null
+  }
+
+  let terminalTabs: WindowingTerminalTabSnapshot[] | undefined
+  const hasTerminalTabs = hasWindowingOwnKey(value, 'terminalTabs')
+  if (hasTerminalTabs) {
+    if (!isTerminalBackedPanelKind(kind) || !Array.isArray(parsed.terminalTabs) || !tabBinding) {
+      return null
+    }
+    const normalizedTerminalTabs = parsed.terminalTabs.map((entry) =>
+      normalizeWindowingTerminalTabSnapshot(entry),
+    )
+    if (normalizedTerminalTabs.some((entry) => !entry)) {
+      return null
+    }
+    terminalTabs = normalizedTerminalTabs as WindowingTerminalTabSnapshot[]
+    const seenTerminalIds = new Set<string>()
+    for (const terminalTab of terminalTabs) {
+      if (
+        seenTerminalIds.has(terminalTab.id) ||
+        !tabBinding.tabIds.includes(terminalTab.id)
+      ) {
+        return null
+      }
+      seenTerminalIds.add(terminalTab.id)
+    }
+  }
+
+  const hasFileEditorSnapshot = hasWindowingOwnKey(
+    value,
+    'fileEditorSnapshot',
+  )
+  const fileEditorSnapshot = hasFileEditorSnapshot
+    ? parseStrictFileEditorSnapshot(parsed.fileEditorSnapshot) ?? undefined
+    : undefined
+  if (
+    (hasFileEditorSnapshot && !fileEditorSnapshot) ||
+    (fileEditorSnapshot && kind !== 'fileEditor')
+  ) {
+    return null
+  }
+
   return {
     sourceClientId,
     sourcePanelId,
     kind,
     ...(stateToken ? { stateToken } : {}),
     ...(tabBinding ? { tabBinding } : {}),
-    ...(terminalTabs && terminalTabs.length > 0 ? { terminalTabs } : {}),
+    ...(terminalTabs !== undefined ? { terminalTabs } : {}),
     ...(fileEditorSnapshot ? { fileEditorSnapshot } : {})
   }
 }
 
-const normalizeTabDragState = (value: unknown): WindowingTabDragPayload | null => {
-  if (!value || typeof value !== 'object') {
+export const normalizeWindowingTabDragPayload = (
+  value: unknown,
+): WindowingTabDragPayload | null => {
+  if (
+    !isWindowingRecord(value) ||
+    !hasWindowingOnlyKeys(value, [
+      'sourceClientId',
+      'tabId',
+      'kind',
+      'sourcePanelId',
+      'stateToken',
+      'terminalTab',
+    ])
+  ) {
     return null
   }
-  const parsed = value as Partial<WindowingTabDragPayload>
-  const sourceClientId = typeof parsed.sourceClientId === 'string' ? parsed.sourceClientId.trim() : ''
-  const tabId = typeof parsed.tabId === 'string' ? parsed.tabId.trim() : ''
-  const sourcePanelId = typeof parsed.sourcePanelId === 'string' ? parsed.sourcePanelId.trim() : ''
+  if (
+    !hasWindowingOwnKeys(value, [
+      'sourceClientId',
+      'tabId',
+      'kind',
+      'sourcePanelId',
+    ])
+  ) {
+    return null
+  }
+  const parsed = value as unknown as Partial<WindowingTabDragPayload>
+  const sourceClientId = readTransportIdentifier(parsed.sourceClientId)
+  const sourcePanelId = readOpaqueNonBlankWellFormedString(parsed.sourcePanelId)
   const kind = parsed.kind
-  const stateToken = typeof parsed.stateToken === 'string' ? parsed.stateToken.trim() : ''
-  if (!sourceClientId || !tabId || !sourcePanelId) {
+  const hasStateToken = hasWindowingOwnKey(value, 'stateToken')
+  const stateToken = hasStateToken
+    ? readTransportIdentifier(parsed.stateToken)
+    : undefined
+  if (
+    !sourceClientId ||
+    !sourcePanelId ||
+    !isTabbedPanelKind(kind as PanelKind) ||
+    (hasStateToken && !stateToken)
+  ) {
     return null
   }
-  if (kind !== 'chat' && kind !== 'terminal' && kind !== 'filesystem' && kind !== 'fileEditor' && kind !== 'monitor' && kind !== 'listPanel') {
+  const tabId = readWindowingTabId(kind as PanelKind, parsed.tabId)
+  if (!tabId) {
     return null
   }
-  const terminalTab = normalizeWindowingTerminalTabSnapshot(parsed.terminalTab)
+
+  const hasTerminalTab = hasWindowingOwnKey(value, 'terminalTab')
+  const terminalTab = hasTerminalTab
+    ? normalizeWindowingTerminalTabSnapshot(parsed.terminalTab)
+    : undefined
+  if (
+    (hasTerminalTab && !terminalTab) ||
+    (terminalTab &&
+      (!isTerminalBackedPanelKind(kind as PanelKind) || terminalTab.id !== tabId))
+  ) {
+    return null
+  }
+
   return {
     sourceClientId,
     tabId,
     sourcePanelId,
-    kind,
+    kind: kind as WindowingTabKind,
     ...(stateToken ? { stateToken } : {}),
     ...(terminalTab ? { terminalTab } : {})
   }
@@ -560,7 +1301,7 @@ const getTabDragStateStorageKey = (token: string): string | null => {
 export const stashTabDragState = (token: string, payload: WindowingTabDragPayload): boolean => {
   const key = getTabDragStateStorageKey(token)
   const storage = readLocalStorage()
-  const normalizedPayload = normalizeTabDragState(payload)
+  const normalizedPayload = normalizeWindowingTabDragPayload(payload)
   if (!key || !storage || !normalizedPayload) {
     return false
   }
@@ -580,7 +1321,7 @@ export const readTabDragState = (token: string): WindowingTabDragPayload | null 
   }
   try {
     const raw = storage.getItem(key)
-    return normalizeTabDragState(raw ? JSON.parse(raw) : null)
+    return normalizeWindowingTabDragPayload(raw ? JSON.parse(raw) : null)
   } catch {
     return null
   }
@@ -615,7 +1356,7 @@ const getPanelDragStateStorageKey = (token: string): string | null => {
 export const stashPanelDragState = (token: string, payload: WindowingPanelDragPayload): boolean => {
   const key = getPanelDragStateStorageKey(token)
   const storage = readLocalStorage()
-  const normalizedPayload = normalizePanelDragState(payload)
+  const normalizedPayload = normalizeWindowingPanelDragPayload(payload)
   if (!key || !storage || !normalizedPayload) {
     return false
   }
@@ -639,7 +1380,7 @@ export const readPanelDragState = (token: string): WindowingPanelDragPayload | n
   }
   try {
     const raw = storage.getItem(key)
-    return normalizePanelDragState(raw ? JSON.parse(raw) : null)
+    return normalizeWindowingPanelDragPayload(raw ? JSON.parse(raw) : null)
   } catch {
     return null
   }
@@ -690,8 +1431,10 @@ const createStorageWindowingChannel = (): WindowingChannel | null => {
       return
     }
     try {
-      const payload = JSON.parse(event.newValue) as WindowingMessage
-      messageHandler?.({ data: payload })
+      const payload = normalizeWindowingMessage(JSON.parse(event.newValue))
+      if (payload) {
+        messageHandler?.({ data: payload })
+      }
     } catch {
       // ignore malformed windowing payloads
     }

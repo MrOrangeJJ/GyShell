@@ -6,6 +6,7 @@ import type {
   RpcRequest,
   UIUpdateAction,
 } from './protocol'
+import { readTuiSessionId } from './session-identity'
 
 type PendingRequest = {
   resolve: (value: unknown) => void
@@ -151,9 +152,13 @@ export class GatewayClient {
       typeof uiRevision === 'number' && Number.isFinite(uiRevision)
         ? uiRevision
         : null
-    const normalizedSessionId = String(sessionId || '').trim()
+    const hasSessionSelector = sessionId !== undefined
+    const exactSessionId = hasSessionSelector
+      ? readTuiSessionId(sessionId)
+      : undefined
+    if (hasSessionSelector && exactSessionId === undefined) return
     this.pendingUiUpdates = this.pendingUiUpdates.filter((update) => {
-      if (normalizedSessionId && update.sessionId !== normalizedSessionId) {
+      if (exactSessionId !== undefined && update.sessionId !== exactSessionId) {
         return true
       }
       return shouldReplayUiUpdateAfterSnapshot(
@@ -212,6 +217,7 @@ export class GatewayClient {
     }
 
     if (payload.type === 'gateway:ui-update') {
+      if (readTuiSessionId(payload.payload?.sessionId) === undefined) return
       if (this.emitter.listenerCount('uiUpdate') === 0) {
         this.pendingUiUpdates.push(payload.payload)
       } else {

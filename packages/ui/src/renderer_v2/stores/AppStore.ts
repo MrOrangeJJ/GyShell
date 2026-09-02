@@ -10,7 +10,9 @@ import { v4 as uuidv4 } from "uuid";
 import type { ITheme } from "@xterm/xterm";
 import {
   DEFAULT_PANEL_TAB_DISPLAY_MODE,
+  isValidTerminalRuntimeId,
   normalizeModelRequestParameters,
+  readOpaqueNonBlankString,
   type PanelTabDisplayModePreference,
 } from "@gyshell/shared";
 import type {
@@ -41,12 +43,15 @@ import { FileEditorStore } from "./FileEditorStore";
 import {
   buildLayoutTree,
   listPanels,
+  normalizeWindowingTabIds,
+  readWindowingTabId,
   type LayoutTree,
   type PanelKind,
 } from "../layout";
 import {
   buildDetachedLayoutTree,
   WINDOW_CONTEXT,
+  normalizeWindowingTerminalTabSnapshot,
   openDetachedWindowState,
   readDetachedWindowState,
   type DetachedWindowState,
@@ -170,6 +175,88 @@ const shouldInitializeLocalTerminalSilently = (): boolean => {
 const toPlainTerminalConfig = (config: TerminalConfig): TerminalConfig =>
   JSON.parse(JSON.stringify(config)) as TerminalConfig;
 
+type SshConnectionEntry = AppSettings["connections"]["ssh"][number];
+type SshTerminalConfig = Extract<TerminalConfig, { type: "ssh" }>;
+
+const buildSshTerminalConfig = (
+  entry: SshConnectionEntry,
+  settings: AppSettings,
+  options: {
+    id: string;
+    title: string;
+    depth?: number;
+    ancestorEntryIds?: ReadonlySet<string>;
+  },
+): SshTerminalConfig | null => {
+  const depth = options.depth ?? 0;
+  const ancestorEntryIds = options.ancestorEntryIds ?? new Set<string>();
+  if (
+    depth > 4 ||
+    !isValidTerminalRuntimeId(options.id) ||
+    ancestorEntryIds.has(entry.id)
+  ) {
+    return null;
+  }
+
+  const nextAncestorEntryIds = new Set(ancestorEntryIds);
+  nextAncestorEntryIds.add(entry.id);
+  const proxy = entry.proxyId
+    ? settings.connections.proxies.find(
+        (candidate) => candidate.id === entry.proxyId,
+      )
+    : undefined;
+  const tunnels = (entry.tunnelIds ?? [])
+    .map((tunnelId) =>
+      settings.connections.tunnels.find(
+        (candidate) => candidate.id === tunnelId,
+      ),
+    )
+    .filter((tunnel): tunnel is TunnelEntry => Boolean(tunnel));
+  const jumpHost = entry.jumpHost
+    ? buildSshTerminalConfig(entry.jumpHost, settings, {
+        id: entry.jumpHost.id,
+        title: normalizeTerminalTitle(
+          entry.jumpHost.name,
+          `${entry.jumpHost.username}@${entry.jumpHost.host}`,
+        ),
+        depth: depth + 1,
+        ancestorEntryIds: nextAncestorEntryIds,
+      })
+    : undefined;
+  if (entry.jumpHost && !jumpHost) {
+    return null;
+  }
+
+  return {
+    type: "ssh",
+    id: options.id,
+    title: normalizeTerminalTitle(options.title, options.id),
+    cols: 80,
+    rows: 24,
+    host: entry.host,
+    port: entry.port,
+    username: entry.username,
+    authMethod: entry.authMethod,
+    ...(typeof entry.password === "string"
+      ? { password: entry.password }
+      : {}),
+    ...(typeof entry.privateKey === "string"
+      ? { privateKey: entry.privateKey }
+      : {}),
+    ...(typeof entry.privateKeyPath === "string"
+      ? { privateKeyPath: entry.privateKeyPath }
+      : {}),
+    ...(typeof entry.passphrase === "string"
+      ? { passphrase: entry.passphrase }
+      : {}),
+    ...(proxy ? { proxy: toJS(proxy) as ProxyEntry } : {}),
+    ...(tunnels.length > 0
+      ? { tunnels: tunnels.map((tunnel) => toJS(tunnel) as TunnelEntry) }
+      : {}),
+    ...(jumpHost ? { jumpHost } : {}),
+  };
+};
+
 const resolveSuppressionKinds = (kind: PanelKind): WindowScopedTabKind[] =>
   kind === "chat"
     ? ["chat"]
@@ -266,12 +353,12 @@ export interface FileSystemClipboardState {
 const cloneFileSystemClipboardState = (
   payload: FileSystemClipboardState | null,
 ): FileSystemClipboardState | null => {
-  if (!payload) {
+  if (!payload || !isValidTerminalRuntimeId(payload.sourceTerminalId)) {
     return null;
   }
   return {
     mode: payload.mode === "move" ? "move" : "copy",
-    sourceTerminalId: String(payload.sourceTerminalId || ""),
+    sourceTerminalId: payload.sourceTerminalId,
     sourcePaths: Array.isArray(payload.sourcePaths)
       ? payload.sourcePaths
           .map((path) => String(path || ""))
@@ -549,7 +636,7 @@ export class AppStore {
     const normalized: string[] = [];
     const seen = new Set<string>();
     keys.forEach((value) => {
-      const rawKey = typeof value === "string" ? value.trim() : "";
+      const rawKey = readOpaqueNonBlankString(value);
       if (!rawKey) {
         return;
       }
@@ -759,7 +846,9 @@ export class AppStore {
   }
 
   private applyMonitorSnapshot(snapshot: MonitorSnapshot): void {
-    const terminalId = String(snapshot?.terminalId || "").trim();
+    const terminalId = isValidTerminalRuntimeId(snapshot?.terminalId)
+      ? snapshot.terminalId
+      : undefined;
     if (!terminalId) {
       return;
     }
@@ -957,13 +1046,14 @@ export class AppStore {
       if (!panelKind) {
         return;
       }
-      const tabIds = Array.isArray(binding?.tabIds) ? binding.tabIds : [];
+      const tabIds = normalizeWindowingTabIds(
+        panelKind,
+        Array.isArray(binding?.tabIds) ? binding.tabIds : [],
+      );
       tabIds.forEach((tabId) => {
-        const normalized = typeof tabId === "string" ? tabId.trim() : "";
-        if (!normalized) return;
-        this.getVisibilityLinkedKindsForTab(panelKind, normalized).forEach(
+        this.getVisibilityLinkedKindsForTab(panelKind, tabId).forEach(
           (targetKind) => {
-            sets[targetKind].add(normalized);
+            sets[targetKind].add(tabId);
           },
         );
       });
@@ -981,9 +1071,7 @@ export class AppStore {
       return false;
     }
 
-    const normalizedIds = tabIds
-      .map((tabId) => String(tabId || "").trim())
-      .filter((tabId) => tabId.length > 0);
+    const normalizedIds = normalizeWindowingTabIds(kind, tabIds);
     if (normalizedIds.length === 0) {
       return false;
     }
@@ -1007,9 +1095,7 @@ export class AppStore {
   }
 
   private handleChatSessionsChanged(sessionIds: string[]): void {
-    const normalizedIds = sessionIds
-      .map((sessionId) => String(sessionId || "").trim())
-      .filter((sessionId) => sessionId.length > 0);
+    const normalizedIds = normalizeWindowingTabIds("chat", sessionIds);
     const nextIds = new Set(normalizedIds);
     const addedIds = normalizedIds.filter(
       (sessionId) => !this.lastKnownChatSessionIds.has(sessionId),
@@ -1035,16 +1121,17 @@ export class AppStore {
   private upsertTransferredTerminalTab(
     snapshot: WindowingTerminalTabSnapshot,
   ): void {
-    const normalizedId = String(snapshot.id || "").trim();
-    if (!normalizedId) {
+    const normalizedSnapshot = normalizeWindowingTerminalTabSnapshot(snapshot);
+    if (!normalizedSnapshot) {
       return;
     }
+    const normalizedId = normalizedSnapshot.id;
     const title = this.getUniqueTerminalTitle(
-      normalizeTerminalTitle(snapshot.title, normalizedId),
+      normalizeTerminalTitle(normalizedSnapshot.title, normalizedId),
       { excludeTabId: normalizedId },
     );
     const config = {
-      ...snapshot.config,
+      ...normalizedSnapshot.config,
       title,
     } as TerminalConfig;
     const nextTab: TerminalTabModel = {
@@ -1052,12 +1139,14 @@ export class AppStore {
       title,
       config,
       capabilities: resolveTerminalConnectionCapabilities(config),
-      ...(snapshot.connectionRef
-        ? { connectionRef: snapshot.connectionRef }
+      ...(normalizedSnapshot.connectionRef
+        ? { connectionRef: normalizedSnapshot.connectionRef }
         : {}),
-      ...(snapshot.runtimeState ? { runtimeState: snapshot.runtimeState } : {}),
-      ...(typeof snapshot.lastExitCode === "number"
-        ? { lastExitCode: snapshot.lastExitCode }
+      ...(normalizedSnapshot.runtimeState
+        ? { runtimeState: normalizedSnapshot.runtimeState }
+        : {}),
+      ...(typeof normalizedSnapshot.lastExitCode === "number"
+        ? { lastExitCode: normalizedSnapshot.lastExitCode }
         : {}),
     };
     this.terminalTabs = upsertById(this.terminalTabs, nextTab);
@@ -1073,7 +1162,7 @@ export class AppStore {
       terminalTab?: WindowingTerminalTabSnapshot;
     },
   ): void {
-    const normalizedTabId = String(tabId || "").trim();
+    const normalizedTabId = readWindowingTabId(kind, tabId);
     if (!normalizedTabId) {
       return;
     }
@@ -1104,23 +1193,19 @@ export class AppStore {
       terminalTabs?: WindowingTerminalTabSnapshot[];
     },
   ): string[] {
-    const normalizedTabIds = Array.from(
-      new Set(
-        (tabIds || [])
-          .map((tabId) => String(tabId || "").trim())
-          .filter((tabId) => tabId.length > 0),
-      ),
-    );
+    const normalizedTabIds = normalizeWindowingTabIds(kind, tabIds || []);
     if (normalizedTabIds.length === 0) {
       return normalizedTabIds;
     }
     const terminalTabById = new Map(
       (options?.terminalTabs || [])
-        .map(
-          (terminalTab) =>
-            [String(terminalTab.id || "").trim(), terminalTab] as const,
+        .map((terminalTab) => normalizeWindowingTerminalTabSnapshot(terminalTab))
+        .filter(
+          (
+            terminalTab,
+          ): terminalTab is WindowingTerminalTabSnapshot => !!terminalTab,
         )
-        .filter(([tabId]) => tabId.length > 0),
+        .map((terminalTab) => [terminalTab.id, terminalTab] as const),
     );
     // Cross-window transferred tabs must create owner inventory entries before
     // any layout sync runs, otherwise syncPanelBindings() can strip them back
@@ -1134,7 +1219,7 @@ export class AppStore {
   }
 
   hydrateTransferredTabEntry(kind: PanelKind, tabId: string): void {
-    const normalizedTabId = String(tabId || "").trim();
+    const normalizedTabId = readWindowingTabId(kind, tabId);
     if (!normalizedTabId || kind !== "chat") {
       return;
     }
@@ -1155,13 +1240,7 @@ export class AppStore {
   }
 
   hydrateTransferredTabs(kind: PanelKind, tabIds: string[]): string[] {
-    const normalizedTabIds = Array.from(
-      new Set(
-        (tabIds || [])
-          .map((tabId) => String(tabId || "").trim())
-          .filter((tabId) => tabId.length > 0),
-      ),
-    );
+    const normalizedTabIds = normalizeWindowingTabIds(kind, tabIds || []);
     normalizedTabIds.forEach((tabId) => {
       this.hydrateTransferredTabEntry(kind, tabId);
     });
@@ -1179,9 +1258,7 @@ export class AppStore {
     if (targetKinds.length === 0) return;
 
     let changed = false;
-    const normalizedIds = tabIds
-      .map((tabId) => String(tabId || "").trim())
-      .filter((tabId) => tabId.length > 0);
+    const normalizedIds = normalizeWindowingTabIds(kind, tabIds);
     if (normalizedIds.length === 0) return;
 
     targetKinds.forEach((targetKind) => {
@@ -1219,9 +1296,7 @@ export class AppStore {
     if (targetKinds.length === 0) return;
 
     let changed = false;
-    const normalizedIds = tabIds
-      .map((tabId) => String(tabId || "").trim())
-      .filter((tabId) => tabId.length > 0);
+    const normalizedIds = normalizeWindowingTabIds(kind, tabIds);
     if (normalizedIds.length === 0) return;
 
     targetKinds.forEach((targetKind) => {
@@ -1255,11 +1330,10 @@ export class AppStore {
     ): string[] => {
       const ids = new Set<string>();
       this.layout.getPanelIdsByKind(kind).forEach((panelId) => {
-        this.layout.getPanelTabIds(panelId).forEach((tabId) => {
-          const normalized = String(tabId || "").trim();
-          if (!normalized) return;
-          ids.add(normalized);
-        });
+        normalizeWindowingTabIds(
+          kind,
+          this.layout.getPanelTabIds(panelId),
+        ).forEach((tabId) => ids.add(tabId));
       });
       return Array.from(ids);
     };
@@ -1409,12 +1483,10 @@ export class AppStore {
       const chatPanelSet = new Set(chatPanelIds);
       const chatBindings = chatPanelIds.map((panelId) => {
         const binding = tree.panelTabs?.[panelId];
-        const tabIds = Array.isArray(binding?.tabIds)
-          ? binding.tabIds.filter(
-              (tabId): tabId is string =>
-                typeof tabId === "string" && tabId.length > 0,
-            )
-          : [];
+        const tabIds = normalizeWindowingTabIds(
+          "chat",
+          Array.isArray(binding?.tabIds) ? binding.tabIds : [],
+        );
         const activeTabId =
           typeof binding?.activeTabId === "string" &&
           tabIds.includes(binding.activeTabId)
@@ -1498,10 +1570,15 @@ export class AppStore {
 
   reconcileTerminalTabs(payload: TerminalListPayload): void {
     const firstHydration = this.terminalTabsHydrated !== true;
-    const incoming = payload?.terminals || [];
-    const incomingIds = incoming
-      .map((item) => item.id)
-      .filter((id): id is string => typeof id === "string" && id.length > 0);
+    const seenIncomingIds = new Set<string>();
+    const incoming = (payload?.terminals || []).filter((item) => {
+      if (!isValidTerminalRuntimeId(item?.id) || seenIncomingIds.has(item.id)) {
+        return false;
+      }
+      seenIncomingIds.add(item.id);
+      return true;
+    });
+    const incomingIds = incoming.map((item) => item.id);
     if (firstHydration) {
       const unresolvedPanelIds = this.layout.getPanelsWithMissingTabBindings(
         "terminal",
@@ -2508,16 +2585,13 @@ export class AppStore {
       const detachedTerminalSnapshots = Array.from(
         new Map(
           (detachedWindowState?.terminalTabs || [])
-            .map((snapshot) => {
-              const id = String(snapshot.id || "").trim();
-              return id ? ([id, snapshot] as const) : null;
-            })
+            .map((snapshot) => normalizeWindowingTerminalTabSnapshot(snapshot))
             .filter(
               (
-                entry,
-              ): entry is readonly [string, WindowingTerminalTabSnapshot] =>
-                !!entry,
-            ),
+                snapshot,
+              ): snapshot is WindowingTerminalTabSnapshot => !!snapshot,
+            )
+            .map((snapshot) => [snapshot.id, snapshot] as const),
         ).values(),
       );
       const buildTerminalSnapshotForBootstrap = (
@@ -2840,38 +2914,19 @@ export class AppStore {
       console.warn("SSH entry not found", entryId);
       return null;
     }
-    const proxy = entry.proxyId
-      ? this.settings?.connections?.proxies?.find((p) => p.id === entry.proxyId)
-      : undefined;
-    const tunnels = (entry.tunnelIds ?? [])
-      .map((id) =>
-        this.settings?.connections?.tunnels?.find((t) => t.id === id),
-      )
-      .filter(Boolean) as any[];
     const id = `ssh-${uuidv4()}`;
     const baseTitle = entry.name || `${entry.username}@${entry.host}`;
     const title = this.getUniqueTitle(baseTitle);
-    const jumpHost = (entry as any).jumpHost
-      ? (toJS((entry as any).jumpHost) as any)
-      : undefined;
-    const cfg: TerminalConfig = {
-      type: "ssh",
+    const settings = this.settings;
+    if (!settings) return null;
+    const cfg = buildSshTerminalConfig(toJS(entry), toJS(settings), {
       id,
       title,
-      cols: 80,
-      rows: 24,
-      host: entry.host,
-      port: entry.port,
-      username: entry.username,
-      authMethod: entry.authMethod,
-      password: entry.password,
-      privateKey: entry.privateKey,
-      privateKeyPath: entry.privateKeyPath,
-      passphrase: entry.passphrase,
-      proxy,
-      tunnels,
-      jumpHost,
-    } as any;
+    });
+    if (!cfg) {
+      console.warn("SSH entry contains an invalid jump-host chain", entryId);
+      return null;
+    }
     const tab: TerminalTabModel = {
       id,
       title,
@@ -3261,7 +3316,7 @@ export class AppStore {
       loadAgentContext?: boolean;
     },
   ): Promise<void> {
-    const normalizedSessionId = String(sessionId || "").trim();
+    const normalizedSessionId = readWindowingTabId("chat", sessionId);
     if (!normalizedSessionId) {
       return;
     }

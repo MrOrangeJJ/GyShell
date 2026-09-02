@@ -64,7 +64,7 @@ function toolHistoryFixture(content: string, messageId = 'exec-message') {
         id: 'exec-call',
         name: 'exec_command',
         args: {
-          tabIdOrName: 'local-terminal',
+          terminalId: 'local-terminal',
           command: 'printf durable',
           waitMode: 'nowait'
         }
@@ -102,6 +102,12 @@ function createTerminalRuntime() {
     capabilities: { supportsFilesystem: true }
   }
   return {
+    getTerminalById(reference: string) {
+      return reference === terminal.id ? terminal : undefined
+    },
+    getDisplayTerminals() {
+      return [terminal]
+    },
     resolveTerminal(reference: string) {
       return reference === terminal.id || reference === terminal.title
         ? { found: [terminal], bestMatch: terminal }
@@ -258,7 +264,7 @@ await runCase('runtime disable and MCP annotation drift break a parallel wave be
       {
         id: 'file',
         name: 'read_file',
-        args: { tabIdOrName: 'local-terminal', filePath: '/tmp/pixel.png' }
+        args: { terminalId: 'local-terminal', filePath: '/tmp/pixel.png' }
       },
       { id: 'lookup', name: 'mcp_lookup', args: {} }
     ]
@@ -303,7 +309,7 @@ await runCase('any rejected parallel command has an unknown non-retryable outcom
   const calls = ['one', 'two'].map((reference, ordinal) => ({
     id: reference,
     name: 'exec_command',
-    args: { tabIdOrName: reference, command: reference },
+    args: { terminalId: reference, command: reference },
     _gyshellExecution: {
       ordinal,
       mode: 'execute',
@@ -346,7 +352,7 @@ await runCase('a wait command switched to background defers its same-terminal ta
           id: 'command',
           name: 'exec_command',
           args: {
-            tabIdOrName: 'local-terminal',
+            terminalId: 'local-terminal',
             command: 'server',
             waitMode: 'wait'
           }
@@ -354,7 +360,7 @@ await runCase('a wait command switched to background defers its same-terminal ta
         {
           id: 'edit',
           name: 'edit_file',
-          args: { tabIdOrName: 'local-terminal', filePath: '/tmp/a', patch: 'x' }
+          args: { terminalId: 'local-terminal', filePath: '/tmp/a', patch: 'x' }
         }
       ]
     })
@@ -396,7 +402,7 @@ await runCase('a terminal exit during wait defers its same-terminal tail', async
           id: 'command',
           name: 'exec_command',
           args: {
-            tabIdOrName: 'local-terminal',
+            terminalId: 'local-terminal',
             command: 'may-have-run',
             waitMode: 'wait'
           }
@@ -405,7 +411,7 @@ await runCase('a terminal exit during wait defers its same-terminal tail', async
           id: 'edit',
           name: 'edit_file',
           args: {
-            tabIdOrName: 'local-terminal',
+            terminalId: 'local-terminal',
             filePath: '/tmp/a',
             oldString: 'a',
             newString: 'b'
@@ -441,6 +447,12 @@ await runCase('a parallel command switched to background defers its parent-batch
     capabilities: { supportsFilesystem: true }
   }))
   const terminalRuntime = {
+    getTerminalById(reference: string) {
+      return terminals.find((candidate) => candidate.id === reference)
+    },
+    getDisplayTerminals() {
+      return terminals
+    },
     resolveTerminal(reference: string) {
       const terminal = terminals.find(
         (candidate) => candidate.id === reference || candidate.title === reference
@@ -472,12 +484,12 @@ await runCase('a parallel command switched to background defers its parent-batch
   const agent = createAgent({ terminalRuntime })
   const originalRunCommand = toolImplementations.runCommand
   ;(toolImplementations as any).runCommand = async (
-    args: { tabIdOrName: string },
+    args: { terminalId: string },
     _context: unknown,
     options: { onContinuesInBackground?: () => void }
   ) => {
-    if (args.tabIdOrName === 'A') options.onContinuesInBackground?.()
-    return `${args.tabIdOrName} result`
+    if (args.terminalId === 'A') options.onContinuesInBackground?.()
+    return `${args.terminalId} result`
   }
   try {
     const source = new AIMessage({
@@ -486,17 +498,17 @@ await runCase('a parallel command switched to background defers its parent-batch
         {
           id: 'command-a',
           name: 'exec_command',
-          args: { tabIdOrName: 'A', command: 'server', waitMode: 'wait' }
+          args: { terminalId: 'A', command: 'server', waitMode: 'wait' }
         },
         {
           id: 'command-b',
           name: 'exec_command',
-          args: { tabIdOrName: 'B', command: 'check', waitMode: 'wait' }
+          args: { terminalId: 'B', command: 'check', waitMode: 'wait' }
         },
         {
           id: 'edit-a',
           name: 'edit_file',
-          args: { tabIdOrName: 'A', filePath: '/tmp/a', oldString: 'a', newString: 'b' }
+          args: { terminalId: 'A', filePath: '/tmp/a', oldString: 'a', newString: 'b' }
         }
       ]
     })
@@ -540,7 +552,7 @@ await runCase('an existing active terminal task defers the preserved mutation ta
           id: 'blocked-command',
           name: 'exec_command',
           args: {
-            tabIdOrName: 'local-terminal',
+            terminalId: 'local-terminal',
             command: 'next',
             waitMode: 'wait'
           }
@@ -548,7 +560,7 @@ await runCase('an existing active terminal task defers the preserved mutation ta
         {
           id: 'unsafe-edit',
           name: 'edit_file',
-          args: { tabIdOrName: 'local-terminal', filePath: '/tmp/a' }
+          args: { terminalId: 'local-terminal', filePath: '/tmp/a' }
         }
       ]
     })
@@ -739,7 +751,7 @@ await runCase('a lifecycle tool disabled after planning fails closed with a stru
       {
         id: 'runtime-disabled-close',
         name: 'close_terminal_tab',
-        args: { tabIdOrName: 'local-terminal' }
+        args: { terminalId: 'local-terminal' }
       }
     ]
   })
@@ -793,7 +805,7 @@ await runCase('lifecycle tool AbortError is never converted into a validation re
       {
         id: 'aborted-close',
         name: 'close_terminal_tab',
-        args: { tabIdOrName: 'local-terminal' }
+        args: { terminalId: 'local-terminal' }
       }
     ]) {
       await assert.rejects(
@@ -885,7 +897,7 @@ await runCase('a read_file adapter that ignores stop cannot publish a late resul
               id: 'slow-file',
               name: 'read_file',
               args: {
-                tabIdOrName: 'local-terminal',
+                terminalId: 'local-terminal',
                 filePath: '/tmp/pixel.png'
               }
             }
@@ -896,7 +908,7 @@ await runCase('a read_file adapter that ignores stop cannot publish a late resul
         {
           id: 'slow-file',
           name: 'read_file',
-          args: { tabIdOrName: 'local-terminal', filePath: '/tmp/pixel.png' }
+          args: { terminalId: 'local-terminal', filePath: '/tmp/pixel.png' }
         }
       ],
       pendingToolSupplementMessages: []
@@ -916,6 +928,7 @@ await runCase('a stopped file mutation settles before a restarted run can overwr
   let markWriteStarted!: () => void
   let writeCallCount = 0
   const committedContents: string[] = []
+  const fileContents = new Map<string, string>()
   const writeGate = new Promise<void>((resolve) => {
     releaseWrite = resolve
   })
@@ -924,12 +937,16 @@ await runCase('a stopped file mutation settles before a restarted run can overwr
   })
   const terminalRuntime = {
     ...createTerminalRuntime(),
-    async writeFile(_terminalId: string, _filePath: string, content: string) {
+    async readFile(_terminalId: string, filePath: string) {
+      return Buffer.from(fileContents.get(filePath) ?? '', 'utf8')
+    },
+    async writeFile(_terminalId: string, filePath: string, content: string) {
       writeCallCount += 1
       if (writeCallCount === 1) {
         markWriteStarted()
         await writeGate
       }
+      fileContents.set(filePath, content)
       committedContents.push(content)
     }
   }
@@ -942,7 +959,7 @@ await runCase('a stopped file mutation settles before a restarted run can overwr
     id: 'stale-write',
     name: 'write_file',
     args: {
-      tabIdOrName: 'local-terminal',
+      terminalId: 'local-terminal',
       filePath: '/tmp/new.txt',
       content: 'stale-run-content'
     }
@@ -964,7 +981,7 @@ await runCase('a stopped file mutation settles before a restarted run can overwr
     id: 'fresh-write',
     name: 'write_file',
     args: {
-      tabIdOrName: 'local-terminal',
+      terminalId: 'local-terminal',
       filePath: '/tmp/new.txt',
       content: 'fresh-run-content'
     }
@@ -1026,7 +1043,7 @@ await runCase('specialized built-in nodes fail closed when disabled after routin
         capability: 'exec_command',
         route: 'command_tools',
         args: {
-          tabIdOrName: 'local-terminal',
+          terminalId: 'local-terminal',
           command: 'touch /tmp/should-not-run',
           waitMode: 'nowait'
         },
@@ -1039,7 +1056,7 @@ await runCase('specialized built-in nodes fail closed when disabled after routin
         capability: 'create_or_edit',
         route: 'file_tools',
         args: {
-          tabIdOrName: 'local-terminal',
+          terminalId: 'local-terminal',
           filePath: '/tmp/should-not-write',
           content: 'blocked'
         },
@@ -1052,7 +1069,7 @@ await runCase('specialized built-in nodes fail closed when disabled after routin
         capability: 'read_file',
         route: 'read_file',
         args: {
-          tabIdOrName: 'local-terminal',
+          terminalId: 'local-terminal',
           filePath: '/tmp/pixel.png'
         },
         node: () => (agent as any).createReadFileNode(),
@@ -1151,7 +1168,7 @@ await runCase(
         id: 'exec-call',
         name: 'exec_command',
         args: {
-          tabIdOrName: 'local-terminal',
+          terminalId: 'local-terminal',
           command: 'printf durable',
           waitMode: 'nowait'
         }
@@ -1460,7 +1477,7 @@ await runCase(
         id: 'exec-call',
         name: 'exec_command',
         args: {
-          tabIdOrName: 'local-terminal',
+          terminalId: 'local-terminal',
           command: 'long-running',
           waitMode: 'wait'
         }
@@ -1595,7 +1612,7 @@ await runCase(
         id: 'image',
         name: 'read_file',
         args: {
-          tabIdOrName: 'local-terminal',
+          terminalId: 'local-terminal',
           filePath: '/tmp/pixel.png'
         }
       },

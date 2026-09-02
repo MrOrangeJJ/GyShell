@@ -11,7 +11,10 @@ import {
   clearTabDragState,
   clearPanelDragState,
   createWindowingChannel,
+  normalizeWindowingPanelDragPayload,
+  normalizeWindowingTerminalTabSnapshot,
   openDetachedWindowState,
+  parseDetachedWindowState,
   readPanelDragState,
   readTabDragState,
   readDetachedWindowState,
@@ -21,7 +24,11 @@ import {
   stashPanelDragState,
   WINDOWING_STORAGE_CHANNEL_KEY
 } from './windowing'
-import type { LayoutTree, PanelKind } from '../layout'
+import {
+  parseStrictLayoutTree,
+  type LayoutTree,
+  type PanelKind
+} from '../layout'
 
 const assertEqual = <T>(actual: T, expected: T, message: string): void => {
   if (actual !== expected) {
@@ -45,6 +52,34 @@ const runCase = (name: string, fn: () => void): void => {
   fn()
   console.log(`PASS ${name}`)
 }
+
+const createLocalTerminalSnapshot = (id = 'term-local') => ({
+  id,
+  title: 'Local',
+  config: {
+    type: 'local',
+    id,
+    title: 'Local',
+    cols: 80,
+    rows: 24
+  }
+})
+
+const createSshTerminalConfig = (
+  id: string,
+  jumpHost?: Record<string, unknown>
+): Record<string, unknown> => ({
+  type: 'ssh',
+  id,
+  title: `SSH ${id}`,
+  cols: 120,
+  rows: 32,
+  host: 'host.example.test',
+  port: 22,
+  username: 'operator',
+  authMethod: 'password',
+  ...(jumpHost ? { jumpHost } : {})
+})
 
 // ---------------------------------------------------------------------------
 // WindowingDragStartMessage type checks
@@ -216,7 +251,13 @@ runCase('detached window state survives repeated reads for renderer reloads', ()
       layoutTree: {
         schemaVersion: 2,
         root: { type: 'panel' as const, id: 'node-term', panel: { id: 'panel-term', kind: 'terminal' as const } },
-        focusedPanelId: 'panel-term'
+        focusedPanelId: 'panel-term',
+        panelTabs: {
+          'panel-term': {
+            tabIds: ['ssh-detached'],
+            activeTabId: 'ssh-detached'
+          }
+        }
       } as LayoutTree,
       createdAt: 123,
       terminalTabs: [
@@ -232,7 +273,8 @@ runCase('detached window state survives repeated reads for renderer reloads', ()
             host: 'deploy.example.test',
             port: 22,
             username: 'deploy',
-            authMethod: 'password' as const
+            authMethod: 'password' as const,
+            password: undefined
           },
           connectionRef: { type: 'ssh', entryId: 'ssh-entry' },
           runtimeState: 'initializing' as const
@@ -249,19 +291,422 @@ runCase('detached window state survives repeated reads for renderer reloads', ()
     assertDeepEqual(readDetachedWindowState(token), detachedState, 'second detached state read should still succeed after reload')
 
     const refreshedState = {
-      ...detachedState,
-      createdAt: 456,
+      sourceClientId: detachedState.sourceClientId,
       layoutTree: {
         schemaVersion: 2,
         root: { type: 'panel' as const, id: 'node-chat', panel: { id: 'panel-chat', kind: 'chat' as const } },
         focusedPanelId: 'panel-chat'
-      } as LayoutTree
+      } as LayoutTree,
+      createdAt: 456
     }
     assertEqual(syncDetachedWindowState(token, refreshedState), true, 'detached state refresh should update session snapshot')
     assertDeepEqual(readDetachedWindowState(token), refreshedState, 'later reads should pick refreshed detached session snapshot')
   } finally {
     ;(globalThis as any).window = originalWindow
   }
+})
+
+runCase('strict detached layout rejects malformed structure without repair', () => {
+  const validTree = {
+    schemaVersion: 2,
+    root: {
+      type: 'split',
+      id: 'root',
+      direction: 'horizontal',
+      children: [
+        {
+          type: 'panel',
+          id: 'node-terminal',
+          panel: { id: 'panel-terminal', kind: 'terminal' }
+        },
+        {
+          type: 'panel',
+          id: 'node-chat',
+          panel: { id: 'panel-chat', kind: 'chat' }
+        }
+      ],
+      sizes: [0, 7]
+    },
+    focusedPanelId: 'panel-terminal',
+    panelTabs: {
+      'panel-terminal': {
+        tabIds: [' Term ', 'Term', 'term', '终端🙂'],
+        activeTabId: ' Term '
+      },
+      'panel-chat': {
+        tabIds: [' Chat ', 'Chat', 'chat', '__proto__'],
+        activeTabId: '__proto__'
+      }
+    }
+  }
+  const parsed = parseStrictLayoutTree(validTree)
+  assertCondition(parsed, 'a valid strict layout should parse')
+  assertDeepEqual(
+    parsed?.root.type === 'split' ? parsed.root.sizes : null,
+    [0, 7],
+    'strict split weights should be preserved without normalization'
+  )
+  assertEqual(
+    Object.getPrototypeOf(parsed?.panelTabs),
+    null,
+    'session-keyed bindings should use a null-prototype record'
+  )
+  assertDeepEqual(
+    parsed?.panelTabs?.['panel-terminal']?.tabIds,
+    [' Term ', 'Term', 'term', '终端🙂'],
+    'terminal identities should remain byte-for-byte distinct'
+  )
+
+  const rejects = (mutate: (candidate: any) => void, message: string) => {
+    const candidate = JSON.parse(JSON.stringify(validTree))
+    mutate(candidate)
+    assertEqual(parseStrictLayoutTree(candidate), null, message)
+  }
+  rejects((candidate) => {
+    candidate.unknown = true
+  }, 'unknown root keys must reject the layout')
+  rejects((candidate) => {
+    candidate.root.children[1].id = 'node-terminal'
+  }, 'duplicate node ids must reject the layout')
+  rejects((candidate) => {
+    candidate.root.children[1].panel.id = 'panel-terminal'
+  }, 'duplicate panel ids must reject the layout')
+  rejects((candidate) => {
+    candidate.root.sizes = [0, 0]
+  }, 'all-zero split weights must reject the layout')
+  rejects((candidate) => {
+    candidate.root.sizes = [100]
+  }, 'mismatched split weights must reject the layout')
+  rejects((candidate) => {
+    candidate.focusedPanelId = 'missing-panel'
+  }, 'an unknown focused panel must reject the layout')
+  rejects((candidate) => {
+    candidate.panelTabs['panel-terminal'].activeTabId = 'missing-tab'
+  }, 'an unbound active tab must reject the layout')
+  rejects((candidate) => {
+    candidate.panelTabs['missing-panel'] = { tabIds: [] }
+  }, 'an orphan panel binding must reject the layout')
+  rejects((candidate) => {
+    candidate.managerPanels = { terminal: 'panel-chat' }
+  }, 'a manager kind mismatch must reject the layout')
+
+  const inheritedTree = Object.create({ inherited: true })
+  Object.assign(inheritedTree, validTree)
+  assertEqual(
+    parseStrictLayoutTree(inheritedTree),
+    null,
+    'prototype-bearing direct records must reject strict admission'
+  )
+})
+
+runCase('strict terminal snapshots enforce variant keys and preserve generic JSON extensions', () => {
+  const local = createLocalTerminalSnapshot(' local #]::🙂 ')
+  const normalizedLocal = normalizeWindowingTerminalTabSnapshot(local)
+  assertEqual(
+    normalizedLocal?.id,
+    ' local #]::🙂 ',
+    'outer and config terminal ids should remain exact'
+  )
+  assertEqual(
+    Object.getPrototypeOf(normalizedLocal?.config),
+    null,
+    'normalized terminal configs should use null-prototype records'
+  )
+
+  assertEqual(
+    normalizeWindowingTerminalTabSnapshot({
+      ...local,
+      config: { ...local.config, host: 'ssh-only.example.test' }
+    }),
+    undefined,
+    'local configs must reject SSH-only keys'
+  )
+
+  const sshId = 'ssh-exact'
+  const jumpHost = createSshTerminalConfig('jump-exact')
+  const sshConfig = {
+    ...createSshTerminalConfig(sshId, jumpHost),
+    password: '',
+    proxy: {
+      id: 'proxy-1',
+      name: 'Proxy',
+      type: 'socks5',
+      host: 'proxy.example.test',
+      port: 1080,
+      username: '',
+      password: ''
+    },
+    tunnels: []
+  }
+  const normalizedSsh = normalizeWindowingTerminalTabSnapshot({
+    id: sshId,
+    title: 'SSH',
+    config: sshConfig
+  })
+  assertCondition(normalizedSsh, 'valid proxy, empty tunnels, and jump host should parse')
+  assertEqual(
+    (normalizedSsh?.config as any).jumpHost.id,
+    'jump-exact',
+    'jump-host identity should remain exact'
+  )
+
+  assertEqual(
+    normalizeWindowingTerminalTabSnapshot({
+      id: sshId,
+      title: 'SSH',
+      config: { ...sshConfig, cwd: '/ssh-cannot-use-local-cwd' }
+    }),
+    undefined,
+    'SSH configs must reject local-only keys'
+  )
+  assertEqual(
+    normalizeWindowingTerminalTabSnapshot({
+      id: sshId,
+      title: 'SSH',
+      config: { ...sshConfig, proxy: { ...(sshConfig.proxy as object), extra: true } }
+    }),
+    undefined,
+    'known proxy configs must reject unknown keys'
+  )
+  assertEqual(
+    normalizeWindowingTerminalTabSnapshot({
+      id: sshId,
+      title: 'SSH',
+      config: { ...sshConfig, tunnels: [{ id: 'bad' }] }
+    }),
+    undefined,
+    'malformed tunnel entries must reject the snapshot'
+  )
+  assertEqual(
+    normalizeWindowingTerminalTabSnapshot({
+      id: sshId,
+      title: 'SSH',
+      config: { ...sshConfig, password: undefined }
+    }),
+    undefined,
+    'explicit undefined optional fields must reject direct object admission'
+  )
+
+  let nestedJumpHost: Record<string, unknown> | undefined
+  for (let index = 5; index >= 0; index -= 1) {
+    nestedJumpHost = createSshTerminalConfig(`jump-${index}`, nestedJumpHost)
+  }
+  assertEqual(
+    normalizeWindowingTerminalTabSnapshot({
+      id: sshId,
+      title: 'SSH',
+      config: createSshTerminalConfig(sshId, nestedJumpHost)
+    }),
+    undefined,
+    'jump-host chains beyond the strict depth bound must reject'
+  )
+
+  const generic = normalizeWindowingTerminalTabSnapshot({
+    id: 'generic-id',
+    title: 'Generic',
+    config: {
+      type: 'plugin.connection',
+      id: 'generic-id',
+      title: 'Generic',
+      cols: 90,
+      rows: 30,
+      extension: {
+        flag: true,
+        values: ['::', '#', '🙂'],
+        nested: { count: 1 }
+      }
+    }
+  })
+  assertCondition(generic, 'generic JSON extension fields should remain supported')
+  assertDeepEqual(
+    (generic?.config as any).extension.values,
+    ['::', '#', '🙂'],
+    'generic JSON extension values should survive strict cloning'
+  )
+
+  const prototypeConfig = Object.create({ host: 'inherited' })
+  Object.assign(prototypeConfig, createSshTerminalConfig('prototype-id'))
+  assertEqual(
+    normalizeWindowingTerminalTabSnapshot({
+      id: 'prototype-id',
+      title: 'Prototype',
+      config: prototypeConfig
+    }),
+    undefined,
+    'prototype-bearing config records must reject direct admission'
+  )
+})
+
+runCase('native panel drag ingress is presence-sensitive and fail-closed', () => {
+  const validFileEditorSnapshot = {
+    terminalId: 'term-editor',
+    filePath: '/tmp/file.txt',
+    mode: 'text',
+    content: 'draft',
+    dirty: true,
+    errorMessage: null,
+    statusMessage: 'Editing'
+  }
+  const normalizedEditor = normalizeWindowingPanelDragPayload({
+    sourceClientId: ' win-source ',
+    sourcePanelId: ' panel #]::🙂 ',
+    kind: 'fileEditor',
+    fileEditorSnapshot: validFileEditorSnapshot
+  })
+  assertEqual(
+    normalizedEditor?.sourceClientId,
+    'win-source',
+    'transport identifiers may be trimmed'
+  )
+  assertEqual(
+    normalizedEditor?.sourcePanelId,
+    ' panel #]::🙂 ',
+    'panel identity must remain byte-for-byte exact'
+  )
+  assertDeepEqual(
+    normalizedEditor?.fileEditorSnapshot,
+    validFileEditorSnapshot,
+    'a valid strict file-editor snapshot should survive native ingress'
+  )
+
+  assertEqual(
+    normalizeWindowingPanelDragPayload({
+      sourceClientId: 'win-source',
+      sourcePanelId: 'panel-editor',
+      kind: 'fileEditor',
+      fileEditorSnapshot: {
+        ...validFileEditorSnapshot,
+        dirty: 'yes'
+      }
+    }),
+    null,
+    'compatibility repair must not coerce malformed file-editor snapshots'
+  )
+  assertEqual(
+    normalizeWindowingPanelDragPayload({
+      sourceClientId: 'win-source',
+      sourcePanelId: 'panel-editor',
+      kind: 'fileEditor',
+      fileEditorSnapshot: undefined
+    }),
+    null,
+    'an explicitly present undefined optional snapshot must reject'
+  )
+  assertEqual(
+    normalizeWindowingPanelDragPayload({
+      sourceClientId: 'win-source',
+      sourcePanelId: 'panel-editor',
+      kind: 'fileEditor',
+      stateToken: '   '
+    }),
+    null,
+    'an explicitly blank state token must reject'
+  )
+  assertEqual(
+    normalizeWindowingPanelDragPayload({
+      sourceClientId: 'win-source',
+      sourcePanelId: 'panel-editor',
+      kind: 'fileEditor',
+      tabBinding: { tabIds: [] }
+    }),
+    null,
+    'non-tabbed panel kinds must reject tab bindings'
+  )
+  assertEqual(
+    normalizeWindowingPanelDragPayload({
+      sourceClientId: 'win-source',
+      sourcePanelId: 'panel-editor',
+      kind: 'fileEditor',
+      unknown: true
+    }),
+    null,
+    'unknown drag payload keys must reject'
+  )
+
+  const terminalSnapshot = createLocalTerminalSnapshot('term-drag')
+  const terminalPayload = normalizeWindowingPanelDragPayload({
+    sourceClientId: 'win-source',
+    sourcePanelId: 'panel-terminal',
+    kind: 'terminal',
+    tabBinding: {
+      tabIds: ['term-drag'],
+      activeTabId: 'term-drag'
+    },
+    terminalTabs: [terminalSnapshot]
+  })
+  assertEqual(
+    terminalPayload?.terminalTabs?.[0]?.id,
+    'term-drag',
+    'terminal snapshot id must exactly match its binding'
+  )
+  assertEqual(
+    normalizeWindowingPanelDragPayload({
+      sourceClientId: 'win-source',
+      sourcePanelId: 'panel-terminal',
+      kind: 'terminal',
+      tabBinding: { tabIds: ['term-drag'] },
+      terminalTabs: [terminalSnapshot, terminalSnapshot]
+    }),
+    null,
+    'duplicate terminal snapshots must reject the whole payload'
+  )
+  assertEqual(
+    normalizeWindowingPanelDragPayload({
+      sourceClientId: 'win-source',
+      sourcePanelId: 'panel-terminal',
+      kind: 'terminal',
+      tabBinding: { tabIds: ['another-id'] },
+      terminalTabs: [terminalSnapshot]
+    }),
+    null,
+    'orphan terminal snapshots must reject the whole payload'
+  )
+  assertDeepEqual(
+    normalizeWindowingPanelDragPayload({
+      sourceClientId: 'win-source',
+      sourcePanelId: 'panel-terminal',
+      kind: 'terminal',
+      tabBinding: { tabIds: [] },
+      terminalTabs: []
+    })?.terminalTabs,
+    [],
+    'an explicitly present empty terminal snapshot array should remain present'
+  )
+})
+
+runCase('detached terminal snapshots must be referenced by an exact terminal-backed binding', () => {
+  const orphanState = {
+    sourceClientId: 'win-main',
+    layoutTree: {
+      schemaVersion: 2,
+      root: {
+        type: 'panel',
+        id: 'node-terminal',
+        panel: { id: 'panel-terminal', kind: 'terminal' }
+      },
+      focusedPanelId: 'panel-terminal'
+    },
+    createdAt: 1,
+    terminalTabs: [
+      {
+        id: 'term-orphan',
+        title: 'Orphan',
+        config: {
+          type: 'local',
+          id: 'term-orphan',
+          title: 'Orphan',
+          cols: 80,
+          rows: 24
+        }
+      }
+    ]
+  }
+
+  assertEqual(
+    parseDetachedWindowState(JSON.stringify(orphanState)),
+    null,
+    'an orphan terminal snapshot must reject the whole detached state'
+  )
 })
 
 runCase('buildDetachedLayoutTree creates a single-panel detached layout with optional tab binding', () => {

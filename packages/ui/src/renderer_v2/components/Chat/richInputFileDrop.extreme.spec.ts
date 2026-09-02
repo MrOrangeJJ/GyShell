@@ -32,7 +32,8 @@ fs.writeFileSync(
     `import * as React from "react";`,
     `import { createRoot } from "react-dom/client";`,
     `import { RichInput } from "./RichInput";`,
-    `(globalThis as any).RichInputModule = { RichInput, React, createRoot };`,
+    `import { encodePassChatMentionToken } from "@gyshell/shared";`,
+    `(globalThis as any).RichInputModule = { RichInput, React, createRoot, encodePassChatMentionToken };`,
   ].join("\n"),
 );
 
@@ -63,12 +64,28 @@ const harnessHtml = String.raw`<!doctype html>
 <html><body><div id="root"></div>
 <script src="./richInput.js"></script>
 <script>
-const { RichInput, React, createRoot } = RichInputModule;
+const { RichInput, React, createRoot, encodePassChatMentionToken } = RichInputModule;
 
 const store = {
   terminalTabs: [
-    { id: "local-main", title: "Local (1)", config: { type: "local" } },
-    { id: "ssh-1", title: "Remote", config: { type: "ssh" } },
+    {
+      id: "local-main",
+      title: "Local (1)",
+      config: { type: "local" },
+      capabilities: { supportsFilesystem: true, supportsMonitor: true },
+    },
+    {
+      id: "ssh-1",
+      title: "Remote",
+      config: { type: "ssh" },
+      capabilities: { supportsFilesystem: true, supportsMonitor: true },
+    },
+    {
+      id: "ssh-no-filesystem",
+      title: "Remote without filesystem",
+      config: { type: "ssh" },
+      capabilities: { supportsFilesystem: false, supportsMonitor: true },
+    },
   ],
   getPreferredLocalTerminalId: () => "local-main",
   skills: [],
@@ -108,6 +125,46 @@ function panelTransfer(entries, sourceTerminalId) {
     JSON.stringify({ version: 1, sourceTerminalId, sourceBasePath: "/base", entries }),
   );
   return dt;
+}
+
+function authoritativePanelTransfer(rawBody, counters) {
+  return {
+    types: ["application/x-gyshell-filesystem-items", "Files"],
+    getData(type) {
+      counters.customBodyReads += 1;
+      return type === "application/x-gyshell-filesystem-items" ? rawBody : "";
+    },
+    get files() {
+      counters.nativeFilesReads += 1;
+      return [makeFile("native-bypass.txt")];
+    },
+  };
+}
+
+function makeDropCounters() {
+  return {
+    customBodyReads: 0,
+    nativeFilesReads: 0,
+    nativePathReads: 0,
+    filesystemReads: 0,
+  };
+}
+
+function installDropSideEffectSpies(counters) {
+  window.gyshell = {
+    system: {
+      getPathForFile: () => {
+        counters.nativePathReads += 1;
+        return "/native/bypass.txt";
+      },
+    },
+    filesystem: {
+      readFileBase64: async () => {
+        counters.filesystemReads += 1;
+        return { contentBase64: "eA==", path: "/source/image.png", mimeType: "image/png" };
+      },
+    },
+  };
 }
 
 function fireDrop(dataTransfer) {
@@ -190,6 +247,45 @@ window.__cases = {
     return { count: tags().length, names: names() };
   },
 
+  async malformedAdvertisedPanelPayloadIsSideEffectFree() {
+    reset();
+    const counters = makeDropCounters();
+    installDropSideEffectSpies(counters);
+    fireDrop(authoritativePanelTransfer('{"version":1,"entries":[]}', counters));
+    await wait();
+    return { counters, count: tags().length, serialized: handle.getValue() };
+  },
+
+  async missingPanelSourceIsSideEffectFree() {
+    reset();
+    const counters = makeDropCounters();
+    installDropSideEffectSpies(counters);
+    const body = JSON.stringify({
+      version: 1,
+      sourceTerminalId: "missing-source",
+      sourceBasePath: "/source",
+      entries: [{ name: "image.png", path: "/source/image.png", isDirectory: false }],
+    });
+    fireDrop(authoritativePanelTransfer(body, counters));
+    await wait();
+    return { counters, count: tags().length, serialized: handle.getValue() };
+  },
+
+  async unsupportedPanelSourceIsSideEffectFree() {
+    reset();
+    const counters = makeDropCounters();
+    installDropSideEffectSpies(counters);
+    const body = JSON.stringify({
+      version: 1,
+      sourceTerminalId: "ssh-no-filesystem",
+      sourceBasePath: "/source",
+      entries: [{ name: "image.png", path: "/source/image.png", isDirectory: false }],
+    });
+    fireDrop(authoritativePanelTransfer(body, counters));
+    await wait();
+    return { counters, count: tags().length, serialized: handle.getValue() };
+  },
+
   async duplicatePathsAreKept() {
     reset();
     window.gyshell = { system: { getPathForFile: () => "/Users/demo/same.txt" } };
@@ -231,6 +327,36 @@ window.__cases = {
     await wait();
     handle.clear();
     return { count: tags().length, serialized: handle.getValue() };
+  },
+
+  async canonicalPassChatRoundTrip() {
+    reset();
+    const sessionId = "  Session#opaque::]🙂  ";
+    const title = "Canonical # Plan ] 🙂";
+    const token = encodePassChatMentionToken(sessionId, title);
+    handle.setValue("before " + token + " after");
+    await wait();
+    const passChatTag = tags().find((tag) => tag.dataset.type === "pass-chat");
+    return {
+      token,
+      serialized: handle.getValue(),
+      count: tags().length,
+      id: passChatTag?.dataset.id,
+      name: passChatTag?.dataset.name,
+      text: passChatTag?.textContent,
+    };
+  },
+
+  async malformedCanonicalPassChatStaysLiteral() {
+    reset();
+    const malformed = "[MENTION_PASS_CHAT_V2:#broken#]";
+    handle.setValue("before " + malformed + " after");
+    await wait();
+    return {
+      serialized: handle.getValue(),
+      count: tags().length,
+      text: editor().textContent,
+    };
   },
 
   async backspaceStillRemovesLastMention() {
@@ -387,6 +513,21 @@ check("panelMixedWithDirectories", "panel selections mixing files and directorie
   );
 });
 
+for (const [caseName, label] of [
+  ["malformedAdvertisedPanelPayloadIsSideEffectFree", "malformed advertised panel payload"],
+  ["missingPanelSourceIsSideEffectFree", "missing panel source terminal"],
+  ["unsupportedPanelSourceIsSideEffectFree", "filesystem-ineligible panel source terminal"],
+]) {
+  check(caseName, `${label} is rejected before every drop side effect`, (v) => {
+    assert(v.counters.customBodyReads === 1, "custom payload body must be read exactly once");
+    assert(v.counters.nativeFilesReads === 0, "authoritative custom payload must not read native Files");
+    assert(v.counters.nativePathReads === 0, "authoritative custom payload must not resolve native paths");
+    assert(v.counters.filesystemReads === 0, "rejected source must not read filesystem content");
+    assert(v.count === 0, "rejected source must not insert a mention");
+    assert(v.serialized === "", "rejected source must leave the draft unchanged");
+  });
+}
+
 check("duplicatePathsAreKept", "dropping the same path twice keeps both mentions", (v) => {
   assert(v.count === 2, `expected 2 mentions, got ${v.count}`);
 });
@@ -413,6 +554,22 @@ check("caretStaysAtEndForTyping", "typing after a multi-file drop appends text w
 check("clearRemovesEverything", "clearing the composer removes every dropped mention", (v) => {
   assert(v.count === 0, `expected no mentions, got ${v.count}`);
   assert(v.serialized === "", `expected empty draft, got ${JSON.stringify(v.serialized)}`);
+});
+
+check("canonicalPassChatRoundTrip", "RichInput restores and serializes canonical pass-chat identity exactly", (v) => {
+  assert(typeof v.token === "string", "canonical token must be generated");
+  assert(v.count === 1, `expected one pass-chat tag, got ${v.count}`);
+  assert(v.id === "  Session#opaque::]🙂  ", "session identity must remain exact");
+  assert(v.name === "Canonical # Plan ] 🙂", "title metadata must remain exact");
+  assert(v.serialized === `before ${v.token} after`, "serialized token must round-trip exactly");
+  assert(v.text === "@Pass Chat: Canoni...", "visible label must use the truncated title");
+});
+
+check("malformedCanonicalPassChatStaysLiteral", "RichInput keeps malformed canonical pass-chat text literal", (v) => {
+  const malformed = "[MENTION_PASS_CHAT_V2:#broken#]";
+  assert(v.count === 0, "malformed canonical token must not become a badge");
+  assert(v.serialized === `before ${malformed} after`, "malformed token must survive serialization");
+  assert(v.text === `before ${malformed} after`, "malformed token must remain visible as text");
 });
 
 check("backspaceStillRemovesLastMention", "backspace still deletes only the mention next to the caret", (v) => {

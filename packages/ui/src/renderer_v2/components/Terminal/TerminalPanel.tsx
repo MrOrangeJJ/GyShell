@@ -554,6 +554,9 @@ export const TerminalPanel: React.FC<TerminalPanelProps> = observer(
                           (candidate) => candidate.id === tab.id,
                         )
                       }
+                      supportsFilesystem={
+                        tab.capabilities.supportsFilesystem === true
+                      }
                       isActive={isActive}
                       layoutSignature={layoutSignature}
                       onSelectionChange={(text) =>

@@ -1,7 +1,9 @@
 import type { ChatMessage, UIUpdateAction } from "./protocol";
+import { requireTuiSessionId } from "./session-identity";
 import {
   extractCommandOutputDisplayText,
   parseCommandOutputContractV1,
+  transformPassChatMentionText,
 } from "@gyshell/shared";
 
 export interface SessionState {
@@ -21,8 +23,9 @@ export function createSessionState(
   id: string,
   title = "New Chat",
 ): SessionState {
+  const exactSessionId = requireTuiSessionId(id);
   return {
-    id,
+    id: exactSessionId,
     title,
     messages: [],
     isThinking: false,
@@ -578,38 +581,27 @@ export function getTuiCommandOutputStatusFromMetadata(
 }
 
 function normalizeCompactText(input: string): string {
-  return String(input || "")
-    .replace(/\u001b\[[0-9;]*m/g, "")
-    .replace(
-      /\[MENTION_TAB:#([^#\]\r\n]+)(?:##[^#\]\r\n]*)?(?:#\])?/g,
-      (_m, name: string) => `@${name}`,
-    )
-    .replace(
-      /\[MENTION_SKILL:#([^#\]\r\n]+)(?:#\])?/g,
-      (_m, name: string) => `@${name}`,
-    )
-    .replace(
-      /\[MENTION_FILE:#([^#\]\r\n]+)(?:##[^#\]\r\n]*)?(?:#\])?/g,
-      (_m, path: string) => path.split(/[/\\]/).pop() || path,
-    )
-    .replace(
-      /\[MENTION_PASS_CHAT:#([^#\]\r\n]+)(?:##([^#\]\r\n]+))?(?:#\])?/g,
-      (_m, _sessionId: string, title: string) =>
-        `@Pass Chat: ${decodeMentionComponent(title || "Chat")}`,
-    )
-    .replace(/`{3,}[\s\S]*?`{3,}/g, " [code block] ")
-    .replace(/`([^`]+)`/g, "$1")
-    .replace(/[*_~#>[\\\]]+/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
-}
-
-function decodeMentionComponent(value: string): string {
-  try {
-    return decodeURIComponent(value);
-  } catch {
-    return value;
-  }
+  return transformPassChatMentionText(String(input || ""), (value) =>
+    value
+      .replace(/\u001b\[[0-9;]*m/g, "")
+      .replace(
+        /\[MENTION_TAB:#([^#\]\r\n]+)(?:##[^#\]\r\n]*)?(?:#\])?/g,
+        (_m, name: string) => `@${name}`,
+      )
+      .replace(
+        /\[MENTION_SKILL:#([^#\]\r\n]+)(?:#\])?/g,
+        (_m, name: string) => `@${name}`,
+      )
+      .replace(
+        /\[MENTION_FILE:#([^#\]\r\n]+)(?:##[^#\]\r\n]*)?(?:#\])?/g,
+        (_m, path: string) => path.split(/[/\\]/).pop() || path,
+      )
+      .replace(/`{3,}[\s\S]*?`{3,}/g, " [code block] ")
+      .replace(/`([^`]+)`/g, "$1")
+      .replace(/[*_~#>[\\\]]+/g, " ")
+      .replace(/\s+/g, " ")
+      .trim(),
+  );
 }
 
 function summarizeDiff(diff: string): string {

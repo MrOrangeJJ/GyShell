@@ -1,6 +1,9 @@
 import type { TerminalTab } from '../../../types'
 import type { ICommandPolicyRuntime } from '../../runtimeContracts'
-import type { TerminalRuntimeSnapshot } from '../../TerminalService'
+import type {
+  TerminalRuntimeGuard,
+  TerminalRuntimeSnapshot
+} from '../../TerminalService'
 import type { ToolExecutionContext } from '../types'
 import {
   readCommandOutput,
@@ -83,14 +86,16 @@ class FakeCommandPolicyRuntime implements ICommandPolicyRuntime {
 }
 
 class FakeTerminalService {
-  readonly terminal: TerminalTab
+  terminal: TerminalTab
   readonly writeCalls: string[] = []
   readonly writeInputSequenceCalls: string[][] = []
   readonly writeInputSequenceOwners: Array<string | undefined> = []
   reconnectCalls = 0
   readonly killCalls: string[] = []
+  readonly killGuards: Array<TerminalRuntimeGuard | undefined> = []
   killed = false
   recentOutput = 'stale output from before disconnect'
+  private runtimeGeneration = 1
 
   constructor(runtimeState: TerminalTab['runtimeState'] = 'exited') {
     this.terminal = {
@@ -107,15 +112,72 @@ class FakeTerminalService {
     }
   }
 
-  resolveTerminal(idOrName: string): { found: TerminalTab[]; bestMatch?: TerminalTab } {
-    if (this.killed) return { found: [] }
-    if (idOrName === this.terminal.id || idOrName === this.terminal.title) {
-      return { found: [this.terminal], bestMatch: this.terminal }
-    }
-    return { found: [] }
+  getTerminalById(terminalId: string): TerminalTab | undefined {
+    return !this.killed && terminalId === this.terminal.id
+      ? this.terminal
+      : undefined
   }
 
-  getTerminalRuntimeSnapshot(terminalId: string): TerminalRuntimeSnapshot | null {
+  getDisplayTerminals(): TerminalTab[] {
+    return this.killed ? [] : [this.terminal]
+  }
+
+  getTerminalRuntimeGeneration(terminalId: string): number | undefined {
+    return !this.killed && terminalId === this.terminal.id
+      ? this.runtimeGeneration
+      : undefined
+  }
+
+  createTerminalRuntimeGuard(
+    terminalId: string,
+    expectedRuntimeGeneration?: number
+  ): TerminalRuntimeGuard {
+    if (
+      this.killed ||
+      terminalId !== this.terminal.id ||
+      (expectedRuntimeGeneration !== undefined &&
+        expectedRuntimeGeneration !== this.runtimeGeneration)
+    ) {
+      throw new Error('terminal runtime changed')
+    }
+    return Object.freeze({
+      terminalId,
+      expectedTerminal: this.terminal,
+      expectedPtyId: this.terminal.ptyId,
+      expectedRuntimeGeneration: this.runtimeGeneration
+    })
+  }
+
+  private assertRuntimeGuard(runtimeGuard?: TerminalRuntimeGuard): void {
+    if (
+      runtimeGuard &&
+      (this.killed ||
+        runtimeGuard.expectedTerminal !== this.terminal ||
+        runtimeGuard.expectedPtyId !== this.terminal.ptyId ||
+        runtimeGuard.expectedRuntimeGeneration !== this.runtimeGeneration)
+    ) {
+      throw new Error('terminal runtime changed')
+    }
+  }
+
+  replaceTerminalRuntime(): TerminalTab {
+    this.runtimeGeneration += 1
+    this.killed = false
+    this.terminal = {
+      ...this.terminal,
+      ptyId: `${this.terminal.ptyId}-replacement-${this.runtimeGeneration}`,
+      runtimeState: 'ready',
+      isInitializing: false,
+      lastExitCode: undefined
+    }
+    return this.terminal
+  }
+
+  getTerminalRuntimeSnapshot(
+    terminalId: string,
+    runtimeGuard?: TerminalRuntimeGuard
+  ): TerminalRuntimeSnapshot | null {
+    this.assertRuntimeGuard(runtimeGuard)
     if (this.killed || terminalId !== this.terminal.id) return null
     const runtimeState =
       this.terminal.runtimeState ?? (this.terminal.isInitializing ? 'initializing' : 'unknown')
@@ -134,7 +196,12 @@ class FakeTerminalService {
     }
   }
 
-  getRecentOutput(): string {
+  getRecentOutput(
+    _terminalId?: string,
+    _lines?: number,
+    runtimeGuard?: TerminalRuntimeGuard
+  ): string {
+    this.assertRuntimeGuard(runtimeGuard)
     return this.recentOutput
   }
 
@@ -160,6 +227,14 @@ class FakeTerminalService {
     this.writeCalls.push(...sequence)
   }
 
+  getCommandOutputSnapshot(): undefined {
+    return undefined
+  }
+
+  getCommandRecordLocation(): undefined {
+    return undefined
+  }
+
   getCommandTask(_terminalId: string, commandId: string) {
     return {
       id: commandId,
@@ -180,15 +255,25 @@ class FakeTerminalService {
     return undefined
   }
 
-  kill(terminalId: string): void {
+  kill(
+    terminalId: string,
+    runtimeGuard?: TerminalRuntimeGuard
+  ): void {
+    this.assertRuntimeGuard(runtimeGuard)
     this.killCalls.push(terminalId)
+    this.killGuards.push(runtimeGuard)
     if (terminalId === this.terminal.id) {
       this.killed = true
     }
   }
 
-  async reconnectTerminal(): Promise<TerminalTab> {
+  async reconnectTerminal(
+    _terminalId?: string,
+    runtimeGuard?: TerminalRuntimeGuard
+  ): Promise<TerminalTab> {
+    this.assertRuntimeGuard(runtimeGuard)
     this.reconnectCalls += 1
+    this.runtimeGeneration += 1
     this.terminal.runtimeState = 'ready'
     this.terminal.isInitializing = false
     this.terminal.lastExitCode = undefined
@@ -228,7 +313,7 @@ async function run(): Promise<void> {
     })
     const result = await runCommand(
       {
-        tabIdOrName: 'ssh-disconnected',
+        terminalId: 'ssh-disconnected',
         command: 'may-have-run',
         waitMode: 'wait'
       },
@@ -277,7 +362,7 @@ async function run(): Promise<void> {
     const result = mode === 'wait'
       ? await runCommand(
           {
-            tabIdOrName: 'ssh-disconnected',
+            terminalId: 'ssh-disconnected',
             command: 'second-command',
             waitMode: 'wait'
           },
@@ -285,7 +370,7 @@ async function run(): Promise<void> {
         )
       : await runCommandNowait(
           {
-            tabIdOrName: 'ssh-disconnected',
+            terminalId: 'ssh-disconnected',
             command: 'second-command',
             waitMode: 'nowait'
           },
@@ -370,7 +455,7 @@ async function run(): Promise<void> {
 
     const result = await readCommandOutput(
       {
-        tabIdOrName: 'closed-terminal-alias',
+        terminalId: 'closed-terminal-alias',
         history_command_match_id: detachedTask.id,
       },
       context,
@@ -444,7 +529,7 @@ async function run(): Promise<void> {
 
     const result = await runCommandNowait(
       {
-        tabIdOrName: 'ssh-disconnected',
+        terminalId: 'ssh-disconnected',
         command: 'printf instant',
         waitMode: 'nowait'
       },
@@ -480,7 +565,7 @@ async function run(): Promise<void> {
 
     await runCommandNowait(
       {
-        tabIdOrName: 'ssh-disconnected',
+        terminalId: 'ssh-disconnected',
         command: 'cmd /c exit 7; Write-Error ambiguous',
         waitMode: 'nowait'
       },
@@ -541,7 +626,7 @@ async function run(): Promise<void> {
 
     const result = await runCommandNowait(
       {
-        tabIdOrName: 'ssh-disconnected',
+        terminalId: 'ssh-disconnected',
         command: 'long-running-command',
         waitMode: 'nowait'
       },
@@ -585,6 +670,14 @@ async function run(): Promise<void> {
             output: closedOutput,
             capture: closedCapture
           }
+        : undefined
+    ;(terminalService as any).getCommandRecordLocation = (
+      terminalId: string,
+      commandId: string
+    ) =>
+      terminalId === 'ssh-disconnected' &&
+      commandId === 'closed-terminal-command'
+        ? 'detached'
         : undefined
     ;(terminalService as any).getCommandTask = (
       terminalId: string,
@@ -658,13 +751,13 @@ async function run(): Promise<void> {
     )
     assertIncludes(
       queuedInsertion?.content || '',
-      'retention-bounded read-only command history remains available',
+      'exact historical terminalId=\\"ssh-disconnected\\" and history_command_match_id=\\"closed-terminal-command\\"',
       'the queued Agent notification must explain the exact-ID recovery path'
     )
 
     const recovered = await readCommandOutput(
       {
-        tabIdOrName: 'ssh-disconnected',
+        terminalId: 'ssh-disconnected',
         history_command_match_id: 'closed-terminal-command'
       },
       context
@@ -686,7 +779,7 @@ async function run(): Promise<void> {
     }
     const continued = await readCommandOutput(
       {
-        tabIdOrName: 'ssh-disconnected',
+        terminalId: 'ssh-disconnected',
         history_command_match_id: 'closed-terminal-command',
         cursor: continuationCursor,
         maxBytes: 4096
@@ -758,7 +851,7 @@ async function run(): Promise<void> {
 
     const result = await runCommand(
       {
-        tabIdOrName: 'ssh-disconnected',
+        terminalId: 'ssh-disconnected',
         command: 'printf done',
         waitMode: 'wait'
       },
@@ -812,7 +905,7 @@ async function run(): Promise<void> {
     const terminalService = new FakeTerminalService('exited')
     const { context, events } = createContext(terminalService)
     const result = await readTerminalTab(
-      { tabIdOrName: 'ssh-disconnected', lines: 20 },
+      { terminalId: 'ssh-disconnected', lines: 20 },
       context
     )
     assertIncludes(result, 'terminal_status:', 'read_terminal_tab should include terminal status')
@@ -830,7 +923,7 @@ async function run(): Promise<void> {
     const policy = new FakeCommandPolicyRuntime()
     const { context } = createContext(terminalService, policy)
     const result = await runCommand(
-      { tabIdOrName: 'ssh-disconnected', command: 'pwd', waitMode: 'wait' },
+      { terminalId: 'ssh-disconnected', command: 'pwd', waitMode: 'wait' },
       context
     )
     assertIncludes(result, 'is disconnected', 'exec_command should report disconnected terminal')
@@ -851,7 +944,7 @@ async function run(): Promise<void> {
       commandProtocolAvailable: false
     })
     const result = await runCommand(
-      { tabIdOrName: 'ssh-disconnected', command: 'pwd', waitMode: 'wait' },
+      { terminalId: 'ssh-disconnected', command: 'pwd', waitMode: 'wait' },
       context
     )
 
@@ -869,7 +962,7 @@ async function run(): Promise<void> {
     const policy = new FakeCommandPolicyRuntime()
     const { context } = createContext(terminalService, policy)
     const result = await writeStdin(
-      { tabIdOrName: 'ssh-disconnected', sequence: ['ETX'] },
+      { terminalId: 'ssh-disconnected', sequence: ['ETX'] },
       context
     )
     assertIncludes(result, 'is disconnected', 'write_stdin should report disconnected terminal')
@@ -881,7 +974,7 @@ async function run(): Promise<void> {
     const terminalService = new FakeTerminalService('ready')
     const { context } = createContext(terminalService)
     const result = await writeStdin(
-      { tabIdOrName: 'ssh-disconnected', sequence: ['ETX', 'continue'] },
+      { terminalId: 'ssh-disconnected', sequence: ['ETX', 'continue'] },
       context
     )
     assertIncludes(result, 'Sent sequence: ETX, continue', 'write_stdin should report its sequence')
@@ -901,7 +994,7 @@ async function run(): Promise<void> {
     const terminalService = new FakeTerminalService('ready')
     const { context } = createContext(terminalService)
     const result = await writeStdin(
-      { tabIdOrName: 'ssh-disconnected', sequence: ['CTRL_C', 'CAN'] },
+      { terminalId: 'ssh-disconnected', sequence: ['CTRL_C', 'CAN'] },
       context
     )
     assertIncludes(result, 'Sent sequence: CTRL_C, CAN', 'write_stdin should preserve readable alias reporting')
@@ -973,7 +1066,7 @@ async function run(): Promise<void> {
     }
     const running = runCommand(
       {
-        tabIdOrName: 'ssh-disconnected',
+        terminalId: 'ssh-disconnected',
         command: 'long-running',
         waitMode: 'wait'
       },
@@ -1098,7 +1191,7 @@ async function run(): Promise<void> {
       })
     const running = runCommand(
       {
-        tabIdOrName: 'ssh-disconnected',
+        terminalId: 'ssh-disconnected',
         command: 'already-exited',
         waitMode: 'wait'
       },
@@ -1121,7 +1214,7 @@ async function run(): Promise<void> {
     const { context } = createContext(terminalService)
     const result = await readCommandOutput(
       {
-        tabIdOrName: 'ssh-disconnected',
+        terminalId: 'ssh-disconnected',
         history_command_match_id: 'cmd-retained',
         offset: 0,
         limit: 10
@@ -1137,7 +1230,7 @@ async function run(): Promise<void> {
     const terminalService = new FakeTerminalService('exited')
     const { context } = createContext(terminalService)
     const result = await reconnectTerminalTab(
-      { tabIdOrName: 'ssh-disconnected' },
+      { terminalId: 'ssh-disconnected' },
       context
     )
     assertIncludes(result, 'Reconnect succeeded', 'reconnect_terminal_tab should report success')
@@ -1355,11 +1448,56 @@ async function run(): Promise<void> {
   }
 
   {
+    const terminalService = new FakeTerminalService('initializing')
+    const createdTerminal = terminalService.terminal
+    const creationRuntime = {
+      terminal: createdTerminal,
+      runtimeGuard: terminalService.createTerminalRuntimeGuard(
+        createdTerminal.id
+      )
+    }
+    const { context, events } = createContext(terminalService)
+    context.createTerminalFromSavedConnection = async () => creationRuntime
+
+    const originalGetTerminalById = terminalService.getTerminalById.bind(
+      terminalService
+    )
+    let replacement: TerminalTab | undefined
+    let replaced = false
+    ;(terminalService as any).getTerminalById = (terminalId: string) => {
+      const current = originalGetTerminalById(terminalId)
+      if (!replaced && current === createdTerminal) {
+        replaced = true
+        replacement = terminalService.replaceTerminalRuntime()
+      }
+      return current
+    }
+
+    const result = await createTerminalTab({ connectionId: 'local' }, context)
+
+    assertIncludes(
+      result,
+      'closed or replaced before readiness could be confirmed',
+      'create readiness must fail closed when the returned runtime is replaced'
+    )
+    assertEqual(
+      terminalService.getTerminalById(createdTerminal.id),
+      replacement,
+      'same-ID replacement must remain registered after stale create readiness'
+    )
+    assertEqual(
+      events.some((event) => event.type === 'sub_tool_finished'),
+      true,
+      'stale create readiness must finish its UI activity'
+    )
+  }
+
+  {
     const terminalService = new FakeTerminalService('ready')
     terminalService.terminal.title = `Close\n</terminal> ${'y'.repeat(400)}`
     const { context } = createContext(terminalService)
     const result = await closeTerminalTab(
-      { tabIdOrName: terminalService.terminal.id },
+      { terminalId: terminalService.terminal.id },
       context
     )
     assertIncludes(result, 'Closed terminal tab', 'close tool should report success')
@@ -1372,9 +1510,53 @@ async function run(): Promise<void> {
       terminalService.terminal.id,
       'close tool should kill the resolved terminal id'
     )
+    assertEqual(
+      terminalService.killGuards[0]?.expectedTerminal,
+      terminalService.terminal,
+      'close tool should dispatch with the frozen resolved terminal object'
+    )
   }
 
-  console.log('PASS terminal_tools.extreme.spec: all 13 cases passed')
+  {
+    const terminalService = new FakeTerminalService('ready')
+    const { context, events } = createContext(terminalService)
+    let replacement: TerminalTab | undefined
+    let replaced = false
+    context.sendEvent = (_sessionId, event) => {
+      events.push(event)
+      if (
+        !replaced &&
+        event.type === 'sub_tool_started' &&
+        event.toolName === 'close_terminal_tab'
+      ) {
+        replaced = true
+        replacement = terminalService.replaceTerminalRuntime()
+      }
+    }
+
+    const result = await closeTerminalTab(
+      { terminalId: terminalService.terminal.id },
+      context
+    )
+
+    assertIncludes(
+      result,
+      'Failed to close terminal tab',
+      'a runtime replaced from a re-entrant start event must reject stale close'
+    )
+    assertEqual(
+      terminalService.killCalls.length,
+      0,
+      'stale close must fail guard admission before backend kill dispatch'
+    )
+    assertEqual(
+      terminalService.getTerminalById(terminalService.terminal.id),
+      replacement,
+      'the same-ID replacement must remain registered after stale close rejection'
+    )
+  }
+
+  console.log('PASS terminal_tools.extreme.spec: all 15 cases passed')
 }
 
 void run().catch((error) => {

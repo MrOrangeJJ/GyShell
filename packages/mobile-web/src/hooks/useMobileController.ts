@@ -33,11 +33,17 @@ import {
   applyUiUpdateToUnloadedSession,
   cloneMessage,
   cloneSession,
+  cloneSessionRecord,
+  createSessionRecord,
   createUnloadedRenamedSession,
   createSessionState,
+  normalizeMobileSessionSummaries,
   normalizeSessionPreview,
   previewFromSession,
+  readMatchingMobileSessionSnapshot,
+  readMobileSessionId,
   reorderSessionIds,
+  requireMobileSessionId,
   shouldReplayUiUpdateAfterSnapshot,
   type SessionMeta,
   type SessionState,
@@ -139,8 +145,8 @@ const INITIAL_VIEW_STATE: ViewState = {
     asklist: [],
   },
   memory: { filePath: "", content: "" },
-  sessions: {},
-  sessionMeta: {},
+  sessions: createSessionRecord<SessionState>(),
+  sessionMeta: createSessionRecord<SessionMeta>(),
   sessionOrder: [],
   activeSessionId: null,
   statusLine: "Ready",
@@ -440,16 +446,15 @@ export function useMobileController(): {
   }, []);
 
   const applyLiveUpdate = React.useCallback((update: UIUpdateAction) => {
-    const loadBuffer = sessionLoadUpdateBuffersRef.current.get(
-      update.sessionId,
-    );
+    const sessionId = readMobileSessionId(update?.sessionId);
+    if (sessionId === undefined) return;
+    const loadBuffer = sessionLoadUpdateBuffersRef.current.get(sessionId);
     if (loadBuffer) {
       loadBuffer.push(update);
       return;
     }
     setView((previous) => {
-      const installedRevision =
-        previous.sessionMeta[update.sessionId]?.uiRevision;
+      const installedRevision = previous.sessionMeta[sessionId]?.uiRevision;
       if (
         typeof update.uiRevision === "number" &&
         Number.isFinite(update.uiRevision) &&
@@ -459,14 +464,14 @@ export function useMobileController(): {
       ) {
         return previous;
       }
-      const sessions = { ...previous.sessions };
-      const sessionMeta = { ...previous.sessionMeta };
+      const sessions = cloneSessionRecord(previous.sessions);
+      const sessionMeta = cloneSessionRecord(previous.sessionMeta);
       const sessionOrder = [...previous.sessionOrder];
 
-      const current = sessions[update.sessionId];
+      const current = sessions[sessionId];
       if (update.type === "SESSION_RENAMED") {
         const nextSession = current ? cloneSession(current) : undefined;
-        const currentMeta = sessionMeta[update.sessionId];
+        const currentMeta = sessionMeta[sessionId];
         const nextMeta = currentMeta ? { ...currentMeta } : undefined;
         if (
           applyRenameToUnloadedSession(
@@ -477,7 +482,7 @@ export function useMobileController(): {
           )
         ) {
           if (nextSession) {
-            sessions[update.sessionId] = nextSession;
+            sessions[sessionId] = nextSession;
           }
           if (
             typeof update.uiRevision === "number" &&
@@ -485,7 +490,7 @@ export function useMobileController(): {
           ) {
             nextMeta!.uiRevision = update.uiRevision;
           }
-          sessionMeta[update.sessionId] = nextMeta!;
+          sessionMeta[sessionId] = nextMeta!;
           return {
             ...previous,
             sessions,
@@ -495,16 +500,16 @@ export function useMobileController(): {
         }
         if (!currentMeta) {
           const created = createUnloadedRenamedSession(
-            update.sessionId,
+            sessionId,
             update.title,
             Date.now(),
             nextSession,
           );
-          sessions[update.sessionId] = created.session;
+          sessions[sessionId] = created.session;
           created.meta.uiRevision = update.uiRevision;
-          sessionMeta[update.sessionId] = created.meta;
-          if (!sessionOrder.includes(update.sessionId)) {
-            sessionOrder.unshift(update.sessionId);
+          sessionMeta[sessionId] = created.meta;
+          if (!sessionOrder.includes(sessionId)) {
+            sessionOrder.unshift(sessionId);
           }
           return {
             ...previous,
@@ -514,15 +519,15 @@ export function useMobileController(): {
           };
         }
       }
-      const currentMeta = sessionMeta[update.sessionId];
+      const currentMeta = sessionMeta[sessionId];
       if (!currentMeta?.loaded) {
         const nextSession = current
           ? cloneSession(current)
-          : createSessionState(update.sessionId, "New Chat");
+          : createSessionState(sessionId, "New Chat");
         const nextMeta: SessionMeta = currentMeta
           ? { ...currentMeta }
           : {
-              id: update.sessionId,
+              id: sessionId,
               title: nextSession.title,
               updatedAt: Date.now(),
               messagesCount: 0,
@@ -534,10 +539,10 @@ export function useMobileController(): {
           update,
           Date.now(),
         );
-        sessions[update.sessionId] = nextSession;
-        sessionMeta[update.sessionId] = nextMeta;
-        if (!sessionOrder.includes(update.sessionId)) {
-          sessionOrder.unshift(update.sessionId);
+        sessions[sessionId] = nextSession;
+        sessionMeta[sessionId] = nextMeta;
+        if (!sessionOrder.includes(sessionId)) {
+          sessionOrder.unshift(sessionId);
         }
         return {
           ...previous,
@@ -548,7 +553,7 @@ export function useMobileController(): {
       }
       const nextSession = current
         ? cloneSession(current)
-        : createSessionState(update.sessionId, "New Chat");
+        : createSessionState(sessionId, "New Chat");
       const wasBusy = nextSession.isBusy;
 
       if (
@@ -561,14 +566,14 @@ export function useMobileController(): {
       }
 
       applyUiUpdate(nextSession, update);
-      sessions[update.sessionId] = nextSession;
+      sessions[sessionId] = nextSession;
 
-      if (!sessionOrder.includes(update.sessionId)) {
-        sessionOrder.unshift(update.sessionId);
+      if (!sessionOrder.includes(sessionId)) {
+        sessionOrder.unshift(sessionId);
       }
 
-      const prevMeta = sessionMeta[update.sessionId];
-      sessionMeta[update.sessionId] = buildSessionMeta(nextSession, prevMeta, {
+      const prevMeta = sessionMeta[sessionId];
+      sessionMeta[sessionId] = buildSessionMeta(nextSession, prevMeta, {
         loaded: true,
         updatedAt: Date.now(),
         uiRevision:
@@ -583,7 +588,7 @@ export function useMobileController(): {
         sessions,
         sessionMeta,
         sessionOrder: reorderSessionIds(sessionOrder, sessionMeta),
-        activeSessionId: previous.activeSessionId || update.sessionId,
+        activeSessionId: previous.activeSessionId || sessionId,
       };
     });
   }, []);
@@ -703,7 +708,13 @@ export function useMobileController(): {
         sessions: GatewaySessionSummary[];
         uiRevision?: number;
       }>("session:list", {});
-      let summaries = sessionPayload.sessions || [];
+      const normalizedSummaries = normalizeMobileSessionSummaries(
+        sessionPayload?.sessions,
+      );
+      if (!normalizedSummaries) {
+        throw new Error("Gateway returned invalid session metadata.");
+      }
+      let summaries = normalizedSummaries;
       const summaryRevision = summaries.reduce<number | undefined>(
         (latest, summary) =>
           typeof summary.uiRevision === "number" &&
@@ -721,9 +732,10 @@ export function useMobileController(): {
           "gateway:createSession",
           {},
         );
+        const createdSessionId = requireMobileSessionId(created?.sessionId);
         summaries = [
           {
-            id: created.sessionId,
+            id: createdSessionId,
             title: "New Chat",
             updatedAt: Date.now(),
             messagesCount: 0,
@@ -756,11 +768,18 @@ export function useMobileController(): {
             const payload = await client.request<{
               session: GatewaySessionSnapshot;
             }>("session:get", { sessionId });
-            uiUpdateBootstrapBufferRef.current.discardCoveredBySnapshot(
-              payload.session.uiRevision,
+            const snapshot = readMatchingMobileSessionSnapshot(
+              payload?.session,
               sessionId,
             );
-            loadedSnapshots.set(sessionId, payload.session);
+            if (!snapshot) {
+              throw new Error("Gateway returned a mismatched session snapshot.");
+            }
+            uiUpdateBootstrapBufferRef.current.discardCoveredBySnapshot(
+              snapshot.uiRevision,
+              sessionId,
+            );
+            loadedSnapshots.set(sessionId, snapshot);
           } catch (error) {
             if (sessionId === preferredSummary.id) {
               throw error;
@@ -769,8 +788,8 @@ export function useMobileController(): {
         }),
       );
 
-      const sessions: Record<string, SessionState> = {};
-      const sessionMeta: Record<string, SessionMeta> = {};
+      const sessions = createSessionRecord<SessionState>();
+      const sessionMeta = createSessionRecord<SessionMeta>();
       const activeSessionId = loadedSnapshots.has(preferredSummary.id)
         ? preferredSummary.id
         : sortedSummaries[0]?.id || null;
@@ -1295,6 +1314,7 @@ export function useMobileController(): {
 
   const ensureSessionLoaded = React.useCallback(
     async (sessionId: string) => {
+      sessionId = requireMobileSessionId(sessionId);
       const inFlight = sessionLoadPromisesRef.current.get(sessionId);
       if (inFlight) {
         await inFlight;
@@ -1311,11 +1331,17 @@ export function useMobileController(): {
           const payload = await client.request<{
             session: GatewaySessionSnapshot;
           }>("session:get", { sessionId });
-          const snapshot = payload.session;
+          const snapshot = readMatchingMobileSessionSnapshot(
+            payload?.session,
+            sessionId,
+          );
+          if (!snapshot) {
+            throw new Error("Gateway returned a mismatched session snapshot.");
+          }
 
           setView((previous) => {
-            const sessions = { ...previous.sessions };
-            const sessionMeta = { ...previous.sessionMeta };
+            const sessions = cloneSessionRecord(previous.sessions);
+            const sessionMeta = cloneSessionRecord(previous.sessionMeta);
 
             const nextSession = createSessionState(
               sessionId,
@@ -1399,18 +1425,19 @@ export function useMobileController(): {
         "gateway:createSession",
         {},
       );
+      const sessionId = requireMobileSessionId(payload?.sessionId);
 
       setView((previous) => {
-        const sessions = { ...previous.sessions };
-        const sessionMeta = { ...previous.sessionMeta };
+        const sessions = cloneSessionRecord(previous.sessions);
+        const sessionMeta = cloneSessionRecord(previous.sessionMeta);
         const sessionOrder = [
-          payload.sessionId,
-          ...previous.sessionOrder.filter((id) => id !== payload.sessionId),
+          sessionId,
+          ...previous.sessionOrder.filter((id) => id !== sessionId),
         ];
-        const nextSession = createSessionState(payload.sessionId);
-        sessions[payload.sessionId] = nextSession;
-        sessionMeta[payload.sessionId] = {
-          id: payload.sessionId,
+        const nextSession = createSessionState(sessionId);
+        sessions[sessionId] = nextSession;
+        sessionMeta[sessionId] = {
+          id: sessionId,
           title: nextSession.title,
           updatedAt: Date.now(),
           messagesCount: 0,
@@ -1422,12 +1449,12 @@ export function useMobileController(): {
           sessions,
           sessionMeta,
           sessionOrder,
-          activeSessionId: payload.sessionId,
-          statusLine: `Created session ${payload.sessionId.slice(0, 8)}`,
+          activeSessionId: sessionId,
+          statusLine: `Created session ${sessionId.slice(0, 8)}`,
         };
       });
 
-      return { sessionId: payload.sessionId };
+      return { sessionId };
     } catch (error) {
       setConnectionError(`Failed to create session: ${safeError(error)}`);
       return null;
@@ -1441,7 +1468,9 @@ export function useMobileController(): {
 
   const deleteSession = React.useCallback(
     async (sessionId: string): Promise<boolean> => {
-      if (!sessionId) return false;
+      const exactSessionId = readMobileSessionId(sessionId);
+      if (exactSessionId === undefined) return false;
+      sessionId = exactSessionId;
       if (!client.isConnected()) {
         setConnectionError("Gateway is not connected");
         return false;
@@ -1454,8 +1483,8 @@ export function useMobileController(): {
             return previous;
           }
 
-          const sessions = { ...previous.sessions };
-          const sessionMeta = { ...previous.sessionMeta };
+          const sessions = cloneSessionRecord(previous.sessions);
+          const sessionMeta = cloneSessionRecord(previous.sessionMeta);
           const sessionOrder = previous.sessionOrder.filter(
             (id) => id !== sessionId,
           );
@@ -1598,7 +1627,7 @@ export function useMobileController(): {
     };
 
     setView((previous) => {
-      const sessions = { ...previous.sessions };
+      const sessions = cloneSessionRecord(previous.sessions);
       const current = sessions[targetSessionId!];
       if (current) {
         const copy = cloneSession(current);
@@ -1630,7 +1659,7 @@ export function useMobileController(): {
     } catch (error) {
       setConnectionError(`Failed to send prompt: ${safeError(error)}`);
       setView((previous) => {
-        const sessions = { ...previous.sessions };
+        const sessions = cloneSessionRecord(previous.sessions);
         const current = sessions[targetSessionId!];
         if (current) {
           const copy = cloneSession(current);
@@ -1839,7 +1868,7 @@ export function useMobileController(): {
         }
 
         setView((previous) => {
-          const sessions = { ...previous.sessions };
+          const sessions = cloneSessionRecord(previous.sessions);
           const current = sessions[activeSessionId];
           if (!current) return previous;
 
@@ -1909,8 +1938,8 @@ export function useMobileController(): {
             };
           }
 
-          const sessions = { ...previous.sessions };
-          const sessionMeta = { ...previous.sessionMeta };
+          const sessions = cloneSessionRecord(previous.sessions);
+          const sessionMeta = cloneSessionRecord(previous.sessionMeta);
           const copy = cloneSession(current);
           copy.messages = copy.messages.slice(0, rollbackIndex);
           copy.isThinking = false;
@@ -2288,16 +2317,26 @@ export function useMobileController(): {
           setConnectionError(payload?.reason || "Branch failed");
           return null;
         }
-        const branchSessionId = payload.sessionId;
+        const branchSessionId = readMobileSessionId(payload.sessionId);
+        if (branchSessionId === undefined) {
+          setConnectionError("Gateway returned an invalid branch session id");
+          return null;
+        }
         // Load the branched session snapshot and surface it as the new active session.
         try {
           const snapshotPayload = await client.request<{
             session: GatewaySessionSnapshot;
           }>("session:get", { sessionId: branchSessionId });
-          const snapshot = snapshotPayload.session;
+          const snapshot = readMatchingMobileSessionSnapshot(
+            snapshotPayload?.session,
+            branchSessionId,
+          );
+          if (!snapshot) {
+            throw new Error("Gateway returned a mismatched session snapshot.");
+          }
           setView((previous) => {
-            const sessions = { ...previous.sessions };
-            const sessionMeta = { ...previous.sessionMeta };
+            const sessions = cloneSessionRecord(previous.sessions);
+            const sessionMeta = cloneSessionRecord(previous.sessionMeta);
             const nextSession = createSessionState(
               branchSessionId,
               snapshot.title || payload.title || "Branched Session",
@@ -2411,14 +2450,14 @@ export function useMobileController(): {
     [view.sessionOrder, view.sessionMeta, view.sessions],
   );
   const sessionStatuses = React.useMemo(() => {
-    const map: Record<string, SessionStatusInfo> = {};
+    const map = createSessionRecord<SessionStatusInfo>();
     for (const [id, session] of Object.entries(view.sessions)) {
       map[id] = deriveSessionStatus(session);
     }
     return map;
   }, [view.sessions]);
   const sessionTokenPercents = React.useMemo(() => {
-    const map: Record<string, number | null> = {};
+    const map = createSessionRecord<number | null>();
     for (const [id, session] of Object.entries(view.sessions)) {
       const usage = getLatestTokenUsage(session.messages);
       map[id] = usage.percent;

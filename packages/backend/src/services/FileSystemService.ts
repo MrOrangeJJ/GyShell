@@ -1,6 +1,10 @@
 import { extname } from 'node:path'
 import type { FileSystemEntry } from '../types'
-import type { TerminalService } from './TerminalService'
+import {
+  TerminalRuntimeChangedError,
+  type TerminalRuntimeGuard,
+  type TerminalService,
+} from './TerminalService'
 
 const DEFAULT_TEXT_MAX_BYTES = 1024 * 1024
 const DEFAULT_BASE64_MAX_BYTES = 32 * 1024 * 1024
@@ -96,23 +100,66 @@ export class FileSystemService {
   constructor(private readonly terminalService: TerminalService) {}
 
   async listDirectory(terminalId: string, dirPath?: string): Promise<{ path: string; entries: FileSystemEntry[] }> {
-    return await this.terminalService.listDirectory(terminalId, dirPath)
+    const runtimeGuard = this.resolveFilesystemRuntimeGuard(
+      terminalId,
+      undefined,
+      'directory listing admission'
+    )
+    return await this.terminalService.listDirectory(
+      terminalId,
+      dirPath,
+      runtimeGuard
+    )
   }
 
   async createDirectory(terminalId: string, dirPath: string): Promise<void> {
-    await this.terminalService.createDirectory(terminalId, dirPath)
+    const runtimeGuard = this.resolveFilesystemRuntimeGuard(
+      terminalId,
+      undefined,
+      'directory creation admission'
+    )
+    await this.terminalService.createDirectory(
+      terminalId,
+      dirPath,
+      runtimeGuard
+    )
   }
 
   async createFile(terminalId: string, filePath: string): Promise<void> {
-    await this.terminalService.createFile(terminalId, filePath)
+    const runtimeGuard = this.resolveFilesystemRuntimeGuard(
+      terminalId,
+      undefined,
+      'file creation admission'
+    )
+    await this.terminalService.createFile(terminalId, filePath, runtimeGuard)
   }
 
   async deletePath(terminalId: string, targetPath: string, options?: { recursive?: boolean }): Promise<void> {
-    await this.terminalService.deletePath(terminalId, targetPath, options)
+    const runtimeGuard = this.resolveFilesystemRuntimeGuard(
+      terminalId,
+      undefined,
+      'path deletion admission'
+    )
+    await this.terminalService.deletePath(
+      terminalId,
+      targetPath,
+      options,
+      runtimeGuard
+    )
   }
 
   async renamePath(terminalId: string, sourcePath: string, targetPath: string): Promise<void> {
-    await this.terminalService.renamePath(terminalId, sourcePath, targetPath)
+    const runtimeGuard = this.resolveFilesystemRuntimeGuard(
+      terminalId,
+      undefined,
+      'path rename admission'
+    )
+    await this.terminalService.renamePath(
+      terminalId,
+      sourcePath,
+      targetPath,
+      runtimeGuard
+    )
   }
 
   async readTextFile(
@@ -120,7 +167,16 @@ export class FileSystemService {
     filePath: string,
     options?: { maxBytes?: number }
   ): Promise<ReadTextFileResult> {
-    const stat = await this.terminalService.statFile(terminalId, filePath)
+    const runtimeGuard = this.resolveFilesystemRuntimeGuard(
+      terminalId,
+      undefined,
+      'text file read admission'
+    )
+    const stat = await this.terminalService.statFile(
+      terminalId,
+      filePath,
+      runtimeGuard
+    )
     if (!stat.exists) {
       throw new Error(`File not found: ${filePath}`)
     }
@@ -133,12 +189,16 @@ export class FileSystemService {
     // readFileChunk probe only for backends that do not yet return size from stat.
     const probedSize = stat.size !== undefined
       ? Math.max(0, Number(stat.size) || 0)
-      : await this.resolveFileSize(terminalId, filePath)
+      : await this.resolveFileSize(terminalId, filePath, { runtimeGuard })
     if (probedSize > maxBytes) {
       throw new Error(`File is too large for text read (${probedSize} bytes > ${maxBytes} bytes).`)
     }
 
-    const bytes = await this.terminalService.readFile(terminalId, filePath)
+    const bytes = await this.terminalService.readFile(
+      terminalId,
+      filePath,
+      runtimeGuard
+    )
     // Keep a post-read guard for race conditions where file size changes after probing.
     if (bytes.length > maxBytes) {
       throw new Error(`File is too large for text read (${bytes.length} bytes > ${maxBytes} bytes).`)
@@ -161,7 +221,16 @@ export class FileSystemService {
     filePath: string,
     options?: { maxBytes?: number }
   ): Promise<ReadBase64FileResult> {
-    const stat = await this.terminalService.statFile(terminalId, filePath)
+    const runtimeGuard = this.resolveFilesystemRuntimeGuard(
+      terminalId,
+      undefined,
+      'base64 file read admission'
+    )
+    const stat = await this.terminalService.statFile(
+      terminalId,
+      filePath,
+      runtimeGuard
+    )
     if (!stat.exists) {
       throw new Error(`File not found: ${filePath}`)
     }
@@ -172,12 +241,16 @@ export class FileSystemService {
     const maxBytes = this.resolvePositiveMaxBytes(options?.maxBytes, DEFAULT_BASE64_MAX_BYTES)
     const probedSize = stat.size !== undefined
       ? Math.max(0, Number(stat.size) || 0)
-      : await this.resolveFileSize(terminalId, filePath)
+      : await this.resolveFileSize(terminalId, filePath, { runtimeGuard })
     if (probedSize > maxBytes) {
       throw new Error(`File is too large to transfer (${probedSize} bytes > ${maxBytes} bytes).`)
     }
 
-    const bytes = await this.terminalService.readFile(terminalId, filePath)
+    const bytes = await this.terminalService.readFile(
+      terminalId,
+      filePath,
+      runtimeGuard
+    )
     // Keep a post-read guard for race conditions where file size changes after probing.
     if (bytes.length > maxBytes) {
       throw new Error(`File is too large to transfer (${bytes.length} bytes > ${maxBytes} bytes).`)
@@ -192,7 +265,17 @@ export class FileSystemService {
   }
 
   async writeTextFile(terminalId: string, filePath: string, content: string): Promise<void> {
-    await this.terminalService.writeFile(terminalId, filePath, content)
+    const runtimeGuard = this.resolveFilesystemRuntimeGuard(
+      terminalId,
+      undefined,
+      'text file write admission'
+    )
+    await this.terminalService.writeFile(
+      terminalId,
+      filePath,
+      content,
+      runtimeGuard
+    )
   }
 
   async writeFileBase64(
@@ -211,7 +294,17 @@ export class FileSystemService {
     if (buffer.length > maxBytes) {
       throw new Error(`Payload is too large (${buffer.length} bytes > ${maxBytes} bytes).`)
     }
-    await this.terminalService.writeFileBytes(terminalId, filePath, buffer)
+    const runtimeGuard = this.resolveFilesystemRuntimeGuard(
+      terminalId,
+      undefined,
+      'base64 file write admission'
+    )
+    await this.terminalService.writeFileBytes(
+      terminalId,
+      filePath,
+      buffer,
+      runtimeGuard
+    )
   }
 
   async transferEntries(
@@ -227,6 +320,10 @@ export class FileSystemService {
       transferId?: string
       /** Internal trust boundary: only explicit user-owned tasks may delegate credentials. */
       allowPeerDirect?: boolean
+      /** Internal execution metadata; never accepted from renderer or model payloads. */
+      sourceRuntimeGuard?: TerminalRuntimeGuard
+      /** Internal execution metadata; never accepted from renderer or model payloads. */
+      targetRuntimeGuard?: TerminalRuntimeGuard
       signal?: AbortSignal
       onProgress?: (progress: TransferEntriesProgress) => void
     }
@@ -243,27 +340,78 @@ export class FileSystemService {
     }
 
     const signal = options?.signal
+    const sourceRuntimeGuard = this.resolveFilesystemRuntimeGuard(
+      sourceTerminalId,
+      options?.sourceRuntimeGuard,
+      'source file transfer admission'
+    )
+    const targetRuntimeGuard = this.resolveFilesystemRuntimeGuard(
+      targetTerminalId,
+      options?.targetRuntimeGuard,
+      'target file transfer admission'
+    )
+    let mutationWasDispatched = false
     const ensureNotCancelled = (): void => {
       if (signal?.aborted) {
         throw createTransferCancelledError()
       }
+      this.assertTransferRuntimeGuard(
+        sourceRuntimeGuard,
+        'source file transfer',
+        mutationWasDispatched
+      )
+      this.assertTransferRuntimeGuard(
+        targetRuntimeGuard,
+        'target file transfer',
+        mutationWasDispatched
+      )
+    }
+    const markMutationDispatched = (): void => {
+      mutationWasDispatched = true
     }
 
     ensureNotCancelled()
     const targetDirStat = await this.awaitWithCancellation(
-      () => this.terminalService.statFile(targetTerminalId, targetDirPath),
+      () =>
+        this.terminalService.statFile(
+          targetTerminalId,
+          targetDirPath,
+          targetRuntimeGuard
+        ),
       signal
     )
     if (!targetDirStat.exists || !targetDirStat.isDirectory) {
       throw new Error(`Target directory does not exist: ${targetDirPath}`)
     }
 
-    const sourceOs = this.terminalService.getRemoteOs(sourceTerminalId)
-    const targetOs = this.terminalService.getRemoteOs(targetTerminalId)
-    const sourceType = this.terminalService.getTerminalType(sourceTerminalId)
-    const targetType = this.terminalService.getTerminalType(targetTerminalId)
-    const sourceFileSystemIdentity = this.terminalService.getFileSystemIdentity(sourceTerminalId)
-    const targetFileSystemIdentity = this.terminalService.getFileSystemIdentity(targetTerminalId)
+    const sourceOs = this.terminalService.getRemoteOs(
+      sourceTerminalId,
+      sourceRuntimeGuard,
+      { filesystem: true }
+    )
+    const targetOs = this.terminalService.getRemoteOs(
+      targetTerminalId,
+      targetRuntimeGuard,
+      { filesystem: true }
+    )
+    const sourceType = this.terminalService.getTerminalType(
+      sourceTerminalId,
+      sourceRuntimeGuard
+    )
+    const targetType = this.terminalService.getTerminalType(
+      targetTerminalId,
+      targetRuntimeGuard
+    )
+    const sourceFileSystemIdentity = this.terminalService.getFileSystemIdentity(
+      sourceTerminalId,
+      sourceRuntimeGuard,
+      { requireActive: true }
+    )
+    const targetFileSystemIdentity = this.terminalService.getFileSystemIdentity(
+      targetTerminalId,
+      targetRuntimeGuard,
+      { requireActive: true }
+    )
     const sameFileSystem = !!sourceFileSystemIdentity
       && !!targetFileSystemIdentity
       && sourceFileSystemIdentity === targetFileSystemIdentity
@@ -275,20 +423,35 @@ export class FileSystemService {
     for (const sourcePath of sourceList) {
       ensureNotCancelled()
       const resolvedSourcePath = await this.awaitWithCancellation(
-        () => this.terminalService.resolvePathForFileSystem(sourceTerminalId, sourcePath),
+        () =>
+          this.terminalService.resolvePathForFileSystem(
+            sourceTerminalId,
+            sourcePath,
+            sourceRuntimeGuard
+          ),
         signal
       )
       const sourceKey = this.normalizePathForCompare(resolvedSourcePath, sourceOs)
       if (seenSources.has(sourceKey)) continue
       seenSources.add(sourceKey)
 
-      const node = await this.buildTransferNode(sourceTerminalId, resolvedSourcePath, {
-        ensureNotCancelled,
-        signal
-      })
+      const node = await this.buildTransferNode(
+        sourceTerminalId,
+        resolvedSourcePath,
+        {
+          ensureNotCancelled,
+          signal,
+          runtimeGuard: sourceRuntimeGuard
+        }
+      )
       const targetPath = this.joinPathForOs(targetDirPath, node.name, targetOs)
       const resolvedTargetPath = await this.awaitWithCancellation(
-        () => this.terminalService.resolvePathForFileSystem(targetTerminalId, targetPath),
+        () =>
+          this.terminalService.resolvePathForFileSystem(
+            targetTerminalId,
+            targetPath,
+            targetRuntimeGuard
+          ),
         signal
       )
 
@@ -320,7 +483,8 @@ export class FileSystemService {
         conflictStrategy,
         reservedTargetKeys: targetPathSet,
         ensureNotCancelled,
-        signal
+        signal,
+        targetRuntimeGuard
       })
 
       if (
@@ -407,12 +571,17 @@ export class FileSystemService {
       if (peerPlan) {
         ensureNotCancelled()
         if (peerPlan.removeExistingTarget) {
-          await this.terminalService.deletePath(targetTerminalId, peerPlan.targetPath, {
-            recursive: true
-          })
+          markMutationDispatched()
+          await this.terminalService.deletePath(
+            targetTerminalId,
+            peerPlan.targetPath,
+            { recursive: true },
+            targetRuntimeGuard
+          )
           peerPlan.removeExistingTarget = false
         }
 
+        markMutationDispatched()
         const peerResult = await this.terminalService.tryPeerFileTransfer(
           sourceTerminalId,
           peerPlan.sourcePath,
@@ -428,16 +597,22 @@ export class FileSystemService {
               )
               notifyProgress(false)
             }
-          }
+          },
+          sourceRuntimeGuard,
+          targetRuntimeGuard
         )
         if (peerResult.status === 'transferred') {
           progressState.bytesTransferred = peerPlan.node.size
           progressState.transferredFiles = 1
           if (mode === 'move') {
             ensureNotCancelled()
-            await this.terminalService.deletePath(sourceTerminalId, peerPlan.sourcePath, {
-              recursive: true
-            })
+            markMutationDispatched()
+            await this.terminalService.deletePath(
+              sourceTerminalId,
+              peerPlan.sourcePath,
+              { recursive: true },
+              sourceRuntimeGuard
+            )
           }
           notifyProgress(true)
           return {
@@ -456,7 +631,13 @@ export class FileSystemService {
       for (const plan of rootPlans) {
         ensureNotCancelled()
         if (plan.removeExistingTarget) {
-          await this.terminalService.deletePath(targetTerminalId, plan.targetPath, { recursive: true })
+          markMutationDispatched()
+          await this.terminalService.deletePath(
+            targetTerminalId,
+            plan.targetPath,
+            { recursive: true },
+            targetRuntimeGuard
+          )
         }
         await this.copyTransferNode({
           sourceTerminalId,
@@ -469,6 +650,9 @@ export class FileSystemService {
           targetPath: plan.targetPath,
           progressState,
           ensureNotCancelled,
+          markMutationDispatched,
+          sourceRuntimeGuard,
+          targetRuntimeGuard,
           signal,
           overwrite,
           notifyProgress
@@ -478,7 +662,13 @@ export class FileSystemService {
       if (mode === 'move') {
         ensureNotCancelled()
         for (const plan of rootPlans) {
-          await this.terminalService.deletePath(sourceTerminalId, plan.sourcePath, { recursive: true })
+          markMutationDispatched()
+          await this.terminalService.deletePath(
+            sourceTerminalId,
+            plan.sourcePath,
+            { recursive: true },
+            sourceRuntimeGuard
+          )
         }
       }
 
@@ -492,6 +682,79 @@ export class FileSystemService {
     } catch (error) {
       if (signal?.aborted || isAbortLikeError(error) || isFileSystemTransferCancelledError(error)) {
         throw createTransferCancelledError()
+      }
+      throw error
+    }
+  }
+
+  private resolveFilesystemRuntimeGuard(
+    terminalId: string,
+    suppliedGuard: TerminalRuntimeGuard | undefined,
+    operation: string
+  ): TerminalRuntimeGuard | undefined {
+    const getFilesystemRuntime = (this.terminalService as Partial<
+      Pick<TerminalService, 'getTerminalFilesystemRuntime'>
+    >).getTerminalFilesystemRuntime
+    if (typeof getFilesystemRuntime === 'function') {
+      return getFilesystemRuntime.call(
+        this.terminalService,
+        terminalId,
+        suppliedGuard,
+        operation
+      ).runtimeGuard
+    }
+
+    const assertRuntimeGuard = (this.terminalService as Partial<
+      Pick<TerminalService, 'assertTerminalRuntimeGuard'>
+    >).assertTerminalRuntimeGuard
+    if (suppliedGuard) {
+      assertRuntimeGuard?.call(
+        this.terminalService,
+        suppliedGuard,
+        operation
+      )
+      return suppliedGuard
+    }
+
+    const createRuntimeGuard = (this.terminalService as Partial<
+      Pick<TerminalService, 'createTerminalRuntimeGuard'>
+    >).createTerminalRuntimeGuard
+    return typeof createRuntimeGuard === 'function'
+      ? createRuntimeGuard.call(this.terminalService, terminalId)
+      : undefined
+  }
+
+  private assertTransferRuntimeGuard(
+    guard: TerminalRuntimeGuard | undefined,
+    operation: string,
+    mutationWasDispatched: boolean
+  ): void {
+    if (!guard) return
+    try {
+      const assertFilesystemGuard = (this.terminalService as Partial<
+        Pick<TerminalService, 'assertTerminalFilesystemRuntimeGuard'>
+      >).assertTerminalFilesystemRuntimeGuard
+      if (typeof assertFilesystemGuard === 'function') {
+        assertFilesystemGuard.call(
+          this.terminalService,
+          guard,
+          operation,
+          {
+            mutation: mutationWasDispatched,
+            operationWasDispatched: mutationWasDispatched
+          }
+        )
+      } else {
+        this.terminalService.assertTerminalRuntimeGuard(guard, operation)
+      }
+    } catch (error) {
+      if (mutationWasDispatched) {
+        throw new TerminalRuntimeChangedError(
+          guard.terminalId,
+          true,
+          operation,
+          { operationWasDispatched: true }
+        )
       }
       throw error
     }
@@ -556,6 +819,7 @@ export class FileSystemService {
     reservedTargetKeys: Set<string>
     ensureNotCancelled: () => void
     signal?: AbortSignal
+    targetRuntimeGuard?: TerminalRuntimeGuard
   }): Promise<ResolveTransferTargetPathResult> {
     const {
       targetTerminalId,
@@ -566,11 +830,17 @@ export class FileSystemService {
       conflictStrategy,
       reservedTargetKeys,
       ensureNotCancelled,
-      signal
+      signal,
+      targetRuntimeGuard
     } = params
     ensureNotCancelled()
     const initialTargetStat = await this.awaitWithCancellation(
-      () => this.terminalService.statFile(targetTerminalId, initialResolvedTargetPath),
+      () =>
+        this.terminalService.statFile(
+          targetTerminalId,
+          initialResolvedTargetPath,
+          targetRuntimeGuard
+        ),
       signal
     )
     const initialTargetKey = this.normalizePathForCompare(initialResolvedTargetPath, targetOs)
@@ -607,7 +877,12 @@ export class FileSystemService {
       const candidateName = `${duplicateName.baseName} (${index})${duplicateName.extension}`
       const candidatePath = this.joinPathForOs(targetDirPath, candidateName, targetOs)
       const resolvedCandidatePath = await this.awaitWithCancellation(
-        () => this.terminalService.resolvePathForFileSystem(targetTerminalId, candidatePath),
+        () =>
+          this.terminalService.resolvePathForFileSystem(
+            targetTerminalId,
+            candidatePath,
+            targetRuntimeGuard
+          ),
         signal
       )
       const candidateKey = this.normalizePathForCompare(resolvedCandidatePath, targetOs)
@@ -615,7 +890,12 @@ export class FileSystemService {
         continue
       }
       const candidateStat = await this.awaitWithCancellation(
-        () => this.terminalService.statFile(targetTerminalId, resolvedCandidatePath),
+        () =>
+          this.terminalService.statFile(
+            targetTerminalId,
+            resolvedCandidatePath,
+            targetRuntimeGuard
+          ),
         signal
       )
       if (!candidateStat.exists) {
@@ -666,6 +946,9 @@ export class FileSystemService {
     targetPath: string
     progressState: { bytesTransferred: number; transferredFiles: number }
     ensureNotCancelled: () => void
+    markMutationDispatched: () => void
+    sourceRuntimeGuard?: TerminalRuntimeGuard
+    targetRuntimeGuard?: TerminalRuntimeGuard
     signal?: AbortSignal
     overwrite: boolean
     notifyProgress: (eof: boolean) => void
@@ -681,6 +964,9 @@ export class FileSystemService {
       targetPath,
       progressState,
       ensureNotCancelled,
+      markMutationDispatched,
+      sourceRuntimeGuard,
+      targetRuntimeGuard,
       signal,
       overwrite,
       notifyProgress
@@ -690,15 +976,40 @@ export class FileSystemService {
 
     if (node.isDirectory) {
       if (overwrite) {
-        const targetStat = await this.terminalService.statFile(targetTerminalId, targetPath)
+        const targetStat = await this.terminalService.statFile(
+          targetTerminalId,
+          targetPath,
+          targetRuntimeGuard
+        )
         if (targetStat.exists && !targetStat.isDirectory) {
-          await this.terminalService.deletePath(targetTerminalId, targetPath, { recursive: true })
-          await this.terminalService.createDirectory(targetTerminalId, targetPath)
+          markMutationDispatched()
+          await this.terminalService.deletePath(
+            targetTerminalId,
+            targetPath,
+            { recursive: true },
+            targetRuntimeGuard
+          )
+          markMutationDispatched()
+          await this.terminalService.createDirectory(
+            targetTerminalId,
+            targetPath,
+            targetRuntimeGuard
+          )
         } else if (!targetStat.exists) {
-          await this.terminalService.createDirectory(targetTerminalId, targetPath)
+          markMutationDispatched()
+          await this.terminalService.createDirectory(
+            targetTerminalId,
+            targetPath,
+            targetRuntimeGuard
+          )
         }
       } else {
-        await this.terminalService.createDirectory(targetTerminalId, targetPath)
+        markMutationDispatched()
+        await this.terminalService.createDirectory(
+          targetTerminalId,
+          targetPath,
+          targetRuntimeGuard
+        )
       }
       for (const child of node.children) {
         const childTargetPath = this.joinPathForOs(targetPath, child.name, targetOs)
@@ -713,6 +1024,9 @@ export class FileSystemService {
           targetPath: childTargetPath,
           progressState,
           ensureNotCancelled,
+          markMutationDispatched,
+          sourceRuntimeGuard,
+          targetRuntimeGuard,
           signal,
           overwrite,
           notifyProgress
@@ -722,9 +1036,19 @@ export class FileSystemService {
     }
 
     if (overwrite) {
-      const targetStat = await this.terminalService.statFile(targetTerminalId, targetPath)
+      const targetStat = await this.terminalService.statFile(
+        targetTerminalId,
+        targetPath,
+        targetRuntimeGuard
+      )
       if (targetStat.exists && targetStat.isDirectory) {
-        await this.terminalService.deletePath(targetTerminalId, targetPath, { recursive: true })
+        markMutationDispatched()
+        await this.terminalService.deletePath(
+          targetTerminalId,
+          targetPath,
+          { recursive: true },
+          targetRuntimeGuard
+        )
       }
     }
 
@@ -738,6 +1062,9 @@ export class FileSystemService {
       chunkSize,
       fileSize: node.size,
       ensureNotCancelled,
+      markMutationDispatched,
+      sourceRuntimeGuard,
+      targetRuntimeGuard,
       signal,
       onChunkWritten: (bytesWritten) => {
         progressState.bytesTransferred += bytesWritten
@@ -759,6 +1086,9 @@ export class FileSystemService {
     chunkSize: number
     fileSize: number
     ensureNotCancelled: () => void
+    markMutationDispatched: () => void
+    sourceRuntimeGuard?: TerminalRuntimeGuard
+    targetRuntimeGuard?: TerminalRuntimeGuard
     signal?: AbortSignal
     onChunkWritten: (bytesWritten: number) => void
   }): Promise<void> {
@@ -772,16 +1102,25 @@ export class FileSystemService {
       chunkSize,
       fileSize,
       ensureNotCancelled,
+      markMutationDispatched,
+      sourceRuntimeGuard,
+      targetRuntimeGuard,
       signal,
       onChunkWritten
     } = params
 
     if (fileSize <= 0) {
+      markMutationDispatched()
       await this.awaitWithCancellation(
-        () => this.terminalService.writeFileChunk(targetTerminalId, targetPath, 0, Buffer.alloc(0), {
-          truncate: true,
-          close: true
-        }),
+        () =>
+          this.terminalService.writeFileChunk(
+            targetTerminalId,
+            targetPath,
+            0,
+            Buffer.alloc(0),
+            { truncate: true, close: true },
+            targetRuntimeGuard
+          ),
         signal
       )
       return
@@ -789,6 +1128,7 @@ export class FileSystemService {
 
     if (sourceType === 'local' && (targetType === 'ssh' || targetType === 'local')) {
       let lastTransferred = 0
+      markMutationDispatched()
       const uploaded = await this.awaitWithCancellation(
         () => this.terminalService.uploadFileFromLocalPath(
           targetTerminalId,
@@ -804,10 +1144,12 @@ export class FileSystemService {
                 onChunkWritten(delta)
               }
             }
-          }
+          },
+          targetRuntimeGuard
         ),
         signal
       )
+      ensureNotCancelled()
       if (uploaded) {
         if (uploaded.totalBytes > lastTransferred) {
           onChunkWritten(uploaded.totalBytes - lastTransferred)
@@ -818,6 +1160,7 @@ export class FileSystemService {
 
     if (sourceType === 'ssh' && targetType === 'local') {
       let lastTransferred = 0
+      markMutationDispatched()
       const downloaded = await this.awaitWithCancellation(
         () => this.terminalService.downloadFileToLocalPath(
           sourceTerminalId,
@@ -833,10 +1176,12 @@ export class FileSystemService {
                 onChunkWritten(delta)
               }
             }
-          }
+          },
+          sourceRuntimeGuard
         ),
         signal
       )
+      ensureNotCancelled()
       if (downloaded) {
         if (downloaded.totalBytes > lastTransferred) {
           onChunkWritten(downloaded.totalBytes - lastTransferred)
@@ -855,13 +1200,15 @@ export class FileSystemService {
           sourcePath,
           offset,
           chunkSize,
-          totalSizeHint !== undefined ? { totalSizeHint } : undefined
+          totalSizeHint !== undefined ? { totalSizeHint } : undefined,
+          sourceRuntimeGuard
         ),
         signal
       )
       totalSizeHint = chunk.totalSize
 
       if (chunk.bytesRead > 0) {
+        markMutationDispatched()
         await this.awaitWithCancellation(
           () => this.terminalService.writeFileChunk(
             targetTerminalId,
@@ -871,7 +1218,8 @@ export class FileSystemService {
             {
               truncate: offset === 0,
               close: chunk.eof
-            }
+            },
+            targetRuntimeGuard
           ),
           signal
         )
@@ -923,6 +1271,7 @@ export class FileSystemService {
     options: {
       ensureNotCancelled: () => void
       signal?: AbortSignal
+      runtimeGuard?: TerminalRuntimeGuard
     }
   ): Promise<TransferNode> {
     // NOTE: This method recursively scans the full directory tree into memory before
@@ -931,7 +1280,12 @@ export class FileSystemService {
     // phase may take noticeable time before transfer begins.
     options.ensureNotCancelled()
     const stat = await this.awaitWithCancellation(
-      () => this.terminalService.statFile(terminalId, sourcePath),
+      () =>
+        this.terminalService.statFile(
+          terminalId,
+          sourcePath,
+          options.runtimeGuard
+        ),
       options.signal
     )
     if (!stat.exists) {
@@ -939,7 +1293,11 @@ export class FileSystemService {
     }
     options.ensureNotCancelled()
 
-    const osType = this.terminalService.getRemoteOs(terminalId)
+    const osType = this.terminalService.getRemoteOs(
+      terminalId,
+      options.runtimeGuard,
+      { filesystem: true }
+    )
     const name = this.basenamePathForOs(sourcePath, osType)
     if (!name) {
       throw new Error(`Invalid source path: ${sourcePath}`)
@@ -961,7 +1319,12 @@ export class FileSystemService {
     }
 
     const listed = await this.awaitWithCancellation(
-      () => this.terminalService.listDirectory(terminalId, sourcePath),
+      () =>
+        this.terminalService.listDirectory(
+          terminalId,
+          sourcePath,
+          options.runtimeGuard
+        ),
       options.signal
     )
     options.ensureNotCancelled()
@@ -999,11 +1362,20 @@ export class FileSystemService {
     options?: {
       ensureNotCancelled?: () => void
       signal?: AbortSignal
+      runtimeGuard?: TerminalRuntimeGuard
     }
   ): Promise<number> {
     options?.ensureNotCancelled?.()
     const probe = await this.awaitWithCancellation(
-      () => this.terminalService.readFileChunk(terminalId, filePath, 0, 1),
+      () =>
+        this.terminalService.readFileChunk(
+          terminalId,
+          filePath,
+          0,
+          1,
+          undefined,
+          options?.runtimeGuard
+        ),
       options?.signal
     )
     options?.ensureNotCancelled?.()

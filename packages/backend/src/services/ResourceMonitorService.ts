@@ -1,4 +1,5 @@
 import os from 'os'
+import { isValidTerminalRuntimeId } from '@gyshell/shared'
 import type { TerminalService } from './TerminalService'
 import type {
   ResourceSnapshot,
@@ -129,16 +130,15 @@ export class ResourceMonitorService {
   }
 
   start(terminalId: string, ownerId = 'default', intervalMs?: number): void {
-    const normalizedTerminalId = String(terminalId || '').trim()
-    if (!normalizedTerminalId) {
+    if (!isValidTerminalRuntimeId(terminalId)) {
       return
     }
     const normalizedOwnerId = String(ownerId || 'default').trim() || 'default'
-    const sourceKey = this.resolveSourceKey(normalizedTerminalId)
+    const sourceKey = this.resolveSourceKey(terminalId)
     const existing = this.sessions.get(sourceKey)
     if (existing) {
-      this.addOwner(existing, normalizedTerminalId, normalizedOwnerId)
-      this.ensureSourceTerminal(existing, normalizedTerminalId)
+      this.addOwner(existing, terminalId, normalizedOwnerId)
+      this.ensureSourceTerminal(existing, terminalId)
       return
     }
 
@@ -149,7 +149,7 @@ export class ResourceMonitorService {
 
     const session: MonitorSession = {
       sourceKey,
-      sourceTerminalId: normalizedTerminalId,
+      sourceTerminalId: terminalId,
       intervalMs: interval,
       ownerIdsByTerminalId: new Map<string, Set<string>>(),
       inFlight: false,
@@ -158,29 +158,28 @@ export class ResourceMonitorService {
       }, interval),
     }
 
-    this.addOwner(session, normalizedTerminalId, normalizedOwnerId)
+    this.addOwner(session, terminalId, normalizedOwnerId)
     this.sessions.set(sourceKey, session)
     void this.collectAndPublish(sourceKey)
   }
 
   stop(terminalId: string, ownerId = 'default'): void {
-    const normalizedTerminalId = String(terminalId || '').trim()
-    if (!normalizedTerminalId) {
+    if (!isValidTerminalRuntimeId(terminalId)) {
       return
     }
     const sourceKey =
-      this.sourceKeyByTerminalId.get(normalizedTerminalId) ||
-      this.resolveSourceKey(normalizedTerminalId)
+      this.sourceKeyByTerminalId.get(terminalId) ||
+      this.resolveSourceKey(terminalId)
     const session = this.sessions.get(sourceKey)
     if (!session) return
     const normalizedOwnerId = String(ownerId || 'default').trim() || 'default'
-    const owners = session.ownerIdsByTerminalId.get(normalizedTerminalId)
+    const owners = session.ownerIdsByTerminalId.get(terminalId)
     if (!owners?.delete(normalizedOwnerId)) {
       return
     }
     if (owners.size === 0) {
-      session.ownerIdsByTerminalId.delete(normalizedTerminalId)
-      this.sourceKeyByTerminalId.delete(normalizedTerminalId)
+      session.ownerIdsByTerminalId.delete(terminalId)
+      this.sourceKeyByTerminalId.delete(terminalId)
       this.ensureSourceTerminal(session)
     }
     if (session.ownerIdsByTerminalId.size > 0) return
@@ -197,25 +196,30 @@ export class ResourceMonitorService {
   }
 
   isMonitoring(terminalId: string): boolean {
-    const normalizedTerminalId = String(terminalId || '').trim()
-    if (!normalizedTerminalId) {
+    if (!isValidTerminalRuntimeId(terminalId)) {
       return false
     }
-    const session = this.getSessionForTerminal(normalizedTerminalId)
-    return !!session?.ownerIdsByTerminalId.has(normalizedTerminalId)
+    const session = this.getSessionForTerminal(terminalId)
+    return !!session?.ownerIdsByTerminalId.has(terminalId)
   }
 
   async collectSnapshot(terminalId: string): Promise<ResourceSnapshot> {
-    const normalizedTerminalId = String(terminalId || '').trim()
-    const session = this.getSessionForTerminal(normalizedTerminalId)
-    const sourceTerminalId = this.resolveCollectTerminalId(normalizedTerminalId, session)
+    if (!isValidTerminalRuntimeId(terminalId)) {
+      return {
+        timestamp: Date.now(),
+        terminalId: typeof terminalId === 'string' ? terminalId : '',
+        error: 'Invalid terminal ID',
+      }
+    }
+    const session = this.getSessionForTerminal(terminalId)
+    const sourceTerminalId = this.resolveCollectTerminalId(terminalId, session)
     const terminal = sourceTerminalId
       ? this.terminalService.getTerminalById(sourceTerminalId)
-      : this.terminalService.getTerminalById(normalizedTerminalId)
+      : this.terminalService.getTerminalById(terminalId)
     if (!terminal) {
       return {
         timestamp: Date.now(),
-        terminalId: normalizedTerminalId,
+        terminalId,
         error: 'Terminal not found',
       }
     }
@@ -231,7 +235,7 @@ export class ResourceMonitorService {
         const { system, ...rest } = snapshot
         return {
           timestamp: now,
-          terminalId: normalizedTerminalId,
+          terminalId,
           ...rest,
           system: this.mergeSystemSnapshot(baseSystem, system),
         }
@@ -245,7 +249,7 @@ export class ResourceMonitorService {
         const { system, ...rest } = snapshot
         return {
           timestamp: now,
-          terminalId: normalizedTerminalId,
+          terminalId,
           ...rest,
           system: this.mergeSystemSnapshot(baseSystem, system),
         }
@@ -259,7 +263,7 @@ export class ResourceMonitorService {
         const { system, ...rest } = snapshot
         return {
           timestamp: now,
-          terminalId: normalizedTerminalId,
+          terminalId,
           ...rest,
           system: this.mergeSystemSnapshot(baseSystem, system),
         }
@@ -267,14 +271,14 @@ export class ResourceMonitorService {
 
       return {
         timestamp: now,
-        terminalId: normalizedTerminalId,
+        terminalId,
         system: baseSystem,
         error: 'Unsupported monitor platform',
       }
     } catch (error) {
       return {
         timestamp: now,
-        terminalId: normalizedTerminalId,
+        terminalId,
         error: error instanceof Error ? error.message : String(error),
       }
     }

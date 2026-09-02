@@ -1,5 +1,7 @@
+import { COMMAND_OUTPUT_IDENTIFIER_MAX_UTF8_BYTES } from '@gyshell/shared'
 import type { TerminalTab } from '../../../types'
 import type {
+  TerminalRuntimeGuard,
   TerminalRuntimeSnapshot,
   TerminalService
 } from '../../TerminalService'
@@ -10,6 +12,7 @@ export type TerminalToolResolution =
       ok: true
       terminal: TerminalTab
       snapshot: TerminalRuntimeSnapshot
+      runtimeGuard?: TerminalRuntimeGuard
     }
   | {
       ok: false
@@ -17,27 +20,86 @@ export type TerminalToolResolution =
     }
 
 export function resolveTerminalForTool(
-  context: Pick<ToolExecutionContext, 'terminalService'>,
-  tabIdOrName: string,
+  context: Pick<
+    ToolExecutionContext,
+    'terminalService' | 'expectedTerminalRuntimeBindings'
+  >,
+  terminalId: string,
   label = 'terminal tab'
 ): TerminalToolResolution {
-  const { found, bestMatch } = context.terminalService.resolveTerminal(tabIdOrName)
-  if (!bestMatch) {
+  const terminal = context.terminalService.getTerminalById(terminalId)
+  if (!terminal) {
     return {
       ok: false,
-      message: formatTerminalReferenceError(label, tabIdOrName, found)
+      message: formatTerminalIdError(
+        label,
+        terminalId,
+        context.terminalService.getDisplayTerminals()
+      )
     }
   }
 
-  const snapshot = context.terminalService.getTerminalRuntimeSnapshot(bestMatch.id)
+  const expectedRuntimeGeneration =
+    context.expectedTerminalRuntimeBindings?.get(terminalId)
+  const getRuntimeGeneration = (context.terminalService as Partial<
+    Pick<TerminalService, 'getTerminalRuntimeGeneration'>
+  >).getTerminalRuntimeGeneration
+  if (
+    expectedRuntimeGeneration !== undefined &&
+    (typeof getRuntimeGeneration !== 'function' ||
+      getRuntimeGeneration.call(context.terminalService, terminalId) !==
+        expectedRuntimeGeneration)
+  ) {
+    return {
+      ok: false,
+      message: `Error: ${capitalize(label)} terminalId=${JSON.stringify(terminalId)} changed after this tool call was planned. No terminal operation was executed; use the latest Available Terminal Tabs inventory and replan.`
+    }
+  }
+
+  const createRuntimeGuard = (context.terminalService as Partial<
+    Pick<TerminalService, 'createTerminalRuntimeGuard'>
+  >).createTerminalRuntimeGuard
+  let runtimeGuard: TerminalRuntimeGuard | undefined
+  if (typeof createRuntimeGuard === 'function') {
+    try {
+      runtimeGuard = createRuntimeGuard.call(
+        context.terminalService,
+        terminalId,
+        expectedRuntimeGeneration
+      )
+    } catch {
+      return {
+        ok: false,
+        message: `Error: ${capitalize(label)} terminalId=${JSON.stringify(terminalId)} changed while this tool call was entering execution. No terminal operation was executed; use the latest Available Terminal Tabs inventory and replan.`
+      }
+    }
+  } else if (expectedRuntimeGeneration !== undefined) {
+    return {
+      ok: false,
+      message: `Error: ${capitalize(label)} runtime lease validation is unavailable. No terminal operation was executed; use the latest Available Terminal Tabs inventory and replan.`
+    }
+  }
+
+  let snapshot: TerminalRuntimeSnapshot | null
+  try {
+    snapshot = context.terminalService.getTerminalRuntimeSnapshot(
+      terminal.id,
+      runtimeGuard
+    )
+  } catch {
+    return {
+      ok: false,
+      message: `Error: ${capitalize(label)} terminalId=${JSON.stringify(terminalId)} changed while this tool call was entering execution. No terminal operation was executed; use the latest Available Terminal Tabs inventory and replan.`
+    }
+  }
   if (!snapshot) {
     return {
       ok: false,
-      message: `Error: ${capitalize(label)} "${tabIdOrName}" was closed or no longer exists.`
+      message: `Error: ${capitalize(label)} with terminalId=${JSON.stringify(terminalId)} was closed or no longer exists.`
     }
   }
 
-  return { ok: true, terminal: bestMatch, snapshot }
+  return { ok: true, terminal, snapshot, runtimeGuard }
 }
 
 export function requireTerminalReadyForTool(
@@ -147,24 +209,87 @@ export function formatTerminalUnavailableForTool(
   }
   if (snapshot.reconnectable) {
     lines.push(
-      `Call reconnect_terminal_tab with tabIdOrName="${snapshot.id}" to try to reconnect this existing tab.`
+      `Call reconnect_terminal_tab with terminalId=${JSON.stringify(snapshot.id)} to try to reconnect this existing tab.`
     )
   }
 
   return lines.join('\n')
 }
 
-export function formatTerminalReferenceError(
+const TERMINAL_ID_ERROR_MAX_UTF8_BYTES = 16 * 1024
+const TERMINAL_ID_ERROR_MAX_CANDIDATES = 64
+
+export function formatTerminalIdError(
   label: string,
-  tabIdOrName: string,
-  found: Array<{ id: string; title?: string }>
+  terminalId: string,
+  availableTerminals: Array<{ id: string }>
 ): string {
-  if (found.length > 1) {
-    return `Error: Multiple ${label}s found for "${tabIdOrName}". Use a specific tab id: ${found
-      .map((item) => item.id)
-      .join(', ')}`
+  const suppliedTerminalIdUtf8Bytes = Buffer.byteLength(terminalId, 'utf8')
+  const boundedSuppliedTerminalId = truncateUtf8(
+    terminalId,
+    COMMAND_OUTPUT_IDENTIFIER_MAX_UTF8_BYTES
+  )
+  const suppliedTerminalIdTruncated =
+    boundedSuppliedTerminalId !== terminalId
+  const allIds = [
+    ...new Set(
+      availableTerminals
+        .map((terminal) => terminal.id)
+        .filter((id): id is string => typeof id === 'string')
+    )
+  ].sort()
+  const availableTerminalIds = allIds.slice(
+    0,
+    TERMINAL_ID_ERROR_MAX_CANDIDATES
+  )
+
+  const render = (): string => {
+    const resolution = {
+      status: 'not_found',
+      suppliedTerminalId: boundedSuppliedTerminalId,
+      ...(suppliedTerminalIdTruncated
+        ? {
+            suppliedTerminalIdTruncated: true,
+            suppliedTerminalIdUtf8Bytes
+          }
+        : {}),
+      availableTerminalIds,
+      ...(availableTerminalIds.length < allIds.length
+        ? {
+            availableTerminalIdsTruncated: true,
+            availableTerminalCount: allIds.length
+          }
+        : {})
+    }
+    return [
+      `Error: ${capitalize(label)} supplied terminalId does not exactly match a current terminal ID.`,
+      `terminal_id_resolution: ${JSON.stringify(resolution)}`,
+      'Use one complete, case-sensitive ID from availableTerminalIds or the latest Available Terminal Tabs inventory. Terminal names, shortened IDs, reconstructed IDs, case variants, and stale IDs are not accepted.'
+    ].join('\n')
   }
-  return `Error: ${capitalize(label)} "${tabIdOrName}" not found. It may have been closed by the user.`
+
+  let message = render()
+  while (
+    availableTerminalIds.length > 0 &&
+    Buffer.byteLength(message, 'utf8') > TERMINAL_ID_ERROR_MAX_UTF8_BYTES
+  ) {
+    availableTerminalIds.pop()
+    message = render()
+  }
+  return message
+}
+
+function truncateUtf8(value: string, maxUtf8Bytes: number): string {
+  if (Buffer.byteLength(value, 'utf8') <= maxUtf8Bytes) return value
+  let result = ''
+  let bytes = 0
+  for (const character of value) {
+    const characterBytes = Buffer.byteLength(character, 'utf8')
+    if (bytes + characterBytes > maxUtf8Bytes) break
+    result += character
+    bytes += characterBytes
+  }
+  return result
 }
 
 function capitalize(value: string): string {

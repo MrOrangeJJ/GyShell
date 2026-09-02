@@ -10,6 +10,25 @@ const assertEqual = <T>(actual: T, expected: T, message: string): void => {
   }
 };
 
+const assertRejects = async (
+  fn: () => Promise<unknown>,
+  pattern: RegExp,
+  message: string,
+): Promise<void> => {
+  try {
+    await fn();
+    throw new Error(`${message}: expected rejection`);
+  } catch (error) {
+    const actualMessage =
+      error instanceof Error ? error.message : String(error);
+    if (!pattern.test(actualMessage)) {
+      throw new Error(
+        `${message}: unexpected error message "${actualMessage}"`,
+      );
+    }
+  }
+};
+
 const runCase = async (
   name: string,
   fn: () => Promise<void> | void,
@@ -223,6 +242,167 @@ const run = async (): Promise<void> => {
       "manual stop should release the active run state",
     );
   });
+
+  await runCase(
+    "pause and resume preserve exact session identity and active runtime state",
+    async () => {
+      const { gateway, agent } = createGateway();
+      const exactSessionId = "  Session::会话  ";
+      let releaseRun: () => void = () => undefined;
+      agent.onRun = async () => {
+        await new Promise<void>((resolve) => {
+          releaseRun = resolve;
+        });
+      };
+
+      const task = gateway.dispatchTask(exactSessionId, "hello");
+      await Promise.resolve();
+      assertEqual(
+        gateway.getSession(exactSessionId)?.status,
+        "running",
+        "the exact session should enter running state",
+      );
+
+      await gateway.pauseTask("Session::会话");
+      assertEqual(
+        gateway.getSession(exactSessionId)?.status,
+        "running",
+        "a trimmed lookalike must not pause the opaque session",
+      );
+      await gateway.pauseTask(exactSessionId);
+      assertEqual(
+        gateway.getSession(exactSessionId)?.status,
+        "paused",
+        "the exact selector should pause the active session",
+      );
+      await gateway.resumeTask(exactSessionId);
+      assertEqual(
+        gateway.getSession(exactSessionId)?.status,
+        "running",
+        "resume should restore the live run state without creating a new run",
+      );
+
+      releaseRun();
+      await task;
+      assertEqual(
+        gateway.getSession(exactSessionId)?.status,
+        "idle",
+        "the resumed run should still use normal completion cleanup",
+      );
+    },
+  );
+
+  await runCase(
+    "pause is status-only and natural completion still owns cleanup",
+    async () => {
+      const { gateway, agent } = createGateway();
+      let releaseRun: () => void = () => undefined;
+      let executionContinued = false;
+      const activeCounts: number[] = [];
+      gateway.onRunStateChanged((snapshot) => {
+        activeCounts.push(snapshot.activeCount);
+      });
+      agent.onRun = async () => {
+        await new Promise<void>((resolve) => {
+          releaseRun = resolve;
+        });
+        executionContinued = true;
+      };
+
+      const task = gateway.dispatchTask("session-status-only", "hello");
+      await Promise.resolve();
+      await gateway.pauseTask("session-status-only");
+      assertEqual(
+        gateway.getSession("session-status-only")?.status,
+        "paused",
+        "pause should expose the status annotation",
+      );
+
+      releaseRun();
+      await task;
+      assertEqual(
+        executionContinued,
+        true,
+        "status-only pause must not be represented as suspended execution",
+      );
+      assertEqual(
+        gateway.getSession("session-status-only")?.status,
+        "idle",
+        "natural completion must clear a paused annotation",
+      );
+      assertEqual(
+        activeCounts.join(","),
+        "0,1,0",
+        "pause/resume annotations must not emit false active-run transitions",
+      );
+
+      await gateway.resumeTask("session-status-only");
+      assertEqual(
+        gateway.getSession("session-status-only")?.status,
+        "idle",
+        "resume after completion must not create a run",
+      );
+    },
+  );
+
+  await runCase("stopTask aborts and clears a status-only paused run", async () => {
+    const { gateway, agent } = createGateway();
+    agent.onRun = async (_context, _input, signal) => {
+      await new Promise<void>((_resolve, reject) => {
+        signal.addEventListener(
+          "abort",
+          () => {
+            const error = new Error("AbortError");
+            error.name = "AbortError";
+            reject(error);
+          },
+          { once: true },
+        );
+      });
+    };
+
+    const task = gateway.dispatchTask("session-paused-stop", "hello");
+    await Promise.resolve();
+    await gateway.pauseTask("session-paused-stop");
+    await gateway.stopTask("session-paused-stop", { waitForCompletion: true });
+    await task;
+
+    const context = gateway.getSession("session-paused-stop");
+    assertEqual(context?.status, "idle", "stop must clear paused status");
+    assertEqual(context?.activeRunId, null, "stop must clear the active run id");
+    assertEqual(
+      context?.abortController,
+      null,
+      "stop must clear the abort controller",
+    );
+  });
+
+  await runCase(
+    "pause and resume reject malformed selectors and no-op for absent sessions",
+    async () => {
+      const { gateway } = createGateway();
+      for (const selector of [null, 17, "   ", "\ud800"]) {
+        await assertRejects(
+          () => gateway.pauseTask(selector as any),
+          /Session id is required/,
+          "pauseTask should reject malformed session ids",
+        );
+        await assertRejects(
+          () => gateway.resumeTask(selector as any),
+          /Session id is required/,
+          "resumeTask should reject malformed session ids",
+        );
+      }
+
+      await gateway.pauseTask("missing-session");
+      await gateway.resumeTask("missing-session");
+      assertEqual(
+        gateway.getSession("missing-session"),
+        undefined,
+        "pause/resume must not materialize a missing session",
+      );
+    },
+  );
 
   await runCase("session rename broadcasts a UI update to every client", () => {
     const { gateway, agent } = createGateway();
