@@ -309,6 +309,13 @@ export const TerminalPanel: React.FC<TerminalPanelProps> = observer(
                     void store.closeTab(tab.id);
                   },
                   closeTitle: t.common.close,
+                  onContextMenu: onLayoutHeaderContextMenu
+                    ? (event) => {
+                        event.preventDefault();
+                        event.stopPropagation();
+                        onLayoutHeaderContextMenu(event);
+                      }
+                    : undefined,
                 };
               })}
               onChange={onSelectTab}
@@ -371,6 +378,11 @@ export const TerminalPanel: React.FC<TerminalPanelProps> = observer(
                     key={tab.id}
                     className={isActive ? "tab is-active" : "tab"}
                     onClick={() => onSelectTab(tab.id)}
+                    onContextMenu={(event) => {
+                      event.preventDefault();
+                      event.stopPropagation();
+                      onLayoutHeaderContextMenu?.(event);
+                    }}
                     role="button"
                     tabIndex={0}
                     draggable

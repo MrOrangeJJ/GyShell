@@ -1,4 +1,7 @@
-import { readOpaqueNonBlankWellFormedString } from "@gyshell/shared";
+import {
+  isValidTerminalRuntimeId,
+  readOpaqueNonBlankWellFormedString,
+} from "@gyshell/shared";
 import { CliUsageError } from "./errors";
 import type {
   CliEnvironment,
@@ -185,10 +188,20 @@ export function requiredFlag(args: ParsedArguments, name: string): string {
   return value;
 }
 
-export function sessionIdFlag(
-  args: ParsedArguments,
-  required: true,
-): string;
+export function terminalIdFlag(args: ParsedArguments): string {
+  const raw = getFlag(args, "terminal-id");
+  if (raw === undefined) {
+    throw new CliUsageError("--terminal-id is required.");
+  }
+  if (!isValidTerminalRuntimeId(raw)) {
+    throw new CliUsageError(
+      "--terminal-id must be a valid terminal runtime id.",
+    );
+  }
+  return raw;
+}
+
+export function sessionIdFlag(args: ParsedArguments, required: true): string;
 export function sessionIdFlag(
   args: ParsedArguments,
   required?: false,

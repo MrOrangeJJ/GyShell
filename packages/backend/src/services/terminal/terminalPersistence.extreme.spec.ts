@@ -2526,6 +2526,207 @@ const run = async (): Promise<void> => {
       )
     })
 
+    await runCase(
+      "terminal rename preserves opaque identity, runtime ownership, task history, and persistence",
+      async () => {
+        const backend = new FakeTerminalBackend();
+        backend.setEmitExitOnKill(false);
+        const service = createService(stateFilePath, backend);
+        const terminalId = "  rename-terminal-#]::__proto__  ";
+        const terminal = await service.createTerminal({
+          type: "local",
+          id: terminalId,
+          title: "Original title",
+          cols: 96,
+          rows: 28,
+        });
+        terminal.runtimeState = "ready";
+        terminal.isInitializing = false;
+        const originalPtyId = terminal.ptyId;
+        const originalGeneration =
+          service.getTerminalRuntimeGeneration(terminalId);
+        const taskId = await service.runCommandNoWait(
+          terminalId,
+          "rename-invariant-command",
+        );
+
+        const renamed = await service.renameTerminal(
+          terminalId,
+          "  Build \u4e2d\u6587 #]::__proto__  ",
+        );
+        assertEqual(
+          renamed.id,
+          terminalId,
+          "rename must return the exact opaque terminal id",
+        );
+        assertEqual(
+          renamed.title,
+          "Build \u4e2d\u6587 #]::__proto__",
+          "rename should trim only display-title surrounding whitespace",
+        );
+        assertEqual(
+          service.getTerminalById(terminalId)?.ptyId,
+          originalPtyId,
+          "rename must not replace the PTY runtime",
+        );
+        assertEqual(
+          service.getTerminalRuntimeGeneration(terminalId),
+          originalGeneration,
+          "rename must not change runtime generation",
+        );
+        assertEqual(
+          service.getCommandTask(terminalId, taskId)?.id,
+          taskId,
+          "rename must preserve the active command namespace",
+        );
+        assertEqual(
+          (service as any).terminalConfigs.get(terminalId).title,
+          renamed.title,
+          "rename must update the authoritative persisted config",
+        );
+
+        service.flushPersistedState();
+        const persisted = new TerminalStateStore(stateFilePath)
+          .load()
+          .find((record) => record.id === terminalId);
+        assertCondition(!!persisted, "renamed terminal should be persisted");
+        assertEqual(
+          persisted?.id,
+          terminalId,
+          "persisted terminal id must remain byte-for-byte identical",
+        );
+        assertEqual(
+          persisted?.config.title,
+          renamed.title,
+          "persisted config should contain the renamed title",
+        );
+
+        await assertRejects(
+          service.renameTerminal(terminalId, " \u0000 hostile"),
+          /Invalid terminal title: control_character/,
+          "control characters must be rejected before any terminal mutation",
+        );
+        assertEqual(
+          service.getTerminalById(terminalId)?.title,
+          renamed.title,
+          "rejected rename must not mutate the tab",
+        );
+
+        service.kill(terminalId);
+      },
+    );
+
+    await runCase(
+      "terminal rename allocates the existing unique-title suffix without changing ids",
+      async () => {
+        const backend = new FakeTerminalBackend();
+        const service = createService(stateFilePath, backend);
+        await service.createTerminal({
+          type: "local",
+          id: "rename-a",
+          title: "Build",
+          cols: 80,
+          rows: 24,
+        });
+        await service.createTerminal({
+          type: "local",
+          id: "rename-b",
+          title: "Deploy",
+          cols: 80,
+          rows: 24,
+        });
+        const renamed = await service.renameTerminal("rename-b", " Build ");
+        assertEqual(
+          renamed.id,
+          "rename-b",
+          "suffix allocation must preserve the target id",
+        );
+        assertEqual(
+          renamed.title,
+          "Build (1)",
+          "duplicate titles should use the existing unique-title policy",
+        );
+        service.kill("rename-a");
+        service.kill("rename-b");
+      },
+    );
+
+    await runCase(
+      "terminal rename rejects an overlong generated suffix atomically",
+      async () => {
+        const backend = new FakeTerminalBackend();
+        const service = createService(stateFilePath, backend);
+        const boundaryTitle = `${"界".repeat(170)}aa`;
+        await service.createTerminal({
+          type: "local",
+          id: "rename-long-a",
+          title: boundaryTitle,
+          cols: 80,
+          rows: 24,
+        });
+        const second = await service.createTerminal({
+          type: "local",
+          id: "rename-long-b",
+          title: "Other",
+          cols: 80,
+          rows: 24,
+        });
+
+        await assertRejects(
+          service.renameTerminal("rename-long-b", boundaryTitle),
+          /Invalid terminal title: too_long/,
+          "a uniqueness suffix that exceeds the title limit must fail closed",
+        );
+        assertEqual(
+          second.title,
+          "Other",
+          "failed rename must not mutate the terminal tab",
+        );
+        assertEqual(
+          (service as any).terminalConfigs.get("rename-long-b").title,
+          "Other",
+          "failed rename must not mutate the persisted config",
+        );
+        service.kill("rename-long-a");
+        service.kill("rename-long-b");
+      },
+    );
+
+    await runCase(
+      "terminal rename serializes concurrent requests for the same runtime",
+      async () => {
+        const backend = new FakeTerminalBackend();
+        const service = createService(stateFilePath, backend);
+        await service.createTerminal({
+          type: "local",
+          id: "rename-concurrent",
+          title: "Concurrent",
+          cols: 80,
+          rows: 24,
+        });
+        const [first, second] = await Promise.all([
+          service.renameTerminal("rename-concurrent", " First "),
+          service.renameTerminal("rename-concurrent", " Second "),
+        ]);
+        assertEqual(
+          first.id,
+          "rename-concurrent",
+          "first concurrent rename must retain id",
+        );
+        assertEqual(
+          second.id,
+          "rename-concurrent",
+          "second concurrent rename must retain id",
+        );
+        assertEqual(
+          service.getTerminalById("rename-concurrent")?.title,
+          "Second",
+          "lifecycle queue should apply concurrent requests deterministically",
+        );
+        service.kill("rename-concurrent");
+      },
+    );
+
     await runCase('terminal tab broadcasts include monitor identity for agent-created SSH tabs', async () => {
       const backend = new FakeTerminalBackend()
       const service = createService(stateFilePath, backend)

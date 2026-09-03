@@ -185,23 +185,104 @@ await runCase(
   },
 );
 
+await runCase("malformed session flags fail before any RPC", async () => {
+  for (const sessionId of ["   ", "\ud800"]) {
+    const client = new FakeClient();
+    await assert.rejects(
+      executeCommand(
+        args(["session", "delete", "--session-id", sessionId]),
+        client,
+        io().io,
+      ),
+      /session-id must be a non-blank valid string/,
+    );
+    assert.deepEqual(client.calls, []);
+  }
+});
+
 await runCase(
-  "malformed session flags fail before any RPC",
+  "terminal commands preserve opaque runtime ids byte-for-byte",
   async () => {
-    for (const sessionId of ["   ", "\ud800"]) {
+    const terminalId = "  Term#]::__proto__  ";
+    const cases: Array<{
+      argv: string[];
+      method: string;
+      params: Record<string, unknown>;
+    }> = [
+      {
+        argv: [
+          "terminal",
+          "write",
+          "--terminal-id",
+          terminalId,
+          "--data",
+          "echo exact",
+        ],
+        method: "terminal:write",
+        params: { terminalId, data: "echo exact" },
+      },
+      {
+        argv: [
+          "terminal",
+          "resize",
+          "--terminal-id",
+          terminalId,
+          "--cols",
+          "120",
+          "--rows",
+          "40",
+        ],
+        method: "terminal:resize",
+        params: { terminalId, cols: 120, rows: 40 },
+      },
+      {
+        argv: [
+          "terminal",
+          "buffer",
+          "--terminal-id",
+          terminalId,
+          "--from-offset",
+          "7",
+        ],
+        method: "terminal:getBufferDelta",
+        params: { terminalId, fromOffset: 7 },
+      },
+      {
+        argv: ["terminal", "reconnect", "--terminal-id", terminalId],
+        method: "terminal:reconnect",
+        params: { terminalId },
+      },
+      {
+        argv: ["terminal", "close", "--terminal-id", terminalId],
+        method: "terminal:kill",
+        params: { terminalId },
+      },
+    ];
+
+    for (const fixture of cases) {
       const client = new FakeClient();
-      await assert.rejects(
-        executeCommand(
-          args(["session", "delete", "--session-id", sessionId]),
-          client,
-          io().io,
-        ),
-        /session-id must be a non-blank valid string/,
-      );
-      assert.deepEqual(client.calls, []);
+      await executeCommand(args(fixture.argv), client, io().io);
+      assert.deepEqual(client.calls, [
+        { method: fixture.method, params: fixture.params },
+      ]);
     }
   },
 );
+
+await runCase("malformed terminal ids fail before any RPC", async () => {
+  for (const terminalId of ["   ", "bad\u0000id", "\ud800", "x".repeat(1025)]) {
+    const client = new FakeClient();
+    await assert.rejects(
+      executeCommand(
+        args(["terminal", "close", "--terminal-id", terminalId]),
+        client,
+        io().io,
+      ),
+      /terminal-id must be a valid terminal runtime id/,
+    );
+    assert.deepEqual(client.calls, []);
+  }
+});
 
 await runCase(
   "cross-session snapshots cannot authorize chat dispatch",

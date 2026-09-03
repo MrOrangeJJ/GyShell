@@ -1,0 +1,54 @@
+.terminal-rename-card {
+  max-width: 440px;
+}
+
+.terminal-rename-body {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.terminal-rename-body label {
+  color: var(--fg-muted);
+  font-family: var(--font-mono);
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.terminal-rename-body input {
+  width: 100%;
+  height: 32px;
+  box-sizing: border-box;
+  border: 1px solid color-mix(in srgb, var(--accent) 52%, var(--border));
+  border-radius: 3px;
+  outline: none;
+  background: color-mix(in srgb, var(--app-bg) 82%, transparent);
+  color: var(--fg);
+  padding: 4px 8px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+
+.terminal-rename-body input:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--accent) 24%, transparent);
+}
+
+.terminal-rename-body input[aria-invalid="true"] {
+  border-color: color-mix(in srgb, var(--danger) 72%, var(--border));
+}
+
+.terminal-rename-body input:disabled {
+  opacity: 0.62;
+}
+
+.terminal-rename-feedback {
+  min-height: 16px;
+  color: var(--fg-faint);
+  font-size: 10px;
+  line-height: 1.35;
+}
+
+.terminal-rename-feedback[role="alert"] {
+  color: var(--danger);
+}

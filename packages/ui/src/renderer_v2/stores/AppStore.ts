@@ -13,6 +13,8 @@ import {
   isValidTerminalRuntimeId,
   normalizeModelRequestParameters,
   readOpaqueNonBlankString,
+  readTerminalTitle,
+  validateTerminalTitle,
   type PanelTabDisplayModePreference,
 } from "@gyshell/shared";
 import type {
@@ -76,7 +78,7 @@ const removeById = <T extends { id: string }>(list: T[], id: string): T[] =>
   list.filter((x) => x.id !== id);
 
 const normalizeTerminalTitle = (value: unknown, fallback: string): string => {
-  const title = String(value || "").trim();
+  const title = readTerminalTitle(value);
   return title || fallback;
 };
 
@@ -524,6 +526,7 @@ export class AppStore {
       createSshTab: action,
       saveSshConnection: action,
       deleteSshConnection: action,
+      renameTerminal: action,
       reconnectTerminal: action,
       closeTab: action,
       setActiveTerminal: action,
@@ -3227,6 +3230,42 @@ export class AppStore {
       }
     });
     await window.gyshell.settings.set({ connections: nextConnections });
+  }
+
+  async renameTerminal(tabId: string, requestedTitle: unknown): Promise<string> {
+    if (!isValidTerminalRuntimeId(tabId)) {
+      throw new Error("Invalid terminal id");
+    }
+    const terminal = this.terminalTabs.find((entry) => entry.id === tabId);
+    if (!terminal) {
+      throw new Error(`Terminal ${JSON.stringify(tabId)} not found`);
+    }
+    const titleResult = validateTerminalTitle(requestedTitle);
+    if (!titleResult.ok) {
+      throw new Error(`Invalid terminal title: ${titleResult.reason}`);
+    }
+
+    const renamed = await window.gyshell.terminal.rename(
+      tabId,
+      titleResult.title,
+    );
+    const returnedTitle = validateTerminalTitle(renamed?.title);
+    if (renamed?.id !== tabId || !returnedTitle.ok) {
+      throw new Error("Terminal rename returned an invalid result");
+    }
+
+    // The backend response is only an operation result. Re-read the complete
+    // inventory so this renderer commits the same authoritative snapshot as
+    // every other renderer instead of applying an optimistic local mutation.
+    const snapshot = await window.gyshell.terminal.list();
+    runInAction(() => {
+      this.reconcileTerminalTabs(snapshot);
+    });
+    const current = this.terminalTabs.find((entry) => entry.id === tabId);
+    if (!current || current.title !== returnedTitle.title) {
+      throw new Error("Terminal rename was not present in the authoritative inventory");
+    }
+    return current.title;
   }
 
   async reconnectTerminal(tabId: string): Promise<boolean> {

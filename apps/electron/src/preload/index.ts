@@ -631,6 +631,10 @@ export interface GyShellAPI {
       terminals: TerminalSummary[];
     }>;
     createTab: (config: TerminalConfig) => Promise<{ id: string }>;
+    rename: (
+      terminalId: string,
+      title: string,
+    ) => Promise<{ id: string; title: string }>;
     reconnect: (terminalId: string) => Promise<{ id: string }>;
     write: (terminalId: string, data: string) => Promise<void>;
     writePaths: (terminalId: string, paths: string[]) => Promise<void>;
@@ -1133,6 +1137,8 @@ const api: GyShellAPI = {
   terminal: {
     list: () => ipcRenderer.invoke("terminal:list"),
     createTab: (config) => ipcRenderer.invoke("terminal:createTab", config),
+    rename: (terminalId, title) =>
+      ipcRenderer.invoke("terminal:rename", terminalId, title),
     reconnect: (terminalId) =>
       ipcRenderer.invoke("terminal:reconnect", terminalId),
     write: (terminalId, data) =>

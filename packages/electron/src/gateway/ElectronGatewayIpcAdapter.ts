@@ -942,6 +942,17 @@ export class ElectronGatewayIpcAdapter {
       return { id: tab.id };
     });
 
+    ipcMain.handle(
+      "terminal:rename",
+      async (_: any, terminalId: unknown, title: unknown) => {
+        if (typeof terminalId !== "string") {
+          throw new Error("Invalid terminal id");
+        }
+        const tab = await this.terminalService.renameTerminal(terminalId, title);
+        return { id: tab.id, title: tab.title };
+      },
+    );
+
     ipcMain.handle("terminal:reconnect", async (_: any, terminalId: string) => {
       const tab = await this.terminalService.reconnectTerminal(terminalId);
       return { id: tab.id };
