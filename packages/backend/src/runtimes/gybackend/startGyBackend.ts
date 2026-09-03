@@ -8,7 +8,6 @@ import { UIHistoryService } from "../../services/UIHistoryService";
 import { ChatHistoryService } from "../../services/ChatHistoryService";
 import { GatewayService } from "../../services/Gateway/GatewayService";
 import { WebSocketGatewayAdapter } from "../../services/Gateway/WebSocketGatewayAdapter";
-import { requireLiveTerminalBridgeTarget } from "../../services/Gateway/terminalBridgeAdmission";
 import {
   WebSocketGatewayControlService,
   resolveWsGatewayAccessFromHost,
@@ -242,19 +241,15 @@ export async function startGyBackend(): Promise<void> {
             return { id: tab.id };
           },
           write: async (terminalId, data) => {
-            requireLiveTerminalBridgeTarget(terminalService, terminalId);
             terminalService.write(terminalId, data);
           },
           writePaths: async (terminalId, paths) => {
-            requireLiveTerminalBridgeTarget(terminalService, terminalId);
             terminalService.writePaths(terminalId, paths);
           },
           resize: async (terminalId, cols, rows) => {
-            requireLiveTerminalBridgeTarget(terminalService, terminalId);
             terminalService.resize(terminalId, cols, rows);
           },
           kill: async (terminalId) => {
-            requireLiveTerminalBridgeTarget(terminalService, terminalId);
             if (terminalService.getDisplayTerminals().length <= 1) {
               throw new Error("Cannot close the last terminal tab.");
             }
@@ -265,11 +260,9 @@ export async function startGyBackend(): Promise<void> {
             return { id: tab.id };
           },
           setSelection: async (terminalId, selectionText) => {
-            requireLiveTerminalBridgeTarget(terminalService, terminalId);
             terminalService.setSelection(terminalId, selectionText);
           },
           getBufferDelta: async (terminalId, fromOffset) => {
-            requireLiveTerminalBridgeTarget(terminalService, terminalId);
             const data = terminalService.getBufferDelta(terminalId, fromOffset);
             const offset = terminalService.getCurrentOffset(terminalId);
             return {

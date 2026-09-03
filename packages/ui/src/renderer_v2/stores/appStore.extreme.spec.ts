@@ -31,25 +31,6 @@ const runCase = async (
   console.log(`PASS ${name}`);
 };
 
-const assertRejectedPromise = async (
-  promise: Promise<unknown>,
-  expectedMessage: RegExp,
-  message: string,
-): Promise<void> => {
-  try {
-    await promise;
-    throw new Error(`${message}: expected rejection`);
-  } catch (error) {
-    const actualMessage =
-      error instanceof Error ? error.message : String(error);
-    if (!expectedMessage.test(actualMessage)) {
-      throw new Error(
-        `${message}: expected ${String(expectedMessage)}, actual ${actualMessage}`,
-      );
-    }
-  }
-};
-
 const createStorage = (state: Map<string, string>) => ({
   getItem(key: string) {
     return state.has(key) ? state.get(key)! : null;
@@ -2052,100 +2033,6 @@ const run = async (): Promise<void> => {
         JSON.stringify(["Local (1)", "Local (1) (1)", "Local (3)"]),
         "terminal configs should carry the unique display title",
       );
-    },
-  );
-
-  await runCase(
-    "renameTerminal uses the exact id and commits only the authoritative terminal snapshot",
-    async () => {
-      const originalWindow = (globalThis as any).window;
-      try {
-        const store = new AppStore();
-        (store as any).terminalTabs = [
-          {
-            id: "  rename-ui-#]::__proto__  ",
-            title: "Before",
-            config: {
-              type: "local",
-              id: "  rename-ui-#]::__proto__  ",
-              title: "Before",
-              cols: 80,
-              rows: 24,
-              cwd: "/tmp",
-            },
-            capabilities: {
-              supportsFilesystem: true,
-              supportsMonitor: true,
-            },
-            runtimeState: "ready",
-          },
-        ];
-        (store as any).terminalTabsHydrated = true;
-        (store.layout as any).syncPanelBindings = () => {};
-
-        const terminalId = "  rename-ui-#]::__proto__  ";
-        let authoritativeTitle = "Before";
-        const renameCalls: Array<{ id: string; title: string }> = [];
-        const terminalApi = (globalThis as any).window.gyshell.terminal;
-        terminalApi.rename = async (id: string, title: string) => {
-          renameCalls.push({ id, title });
-          authoritativeTitle = title;
-          return { id, title };
-        };
-        terminalApi.list = async () => ({
-          terminals: [
-            {
-              id: terminalId,
-              title: authoritativeTitle,
-              type: "local",
-              cols: 80,
-              rows: 24,
-              runtimeState: "ready",
-            },
-          ],
-        });
-
-        const result = await store.renameTerminal(terminalId, "  After #]  ");
-        assertEqual(
-          result,
-          "After #]",
-          "rename should return the backend title",
-        );
-        assertEqual(
-          JSON.stringify(renameCalls),
-          JSON.stringify([{ id: terminalId, title: "After #]" }]),
-          "IPC should receive the byte-for-byte terminal id and normalized display title",
-        );
-        assertEqual(
-          store.terminalTabs[0].id,
-          terminalId,
-          "authoritative reconciliation must preserve the opaque id",
-        );
-        assertEqual(
-          store.terminalTabs[0].title,
-          "After #]",
-          "authoritative reconciliation should update the visible title",
-        );
-        assertEqual(
-          (store.terminalTabs[0].config as any).cwd,
-          "/tmp",
-          "authoritative reconciliation should preserve existing connection fields",
-        );
-        assertEqual(
-          store.terminalTabs[0].runtimeState,
-          "ready",
-          "rename must not change runtime state",
-        );
-
-        await assertRejectedPromise(
-          store.renameTerminal(terminalId, "\u0000bad"),
-          /Invalid terminal title: control_character/,
-          "invalid title should fail before IPC",
-        );
-        assertEqual(renameCalls.length, 1, "invalid title must not call IPC");
-      } finally {
-        (globalThis as any).window = originalWindow;
-      }
     },
   );
 

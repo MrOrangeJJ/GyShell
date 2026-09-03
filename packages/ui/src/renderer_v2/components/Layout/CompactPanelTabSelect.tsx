@@ -20,7 +20,6 @@ export interface CompactPanelTabOption {
   trailingMeasureKey?: string;
   onClose?: () => void;
   closeTitle?: string;
-  onContextMenu?: (event: React.MouseEvent<HTMLElement>) => void;
 }
 
 interface CompactPanelTabSelectProps {
@@ -391,7 +390,6 @@ export const CompactPanelTabSelect: React.FC<CompactPanelTabSelectProps> = ({
           data-layout-tab-panel-id={panelId}
           data-layout-tab-index={String(activeOptionIndex)}
           onClick={toggleMenu}
-          onContextMenu={activeOption?.onContextMenu}
           onKeyDown={(event) => {
             if (event.key === "Enter" || event.key === " ") {
               event.preventDefault();
@@ -473,10 +471,6 @@ export const CompactPanelTabSelect: React.FC<CompactPanelTabSelectProps> = ({
                         }
                         onChange(option.value);
                         setOpen(false);
-                      }}
-                      onContextMenu={(event) => {
-                        setOpen(false);
-                        option.onContextMenu?.(event);
                       }}
                       onKeyDown={(event) => {
                         if (event.key === "Enter" || event.key === " ") {

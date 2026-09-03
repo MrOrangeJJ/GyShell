@@ -20,12 +20,11 @@ import { resolveFloatingMenuPlacement } from "../../lib/menuPlacement";
 import { normalizeSessionTitleText } from "../../lib/sessionTitleDisplay";
 import { TerminalAddButton } from "../Terminal/TerminalAddButton";
 import { resolveTerminalTabIcon } from "../Terminal/terminalTabIcons";
-import { TerminalRenameDialog } from "../Terminal/TerminalRenameDialog";
 import {
   buildListPanelChatSources,
   buildListPanelRows,
   resolveCreatedTerminalTabActivation,
-  resolveListPanelRowContextActions,
+  resolveListPanelRowContextAction,
   resolveListPanelRowActivation,
   type ListPanelRowContextAction,
   type ListPanelRow,
@@ -44,8 +43,7 @@ interface ListPanelProps {
 
 interface ListPanelRowContextMenuState {
   rowId: string;
-  kind: ListPanelTabKind;
-  actions: ListPanelRowContextAction[];
+  action: ListPanelRowContextAction;
   x: number;
   y: number;
 }
@@ -120,9 +118,6 @@ export const ListPanel: React.FC<ListPanelProps> = observer(
       React.useState<React.CSSProperties>();
     const [chatRename, setChatRename] =
       React.useState<ListPanelChatRenameState | null>(null);
-    const [terminalRenameId, setTerminalRenameId] = React.useState<
-      string | null
-    >(null);
     const rowContextMenuRef = React.useRef<HTMLDivElement | null>(null);
     const rowContextMenuTriggerRef = React.useRef<HTMLElement | null>(null);
     const t = store.i18n.t;
@@ -172,19 +167,19 @@ export const ListPanel: React.FC<ListPanelProps> = observer(
     const terminalAddTargetPanelId =
       store.layout.getPrimaryPanelId("terminal") || undefined;
 
-    const resolveRowContextActions = React.useCallback(
-      (row: ListPanelRow): ListPanelRowContextAction[] => {
+    const resolveRowContextAction = React.useCallback(
+      (row: ListPanelRow): ListPanelRowContextAction | null => {
         const terminalTab =
           row.kind === "terminal"
             ? store.terminalTabs.find((tab) => tab.id === row.id) || null
             : null;
-        return resolveListPanelRowContextActions({
+        return resolveListPanelRowContextAction({
           kind: row.kind,
           terminalType: terminalTab?.config.type,
           terminalRuntimeState: terminalTab?.runtimeState,
         });
       },
-      [store.terminalTabs],
+      [store],
     );
 
     const recomputeRowContextMenuStyle = React.useCallback(() => {
@@ -281,14 +276,10 @@ export const ListPanel: React.FC<ListPanelProps> = observer(
 
     React.useEffect(() => {
       if (rowContextMenu) {
-        const menuRow = rows.find(
-          (row) =>
-            row.id === rowContextMenu.rowId && row.kind === rowContextMenu.kind,
-        );
+        const menuRow = rows.find((row) => row.id === rowContextMenu.rowId);
         if (
           !menuRow ||
-          resolveRowContextActions(menuRow).join("\0") !==
-            rowContextMenu.actions.join("\0")
+          resolveRowContextAction(menuRow) !== rowContextMenu.action
         ) {
           closeRowContextMenu();
         }
@@ -305,7 +296,7 @@ export const ListPanel: React.FC<ListPanelProps> = observer(
       chatRename,
       closeRowContextMenu,
       rowContextMenu,
-      resolveRowContextActions,
+      resolveRowContextAction,
       rows,
       store.chat.sessions,
     ]);
@@ -396,22 +387,21 @@ export const ListPanel: React.FC<ListPanelProps> = observer(
         x: number,
         y: number,
       ): boolean => {
-        const actions = resolveRowContextActions(row);
-        if (actions.length === 0) {
+        const action = resolveRowContextAction(row);
+        if (!action) {
           return false;
         }
         rowContextMenuTriggerRef.current = trigger;
         setRowContextMenuStyle(undefined);
         setRowContextMenu({
           rowId: row.id,
-          kind: row.kind,
-          actions,
+          action,
           x,
           y,
         });
         return true;
       },
-      [resolveRowContextActions],
+      [resolveRowContextAction],
     );
 
     const handleRowContextMenu = React.useCallback(
@@ -499,29 +489,22 @@ export const ListPanel: React.FC<ListPanelProps> = observer(
       t.chat.history.renameSessionFailed,
     ]);
 
-    const runRowContextMenuAction = React.useCallback(
-      (action: ListPanelRowContextAction) => {
-        const menu = rowContextMenu;
-        if (!menu || !menu.actions.includes(action)) return;
-        setRowContextMenu(null);
-        if (action === "reconnect") {
-          void store.reconnectTerminal(menu.rowId);
-          restoreRowContextTriggerFocus();
-          return;
-        }
-        if (menu.kind === "terminal") {
-          setTerminalRenameId(menu.rowId);
-          return;
-        }
-        startChatRename(menu.rowId);
-      },
-      [
-        restoreRowContextTriggerFocus,
-        rowContextMenu,
-        startChatRename,
-        store,
-      ],
-    );
+    const runRowContextMenuAction = React.useCallback(() => {
+      const menu = rowContextMenu;
+      if (!menu) return;
+      setRowContextMenu(null);
+      if (menu.action === "reconnect") {
+        void store.reconnectTerminal(menu.rowId);
+        restoreRowContextTriggerFocus();
+        return;
+      }
+      startChatRename(menu.rowId);
+    }, [
+      restoreRowContextTriggerFocus,
+      rowContextMenu,
+      startChatRename,
+      store,
+    ]);
 
     const changeMode = React.useCallback(
       (nextMode: ListPanelTabKind) => {
@@ -543,7 +526,7 @@ export const ListPanel: React.FC<ListPanelProps> = observer(
         row.kind === "terminal"
           ? getTerminalStatusClassName(store, row)
           : row.statusLabel;
-      const contextActions = resolveRowContextActions(row);
+      const contextAction = resolveRowContextAction(row);
       const isEditing = chatRename?.sessionId === row.id;
       const tooltip = row.host
         ? `${row.title} · panel ${row.host.panelIndex + 1}`
@@ -559,11 +542,9 @@ export const ListPanel: React.FC<ListPanelProps> = observer(
           tabIndex={isEditing ? -1 : 0}
           draggable={row.canDrag && !isEditing}
           title={isEditing ? undefined : tooltip}
-          aria-haspopup={contextActions.length > 0 ? "menu" : undefined}
+          aria-haspopup={contextAction ? "menu" : undefined}
           aria-expanded={
-            contextActions.length > 0
-              ? rowContextMenu?.rowId === row.id
-              : undefined
+            contextAction ? rowContextMenu?.rowId === row.id : undefined
           }
           onClick={() => {
             if (!isEditing) handleActivateRow(row);
@@ -794,14 +775,6 @@ export const ListPanel: React.FC<ListPanelProps> = observer(
             <div className="list-panel-empty">{emptyLabel}</div>
           )}
         </div>
-        <TerminalRenameDialog
-          store={store}
-          terminalId={terminalRenameId}
-          onClose={() => {
-            setTerminalRenameId(null);
-            restoreRowContextTriggerFocus();
-          }}
-        />
         {rowContextMenu
           ? createPortal(
               <div
@@ -817,21 +790,16 @@ export const ListPanel: React.FC<ListPanelProps> = observer(
                 }
                 onContextMenu={(event) => event.preventDefault()}
               >
-                {rowContextMenu.actions.map((action) => (
-                  <button
-                    key={action}
-                    type="button"
-                    className="gyshell-layout-menu-item"
-                    role="menuitem"
-                    onClick={() => runRowContextMenuAction(action)}
-                  >
-                    {action === "reconnect"
-                      ? t.layout.reconnectTab
-                      : rowContextMenu.kind === "terminal"
-                        ? t.terminal.renameAction
-                        : t.chat.history.renameSession}
-                  </button>
-                ))}
+                <button
+                  type="button"
+                  className="gyshell-layout-menu-item"
+                  role="menuitem"
+                  onClick={runRowContextMenuAction}
+                >
+                  {rowContextMenu.action === "reconnect"
+                    ? t.layout.reconnectTab
+                    : t.chat.history.renameSession}
+                </button>
               </div>,
               document.body,
             )

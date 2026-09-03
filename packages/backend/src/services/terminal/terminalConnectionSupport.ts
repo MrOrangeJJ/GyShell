@@ -2,7 +2,6 @@ import {
   getTerminalConnectionCapabilities,
   getTerminalConnectionTypeDefinition,
   isValidTerminalRuntimeId as isValidSharedTerminalRuntimeId,
-  validateTerminalTitle,
 } from '@gyshell/shared'
 import { createHmac, randomBytes } from 'node:crypto'
 import { v4 as uuidv4 } from 'uuid'
@@ -215,9 +214,8 @@ export const normalizePersistedTerminalConfig = (
   // Whitespace is checked by isValidTerminalRuntimeId, but remains part of the
   // identity when it is otherwise valid.
   const id = typeof raw.id === 'string' ? raw.id : ''
-  const titleResult = validateTerminalTitle(raw.title)
-  if (!isValidTerminalRuntimeId(id) || !titleResult.ok) return null
-  const title = titleResult.title
+  const title = typeof raw.title === 'string' ? raw.title.trim() : ''
+  if (!isValidTerminalRuntimeId(id) || !title) return null
 
   const cols = asPositiveInt(raw.cols, 80)
   const rows = asPositiveInt(raw.rows, 24)

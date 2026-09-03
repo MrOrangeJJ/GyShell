@@ -4,7 +4,7 @@ import {
   resolveCreatedTerminalTabActivation,
   resolveListPanelChatStatusLabel,
   resolveListPanelHost,
-  resolveListPanelRowContextActions,
+  resolveListPanelRowContextAction,
   resolveListPanelRowActivation,
   type ListPanelTabSource,
 } from "./listPanelModel";
@@ -323,39 +323,39 @@ runCase(
 );
 
 runCase(
-  "row context actions always expose terminal rename and preserve reconnect",
+  "row context actions match terminal reconnect and chat rename rules",
   () => {
-    assertDeepEqual(
-      resolveListPanelRowContextActions({
+    assertEqual(
+      resolveListPanelRowContextAction({
         kind: "terminal",
         terminalType: "ssh",
         terminalRuntimeState: "exited",
       }),
-      ["rename", "reconnect"],
-      "an exited SSH terminal should expose rename and reconnect",
+      "reconnect",
+      "an exited SSH terminal should expose reconnect",
     );
-    assertDeepEqual(
-      resolveListPanelRowContextActions({
+    assertEqual(
+      resolveListPanelRowContextAction({
         kind: "terminal",
         terminalType: "ssh",
         terminalRuntimeState: "ready",
       }),
-      ["rename"],
-      "a ready SSH terminal should expose rename without reconnect",
+      null,
+      "a ready SSH terminal should not expose reconnect",
     );
-    assertDeepEqual(
-      resolveListPanelRowContextActions({
+    assertEqual(
+      resolveListPanelRowContextAction({
         kind: "terminal",
         terminalType: "local",
         terminalRuntimeState: "exited",
       }),
-      ["rename"],
-      "an exited local terminal should remain renameable",
+      null,
+      "an exited local terminal should not expose reconnect",
     );
-    assertDeepEqual(
-      resolveListPanelRowContextActions({ kind: "chat" }),
-      ["rename"],
-      "chat rows should keep their existing rename action",
+    assertEqual(
+      resolveListPanelRowContextAction({ kind: "chat" }),
+      "rename",
+      "chat rows should always expose rename",
     );
   },
 );

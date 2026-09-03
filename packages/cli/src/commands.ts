@@ -11,7 +11,6 @@ import {
   MAX_TIMER_DELAY_MS,
   requiredFlag,
   sessionIdFlag,
-  terminalIdFlag,
 } from "./arguments";
 import { CliUsageError } from "./errors";
 import { readJsonSource, readTextSource } from "./io";
@@ -213,8 +212,6 @@ function validateCommandOptions(command: string, args: ParsedArguments): void {
   for (const name of REQUIRED_FLAGS_BY_COMMAND[command] || []) {
     if (name === "session-id") {
       sessionIdFlag(args, true);
-    } else if (name === "terminal-id") {
-      terminalIdFlag(args);
     } else {
       requiredFlag(args, name);
     }
@@ -671,7 +668,7 @@ async function terminalWrite(
     label: "Terminal data",
   });
   if (hasFlag(args, "enter")) data += "\r";
-  const terminalId = terminalIdFlag(args);
+  const terminalId = requiredFlag(args, "terminal-id");
   await client.request("terminal:write", { terminalId, data });
   return { terminalId, bytesWritten: Buffer.byteLength(data) };
 }
@@ -680,7 +677,7 @@ async function terminalResize(
   args: ParsedArguments,
   client: RpcClient,
 ): Promise<unknown> {
-  const terminalId = terminalIdFlag(args);
+  const terminalId = requiredFlag(args, "terminal-id");
   const cols = integerFlag(args, "cols", undefined, { min: 1, max: 1000 });
   const rows = integerFlag(args, "rows", undefined, { min: 1, max: 1000 });
   await client.request("terminal:resize", { terminalId, cols, rows });
@@ -692,7 +689,7 @@ async function terminalBuffer(
   client: RpcClient,
 ): Promise<unknown> {
   return await client.request("terminal:getBufferDelta", {
-    terminalId: terminalIdFlag(args),
+    terminalId: requiredFlag(args, "terminal-id"),
     fromOffset: integerFlag(args, "from-offset", 0, { min: 0 }),
   });
 }
@@ -702,7 +699,7 @@ async function terminalReconnect(
   client: RpcClient,
 ): Promise<unknown> {
   return await client.request("terminal:reconnect", {
-    terminalId: terminalIdFlag(args),
+    terminalId: requiredFlag(args, "terminal-id"),
   });
 }
 
@@ -710,7 +707,7 @@ async function terminalClose(
   args: ParsedArguments,
   client: RpcClient,
 ): Promise<unknown> {
-  const terminalId = terminalIdFlag(args);
+  const terminalId = requiredFlag(args, "terminal-id");
   await client.request("terminal:kill", { terminalId });
   return { terminalId, closed: true };
 }

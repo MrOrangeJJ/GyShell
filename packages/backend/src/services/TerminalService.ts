@@ -25,7 +25,6 @@ import {
   isSshConnectionConfig,
   isTerminalFileSystemBackend,
 } from '../types'
-import { validateTerminalTitle } from '@gyshell/shared'
 import { NodePtyBackend } from './NodePtyBackend'
 import { SSHBackend } from './SSHBackend'
 import { escapeShellPathList } from './ShellUtility'
@@ -332,13 +331,9 @@ const normalizeTerminalConfigForRuntime = (config: TerminalConfig): TerminalConf
   if (!isValidTerminalRuntimeId(config.id)) {
     throw new Error('Terminal id is empty, contains control characters, or exceeds the safe output-contract limit.')
   }
-  const titleResult = validateTerminalTitle(config.title)
-  if (!titleResult.ok) {
-    throw new Error(`Invalid terminal title: ${titleResult.reason}`)
-  }
   const normalized = cloneTerminalConfig(config)
   normalized.id = config.id
-  normalized.title = titleResult.title
+  normalized.title = config.title
   normalized.cols = Number.isFinite(config.cols) && config.cols > 0 ? Math.max(1, Math.floor(config.cols)) : 80
   normalized.rows = Number.isFinite(config.rows) && config.rows > 0 ? Math.max(1, Math.floor(config.rows)) : 24
   return normalized
@@ -1406,65 +1401,6 @@ export class TerminalService {
           normalizedConfig,
           expectedEpoch
         )
-    )
-  }
-
-  async renameTerminal(
-    terminalId: string,
-    requestedTitle: unknown
-  ): Promise<TerminalTab> {
-    if (!isValidTerminalRuntimeId(terminalId)) {
-      throw new Error('Terminal id is empty, contains control characters, or exceeds the safe output-contract limit.')
-    }
-    const titleResult = validateTerminalTitle(requestedTitle)
-    if (!titleResult.ok) {
-      throw new Error(`Invalid terminal title: ${titleResult.reason}`)
-    }
-
-    return await this.runTerminalLifecycleOperation(
-      terminalId,
-      async (expectedEpoch) => {
-        if (!this.isTerminalLifecycleCurrent(terminalId, expectedEpoch)) {
-          throw new TerminalRuntimeChangedError(
-            terminalId,
-            false,
-            'terminal rename admission'
-          )
-        }
-        const terminal = this.terminals.get(terminalId)
-        if (!terminal) {
-          throw new Error(`Terminal ${JSON.stringify(terminalId)} not found`)
-        }
-        const existingConfig = this.terminalConfigs.get(terminalId)
-        if (!existingConfig) {
-          throw new Error(
-            `Terminal ${JSON.stringify(terminalId)} does not have a mutable configuration`
-          )
-        }
-
-        const nextTitle = this.resolveUniqueTitleForTerminal(
-          titleResult.title,
-          terminalId
-        )
-        if (terminal.title === nextTitle) {
-          return terminal
-        }
-
-        const nextConfig = normalizeTerminalConfigForRuntime({
-          ...existingConfig,
-          id: terminalId,
-          title: nextTitle,
-          cols: terminal.cols,
-          rows: terminal.rows
-        } as TerminalConfig)
-        // Validate the complete replacement before mutating either authority;
-        // a generated uniqueness suffix must not leave a half-renamed tab.
-        terminal.title = nextConfig.title
-        this.terminalConfigs.set(terminalId, nextConfig)
-        this.publishTerminalTabsChanged()
-        this.schedulePersistTerminalState()
-        return terminal
-      }
     )
   }
 

@@ -103,16 +103,14 @@ export const buildListPanelChatSources = (
     };
   });
 
-export const resolveListPanelRowContextActions = (input: {
+export const resolveListPanelRowContextAction = (input: {
   kind: ListPanelTabKind;
   terminalType?: string;
   terminalRuntimeState?: unknown;
-}): ListPanelRowContextAction[] => {
+}): ListPanelRowContextAction | null => {
   if (input.kind === "chat") {
-    return ["rename"];
+    return "rename";
   }
-
-  const actions: ListPanelRowContextAction[] = ["rename"];
   if (
     input.terminalType &&
     canReconnectTerminalRuntime(
@@ -120,9 +118,9 @@ export const resolveListPanelRowContextActions = (input: {
       input.terminalRuntimeState,
     )
   ) {
-    actions.push("reconnect");
+    return "reconnect";
   }
-  return actions;
+  return null;
 };
 
 export const resolveListPanelHost = (

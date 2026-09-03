@@ -32,7 +32,6 @@ import {
 } from "./tabDropTargets";
 import { getPanelKindAdapter } from "../../stores/panelKindAdapters";
 import { canReconnectTerminalRuntime } from "../../lib/terminalConnectionModel";
-import { TerminalRenameDialog } from "../Terminal/TerminalRenameDialog";
 import {
   WINDOW_CONTEXT,
   buildDetachedLayoutTree,
@@ -66,7 +65,6 @@ interface LayoutWorkspaceProps {
 type LayoutMenuMode = "tab" | "bar";
 
 type LayoutMenuAction =
-  | "rename-terminal"
   | "reconnect-terminal"
   | "close-tab"
   | "close-other-tabs"
@@ -78,7 +76,6 @@ type LayoutMenuAction =
   | "close-panel";
 
 type LayoutMenuLabelKey =
-  | "renameTerminalTab"
   | "reconnectTab"
   | "closeTab"
   | "closeOtherTabs"
@@ -557,8 +554,6 @@ export const LayoutWorkspace: React.FC<LayoutWorkspaceProps> = observer(
     const [isDetachHover, setIsDetachHover] = React.useState(false);
     const [pendingTerminalCloseRequest, setPendingTerminalCloseRequest] =
       React.useState<PendingTerminalCloseRequest | null>(null);
-    const [pendingTerminalRenameId, setPendingTerminalRenameId] =
-      React.useState<string | null>(null);
     const [tabInsertIndicatorRect, setTabInsertIndicatorRect] =
       React.useState<LayoutRect | null>(null);
 
@@ -2759,20 +2754,6 @@ export const LayoutWorkspace: React.FC<LayoutWorkspaceProps> = observer(
               (tab) => tab.id === layoutMenu.targetTabId,
             ) || null
           : null;
-      const terminalItems: Array<{
-        action: LayoutMenuAction;
-        labelKey: LayoutMenuLabelKey;
-        danger?: boolean;
-        disabled?: boolean;
-      }> = targetTerminalTab
-        ? [
-            {
-              action: "rename-terminal",
-              labelKey: "renameTerminalTab",
-              disabled: !hasTargetTab,
-            },
-          ]
-        : [];
       const reconnectItems: Array<{
         action: LayoutMenuAction;
         labelKey: LayoutMenuLabelKey;
@@ -2833,7 +2814,6 @@ export const LayoutWorkspace: React.FC<LayoutWorkspaceProps> = observer(
       }));
 
       return [
-        ...terminalItems,
         ...reconnectItems,
         ...closeItems,
         ...splitItems,
@@ -2850,16 +2830,6 @@ export const LayoutWorkspace: React.FC<LayoutWorkspaceProps> = observer(
       (action: LayoutMenuAction) => {
         if (!layoutMenu) return;
         const panelTabIds = store.layout.getPanelTabIds(layoutMenu.panelId);
-
-        if (
-          action === "rename-terminal" &&
-          layoutMenu.panelKind === "terminal" &&
-          layoutMenu.targetTabId
-        ) {
-          setPendingTerminalRenameId(layoutMenu.targetTabId);
-          setLayoutMenu(null);
-          return;
-        }
 
         if (
           action === "reconnect-terminal" &&
@@ -2953,11 +2923,6 @@ export const LayoutWorkspace: React.FC<LayoutWorkspaceProps> = observer(
           />
         )}
         <div ref={canvasRef} className="gyshell-layout-canvas">
-          <TerminalRenameDialog
-            store={store}
-            terminalId={pendingTerminalRenameId}
-            onClose={() => setPendingTerminalRenameId(null)}
-          />
           <ConfirmDialog
             open={pendingTerminalCloseCount > 0}
             title={t.terminal.confirmCloseTitle}

@@ -31,7 +31,6 @@ import { GatewayService } from "../../../backend/src/services/Gateway/GatewaySer
 import { ElectronGatewayIpcAdapter } from "../gateway/ElectronGatewayIpcAdapter";
 import { ElectronWindowTransport } from "../gateway/ElectronWindowTransport";
 import { WebSocketGatewayAdapter } from "../../../backend/src/services/Gateway/WebSocketGatewayAdapter";
-import { requireLiveTerminalBridgeTarget } from "../../../backend/src/services/Gateway/terminalBridgeAdmission";
 import {
   WebSocketGatewayControlService,
   resolveWsGatewayPolicyFromEnv,
@@ -706,19 +705,15 @@ export async function startElectronMain(): Promise<void> {
                   return { id: tab.id };
                 },
                 write: async (terminalId, data) => {
-                  requireLiveTerminalBridgeTarget(terminalService, terminalId);
                   terminalService.write(terminalId, data);
                 },
                 writePaths: async (terminalId, paths) => {
-                  requireLiveTerminalBridgeTarget(terminalService, terminalId);
                   terminalService.writePaths(terminalId, paths);
                 },
                 resize: async (terminalId, cols, rows) => {
-                  requireLiveTerminalBridgeTarget(terminalService, terminalId);
                   terminalService.resize(terminalId, cols, rows);
                 },
                 kill: async (terminalId) => {
-                  requireLiveTerminalBridgeTarget(terminalService, terminalId);
                   if (terminalService.getDisplayTerminals().length <= 1) {
                     throw new Error("Cannot close the last terminal tab.");
                   }
@@ -730,11 +725,9 @@ export async function startElectronMain(): Promise<void> {
                   return { id: tab.id };
                 },
                 setSelection: async (terminalId, selectionText) => {
-                  requireLiveTerminalBridgeTarget(terminalService, terminalId);
                   terminalService.setSelection(terminalId, selectionText);
                 },
                 getBufferDelta: async (terminalId, fromOffset) => {
-                  requireLiveTerminalBridgeTarget(terminalService, terminalId);
                   const data = terminalService.getBufferDelta(
                     terminalId,
                     fromOffset,
