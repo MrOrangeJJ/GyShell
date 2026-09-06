@@ -18,6 +18,8 @@ import {
   WHAT_HAVE_DONE_IN_THE_PAST_TAG,
 } from "./AgentHelper/prompts";
 import { TokenManager } from "./AgentHelper/TokenManager";
+import { buildUiSessionSummary } from "./history/uiHistoryHelpers";
+import type { UIChatSession } from "../types/ui-chat";
 import type { ChatSession } from "../types";
 import {
   formatInitialCommandOutput,
@@ -173,6 +175,357 @@ const run = async (): Promise<void> => {
     });
 
   try {
+    for (const hydration of ["cold", "page", "geometry", "rewrite"] as const) {
+      for (const commandPosition of [2, 503, 504, 1002]) {
+        for (const legacy of [false, true]) {
+          await runCase(
+            `restart branch: ${hydration}, command=${commandPosition}, legacy=${legacy}`,
+            () => {
+              const sourceId = `restart-${hydration}-${commandPosition}-${legacy}`;
+              const running = createRunningCommandOutput();
+              const uiSource: UIChatSession = {
+                id: sourceId,
+                title: "Restarted large session",
+                updatedAt: Date.now(),
+                messages: Array.from({ length: 1004 }, (_, index) => ({
+                  id: `${sourceId}-ui-${index}`,
+                  backendMessageId: `${sourceId}-backend-${index}`,
+                  role: index === 0 ? "user" : "assistant",
+                  type: index === commandPosition ? "command" : "text",
+                  content: `message ${index}`,
+                  timestamp: index,
+                  streaming: index === commandPosition && legacy,
+                  ...(index === commandPosition
+                    ? {
+                        metadata: {
+                          output: legacy ? "started\n" : running.text,
+                          ...(!legacy
+                            ? { commandOutput: running.contract }
+                            : {}),
+                        },
+                      }
+                    : {}),
+                })),
+              };
+              store.saveUiSessions([
+                {
+                  session: uiSource,
+                  summary: buildUiSessionSummary(uiSource),
+                },
+              ]);
+              const stored = mapChatMessagesToStoredMessages([
+                new HumanMessage({
+                  content: "start",
+                  additional_kwargs: createMessageId(`${sourceId}-backend-0`),
+                }),
+                new AIMessage({
+                  content: "early",
+                  additional_kwargs: createMessageId(`${sourceId}-backend-1`),
+                }),
+                new AIMessage({
+                  content: "target",
+                  additional_kwargs: createMessageId(
+                    `${sourceId}-backend-1003`,
+                  ),
+                }),
+              ]);
+              chatHistory.saveSession({
+                id: sourceId,
+                title: uiSource.title,
+                lastCheckpointOffset: 0,
+                messages: new Map(
+                  stored.map((message, index) => [
+                    `${sourceId}-backend-${[0, 1, 1003][index]}`,
+                    message,
+                  ]),
+                ),
+              });
+              const restartedUi = new UIHistoryService({ store });
+              const restartedAgent = createAgent(
+                restartedUi,
+                chatHistory,
+                (terminalId, commandId) =>
+                  terminalSnapshots.get(`${terminalId}\u0000${commandId}`),
+              );
+              if (hydration === "page") restartedUi.getMessagePage(sourceId);
+              if (hydration === "geometry")
+                restartedUi.getMessageGeometryIndex(sourceId);
+              if (hydration === "rewrite") {
+                restartedUi.getMessagePage(sourceId);
+                restartedUi.recordEvent(sourceId, {
+                  type: "compaction_boundary",
+                  messageId: `${sourceId}-boundary`,
+                  boundaryTargetMessageId: `${sourceId}-backend-1003`,
+                  summaryMessageId: `${sourceId}-summary`,
+                } as any);
+              }
+              const expectedCount = hydration === "rewrite" ? 1005 : 1004;
+              const sourceBefore = JSON.stringify(
+                store.loadUiSession(sourceId),
+              );
+              const agentBefore = JSON.stringify([
+                ...chatHistory.loadSession(sourceId)!.messages,
+              ]);
+              const recovered =
+                restartedUi.getSession(sourceId)!.messages[commandPosition];
+              assertEqual(
+                recovered.streaming,
+                false,
+                "full history must agree with restart page recovery",
+              );
+              if (!legacy) {
+                assertEqual(
+                  recovered.metadata?.commandOutput?.executionState,
+                  "outcome_unknown",
+                  "lost tracking must not claim running or success",
+                );
+                terminalSnapshots.set("terminal-running\u0000history-running", {
+                  executionState: "running",
+                  output: "started\n",
+                  capture: running.contract.capture,
+                });
+                const rejected = restartedAgent.branchFromMessage(
+                  sourceId,
+                  `${sourceId}-backend-1003`,
+                  `${sourceId}-live-rejected`,
+                );
+                assertEqual(
+                  rejected.ok,
+                  false,
+                  "actual running UI-only command must block even outside the cache",
+                );
+                assertEqual(
+                  chatHistory.loadSession(`${sourceId}-live-rejected`),
+                  null,
+                  "rejection must not persist agent history",
+                );
+                assertEqual(
+                  store.loadUiSession(`${sourceId}-live-rejected`),
+                  null,
+                  "rejection must not persist UI history",
+                );
+                const early = restartedAgent.branchFromMessage(
+                  sourceId,
+                  `${sourceId}-backend-1`,
+                  `${sourceId}-early`,
+                );
+                assertEqual(
+                  early.ok,
+                  true,
+                  "running commands after the cut must not block branching",
+                );
+                terminalSnapshots.delete(
+                  "terminal-running\u0000history-running",
+                );
+              }
+              for (let repeat = 0; repeat < 2; repeat += 1) {
+                const branchId = `${sourceId}-branch-${repeat}`;
+                const result = restartedAgent.branchFromMessage(
+                  sourceId,
+                  `${sourceId}-backend-1003`,
+                  branchId,
+                );
+                assertEqual(
+                  result.ok,
+                  true,
+                  "recovered history must branch after loading the session",
+                );
+                const persisted = store.loadUiSession(branchId)!;
+                assertEqual(
+                  persisted.messages.length,
+                  expectedCount,
+                  "branch must include the full prefix across the cache boundary",
+                );
+                assertEqual(
+                  persisted.messages.at(-1)?.backendMessageId,
+                  `${sourceId}-backend-1003`,
+                  "branch must end at the selected message",
+                );
+                assertCondition(
+                  persisted.messages.every(
+                    (message) =>
+                      !uiSource.messages.some(
+                        (original) => original.id === message.id,
+                      ),
+                  ),
+                  "all UI ids must be regenerated",
+                );
+                assertEqual(
+                  persisted.messages[commandPosition].streaming,
+                  false,
+                  "branch must persist recovered streaming state",
+                );
+                if (!legacy)
+                  assertEqual(
+                    persisted.messages[commandPosition].metadata?.commandOutput
+                      ?.executionState,
+                    "outcome_unknown",
+                    "branch must persist unknown outcome",
+                  );
+                assertEqual(
+                  new UIHistoryService({ store }).getSession(branchId)?.messages
+                    .length,
+                  expectedCount,
+                  "branch must survive reload",
+                );
+              }
+              assertEqual(
+                JSON.stringify(store.loadUiSession(sourceId)),
+                sourceBefore,
+                "branch and recovery must not rewrite the source UI history",
+              );
+              assertEqual(
+                JSON.stringify([
+                  ...chatHistory.loadSession(sourceId)!.messages,
+                ]),
+                agentBefore,
+                "source model history must remain unchanged",
+              );
+              const cache = (restartedUi as any).sessionsCache[sourceId];
+              if (cache)
+                assertCondition(
+                  cache.session.messages.length <=
+                    (hydration === "rewrite" ? 501 : 500),
+                  "reading full history must not grow the live tail cache",
+                );
+            },
+          );
+        }
+      }
+    }
+
+    await runCase(
+      "full reads preserve clean live and recovered deferred command bodies",
+      () => {
+        const sessionId = "large-live-command";
+        const source = {
+          terminalId: "large-terminal",
+          historyCommandMatchId: "large-command",
+          executionState: "running" as const,
+          output: "x".repeat(30000),
+          capture: {
+            state: "in_progress" as const,
+            observedUtf8Bytes: 30000,
+            retainedUtf8Bytes: 30000,
+            availableLineCount: 1,
+            revision: 1,
+            terminalControlsObserved: false,
+          },
+        };
+        const running = formatInitialCommandOutput(source);
+        uiHistory.recordEvent(sessionId, {
+          type: "command_started",
+          command: "test",
+          commandId: "large-command",
+          messageId: "large-message",
+        } as any);
+        uiHistory.recordEvent(sessionId, {
+          type: "command_finished",
+          commandId: "large-command",
+          messageId: "large-message",
+          outputDelta: running.text,
+          outputMode: "replace",
+          commandOutput: running.contract,
+          isNowait: true,
+        } as any);
+        uiHistory.getMessagePage(sessionId);
+        const live = uiHistory.getSession(sessionId)!.messages[0];
+        assertEqual(
+          live.metadata?.output,
+          running.text,
+          "a clean live projection must hydrate its original full body",
+        );
+        assertEqual(
+          parseCommandOutputEnvelopeContract(live.metadata?.output || "")
+            ?.executionState,
+          "running",
+          "live body and metadata must agree",
+        );
+        assertEqual(
+          uiHistory.validateBranchFromMessage(sessionId, "large-message").ok,
+          false,
+          "flushing cannot make a live command branchable",
+        );
+        const restarted = new UIHistoryService({ store });
+        restarted.getMessagePage(sessionId);
+        const recovered = restarted.getSession(sessionId)!.messages[0];
+        assertEqual(
+          recovered.metadata?.commandOutput?.executionState,
+          "outcome_unknown",
+          "restart must recover cached contract",
+        );
+        assertEqual(
+          parseCommandOutputEnvelopeContract(recovered.metadata?.output || "")
+            ?.executionState,
+          "outcome_unknown",
+          "restart must recover the full deferred body too",
+        );
+        assertCondition(
+          recovered.metadata?.output?.includes(source.output),
+          "restart recovery must retain the entire historical output",
+        );
+        assertEqual(
+          store.loadUiSession(sessionId)!.messages[0].metadata?.output,
+          running.text,
+          "read recovery must not mutate durable source output",
+        );
+      },
+    );
+
+    await runCase(
+      "legacy deferred command recovery survives branch persistence",
+      () => {
+        const session: UIChatSession = {
+          id: "large-legacy-command",
+          title: "Interrupted legacy command",
+          updatedAt: Date.now(),
+          messages: [
+            {
+              id: "large-legacy-ui",
+              backendMessageId: "large-legacy-backend",
+              role: "assistant",
+              type: "command",
+              content: "legacy command",
+              streaming: true,
+              timestamp: 1,
+              metadata: { output: "x".repeat(30000) },
+            },
+          ],
+        };
+        store.saveUiSessions([
+          { session, summary: buildUiSessionSummary(session) },
+        ]);
+        const restarted = new UIHistoryService({ store });
+        const cold = restarted.getSession(session.id)!.messages[0];
+        restarted.getMessagePage(session.id);
+        const warm = restarted.getSession(session.id)!.messages[0];
+        assertEqual(
+          warm.metadata?.output,
+          cold.metadata?.output,
+          "legacy deferred body must match cold recovery",
+        );
+        assertCondition(
+          warm.metadata?.output?.endsWith(
+            "[Session closed before command finished]",
+          ),
+          "legacy interruption must remain explained",
+        );
+        const result = restarted.branchFromMessage(
+          session.id,
+          "legacy-recovered-branch",
+          "large-legacy-backend",
+          "Legacy branch",
+        );
+        assertEqual(result.ok, true, "recovered legacy output must branch");
+        assertEqual(
+          store.loadUiSession("legacy-recovered-branch")!.messages[0].metadata
+            ?.output,
+          cold.metadata?.output,
+          "branch must persist the full recovered legacy body",
+        );
+      },
+    );
+
     await runCase(
       "branch copies history through the selected assistant message",
       () => {

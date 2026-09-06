@@ -471,6 +471,156 @@ runCase('INSERT_MESSAGE ignores missing anchors instead of appending', () => {
   )
 })
 
+const runBranchHydrationCases = async (): Promise<void> => {
+  const previousWindow = (globalThis as any).window
+  try {
+    for (const withGeometry of [false, true]) {
+      const branchSessionId = withGeometry ? 'branch-geometry' : 'branch-page'
+      const branchMessages = Array.from({ length: 4 }, (_, position) =>
+        createAssistantMessage(`branch-message-${position}`, {
+          backendMessageId: `backend-${position}`,
+          role: position % 2 === 0 ? 'user' : 'assistant',
+          content: `Branched message ${position}`,
+          streaming: false,
+        }),
+      )
+      const metadata = {
+        id: branchSessionId,
+        title: 'Source_branch',
+        updatedAt: 123,
+        messagesCount: branchMessages.length,
+        isBusy: false,
+        lockedProfileId: null,
+        uiRevision: 0,
+      }
+      const runtimeLoads: string[] = []
+      const branchRequests: string[][] = []
+      const pageStart = withGeometry ? 2 : 0
+      ;(globalThis as any).window = {
+        gyshell: {
+          agent: {
+            registerSession: async () => undefined,
+            branchFromMessage: async (sessionId: string, messageId: string) => {
+              branchRequests.push([sessionId, messageId])
+              return { ok: true, sessionId: branchSessionId }
+            },
+            getSessionMetadata: async () => metadata,
+            getUiMessagePage: async () => ({
+              sessionId: branchSessionId,
+              entries: branchMessages.slice(pageStart).map((message, offset) => ({
+                position: pageStart + offset,
+                message,
+              })),
+              totalCount: branchMessages.length,
+              startPosition: pageStart,
+              endPosition: branchMessages.length - 1,
+              hasOlder: pageStart > 0,
+              hasNewer: false,
+              uiRevision: 0,
+              metadata,
+            }),
+            ...(withGeometry
+              ? {
+                  getUiMessageGeometry: async () => ({
+                    sessionId: branchSessionId,
+                    totalCount: branchMessages.length,
+                    uiRevision: 0,
+                    entries: branchMessages.map((message, position) => ({
+                      ...message,
+                      position,
+                      geometry: {
+                        contentShape: { lineBuckets: [20, 1], blankLineCount: 0 },
+                      },
+                      projection: { content: message.content },
+                    })),
+                  }),
+                }
+              : {}),
+            loadChatRuntimeSession: async (sessionId: string) => {
+              runtimeLoads.push(sessionId)
+              return null
+            },
+          },
+        },
+      }
+
+      const store = new ChatStore()
+      const source = getActiveSessionOrThrow(store)
+      store.handleUiUpdate({
+        type: 'ADD_MESSAGE',
+        sessionId: source.id,
+        message: createAssistantMessage('source-message', {
+          backendMessageId: 'backend-3',
+          content: 'Source answer',
+          streaming: false,
+        }),
+      })
+      const result = await store.branchFromMessage(source.id, 'backend-3')
+      const branch = getActiveSessionOrThrow(store)
+
+      assertEqual(
+        result.sessionId,
+        branchSessionId,
+        'branch should return the new session',
+      )
+      assertEqual(branch.id, branchSessionId, 'branch should activate the new session')
+      assertEqual(
+        branchRequests[0]?.join(','),
+        `${source.id},backend-3`,
+        'branch should use the selected backend message',
+      )
+      assertEqual(
+        branch.messageIds.join(','),
+        branchMessages.map((message) => message.id).join(','),
+        'new branch must expose its complete ordered history to the renderer',
+      )
+      assertEqual(branch.totalMessageCount, 4, 'new branch must retain its history count')
+      assertEqual(
+        branch.hasLoadedMessagePage,
+        true,
+        'new branch must finish initial page hydration',
+      )
+      assertEqual(
+        branch.isLoadingInitialHistory,
+        false,
+        'new branch must leave the loading state',
+      )
+      assertEqual(branch.geometryLoaded, withGeometry, 'new branch must retain its geometry mode')
+      assertEqual(branch.updatedAt, 123, 'new branch must retain durable metadata')
+      assertEqual(
+        branch.messagesById.get('branch-message-3')?.content,
+        'Branched message 3',
+        'selected assistant content must be visible',
+      )
+      if (withGeometry) {
+        assertEqual(
+          branch.messagePositionById?.get('branch-message-0'),
+          0,
+          'geometry-only history must retain its position',
+        )
+        assertCondition(
+          branch.loadedPayloadPositions?.has(3),
+          'hydrated page positions must be available for rendering',
+        )
+      }
+      assertEqual(runtimeLoads.join(','), branchSessionId, 'branch should load its model context once')
+      assertEqual(
+        source.messageIds.join(','),
+        'source-message',
+        'branch must preserve the source timeline',
+      )
+      assertEqual(
+        source.messagesById.get('source-message')?.content,
+        'Source answer',
+        'branch must preserve source content',
+      )
+      console.log(`PASS new branch hydrates visible history ${withGeometry ? 'with geometry' : 'from a page'}`)
+    }
+  } finally {
+    ;(globalThis as any).window = previousWindow
+  }
+}
+
 const runAsyncCases = async (): Promise<void> => {
   const previousWindow = (globalThis as any).window
   const registeredSessionIds: string[] = []
@@ -850,7 +1000,8 @@ const runAsyncCases = async (): Promise<void> => {
   }
 }
 
-void runAsyncCases()
+void runBranchHydrationCases()
+  .then(runAsyncCases)
   .then(() => {
     console.log('All ChatStore extreme tests passed.')
   })

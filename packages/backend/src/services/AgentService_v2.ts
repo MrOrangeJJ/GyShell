@@ -2,6 +2,7 @@ import path from "node:path";
 import {
   isValidTerminalRuntimeId,
   readOpaqueNonBlankWellFormedString,
+  type CommandOutputContractV1,
 } from "@gyshell/shared";
 import { ChatOpenAI } from "@langchain/openai";
 import {
@@ -7010,9 +7011,17 @@ export class AgentService_v2 {
       return { ok: false, reason: "Branch target message not found." };
     }
 
+    // A live command may be older than the UI tail or absent from model
+    // history. Consult its terminal backing even after UI restart recovery.
+    const isCommandRunning = (contract: CommandOutputContractV1): boolean =>
+      this.getCommandOutputBackingSource(
+        contract.terminalId,
+        contract.historyCommandMatchId,
+      )?.executionState === "running";
     const uiValidation = this.uiHistoryService.validateBranchFromMessage(
       sourceSessionId,
       messageId,
+      isCommandRunning,
     );
     if (!uiValidation.ok) {
       return uiValidation;
@@ -7056,6 +7065,7 @@ export class AgentService_v2 {
       branchSessionId,
       messageId,
       branchTitle,
+      isCommandRunning,
     );
     if (!uiBranch.ok) {
       this.chatHistoryService.deleteSession(branchSessionId);

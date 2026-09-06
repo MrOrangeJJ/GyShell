@@ -2615,6 +2615,8 @@ export class ChatStore {
         );
         session.isLoadingInitialHistory = true;
         this.sessions.push(session);
+        // MobX wraps inserted sessions; hydrate the instance read by the UI.
+        session = this.sessions[this.sessions.length - 1];
       }
 
       const geometryRevision = this.normalizeUiRevision(geometry?.uiRevision);

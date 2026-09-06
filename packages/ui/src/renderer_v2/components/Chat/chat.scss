@@ -26,6 +26,26 @@
   outline: none;
 }
 
+.chat-branch-error {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border);
+  color: var(--danger);
+  font-size: 12px;
+
+  span {
+    flex: 1;
+    min-width: 0;
+    overflow-wrap: anywhere;
+  }
+
+  button {
+    flex: 0 0 24px;
+  }
+}
+
 .panel-header-minimal {
   min-height: var(--panel-tab-header-height);
   display: flex;

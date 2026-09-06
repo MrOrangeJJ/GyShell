@@ -1512,20 +1512,36 @@ export class UIHistoryService {
     if (!loaded) return cached.session;
     if (loaded.id !== sessionId) return null;
 
+    // Durable rows outside the live tail need the same restart recovery as
+    // page reads. Overlay every cached row, including clean live snapshots.
+    const recovered = sanitizeUiSession(loaded, {
+      normalizeCompactionBoundaries: false,
+    });
     const durableById = new Map(
+      recovered.messages.map((message) => [message.id, message] as const),
+    );
+    const rawById = new Map(
       loaded.messages.map((message) => [message.id, message] as const),
     );
+    const hydrateCachedMessage = (message: ChatMessage): ChatMessage => {
+      const raw = rawById.get(message.id);
+      // Clean live projections still own process-local command state. Use
+      // recovered bodies only when the cached lifecycle was recovered too.
+      const sameRuntimeState =
+        message.streaming === raw?.streaming &&
+        JSON.stringify(message.metadata?.commandOutput) ===
+        JSON.stringify(raw?.metadata?.commandOutput);
+      return this.mergeProjectedMessageWithDurable(
+        message,
+        sameRuntimeState ? raw : durableById.get(message.id),
+      );
+    };
     if (cached.requiresFullRewrite) {
       return {
         ...loaded,
         messages: [
-          ...loaded.messages.slice(0, cached.startPosition),
-          ...cached.session.messages.map((message) =>
-            this.mergeProjectedMessageWithDurable(
-              message,
-              durableById.get(message.id),
-            ),
-          ),
+          ...recovered.messages.slice(0, cached.startPosition),
+          ...cached.session.messages.map(hydrateCachedMessage),
         ],
       };
     }
@@ -1533,13 +1549,9 @@ export class UIHistoryService {
     const cachedById = new Map(
       cached.session.messages.map((message) => [message.id, message] as const),
     );
-    const dirtyIds = cached.dirtyMessageIds;
-    const mergedMessages = loaded.messages.map((message) =>
-      dirtyIds.has(message.id)
-        ? this.mergeProjectedMessageWithDurable(
-            cachedById.get(message.id) || message,
-            message,
-          )
+    const mergedMessages = recovered.messages.map((message) =>
+      cachedById.has(message.id)
+        ? hydrateCachedMessage(cachedById.get(message.id)!)
         : message,
     );
     const loadedIds = new Set(loaded.messages.map((message) => message.id));
@@ -1725,6 +1737,7 @@ export class UIHistoryService {
   validateBranchFromMessage(
     sourceSessionId: string,
     backendMessageId: string,
+    isCommandRunning?: (contract: CommandOutputContractV1) => boolean,
   ): { ok: boolean; reason?: string } {
     const exactSourceSessionId = readUiHistorySessionId(sourceSessionId);
     if (exactSourceSessionId === undefined) {
@@ -1750,7 +1763,8 @@ export class UIHistoryService {
         );
         return (
           message.type === "command" &&
-          (commandOutput?.executionState === "running" ||
+          ((commandOutput && isCommandRunning?.(commandOutput)) ||
+            commandOutput?.executionState === "running" ||
             message.streaming === true)
         );
       });
@@ -1769,6 +1783,7 @@ export class UIHistoryService {
     branchSessionId: string,
     backendMessageId: string,
     title: string,
+    isCommandRunning?: (contract: CommandOutputContractV1) => boolean,
   ): {
     ok: boolean;
     sessionId?: string;
@@ -1789,6 +1804,7 @@ export class UIHistoryService {
     const validation = this.validateBranchFromMessage(
       sourceSessionId,
       backendMessageId,
+      isCommandRunning,
     );
     if (!validation.ok) return validation;
 

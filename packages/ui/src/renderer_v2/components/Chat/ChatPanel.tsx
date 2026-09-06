@@ -172,6 +172,10 @@ export const ChatPanel: React.FC<ChatPanelProps> = observer(
       );
     }, []);
     const [showHistory, setShowHistory] = useState(false);
+    const [branchError, setBranchError] = useState<{
+      sessionId: string;
+      message: string;
+    } | null>(null);
     const [rollbackTarget, setRollbackTarget] = useState<ChatMessage | null>(
       null,
     );
@@ -506,9 +510,11 @@ export const ChatPanel: React.FC<ChatPanelProps> = observer(
 
     const handleBranchFromMessage = async (message: ChatMessage) => {
       if (!activeSession?.id || !message.backendMessageId) return;
+      const sourceSessionId = activeSession.id;
+      setBranchError(null);
       try {
         const result = await store.chat.branchFromMessage(
-          activeSession.id,
+          sourceSessionId,
           message.backendMessageId,
         );
         if (!result.sessionId) return;
@@ -516,6 +522,10 @@ export const ChatPanel: React.FC<ChatPanelProps> = observer(
         onSelectSession(result.sessionId);
       } catch (error) {
         console.error("Failed to branch chat session:", error);
+        setBranchError({
+          sessionId: sourceSessionId,
+          message: error instanceof Error ? error.message : String(error),
+        });
       }
     };
 
@@ -933,6 +943,20 @@ export const ChatPanel: React.FC<ChatPanelProps> = observer(
             </button>
           </div>
         </div>
+
+        {branchError?.sessionId === activeSessionId && (
+          <div className="chat-branch-error" role="alert">
+            <span>{branchError.message}</span>
+            <button
+              className="icon-btn-sm"
+              title={t.common.close}
+              aria-label={t.common.close}
+              onClick={() => setBranchError(null)}
+            >
+              <X size={14} />
+            </button>
+          </div>
+        )}
 
         {showExportMenu &&
           createPortal(

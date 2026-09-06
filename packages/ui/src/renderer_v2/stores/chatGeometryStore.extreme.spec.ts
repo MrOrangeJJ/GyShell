@@ -1,4 +1,5 @@
 import type { UiMessageGeometryIndex } from '@gyshell/shared'
+import { autorun, isObservable } from 'mobx'
 import { ChatStore, type ChatMessage } from './ChatStore'
 
 const SESSION_ID = 'geometry-store-session'
@@ -105,8 +106,9 @@ const createPage = (
   }
 }
 
-const run = async (): Promise<void> => {
+const run = async (precreateSession: boolean): Promise<void> => {
   const previousWindow = (globalThis as any).window
+  let stopObservingAtomic: (() => void) | undefined
   const pageRequests: Array<{
     sessionId: string
     limit?: number
@@ -190,25 +192,38 @@ const run = async (): Promise<void> => {
 
   try {
     const atomicStore = new ChatStore()
-    atomicStore.ensureSession(ATOMIC_SESSION_ID)
+    if (precreateSession) atomicStore.ensureSession(ATOMIC_SESSION_ID)
+    const observedMessageCounts: number[] = []
+    stopObservingAtomic = autorun(() => {
+      observedMessageCounts.push(
+        atomicStore.getSessionById(ATOMIC_SESSION_ID)?.messageIds.length ?? 0,
+      )
+    })
     const atomicHydration = atomicStore.hydrateSessionFromBackend(
       ATOMIC_SESSION_ID,
       { activate: true, loadAgentContext: false },
     )
     await atomicPageRequested
-    const atomicSession = atomicStore.getSessionById(ATOMIC_SESSION_ID)!
-    assertEqual(
-      atomicSession.isLoadingInitialHistory,
-      true,
-      'initial history should remain hidden while the page is pending',
-    )
+    if (precreateSession) {
+      assertEqual(
+        atomicStore.getSessionById(ATOMIC_SESSION_ID)?.isLoadingInitialHistory,
+        true,
+        'initial history should remain hidden while the page is pending',
+      )
+    } else {
+      assertEqual(
+        atomicStore.getSessionById(ATOMIC_SESSION_ID),
+        null,
+        'a new session should not appear before its initial history is ready',
+      )
+    }
     ;(resolveAtomicPage as ((value: ReturnType<typeof createPage>) => void) | null)?.(
       createPage(ATOMIC_SESSION_ID),
     )
     await atomicGeometryRequested
     await new Promise((resolve) => setTimeout(resolve, 20))
     assertEqual(
-      atomicSession.messageIds.length,
+      atomicStore.getSessionById(ATOMIC_SESSION_ID)?.messageIds.length ?? 0,
       0,
       'a resolved tail page must not become an intermediate visible transcript',
     )
@@ -216,6 +231,7 @@ const run = async (): Promise<void> => {
       createGeometryIndex(ATOMIC_SESSION_ID, UI_REVISION),
     )
     await atomicHydration
+    const atomicSession = atomicStore.getSessionById(ATOMIC_SESSION_ID)!
     assertEqual(
       atomicSession.messageIds.length,
       MESSAGE_COUNT,
@@ -231,10 +247,19 @@ const run = async (): Promise<void> => {
       false,
       'the transcript should become visible after the atomic commit',
     )
-    console.log('PASS initial page and geometry hydrate atomically')
+    assertEqual(
+      observedMessageCounts.join(','),
+      `0,${MESSAGE_COUNT}`,
+      'observers must see one complete history commit without an intermediate page',
+    )
+    stopObservingAtomic()
+    assertEqual(pageRequests.length, 1, 'initial hydration should request one page')
+    assertEqual(pageRequests[0]?.limit, 300, 'initial page size must remain bounded')
+    assertEqual(fullRequests.length, 0, 'initial hydration must not fetch full message bodies')
+    console.log(`PASS initial page and geometry hydrate atomically (${precreateSession ? 'existing' : 'new'} session)`)
 
     const store = new ChatStore()
-    store.ensureSession(SESSION_ID)
+    if (precreateSession) store.ensureSession(SESSION_ID)
     await store.hydrateSessionFromBackend(SESSION_ID, {
       activate: true,
       loadAgentContext: false,
@@ -251,6 +276,11 @@ const run = async (): Promise<void> => {
       session!.messagePositionById?.get(messageIdAt(MESSAGE_COUNT - 1)),
       MESSAGE_COUNT - 1,
       'the final message id should map to the final durable position',
+    )
+    assertEqual(
+      isObservable(session!.messagesById.get(messageIdAt(MESSAGE_COUNT - 1))),
+      false,
+      'historical message payloads must remain shallow immutable snapshots',
     )
 
     const rangeRequestBaseline = pageRequests.length
@@ -395,7 +425,7 @@ const run = async (): Promise<void> => {
     console.log('PASS geometry ranges deduplicate and payload residency stays bounded')
 
     const staleStore = new ChatStore()
-    staleStore.ensureSession(STALE_SESSION_ID)
+    if (precreateSession) staleStore.ensureSession(STALE_SESSION_ID)
     await staleStore.hydrateSessionFromBackend(STALE_SESSION_ID, {
       activate: true,
       loadAgentContext: false,
@@ -414,11 +444,13 @@ const run = async (): Promise<void> => {
     )
     console.log('PASS stale geometry falls back to paged history')
   } finally {
+    stopObservingAtomic?.()
     ;(globalThis as any).window = previousWindow
   }
 }
 
-void run()
+void run(true)
+  .then(() => run(false))
   .then(() => {
     console.log('All chat geometry store extreme tests passed.')
   })
