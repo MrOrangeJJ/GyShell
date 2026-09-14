@@ -3,7 +3,7 @@ export const WRITE_STDIN_TOOL_DESCRIPTION = [
   'If the target terminal tab is disconnected or not ready, this tool returns an explicit terminal_status instead of pretending input was sent.',
   'This is a specialized, advanced tool for control/interactive programs (e.g. vim, tmux, REPLs) and for sending C0 control characters like Ctrl+C.',
   'When a command is expected to prompt for input, prefer starting it with exec_command waitMode="nowait", inspect the live prompt with read_terminal_tab, then answer with write_stdin. Include "CR" as its own final item when Enter is required.',
-  'For normal commands, always use exec_command/run_command instead.',
+  'For normal commands, always use exec_command instead.',
   '',
   'Send a list of items in order. Each item may be either:',
   '- a normal string (any length), or',
@@ -223,7 +223,7 @@ export function buildReadFileDescription(support: { image: boolean }): string {
     ? 'Image: Supported PNG/JPG/JPEG/GIF/WEBP'
     : 'Image: Not supported'
   return [
-    'Prioritize using this tool to read files; only if the file we need to read is not supported by this tool should we consider other methods.',
+    'Prefer this tool for supported files and use offset/limit to page large files. If the returned representation omits or truncates content needed for the task, use a compatible read-only method to obtain that content. A partial read is not evidence of the complete file.',
     'Use offset/limit to read large files in chunks.',
     'Read a file from a specific terminal tab. It supports reading all common text file, plus',
     'PDF: Supported',
