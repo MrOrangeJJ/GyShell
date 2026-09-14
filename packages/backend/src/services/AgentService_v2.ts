@@ -3159,9 +3159,18 @@ export class AgentService_v2 {
 
       const supplementalMessages: BaseMessage[] = [];
       if (imageMessage) {
+        const supplementBaseId = String(messageId || uuidv4());
         if (meaningLessAIMessage) {
+          meaningLessAIMessage.additional_kwargs = {
+            ...(meaningLessAIMessage.additional_kwargs || {}),
+            _gyshellMessageId: `${supplementBaseId}:read-file-bridge`,
+          };
           supplementalMessages.push(meaningLessAIMessage);
         }
+        imageMessage.additional_kwargs = {
+          ...(imageMessage.additional_kwargs || {}),
+          _gyshellMessageId: `${supplementBaseId}:read-file-image`,
+        };
         supplementalMessages.push(imageMessage);
       }
       const existingSupplementalMessages: BaseMessage[] = Array.isArray(

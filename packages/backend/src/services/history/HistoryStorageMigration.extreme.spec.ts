@@ -192,6 +192,165 @@ const run = async (): Promise<void> => {
       });
     },
   );
+
+  await runCase(
+    "existing sqlite history repair removes duplicate read_file image supplements and is idempotent",
+    async () => {
+      await withTempDir(async (dir) => {
+        const sqlitePath = path.join(dir, "gyshell-history.sqlite");
+        const createImageContent = (url: string) => [
+          {
+            type: "text",
+            text: "This is the image of the file that was read. Please Continue.",
+          },
+          {
+            type: "image_url",
+            image_url: { url },
+          },
+        ];
+        const imageA = createImageContent("data:image/png;base64,AA==");
+        const imageB = createImageContent("data:image/png;base64,BB==");
+        const store = new HistorySqliteStore({ filePath: sqlitePath });
+        store.saveChatSession({
+          id: "duplicate-session",
+          title: "Duplicate image session",
+          messages: [
+            { id: "system", type: "system", data: { content: "system" } },
+            {
+              id: "tool-a",
+              type: "tool",
+              data: {
+                content: "Image read successfully.",
+                name: "read_file",
+              },
+            },
+            {
+              id: "tool-b",
+              type: "tool",
+              data: {
+                content: "Image read successfully.",
+                name: "read_file",
+              },
+            },
+            { id: "bridge-1", type: "ai", data: { content: "let me see" } },
+            { id: "image-1", type: "human", data: { content: imageA } },
+            { id: "bridge-2", type: "ai", data: { content: "let me see" } },
+            { id: "image-2", type: "human", data: { content: imageA } },
+            { id: "bridge-3", type: "ai", data: { content: "let me see" } },
+            { id: "image-3", type: "human", data: { content: imageA } },
+            { id: "bridge-4", type: "ai", data: { content: "let me see" } },
+            { id: "image-4", type: "human", data: { content: imageB } },
+            { id: "bridge-5", type: "ai", data: { content: "let me see" } },
+            { id: "image-5", type: "human", data: { content: imageB } },
+            { id: "bridge-6", type: "ai", data: { content: "let me see" } },
+            { id: "image-6", type: "human", data: { content: imageB } },
+            { id: "assistant", type: "ai", data: { content: "done" } },
+          ],
+          lastCheckpointOffset: 0,
+          createdAt: 1,
+          updatedAt: 1,
+        });
+        store.saveChatSession({
+          id: "legitimate-same-image-wave",
+          title: "Legitimate repeated reads",
+          messages: [
+            { id: "tool-a", type: "tool", data: { content: "Image read successfully.", name: "read_file" } },
+            { id: "tool-b", type: "tool", data: { content: "Image read successfully.", name: "read_file" } },
+            { id: "bridge-a", type: "ai", data: { content: "let me see" } },
+            { id: "image-a", type: "human", data: { content: imageA } },
+            { id: "bridge-b", type: "ai", data: { content: "let me see" } },
+            { id: "image-b", type: "human", data: { content: imageA } },
+          ],
+          lastCheckpointOffset: 0,
+          createdAt: 1,
+          updatedAt: 1,
+        });
+        store.close();
+
+        const migration = new HistoryStorageMigration({ baseDir: dir });
+        await migration.run();
+
+        const repairedStore = new HistorySqliteStore({ filePath: sqlitePath });
+        try {
+          const repaired = repairedStore.loadChatSession("duplicate-session");
+          assertEqual(
+            repaired?.messages.length ?? 0,
+            8,
+            "repair should keep tools, one image wave, and final assistant message",
+          );
+          const repairedMessages = repaired?.messages || [];
+          assertEqual(
+            repairedMessages[3]?.data.additional_kwargs?._gyshellMessageId,
+            "bridge-1",
+            "retained bridge should receive its existing durable row id",
+          );
+          assertEqual(
+            repairedMessages[4]?.data.additional_kwargs?._gyshellMessageId,
+            "image-1",
+            "retained image should receive its existing durable row id",
+          );
+        } finally {
+          repairedStore.close();
+        }
+
+        await migration.run();
+        const secondStore = new HistorySqliteStore({ filePath: sqlitePath });
+        try {
+            assertEqual(
+            secondStore.loadChatSession("duplicate-session")?.messages.length ??
+              0,
+            8,
+            "a second migration run must not alter repaired history",
+          );
+          assertEqual(
+            secondStore.loadChatSession("legitimate-same-image-wave")?.messages.length ??
+              0,
+            6,
+            "a non-block repeated wave must not be deduplicated",
+          );
+        } finally {
+          secondStore.close();
+        }
+        const negativeControlStore = new HistorySqliteStore({ filePath: sqlitePath });
+        try {
+          assertEqual(
+            negativeControlStore.loadChatSession("legitimate-same-image-wave")?.messages.length ?? 0,
+            6,
+            "two distinct read_file calls with the same image must not be deduplicated",
+          );
+        } finally {
+          negativeControlStore.close();
+        }
+      });
+    },
+  );
+
+  await runCase(
+    "existing sqlite repair failures publish an error state",
+    async () => {
+      await withTempDir(async (dir) => {
+        fs.writeFileSync(path.join(dir, "gyshell-history.sqlite"), "not sqlite");
+        const migration = new HistoryStorageMigration({ baseDir: dir });
+        let failed = false;
+        try {
+          await migration.run();
+        } catch {
+          failed = true;
+        }
+        assertCondition(failed, "corrupt sqlite should reject migration");
+        assertEqual(
+          migration.getState().status,
+          "error",
+          "corrupt sqlite should publish an error state",
+        );
+        assertEqual(
+          migration.getState().phase,
+          "error",
+          "corrupt sqlite should finish in the error phase",
+        );
+      });
+    },
+  );
 };
 
 void run().catch((error) => {

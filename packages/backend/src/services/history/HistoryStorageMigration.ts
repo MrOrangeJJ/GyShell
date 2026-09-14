@@ -109,7 +109,11 @@ export class HistoryStorageMigration {
     const legacyChatExists = fs.existsSync(paths.legacyChatHistoryPath);
     const legacyUiExists = fs.existsSync(paths.legacyUiHistoryPath);
 
-    if (!legacyChatExists && !legacyUiExists) {
+    if (
+      !legacyChatExists &&
+      !legacyUiExists &&
+      !fs.existsSync(paths.sqliteDbPath)
+    ) {
       this.emitReady("History storage is ready.");
       return {
         migrated: false,
@@ -122,14 +126,58 @@ export class HistoryStorageMigration {
 
     // SQLite DB already exists — legacy files are leftover backups or stale copies.
     if (fs.existsSync(paths.sqliteDbPath)) {
-      this.emitReady("History storage is ready.");
-      return {
-        migrated: false,
+      this.emitState({
+        status: "running",
+        ready: false,
+        active: true,
+        blocking: true,
         detectedLegacy: false,
-        sqliteDbPath: paths.sqliteDbPath,
-        migratedChatSessions: 0,
-        migratedUiSessions: 0,
-      };
+        phase: "reading",
+        title: "Checking conversation history",
+        message: "Scanning stored read_file image messages.",
+        completedUnits: 0,
+        totalUnits: 1,
+        percent: 0,
+      });
+      try {
+        const { HistorySqliteStore } = await import("./HistorySqliteStore");
+        const store = new HistorySqliteStore({ filePath: paths.sqliteDbPath });
+        let repairResult;
+        try {
+          repairResult = store.repairReadFileImageSupplementDuplicates();
+        } finally {
+          store.close();
+        }
+        const repairMessage =
+          repairResult.sessionsRepaired > 0
+            ? `History storage is ready. Repaired ${repairResult.removedMessages} duplicated read_file image message(s) across ${repairResult.sessionsRepaired} conversation(s).`
+            : "History storage is ready.";
+        this.emitReady(repairMessage);
+        return {
+          migrated: false,
+          detectedLegacy: false,
+          sqliteDbPath: paths.sqliteDbPath,
+          migratedChatSessions: 0,
+          migratedUiSessions: 0,
+        };
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        this.emitState({
+          status: "error",
+          ready: false,
+          active: false,
+          blocking: true,
+          detectedLegacy: false,
+          phase: "error",
+          title: "Conversation history check failed",
+          message: "Stored conversation history could not be checked automatically.",
+          completedUnits: this.state.completedUnits,
+          totalUnits: this.state.totalUnits,
+          percent: this.state.percent,
+          error: message,
+        });
+        throw error;
+      }
     }
 
     this.emitState({
@@ -187,9 +235,8 @@ export class HistoryStorageMigration {
       }
 
       // Lazy-load SQLite only when migration is actually needed.
-      const { openBetterSqlite3Database } = await import(
-        "./betterSqlite3Runtime"
-      );
+      const { openBetterSqlite3Database } =
+        await import("./betterSqlite3Runtime");
       const { HistorySqliteStore } = await import("./HistorySqliteStore");
       const db: DatabaseHandle = openBetterSqlite3Database(tempDbPath);
       try {
@@ -231,6 +278,14 @@ export class HistoryStorageMigration {
         fs.unlinkSync(paths.sqliteDbPath);
       }
       fs.renameSync(tempDbPath, paths.sqliteDbPath);
+      const repairedStore = new HistorySqliteStore({
+        filePath: paths.sqliteDbPath,
+      });
+      try {
+        repairedStore.repairReadFileImageSupplementDuplicates();
+      } finally {
+        repairedStore.close();
+      }
       this.backupAndCleanupLegacy(paths.legacyChatHistoryPath);
       this.backupAndCleanupLegacy(paths.legacyUiHistoryPath);
       this.emitReady("Conversation history migration finished.");

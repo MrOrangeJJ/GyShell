@@ -1643,6 +1643,16 @@ await runCase(
       flushed.messages.map((message: any) => message.getType()),
       ['ai', 'tool', 'tool', 'ai', 'human']
     )
+    assert.equal(
+      flushed.messages[3].additional_kwargs?._gyshellMessageId,
+      `${flushed.messages[1].additional_kwargs?._gyshellMessageId}:read-file-bridge`,
+      'read_file image bridge should have a stable tool-derived message id'
+    )
+    assert.equal(
+      flushed.messages[4].additional_kwargs?._gyshellMessageId,
+      `${flushed.messages[1].additional_kwargs?._gyshellMessageId}:read-file-image`,
+      'read_file image payload should have a stable tool-derived message id'
+    )
     assert.equal(flushed.pendingToolSupplementMessages.length, 0)
   }
 )

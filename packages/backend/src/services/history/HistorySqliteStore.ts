@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
+import { createHash } from "node:crypto";
 import type {
   ChatMessage,
   DeferredUiMessageField,
@@ -54,6 +55,18 @@ interface HistorySqliteStoreOptions {
   filePath?: string;
 }
 
+export interface ReadFileImageSupplementRepairResult {
+  sessionsScanned: number;
+  sessionsRepaired: number;
+  removedMessages: number;
+  assignedMessageIds: number;
+}
+
+const READ_FILE_IMAGE_SUPPLEMENT_REPAIR_VERSION = "1";
+const READ_FILE_IMAGE_BRIDGE_TEXT = "let me see";
+const READ_FILE_IMAGE_PROMPT_TEXT =
+  "This is the image of the file that was read. Please Continue.";
+
 interface ChatSessionRow {
   id: string;
   title: string;
@@ -92,6 +105,101 @@ interface UiSessionMessageRow {
   streaming: number;
 }
 
+type StoredMessageData = Record<string, any>;
+
+const asStoredMessageData = (value: unknown): StoredMessageData | null =>
+  value && typeof value === "object" && !Array.isArray(value)
+    ? (value as StoredMessageData)
+    : null;
+
+const parseJsonSafely = (value: string): unknown => {
+  try {
+    return JSON.parse(value);
+  } catch {
+    return null;
+  }
+};
+
+const getStoredMessagePayload = (
+  data: unknown,
+): StoredMessageData => {
+  const record = asStoredMessageData(data);
+  if (!record) return {};
+  const nested = record.data;
+  return nested && typeof nested === "object" && !Array.isArray(nested)
+    ? nested
+    : record;
+};
+
+const getStoredMessageAdditionalKwargs = (
+  data: unknown,
+): Record<string, any> => {
+  const value = getStoredMessagePayload(data).additional_kwargs;
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? value
+    : {};
+};
+
+const hasStoredMessageId = (data: StoredMessageData): boolean => {
+  const value = getStoredMessageAdditionalKwargs(data)._gyshellMessageId;
+  return typeof value === "string" && value.trim().length > 0;
+};
+
+const isReadFileImageMessage = (
+  row: ChatSessionMessageRow,
+  data: StoredMessageData,
+): boolean => {
+  if (row.message_type !== "human" || hasStoredMessageId(data)) return false;
+  const content = getStoredMessagePayload(data).content;
+  if (!Array.isArray(content)) return false;
+  return (
+    content.some(
+      (part: any) =>
+        part &&
+        typeof part === "object" &&
+        part.type === "text" &&
+        part.text === READ_FILE_IMAGE_PROMPT_TEXT,
+    ) &&
+    content.some(
+      (part: any) =>
+        part &&
+        typeof part === "object" &&
+        part.type === "image_url" &&
+        typeof part.image_url?.url === "string" &&
+        part.image_url.url.length > 0,
+    )
+  );
+};
+
+const isReadFileImageBridgeMessage = (
+  row: ChatSessionMessageRow,
+  data: StoredMessageData,
+): boolean =>
+  row.message_type === "ai" &&
+  !hasStoredMessageId(data) &&
+  getStoredMessagePayload(data).content === READ_FILE_IMAGE_BRIDGE_TEXT;
+
+const readFileImageSignature = (data: StoredMessageData): string =>
+  createHash("sha256")
+    .update(JSON.stringify(getStoredMessagePayload(data).content))
+    .digest("hex");
+
+const assignStoredMessageId = (
+  data: StoredMessageData,
+  messageId: string,
+): StoredMessageData => {
+  const payload = getStoredMessagePayload(data);
+  const hasNestedPayload = payload !== data;
+  const updatedPayload = {
+    ...payload,
+    additional_kwargs: {
+      ...getStoredMessageAdditionalKwargs(data),
+      _gyshellMessageId: messageId,
+    },
+  };
+  return hasNestedPayload ? { ...data, data: updatedPayload } : updatedPayload;
+};
+
 interface UiCommandOutputProjectionFields {
   metadata_command_output_contract_version: unknown;
   metadata_command_output_terminal_id: unknown;
@@ -113,7 +221,8 @@ interface UiCommandOutputProjectionFields {
 }
 
 interface UiSessionMessageProjectionRow
-  extends Omit<UiSessionMessageRow, "content" | "metadata_json">,
+  extends
+    Omit<UiSessionMessageRow, "content" | "metadata_json">,
     UiCommandOutputProjectionFields {
   content_length: number;
   content_head: string | null;
@@ -154,7 +263,8 @@ interface UiSessionMessageProjectionRow
 }
 
 interface UiSessionMessageGeometryRow
-  extends Omit<UiSessionMessageRow, "metadata_json">,
+  extends
+    Omit<UiSessionMessageRow, "metadata_json">,
     UiCommandOutputProjectionFields {
   metadata_tab_name: unknown;
   metadata_command_id: unknown;
@@ -261,9 +371,7 @@ const createBoundedListPreview = (value: string): string => {
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   !!value && typeof value === "object" && !Array.isArray(value);
 
-const sanitizeUiMessageMetadata = (
-  value: unknown,
-): ChatMessage["metadata"] => {
+const sanitizeUiMessageMetadata = (value: unknown): ChatMessage["metadata"] => {
   if (!isRecord(value)) return undefined;
   const metadata: NonNullable<ChatMessage["metadata"]> = {};
   const assignString = <K extends keyof typeof metadata>(key: K): void => {
@@ -604,8 +712,7 @@ const readProjectedCommandOutput = (
   return parseCommandOutputContractV1({
     contractVersion: row.metadata_command_output_contract_version,
     terminalId: row.metadata_command_output_terminal_id,
-    historyCommandMatchId:
-      row.metadata_command_output_history_command_match_id,
+    historyCommandMatchId: row.metadata_command_output_history_command_match_id,
     executionState: row.metadata_command_output_execution_state,
     exitCode:
       row.metadata_command_output_exit_code === null ||
@@ -870,8 +977,7 @@ const readGeometryMetadata = (
   const output = extractCommandOutputDisplayText(
     typeof row.metadata_output === "string" ? row.metadata_output : "",
   );
-  const diff =
-    typeof row.metadata_diff === "string" ? row.metadata_diff : "";
+  const diff = typeof row.metadata_diff === "string" ? row.metadata_diff : "";
   const details =
     typeof row.metadata_details === "string" ? row.metadata_details : "";
   const inputImageCount = Math.max(
@@ -880,9 +986,7 @@ const readGeometryMetadata = (
   );
   const metadata: ChatMessageGeometryMetadata = {};
   let deferred = row.metadata_deferred === 1;
-  const assignBoundedString = <
-    K extends keyof ChatMessageGeometryMetadata,
-  >(
+  const assignBoundedString = <K extends keyof ChatMessageGeometryMetadata>(
     key: K,
     value: unknown,
   ): void => {
@@ -940,10 +1044,7 @@ const readGeometryMetadata = (
   ) {
     metadata.subToolLevel = row.metadata_sub_tool_level;
   }
-  if (
-    row.metadata_decision === "allow" ||
-    row.metadata_decision === "deny"
-  ) {
+  if (row.metadata_decision === "allow" || row.metadata_decision === "deny") {
     metadata.decision = row.metadata_decision;
   }
   if (
@@ -955,10 +1056,7 @@ const readGeometryMetadata = (
   for (const [key, value] of [
     ["totalTokens", row.metadata_total_tokens],
     ["maxTokens", row.metadata_max_tokens],
-    [
-      "compactionBoundaryProtectedNormalRounds",
-      row.metadata_compaction_rounds,
-    ],
+    ["compactionBoundaryProtectedNormalRounds", row.metadata_compaction_rounds],
   ] as const) {
     if (Number.isSafeInteger(value) && Number(value) >= 0) {
       metadata[key] = Number(value);
@@ -1047,6 +1145,309 @@ export class HistorySqliteStore {
     fs.mkdirSync(path.dirname(this.filePath), { recursive: true });
     this.db = openBetterSqlite3Database(this.filePath);
     HistorySqliteStore.initializeDatabase(this.db);
+  }
+
+  repairReadFileImageSupplementDuplicates(): ReadFileImageSupplementRepairResult {
+    const marker = this.db
+      .prepare(
+        `SELECT value
+         FROM history_meta
+         WHERE key = ?`,
+      )
+      .get("read_file_image_supplement_repair_version") as
+      | { value: string }
+      | undefined;
+    if (marker?.value === READ_FILE_IMAGE_SUPPLEMENT_REPAIR_VERSION) {
+      return {
+        sessionsScanned: 0,
+        sessionsRepaired: 0,
+        removedMessages: 0,
+        assignedMessageIds: 0,
+      };
+    }
+
+    const candidateSessions = this.db
+      .prepare(
+        `SELECT DISTINCT session_id
+         FROM chat_session_messages
+         WHERE message_type = 'human'
+           AND message_data_json LIKE '%This is the image of the file that was read. Please Continue.%'
+           AND message_data_json LIKE '%"image_url"%'`,
+      )
+      .all() as Array<{ session_id: string }>;
+    const selectMessages = this.db.prepare(
+      `SELECT position, message_id, message_type, message_data_json,
+              is_compaction_marker
+       FROM chat_session_messages
+       WHERE session_id = ?
+       ORDER BY position ASC`,
+    );
+    const deleteMessages = this.db.prepare(
+      `DELETE FROM chat_session_messages WHERE session_id = ?`,
+    );
+    const insertMessage = this.db.prepare(
+      `INSERT INTO chat_session_messages (
+         session_id, position, message_id, message_type, message_data_json,
+         is_compaction_marker
+       ) VALUES (?, ?, ?, ?, ?, ?)`,
+    );
+    const updateSessionTimestamp = this.db.prepare(
+      `UPDATE chat_sessions SET updated_at = ? WHERE id = ?`,
+    );
+
+    let sessionsRepaired = 0;
+    let removedMessages = 0;
+    let assignedMessageIds = 0;
+    const repair = this.db.transaction(() => {
+      for (const candidate of candidateSessions) {
+        const rows = selectMessages.all(
+          candidate.session_id,
+        ) as ChatSessionMessageRow[];
+        const readFileImageToolCount = rows.reduce((count, row) => {
+          if (row.message_type !== "tool") return count;
+          const data = asStoredMessageData(
+            parseJsonSafely(row.message_data_json),
+          );
+          return getStoredMessagePayload(data).name === "read_file" &&
+            getStoredMessagePayload(data).content === "Image read successfully."
+            ? count + 1
+            : count;
+        }, 0);
+        const readFileImageSignatureCount = new Set(
+          rows.flatMap((row) => {
+            const data = asStoredMessageData(
+              parseJsonSafely(row.message_data_json),
+            );
+            return data && isReadFileImageMessage(row, data)
+              ? [readFileImageSignature(data)]
+              : [];
+          }),
+        ).size;
+        const repairedRows: Array<
+          ChatSessionMessageRow & { data: StoredMessageData; rawData?: string }
+        > = [];
+        let changed = false;
+
+        const parseStoredData = (raw: string): StoredMessageData | null => {
+          try {
+            return asStoredMessageData(JSON.parse(raw));
+          } catch {
+            return null;
+          }
+        };
+        const findSafeRepeatedSupplementCount = (
+          signatures: string[],
+        ): number => {
+          if (readFileImageToolCount < 1 || signatures.length < 2) {
+            return signatures.length;
+          }
+          const uniqueSignatures = new Set(signatures);
+          if (
+            readFileImageToolCount >= 1 &&
+            readFileImageSignatureCount === readFileImageToolCount &&
+            uniqueSignatures.size === 1 &&
+            signatures.length >= 3
+          ) {
+            return 1;
+          }
+          if (uniqueSignatures.size !== readFileImageToolCount) {
+            return signatures.length;
+          }
+          let runCount = 0;
+          let shortestRun = Number.POSITIVE_INFINITY;
+          let previous = signatures[0];
+          let currentRunLength = 0;
+          const seenRuns = new Set<string>();
+          for (const signature of signatures) {
+            if (signature !== previous) {
+              seenRuns.add(previous);
+              runCount += 1;
+              shortestRun = Math.min(shortestRun, currentRunLength);
+              previous = signature;
+              currentRunLength = 0;
+            }
+            currentRunLength += 1;
+          }
+          seenRuns.add(previous);
+          runCount += 1;
+          shortestRun = Math.min(shortestRun, currentRunLength);
+          // Block-shaped repetition is the historical save amplification
+          // shape. A short run remains ambiguous with legitimate reads.
+          return runCount === uniqueSignatures.size &&
+            seenRuns.size === uniqueSignatures.size &&
+            shortestRun >= 3
+            ? uniqueSignatures.size
+            : signatures.length;
+        };
+
+        for (let index = 0; index < rows.length; ) {
+          const row = rows[index];
+          let data: StoredMessageData;
+          const parsed = parseStoredData(row.message_data_json);
+          if (!parsed) {
+            repairedRows.push({
+              ...row,
+              data: {},
+              rawData: row.message_data_json,
+            });
+            index += 1;
+            continue;
+          }
+          data = parsed;
+
+          const imageRow = isReadFileImageMessage(row, data);
+          if (isReadFileImageBridgeMessage(row, data)) {
+            const pairs: Array<{
+              bridgeRow: ChatSessionMessageRow;
+              bridgeData: StoredMessageData;
+              imageRow: ChatSessionMessageRow;
+              imageData: StoredMessageData;
+              signature: string;
+            }> = [];
+            let cursor = index;
+            while (cursor + 1 < rows.length) {
+              const bridgeRow = rows[cursor];
+              const imageRowAtCursor = rows[cursor + 1];
+              const bridgeData = parseStoredData(bridgeRow.message_data_json);
+              const imageData = parseStoredData(
+                imageRowAtCursor.message_data_json,
+              );
+              if (
+                !bridgeData ||
+                !imageData ||
+                !isReadFileImageBridgeMessage(bridgeRow, bridgeData) ||
+                !isReadFileImageMessage(imageRowAtCursor, imageData)
+              ) {
+                break;
+              }
+              pairs.push({
+                bridgeRow,
+                bridgeData,
+                imageRow: imageRowAtCursor,
+                imageData,
+                signature: readFileImageSignature(imageData),
+              });
+              cursor += 2;
+            }
+            const keepPairCount = findSafeRepeatedSupplementCount(
+              pairs.map((pair) => pair.signature),
+            );
+            pairs.slice(0, keepPairCount).forEach((pair) => {
+              repairedRows.push({
+                ...pair.bridgeRow,
+                data: assignStoredMessageId(
+                  pair.bridgeData,
+                  pair.bridgeRow.message_id,
+                ),
+              });
+              repairedRows.push({
+                ...pair.imageRow,
+                data: assignStoredMessageId(
+                  pair.imageData,
+                  pair.imageRow.message_id,
+                ),
+              });
+              if (
+                !hasStoredMessageId(pair.bridgeData) ||
+                !hasStoredMessageId(pair.imageData)
+              ) {
+                assignedMessageIds += 2;
+                changed = true;
+              }
+            });
+            if (keepPairCount < pairs.length) {
+              removedMessages += (pairs.length - keepPairCount) * 2;
+              changed = true;
+            }
+            index = cursor;
+            continue;
+          }
+
+          if (imageRow) {
+            const imageRows: Array<{
+              row: ChatSessionMessageRow;
+              data: StoredMessageData;
+              signature: string;
+            }> = [];
+            let cursor = index;
+            while (cursor < rows.length) {
+              const imageRowAtCursor = rows[cursor];
+              const imageData = parseStoredData(
+                imageRowAtCursor.message_data_json,
+              );
+              if (
+                !imageData ||
+                !isReadFileImageMessage(imageRowAtCursor, imageData)
+              ) {
+                break;
+              }
+              imageRows.push({
+                row: imageRowAtCursor,
+                data: imageData,
+                signature: readFileImageSignature(imageData),
+              });
+              cursor += 1;
+            }
+            const keepImageCount = findSafeRepeatedSupplementCount(
+              imageRows.map((image) => image.signature),
+            );
+            imageRows.slice(0, keepImageCount).forEach((image) => {
+              repairedRows.push({
+                ...image.row,
+                data: assignStoredMessageId(image.data, image.row.message_id),
+              });
+              if (!hasStoredMessageId(image.data)) {
+                assignedMessageIds += 1;
+                changed = true;
+              }
+            });
+            if (keepImageCount < imageRows.length) {
+              removedMessages += imageRows.length - keepImageCount;
+              changed = true;
+            }
+            index = cursor;
+            continue;
+          }
+
+          repairedRows.push({ ...row, data });
+          index += 1;
+        }
+
+        if (!changed) continue;
+        deleteMessages.run(candidate.session_id);
+        repairedRows.forEach((row, position) => {
+          insertMessage.run(
+            candidate.session_id,
+            position,
+            row.message_id,
+            row.message_type,
+            row.rawData ?? JSON.stringify(row.data),
+            row.is_compaction_marker ?? null,
+          );
+        });
+        updateSessionTimestamp.run(Date.now(), candidate.session_id);
+        sessionsRepaired += 1;
+      }
+
+      this.db
+        .prepare(
+          `INSERT INTO history_meta (key, value)
+           VALUES (?, ?)
+           ON CONFLICT(key) DO UPDATE SET value = excluded.value`,
+        )
+        .run(
+          "read_file_image_supplement_repair_version",
+          READ_FILE_IMAGE_SUPPLEMENT_REPAIR_VERSION,
+        );
+    });
+    repair();
+
+    return {
+      sessionsScanned: candidateSessions.length,
+      sessionsRepaired,
+      removedMessages,
+      assignedMessageIds,
+    };
   }
 
   static initializeDatabase(db: DatabaseHandle): void {
@@ -2267,7 +2668,7 @@ export class HistorySqliteStore {
       remainingCount > 0
         ? (this.db
             .prepare(
-            `SELECT position, ui_message_id, backend_message_id, role,
+              `SELECT position, ui_message_id, backend_message_id, role,
                     message_type, content, metadata_json, timestamp, streaming
              FROM ui_session_messages
              WHERE session_id = ? AND position < ?
