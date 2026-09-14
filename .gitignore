@@ -25,3 +25,10 @@ demo.md
 .codex-backups/
 apps/electron/cli-runtime/
 bun.lock
+
+# Local-only prompt RL harness, checkpoints, and generated evaluation artifacts.
+# The harness is intentionally kept in this checkout for reproducible experiments
+# but must never be included in product commits.
+packages/backend/evals/
+.local/prompt-rl/
+packages/backend/src/services/AgentHelper/sharedPrompts.extreme.spec.ts
