@@ -24,6 +24,25 @@ const ensureFile = (filePath) => {
 
 const readJsonFile = (filePath) => JSON.parse(fs.readFileSync(filePath, 'utf8'))
 
+const ensureSpawnHelperExecutable = () => {
+  // node-pty launches spawn-helper through posix_spawn on Unix. A package
+  // install or a copied workspace can lose the executable bit, which makes
+  // every local terminal fail with EACCES before a shell is created.
+  if (process.platform === 'win32') return
+  const candidates = [
+    path.join(nodePtyRoot, 'prebuilds', `${process.platform}-${process.arch}`, 'spawn-helper'),
+    path.join(nodePtyRoot, 'build', 'Release', 'spawn-helper'),
+  ]
+  for (const filePath of candidates) {
+    if (!fs.existsSync(filePath)) continue
+    const mode = fs.statSync(filePath).mode
+    if ((mode & 0o111) !== 0o111) {
+      fs.chmodSync(filePath, mode | 0o111)
+      console.log(`[ensure-node-pty-electron-runtime] restored executable bit: ${filePath}`)
+    }
+  }
+}
+
 ensureFile(nodePtyPackageJsonPath)
 ensureFile(windowsConoutConnectionPath)
 
@@ -37,17 +56,18 @@ if (!supportedVersions.has(nodePtyVersion)) {
   )
 }
 
+ensureSpawnHelperExecutable()
+
 const source = fs.readFileSync(windowsConoutConnectionPath, 'utf8')
 if (source.includes("app.asar.unpacked")) {
   console.log('[ensure-node-pty-electron-runtime] node-pty already patched for app.asar')
-  process.exit(0)
-}
+} else {
+  if (!source.includes(currentScript)) {
+    throw new Error(
+      `Could not find the expected node-pty worker path snippet in ${windowsConoutConnectionPath}`
+    )
+  }
 
-if (!source.includes(currentScript)) {
-  throw new Error(
-    `Could not find the expected node-pty worker path snippet in ${windowsConoutConnectionPath}`
-  )
+  fs.writeFileSync(windowsConoutConnectionPath, source.replace(currentScript, patchedScript), 'utf8')
+  console.log('[ensure-node-pty-electron-runtime] patched node-pty for Electron app.asar packaging')
 }
-
-fs.writeFileSync(windowsConoutConnectionPath, source.replace(currentScript, patchedScript), 'utf8')
-console.log('[ensure-node-pty-electron-runtime] patched node-pty for Electron app.asar packaging')
