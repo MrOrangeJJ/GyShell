@@ -889,7 +889,7 @@ const run = async (): Promise<void> => {
       )
     })
 
-    await runCase('failed restores are pruned from persisted state to avoid repeated startup failures', async () => {
+    await runCase('failed restores remain durable until explicitly closed', async () => {
       const store = new TerminalStateStore(stateFilePath)
       store.save([
         {
@@ -930,8 +930,115 @@ const run = async (): Promise<void> => {
         'successful record should remain in state file'
       )
       assertCondition(
-        !nextSnapshot.some((item) => item.id === 'local-bad'),
-        'failed record should be pruned after restore'
+        nextSnapshot.some((item) => item.id === 'local-bad'),
+        'failed record should remain available for a later retry'
+      )
+
+      // A later flush must retain the failed record as well; this mirrors the
+      // app shutdown path after restore has completed.
+      service.flushPersistedState()
+      assertCondition(
+        store.load().some((item) => item.id === 'local-bad'),
+        'failed record should survive a later persistence flush'
+      )
+
+      service.kill('local-bad')
+      service.flushPersistedState()
+      assertCondition(
+        !store.load().some((item) => item.id === 'local-bad'),
+        'explicitly closing a failed restore should delete its persisted record'
+      )
+    })
+
+    await runCase('successful recreation supersedes a retained failed restore record', async () => {
+      const store = new TerminalStateStore(stateFilePath)
+      store.save([
+        {
+          id: 'local-retry',
+          config: {
+            type: 'local',
+            id: 'local-retry',
+            title: 'Retry Local',
+            cols: 80,
+            rows: 24
+          }
+        }
+      ])
+
+      const failingBackend = new FakeTerminalBackend()
+      failingBackend.failSpawnForTerminalId('local-retry')
+      const failedService = createService(stateFilePath, failingBackend)
+      const failedRestore = await failedService.restorePersistedTerminals()
+      assertCondition(
+        failedRestore.failed.some((item) => item.id === 'local-retry'),
+        'initial restore should fail for retry scenario'
+      )
+
+      const retryService = createService(stateFilePath, new FakeTerminalBackend())
+      await retryService.createTerminal({
+        type: 'local',
+        id: 'local-retry',
+        title: 'Retry Local',
+        cols: 80,
+        rows: 24
+      })
+      retryService.flushPersistedState()
+      const snapshot = store.load()
+      assertEqual(
+        snapshot.filter((item) => item.id === 'local-retry').length,
+        1,
+        'successful recreation should leave exactly one live record'
+      )
+    })
+
+    await runCase('closing a pending restore record prevents it from being resurrected', async () => {
+      const store = new TerminalStateStore(stateFilePath)
+      store.save([
+        {
+          id: 'local-restore-first',
+          config: {
+            type: 'local',
+            id: 'local-restore-first',
+            title: 'First',
+            cols: 80,
+            rows: 24
+          }
+        },
+        {
+          id: 'local-restore-closed',
+          config: {
+            type: 'local',
+            id: 'local-restore-closed',
+            title: 'Closed During Restore',
+            cols: 80,
+            rows: 24
+          }
+        }
+      ])
+
+      const backend = new FakeTerminalBackend()
+      backend.deferNextSpawn()
+      const service = createService(stateFilePath, backend)
+      const restorePromise = service.restorePersistedTerminals()
+      await waitUntil(
+        () => backend.getPendingSpawnCount() === 1,
+        'first restore spawn should be pending before closing the second record'
+      )
+      service.kill('local-restore-closed')
+      backend.releaseNextSpawn()
+      const restore = await restorePromise
+      assertCondition(
+        restore.restored.includes('local-restore-first'),
+        'first record should still restore successfully'
+      )
+      assertCondition(
+        !restore.restored.includes('local-restore-closed'),
+        'closed pending record must be skipped by the restore loop'
+      )
+      service.flushPersistedState()
+      assertCondition(
+        !store.load().some((item) => item.id === 'local-restore-closed'),
+        'closed pending record must stay deleted after restore flush'
       )
     })
 

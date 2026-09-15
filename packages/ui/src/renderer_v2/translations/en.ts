@@ -47,6 +47,11 @@ export const en = {
     memory: "Memory",
     accessTokens: "Gateway",
     version: "Version",
+    macOSFullDiskAccessTitle: "Allow GyShell to Access Your Files",
+    macOSFullDiskAccessMessage:
+      "GyShell can run Agent tasks that access Desktop, Documents, Downloads, and other protected folders. Granting Full Disk Access now helps prevent macOS permission prompts from interrupting unattended tasks. You can choose Skip for now or deny this request; macOS may still show a permission prompt later when an Agent needs a protected folder.",
+    openFullDiskAccessSettings: "Open Privacy & Security",
+    skipFullDiskAccess: "Skip for Now",
     language: "Language",
     tabDisplayMode: "Tab Display Mode",
     fontSize: "Font Size",

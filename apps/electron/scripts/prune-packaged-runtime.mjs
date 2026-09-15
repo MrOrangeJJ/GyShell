@@ -160,6 +160,23 @@ async function pruneNodePtyModule(nodeModulesRoot, platform, arch) {
   );
   await pruneNodePtyBuildOutput(moduleRoot, platform);
 
+  // node-pty starts this helper through posix_spawn. electron-builder can copy
+  // it into app.asar.unpacked with a data-file mode (0644), which makes every
+  // local PTY fail with EACCES on macOS. Restore the executable bit after
+  // pruning so the packaged runtime behaves like the npm module.
+  const executablePaths = [
+    path.join(moduleRoot, "prebuilds", `${platform}-${arch}`, "spawn-helper"),
+    path.join(moduleRoot, "build", "Release", "spawn-helper"),
+  ];
+  await Promise.all(
+    executablePaths.map(async (filePath) => {
+      if (await pathExists(filePath)) {
+        const mode = (await fs.stat(filePath)).mode;
+        await fs.chmod(filePath, mode | 0o111);
+      }
+    }),
+  );
+
   const prebuildsRoot = path.join(moduleRoot, "prebuilds");
   if (!(await pathExists(prebuildsRoot))) {
     return;

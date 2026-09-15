@@ -75,6 +75,7 @@ import { HistorySqliteStore } from "../../../backend/src/services/history/Histor
 import { HistoryStorageMigration } from "../../../backend/src/services/history/HistoryStorageMigration";
 import { SleepBlockerService } from "./SleepBlockerService";
 import { AgentSettingProfileService } from "../../../backend/src/services/AgentSettingProfileService";
+import { MacOSPermissionService } from "../services/MacOSPermissionService";
 import {
   isExperimentalToolConfirmationRequired,
 } from "../../../backend/src/services/settings/experimentalToolConsent";
@@ -113,6 +114,7 @@ const detachedWindowRegistry = new DetachedWindowRegistry<BrowserWindow>();
 let historyStore: HistorySqliteStore | null = null;
 let sleepBlockerService: SleepBlockerService | null = null;
 let agentSettingProfileService: AgentSettingProfileService;
+let macOSPermissionService: MacOSPermissionService;
 
 const DETACHED_WINDOW_DEFAULT_WIDTH_SCALE = 0.5;
 const DETACHED_WINDOW_DEFAULT_HEIGHT_SCALE = 0.75;
@@ -529,6 +531,31 @@ export async function startElectronMain(): Promise<void> {
 
   settingsService = new SettingsService();
   uiSettingsStore = new UiSettingsStore();
+  macOSPermissionService = new MacOSPermissionService(
+    uiSettingsStore,
+    process.platform,
+    app.getVersion(),
+    undefined,
+    [app.getPath("exe"), app.getAppPath()],
+  );
+  ipcMain.handle("system:getMacOSFullDiskAccessState", () =>
+    macOSPermissionService.getFullDiskAccessState(),
+  );
+  ipcMain.handle("system:openMacOSFullDiskAccessSettings", async () => {
+    if (process.platform !== "darwin") return;
+    const urls = [
+      "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles",
+      "x-apple.systempreferences:com.apple.preference.security",
+    ];
+    for (const url of urls) {
+      try {
+        await shell.openExternal(url);
+        return;
+      } catch {
+        // Try the generic Privacy & Security pane on older/newer macOS builds.
+      }
+    }
+  });
   themeStore = new ThemeConfigStore();
   await themeStore.loadCustomThemes();
   const primaryWindow = createWindow();

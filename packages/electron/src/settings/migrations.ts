@@ -47,6 +47,8 @@ function pickUiSnapshot(raw: unknown): Partial<UiSettings> {
     chat: raw.chat,
     runtime: raw.runtime,
     monitorEnabledSources: raw.monitorEnabledSources,
+    macosFullDiskAccessPromptedVersion: raw.macosFullDiskAccessPromptedVersion,
+    macosFullDiskAccessCheckedInstallation: raw.macosFullDiskAccessCheckedInstallation,
   } as Partial<UiSettings>
 }
 
@@ -81,6 +83,20 @@ function normalizeUiSettings(settings: UiSettings): UiSettings {
   }
   if (!Array.isArray(next.monitorEnabledSources)) {
     next.monitorEnabledSources = undefined
+  }
+  if (
+    next.macosFullDiskAccessPromptedVersion !== undefined &&
+    (typeof next.macosFullDiskAccessPromptedVersion !== 'string' ||
+      next.macosFullDiskAccessPromptedVersion.trim().length === 0)
+  ) {
+    next.macosFullDiskAccessPromptedVersion = undefined
+  }
+  if (
+    next.macosFullDiskAccessCheckedInstallation !== undefined &&
+    (typeof next.macosFullDiskAccessCheckedInstallation !== 'string' ||
+      next.macosFullDiskAccessCheckedInstallation.trim().length === 0)
+  ) {
+    next.macosFullDiskAccessCheckedInstallation = undefined
   }
   next.uiSchemaVersion = UI_SETTINGS_SCHEMA_VERSION
   return next

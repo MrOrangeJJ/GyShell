@@ -125,6 +125,18 @@ export const App: React.FC = observer(() => {
         }}
       />
 
+      <ConfirmDialog
+        open={store.showMacOSFullDiskAccessPrompt}
+        title={t.settings.macOSFullDiskAccessTitle}
+        message={t.settings.macOSFullDiskAccessMessage}
+        confirmText={t.settings.openFullDiskAccessSettings}
+        cancelText={t.settings.skipFullDiskAccess}
+        onCancel={() => store.closeMacOSFullDiskAccessPrompt()}
+        onConfirm={() => {
+          void store.openMacOSFullDiskAccessSettings();
+        }}
+      />
+
       <TopBar store={store} />
 
       <div className="gyshell-body">

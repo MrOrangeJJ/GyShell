@@ -470,6 +470,15 @@ export class TerminalService {
   private rawEventPublisher: RawEventPublisher | null = null
   private persistTimer: ReturnType<typeof setTimeout> | null = null
   private readonly terminalStateStore: TerminalStateStore | null
+  /**
+   * Persisted configurations whose runtime could not be restored yet. These
+   * records stay durable across flushes until a live terminal supersedes them
+   * or the user explicitly closes the tab.
+   */
+  private readonly pendingPersistedTerminals = new Map<
+    string,
+    PersistedTerminalRecord
+  >()
   private commandTrackingPollIntervalMs = 250
   private commandTrackingMaxConsecutiveErrors = 8
   private commandTrackingPromptSyncPollIntervalMs = 50
@@ -919,15 +928,26 @@ export class TerminalService {
 
   private getPersistableRecords(): PersistedTerminalRecord[] {
     const records: PersistedTerminalRecord[] = []
+    const liveTerminalIds = new Set<string>()
     Array.from(this.terminals.values()).forEach((terminal) => {
       const config = this.extractTerminalConfigForPersist(terminal)
       if (!config) return
+      liveTerminalIds.add(terminal.id)
       records.push({
         id: terminal.id,
         config
       })
     })
+    this.pendingPersistedTerminals.forEach((record, id) => {
+      if (!liveTerminalIds.has(id)) {
+        records.push(record)
+      }
+    })
     return records
+  }
+
+  private forgetPendingPersistedTerminal(terminalId: string): void {
+    this.pendingPersistedTerminals.delete(terminalId)
   }
 
   private persistTerminalStateNow(): void {
@@ -1354,9 +1374,22 @@ export class TerminalService {
     const restored: string[] = []
     const failed: Array<{ id: string; reason: string }> = []
 
+    // Seed the pending set before any create call can schedule a debounced
+    // persistence flush. A failed or not-yet-attempted record must not be
+    // dropped while a long restore sequence is still in progress.
+    records.forEach((record) => {
+      this.pendingPersistedTerminals.set(record.id, record)
+    })
+
     for (const record of records) {
+      // A close received while restore is awaiting another backend must win;
+      // deleting the pending record is the explicit user intent to forget it.
+      if (!this.pendingPersistedTerminals.has(record.id)) {
+        continue
+      }
       try {
         await this.createTerminal(record.config)
+        this.forgetPendingPersistedTerminal(record.id)
         restored.push(record.id)
       } catch (error) {
         const reason = error instanceof Error ? error.message : String(error)
@@ -1364,7 +1397,6 @@ export class TerminalService {
       }
     }
 
-    // Prune any entries that could not be restored to avoid repeated startup failures.
     this.persistTerminalStateNow()
 
     return { restored, failed }
@@ -1394,7 +1426,7 @@ export class TerminalService {
 
   async createTerminal(rawConfig: TerminalConfig): Promise<TerminalTab> {
     const normalizedConfig = normalizeTerminalConfigForRuntime(rawConfig)
-    return await this.runTerminalLifecycleOperation(
+    const terminal = await this.runTerminalLifecycleOperation(
       normalizedConfig.id,
       async (expectedEpoch) =>
         await this.createTerminalWithinLifecycle(
@@ -1402,13 +1434,15 @@ export class TerminalService {
           expectedEpoch
         )
     )
+    this.forgetPendingPersistedTerminal(normalizedConfig.id)
+    return terminal
   }
 
   async createTerminalWithRuntimeGuard(
     rawConfig: TerminalConfig
   ): Promise<TerminalCreationRuntime> {
     const normalizedConfig = normalizeTerminalConfigForRuntime(rawConfig)
-    return await this.runTerminalLifecycleOperation(
+    const runtime = await this.runTerminalLifecycleOperation(
       normalizedConfig.id,
       async (expectedEpoch) => {
         const terminal = await this.createTerminalWithinLifecycle(
@@ -1429,6 +1463,8 @@ export class TerminalService {
         return Object.freeze({ terminal, runtimeGuard })
       }
     )
+    this.forgetPendingPersistedTerminal(normalizedConfig.id)
+    return runtime
   }
 
   private async createTerminalWithinLifecycle(
@@ -3715,6 +3751,9 @@ export class TerminalService {
         'terminal close admission'
       )
     }
+    // An explicit close also forgets a persisted record that failed to
+    // restore and therefore has no live terminal object to remove.
+    this.forgetPendingPersistedTerminal(terminalId)
     // Guard admission must precede every state mutation. A stale Agent close
     // must not erase pending geometry or fence a same-ID replacement.
     this.pendingResizeByTerminal.delete(terminalId)

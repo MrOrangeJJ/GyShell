@@ -41,4 +41,6 @@ export interface UiSettings {
   chat: ChatUiSettings
   runtime?: RuntimeUiSettings
   monitorEnabledSources?: string[]
+  macosFullDiskAccessPromptedVersion?: string
+  macosFullDiskAccessCheckedInstallation?: string
 }

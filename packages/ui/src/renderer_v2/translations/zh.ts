@@ -47,6 +47,11 @@ export const zh = {
     memory: "记忆",
     accessTokens: "网关",
     version: "版本",
+    macOSFullDiskAccessTitle: "允许 GyShell 访问文件",
+    macOSFullDiskAccessMessage:
+      "GyShell 的 Agent 任务可能需要访问桌面、文稿、下载以及其他受保护的文件夹。现在授予“完全磁盘访问权限”可以减少无人值守任务运行时被 macOS 权限弹窗打断的情况。你可以暂时跳过或拒绝此请求；之后 Agent 需要访问受保护文件夹时，macOS 仍可能再次弹出权限提示。",
+    openFullDiskAccessSettings: "打开“隐私与安全性”",
+    skipFullDiskAccess: "暂时跳过",
     language: "语言",
     tabDisplayMode: "Tab 显示模式",
     fontSize: "字体大小",

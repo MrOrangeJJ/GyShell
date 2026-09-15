@@ -154,6 +154,8 @@ interface UiSettings {
     preventSleepWhileRunning?: boolean;
   };
   monitorEnabledSources?: string[];
+  macosFullDiskAccessPromptedVersion?: string;
+  macosFullDiskAccessCheckedInstallation?: string;
 }
 
 type TerminalRecoveryReason =
@@ -403,6 +405,13 @@ interface HistoryMigrationState {
   error?: string;
 }
 
+interface MacOSFullDiskAccessState {
+  supported: boolean;
+  granted: boolean;
+  shouldPrompt: boolean;
+  promptedVersion: string | null;
+}
+
 interface TerminalSystemInfo {
   os: string;
   platform: string;
@@ -551,6 +560,8 @@ interface OpenDetachedWindowOptions {
 export interface GyShellAPI {
   system: {
     platform: NodeJS.Platform;
+    getMacOSFullDiskAccessState: () => Promise<MacOSFullDiskAccessState>;
+    openMacOSFullDiskAccessSettings: () => Promise<void>;
     openExternal: (url: string) => Promise<void>;
     saveImageAttachment: (
       payload: SaveImageAttachmentPayload,
@@ -1017,6 +1028,10 @@ export interface GyShellAPI {
 const api: GyShellAPI = {
   system: {
     platform: process.platform,
+    getMacOSFullDiskAccessState: () =>
+      ipcRenderer.invoke("system:getMacOSFullDiskAccessState"),
+    openMacOSFullDiskAccessSettings: () =>
+      ipcRenderer.invoke("system:openMacOSFullDiskAccessSettings"),
     openExternal: (url: string) =>
       ipcRenderer.invoke("system:openExternal", url),
     saveImageAttachment: (payload: SaveImageAttachmentPayload) =>

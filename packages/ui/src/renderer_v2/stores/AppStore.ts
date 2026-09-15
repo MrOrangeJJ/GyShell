@@ -449,6 +449,7 @@ export class AppStore {
   versionInfo: VersionCheckResult | null = null;
   versionCheckInProgress = false;
   showVersionUpdateDialog = false;
+  showMacOSFullDiskAccessPrompt = false;
   historyMigrationState: HistoryMigrationSnapshot | null = null;
   mobileWebStatus: { running: boolean; port?: number; urls?: string[] } = {
     running: false,
@@ -502,6 +503,7 @@ export class AppStore {
       versionInfo: observable,
       versionCheckInProgress: observable,
       showVersionUpdateDialog: observable,
+      showMacOSFullDiskAccessPrompt: observable,
       historyMigrationState: observable.ref,
       isDetachedWindow: computed,
       isSettings: computed,
@@ -2560,11 +2562,13 @@ export class AppStore {
       runInAction(() => {
         this.historyMigrationState = initialHistoryMigrationState;
       });
+
       const settledHistoryMigrationState =
         await window.gyshell.historyMigration.waitUntilSettled();
       runInAction(() => {
         this.historyMigrationState = settledHistoryMigrationState;
       });
+
       if (settledHistoryMigrationState.status === "error") {
         return;
       }
@@ -2679,6 +2683,27 @@ export class AppStore {
           );
         }
       });
+
+      // macOS TCC has no public status API. The main process performs a
+      // best-effort protected-path probe and only asks once per installation.
+      // Detached windows do not own onboarding and older preload contexts may
+      // not expose this optional API yet.
+      const getMacOSFullDiskAccessState =
+        !this.isDetachedWindow
+          ? window.gyshell?.system?.getMacOSFullDiskAccessState
+          : undefined;
+      if (typeof getMacOSFullDiskAccessState === "function") {
+        void getMacOSFullDiskAccessState()
+          .then((state) => {
+            if (!state?.shouldPrompt) return;
+            runInAction(() => {
+              this.showMacOSFullDiskAccessPrompt = true;
+            });
+          })
+          .catch(() => {
+            // Permission guidance must never block normal startup.
+          });
+      }
 
       // Setup deterministic UI update listener (backend is the source of truth).
       // Register before awaiting hydration to avoid dropping updates emitted during startup.
@@ -2849,6 +2874,17 @@ export class AppStore {
       void this.loadMobileWebStatus();
       void this.checkVersion({ showPopupOnVersionChange: true });
     }
+  }
+
+  closeMacOSFullDiskAccessPrompt(): void {
+    this.showMacOSFullDiskAccessPrompt = false;
+  }
+
+  async openMacOSFullDiskAccessSettings(): Promise<void> {
+    const openSettings = window.gyshell?.system?.openMacOSFullDiskAccessSettings;
+    if (typeof openSettings !== "function") return;
+    await openSettings();
+    this.closeMacOSFullDiskAccessPrompt();
   }
 
   createLocalTab(
