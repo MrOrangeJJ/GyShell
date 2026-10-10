@@ -37,6 +37,8 @@ import {
   buildWindowsPowerShellRequestMarkerPath,
   buildWindowsPowerShellEncodedCommand,
   parseWindowsBuildNumber,
+  resolveWindowsPtyBackend,
+  resolveWindowsPowerShellInitializationReadyTransport,
   parseWindowsPromptMarkerLine,
   parseWindowsPowerShellRequestMarkerFile,
   shouldUseWindowsPowerShellSidecar,
@@ -47,11 +49,14 @@ import {
   WINDOWS_POWERSHELL_REQUEST_MARKER_MAX_UTF8_BYTES,
   WINDOWS_POWERSHELL_SIDECAR_RETENTION_MS,
   type WindowsCommandTrackingMode,
+  type WindowsPowerShellInitializationReadyTransport,
+  type WindowsPtyBackend,
   type WindowsPromptMarkerState,
 } from './windowsPowerShellTracking'
 import {
   buildCommandProtocolMarkerPrefix,
   buildInitializationReadyMarker,
+  buildPowerShellInitializationReadyMarker,
   buildPowerShellInitializationReadySequence,
   buildUnixCommandDispatcherScript,
   consumeInitializationReadyRecord,
@@ -664,9 +669,26 @@ export class NodePtyBackend implements TerminalBackend {
     const commandProtocolToken = this.shellSupportsCommandProtocol(shell)
       ? randomBytes(16).toString('hex')
       : undefined
+    const windowsPtyBackend: WindowsPtyBackend | undefined =
+      os.platform() === 'win32'
+        ? resolveWindowsPtyBackend({
+            platform: os.platform(),
+            release: os.release(),
+          })
+        : undefined
+    const powerShellReadyTransport =
+      commandShellFamily === 'powershell'
+        ? resolveWindowsPowerShellInitializationReadyTransport({
+            platform: os.platform(),
+            release: os.release(),
+            backend: windowsPtyBackend,
+          })
+        : undefined
     const initializationReadyRecord =
       commandShellFamily === 'powershell'
-        ? buildPowerShellInitializationReadySequence(commandProtocolToken)
+        ? powerShellReadyTransport === 'line'
+          ? buildPowerShellInitializationReadyMarker(commandProtocolToken)
+          : buildPowerShellInitializationReadySequence(commandProtocolToken)
         : buildInitializationReadyMarker(commandProtocolToken)
 
     const {
@@ -677,7 +699,11 @@ export class NodePtyBackend implements TerminalBackend {
       promptMarkerPath,
       commandRequestPath,
       commandOutputPath,
-    } = this.buildShellIntegration(shell, commandProtocolToken)
+    } = this.buildShellIntegration(
+      shell,
+      commandProtocolToken,
+      powerShellReadyTransport,
+    )
     const mergedEnv = { ...env, ...localeEnv, ...envOverrides }
 
     const ptyProcess = pty.spawn(shell, args, {
@@ -686,7 +712,10 @@ export class NodePtyBackend implements TerminalBackend {
       rows: config.rows || 24,
       cwd,
       env: mergedEnv,
-      useConpty: os.platform() === 'win32',
+      useConpty: windowsPtyBackend
+        ? windowsPtyBackend !== 'winpty'
+        : false,
+      useConptyDll: windowsPtyBackend === 'bundled-conpty',
     })
 
     const waitsForPrivateReadyMarker =
@@ -856,7 +885,11 @@ export class NodePtyBackend implements TerminalBackend {
    * - bash: DEBUG trap (preexec-ish) and PROMPT_COMMAND (precmd-ish)
    * - zsh: preexec + precmd hooks
    */
-  private buildShellIntegration(shellPath: string, runtimeToken?: string): {
+  private buildShellIntegration(
+    shellPath: string,
+    runtimeToken?: string,
+    powerShellReadyTransport?: WindowsPowerShellInitializationReadyTransport,
+  ): {
     args: string[]
     envOverrides: Record<string, string>
     tmpPath?: string
@@ -1076,7 +1109,11 @@ export class NodePtyBackend implements TerminalBackend {
       if (commandTrackingMode === 'windows-powershell-sidecar' && tmpPath) {
         const bootstrapPath = path.join(tmpPath, 'bootstrap.ps1')
         const bootstrapScript = buildWindowsPowerShellBootstrapScript({
-          readySequence: buildPowerShellInitializationReadySequence(runtimeToken),
+          readySequence:
+            powerShellReadyTransport === 'line'
+              ? buildPowerShellInitializationReadyMarker(runtimeToken)
+              : buildPowerShellInitializationReadySequence(runtimeToken),
+          readyOutputTransport: powerShellReadyTransport,
           commandTrackingMode,
           promptMarkerPath,
           commandRequestPath,
@@ -1093,7 +1130,8 @@ export class NodePtyBackend implements TerminalBackend {
           promptMarkerPath,
           commandRequestPath,
           commandOutputPath,
-          runtimeToken
+          runtimeToken,
+          powerShellReadyTransport,
         )
       }
       const executionPolicyArgs =
@@ -1242,10 +1280,15 @@ export class NodePtyBackend implements TerminalBackend {
     promptMarkerPath?: string,
     commandRequestPath?: string,
     commandOutputPath?: string,
-    commandProtocolToken?: string
+    commandProtocolToken?: string,
+    readyOutputTransport?: WindowsPowerShellInitializationReadyTransport,
   ): string {
     return buildWindowsPowerShellEncodedCommand({
-      readySequence: buildPowerShellInitializationReadySequence(commandProtocolToken),
+      readySequence:
+        readyOutputTransport === 'line'
+          ? buildPowerShellInitializationReadyMarker(commandProtocolToken)
+          : buildPowerShellInitializationReadySequence(commandProtocolToken),
+      readyOutputTransport,
       commandTrackingMode,
       promptMarkerPath,
       commandRequestPath,

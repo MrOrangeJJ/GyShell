@@ -61,6 +61,16 @@ export const buildPowerShellInitializationReadySequence = (
 }
 
 /**
+ * Builds the printable readiness record used by PowerShell when node-pty has
+ * to fall back to winpty. winpty replays the console screen buffer and may
+ * omit non-rendering OSC sequences, so this record must occupy a visible line.
+ */
+export const buildPowerShellInitializationReadyMarker = (
+  runtimeToken?: string,
+  attempt?: number
+): string => buildInitializationReadyMarker(runtimeToken, attempt)
+
+/**
  * Locates a ready marker only when it is framed as a complete terminal line.
  * Shell echo or tracing may contain the marker text, but not as the isolated
  * protocol record emitted by the bootstrap.
@@ -77,7 +87,7 @@ export const findInitializationReadyMarkerLine = (
     const preceding = buffer[markerOffset - 1]
     const following = buffer[markerOffset + marker.length]
     if (
-      (preceding === '\r' || preceding === '\n') &&
+      (markerOffset === 0 || preceding === '\r' || preceding === '\n') &&
       (following === '\r' || following === '\n')
     ) {
       return markerOffset

@@ -5,6 +5,11 @@ export const WINDOWS_PROMPT_MARKER_PREFIX = '__GYSHELL_PROMPT__::'
 // after that prompt has durably appended this sequence to its journal.
 export const WINDOWS_POWERSHELL_INITIAL_PROMPT_SEQUENCE = 1
 export const WINDOWS_POWERSHELL_SIDECAR_BUILD_THRESHOLD = 17763
+// The bundled node-pty ConPTY implementation lets the packaged app support
+// Windows builds below node-pty's normal system-ConPTY threshold. Keep this
+// threshold in one place so PTY selection and readiness transport agree.
+export const WINDOWS_CONPTY_MIN_BUILD = 17134
+export const WINDOWS_CONPTY_BUILD_THRESHOLD = 18309
 export const WINDOWS_POWERSHELL_LOCAL_SIDECAR_DIR_PREFIX = 'gyshell-winps-'
 export const WINDOWS_POWERSHELL_REMOTE_SIDECAR_DIR_NAME = 'GyShell/prompt-markers'
 export const WINDOWS_POWERSHELL_SIDECAR_RETENTION_MS = 24 * 60 * 60 * 1000
@@ -23,6 +28,8 @@ const WINDOWS_POWERSHELL_INITIALIZATION_READY_VARIABLE_SUFFIX =
 
 export type WindowsCommandTrackingMode = 'shell-integration' | 'windows-powershell-sidecar'
 export type WindowsPowerShellDispatchRequestKind = 'probe' | 'command'
+export type WindowsPowerShellInitializationReadyTransport = 'osc' | 'line'
+export type WindowsPtyBackend = 'system-conpty' | 'bundled-conpty' | 'winpty'
 
 export interface WindowsPromptMarkerState {
   sequence: number
@@ -45,6 +52,42 @@ export const parseWindowsBuildNumber = (release: string | undefined): number | u
   }
   const build = Number.parseInt(match[1], 10)
   return Number.isFinite(build) ? build : undefined
+}
+
+export const resolveWindowsPtyBackend = (options: {
+  platform: string
+  release?: string
+}): WindowsPtyBackend | undefined => {
+  if (options.platform !== 'win32') {
+    return undefined
+  }
+  const buildNumber = parseWindowsBuildNumber(options.release)
+  if (buildNumber === undefined) {
+    return 'winpty'
+  }
+  return buildNumber >= WINDOWS_CONPTY_MIN_BUILD &&
+    buildNumber < WINDOWS_CONPTY_BUILD_THRESHOLD
+    ? 'bundled-conpty'
+    : buildNumber >= WINDOWS_CONPTY_BUILD_THRESHOLD
+      ? 'system-conpty'
+      : 'winpty'
+}
+
+export const resolveWindowsPowerShellInitializationReadyTransport = (options: {
+  platform: string
+  release?: string
+  backend?: WindowsPtyBackend
+}): WindowsPowerShellInitializationReadyTransport => {
+  if (options.platform !== 'win32') {
+    return 'osc'
+  }
+  if (options.backend) {
+    return options.backend === 'winpty' ? 'line' : 'osc'
+  }
+  const buildNumber = parseWindowsBuildNumber(options.release)
+  return buildNumber === undefined || buildNumber < WINDOWS_CONPTY_BUILD_THRESHOLD
+    ? 'line'
+    : 'osc'
 }
 
 export const shouldUseWindowsPowerShellSidecar = (options: {
@@ -150,6 +193,7 @@ export const buildWindowsPowerShellDispatchRequest = (options: {
 
 export const buildWindowsPowerShellBootstrapScript = (options: {
   readySequence: string
+  readyOutputTransport?: WindowsPowerShellInitializationReadyTransport
   readySequenceFromRuntimeVariable?: boolean
   commandTrackingMode: WindowsCommandTrackingMode
   promptMarkerPath?: string
@@ -264,12 +308,15 @@ export const buildWindowsPowerShellBootstrapScript = (options: {
     : `[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('${Buffer.from(options.readySequence, 'utf8').toString('base64')}'))`
   const readySequenceAssignment =
     `$__gyshell_ready_sequence=${readySequenceExpression}`
+  const readyOutputTransport = options.readyOutputTransport || 'osc'
   const readyOutputStatement =
-    `${readySequenceAssignment};` +
-    '$__gyshell_ready_bytes=$__gyshell_utf8.GetBytes($__gyshell_ready_sequence);' +
-    '$__gyshell_ready_stdout=[Console]::OpenStandardOutput();' +
-    '$__gyshell_ready_stdout.Write($__gyshell_ready_bytes,0,$__gyshell_ready_bytes.Length);' +
-    '$__gyshell_ready_stdout.Flush()'
+    readyOutputTransport === 'line'
+      ? `${readySequenceAssignment};Write-Output ([Environment]::NewLine+$__gyshell_ready_sequence)`
+      : `${readySequenceAssignment};` +
+        '$__gyshell_ready_bytes=$__gyshell_utf8.GetBytes($__gyshell_ready_sequence);' +
+        '$__gyshell_ready_stdout=[Console]::OpenStandardOutput();' +
+        '$__gyshell_ready_stdout.Write($__gyshell_ready_bytes,0,$__gyshell_ready_bytes.Length);' +
+        '$__gyshell_ready_stdout.Flush()'
   // -NoExit invokes prompt after the encoded bootstrap returns. Publishing
   // readiness inside that natural prompt makes one event prove both the
   // journal baseline and the visible prompt; an explicit prompt invocation
@@ -277,13 +324,18 @@ export const buildWindowsPowerShellBootstrapScript = (options: {
   const sidecarReadySetup =
     `$global:__gyshell_pending_ready_sequence=${readySequenceExpression}`
   const sidecarReadyPromptStatement =
-    'if($null -ne $global:__gyshell_pending_ready_sequence){' +
-    '$__gyshell_ready_sequence=[string]$global:__gyshell_pending_ready_sequence;' +
-    '$__gyshell_ready_bytes=[Text.Encoding]::UTF8.GetBytes($__gyshell_ready_sequence);' +
-    '$__gyshell_ready_stdout=[Console]::OpenStandardOutput();' +
-    '$__gyshell_ready_stdout.Write($__gyshell_ready_bytes,0,$__gyshell_ready_bytes.Length);' +
-    '$__gyshell_ready_stdout.Flush();' +
-    '$global:__gyshell_pending_ready_sequence=$null}'
+    readyOutputTransport === 'line'
+      ? 'if($null -ne $global:__gyshell_pending_ready_sequence){' +
+        '$__gyshell_ready_sequence=[string]$global:__gyshell_pending_ready_sequence;' +
+        'Write-Output ([Environment]::NewLine+$__gyshell_ready_sequence);' +
+        '$global:__gyshell_pending_ready_sequence=$null}'
+      : 'if($null -ne $global:__gyshell_pending_ready_sequence){' +
+        '$__gyshell_ready_sequence=[string]$global:__gyshell_pending_ready_sequence;' +
+        '$__gyshell_ready_bytes=[Text.Encoding]::UTF8.GetBytes($__gyshell_ready_sequence);' +
+        '$__gyshell_ready_stdout=[Console]::OpenStandardOutput();' +
+        '$__gyshell_ready_stdout.Write($__gyshell_ready_bytes,0,$__gyshell_ready_bytes.Length);' +
+        '$__gyshell_ready_stdout.Flush();' +
+        '$global:__gyshell_pending_ready_sequence=$null}'
   const sidecarPromptFrameStatement = runtimeToken
     ? '$__gyshell_prompt_frame=([string][char]27)+\']1337;' +
       commandProtocolNamespace +

@@ -5,6 +5,7 @@ import { COMMAND_CAPTURE_MAX_UTF8_BYTES } from '@gyshell/shared'
 import { NodePtyBackend } from './NodePtyBackend'
 import {
   buildInitializationReadyMarker,
+  buildPowerShellInitializationReadyMarker,
   buildPowerShellInitializationReadySequence,
   consumeInitializationReadyMarker,
   consumeInitializationReadyRecord,
@@ -14,7 +15,9 @@ import {
   buildWindowsPowerShellDispatchInput,
   buildWindowsPowerShellInputRevisionPath,
   parseWindowsPromptMarkerLine,
+  resolveWindowsPtyBackend,
   parseWindowsPowerShellRequestMarkerFile,
+  resolveWindowsPowerShellInitializationReadyTransport,
   WINDOWS_POWERSHELL_INITIAL_PROMPT_SEQUENCE,
   WINDOWS_POWERSHELL_REQUEST_MARKER_MAX_UTF8_BYTES,
 } from './windowsPowerShellTracking'
@@ -111,6 +114,117 @@ const run = async (): Promise<void> => {
       consumeInitializationReadyRecord(readySequence.slice(0, -1), readySequence),
       undefined,
       'a split PowerShell OSC readiness record must stay buffered'
+    )
+  })
+
+  await runCase('Windows PTY selection aligns PowerShell readiness with the selected backend', () => {
+    const runtimeToken = '12121212121212121212121212121212'
+    assertEqual(
+      resolveWindowsPtyBackend({
+        platform: 'win32',
+        release: '10.0.14393',
+      }),
+      'winpty',
+      'Windows Server 2016 should retain the winpty fallback'
+    )
+    assertEqual(
+      resolveWindowsPtyBackend({
+        platform: 'win32',
+        release: '10.0.17134',
+      }),
+      'bundled-conpty',
+      'the first Windows build with ConPTY support should use the bundled runtime'
+    )
+    assertEqual(
+      resolveWindowsPtyBackend({
+        platform: 'win32',
+        release: '10.0.17763',
+      }),
+      'bundled-conpty',
+      'Windows Server 2019 should use the bundled ConPTY runtime'
+    )
+    assertEqual(
+      resolveWindowsPtyBackend({
+        platform: 'win32',
+        release: '10.0.18362',
+      }),
+      'system-conpty',
+      'newer Windows builds should use the system ConPTY runtime'
+    )
+    assertEqual(
+      resolveWindowsPtyBackend({
+        platform: 'win32',
+        release: 'Windows Server (unknown)',
+      }),
+      'winpty',
+      'an unknown Windows build should retain the winpty fallback'
+    )
+    assertEqual(
+      resolveWindowsPowerShellInitializationReadyTransport({
+        platform: 'win32',
+        release: '10.0.17763',
+      }),
+      'line',
+      'the legacy transport inference should remain a visible line for a winpty fallback'
+    )
+    assertEqual(
+      resolveWindowsPowerShellInitializationReadyTransport({
+        platform: 'win32',
+        release: '10.0.17763',
+        backend: 'bundled-conpty',
+      }),
+      'osc',
+      'the bundled ConPTY backend should use the non-rendering OSC ready record'
+    )
+    assertEqual(
+      resolveWindowsPowerShellInitializationReadyTransport({
+        platform: 'win32',
+        release: '10.0.17763',
+        backend: 'winpty',
+      }),
+      'line',
+      'the winpty fallback should use a visible ready line'
+    )
+    assertEqual(
+      resolveWindowsPowerShellInitializationReadyTransport({
+        platform: 'win32',
+        release: '10.0.18362',
+      }),
+      'osc',
+      'ConPTY-capable Windows builds should retain the non-rendering OSC ready record'
+    )
+    assertEqual(
+      resolveWindowsPowerShellInitializationReadyTransport({
+        platform: 'linux',
+        release: '10.0.17763',
+      }),
+      'osc',
+      'Unix-hosted PowerShell should retain the existing OSC transport'
+    )
+
+    const marker = buildPowerShellInitializationReadyMarker(runtimeToken)
+    assertEqual(
+      consumeInitializationReadyRecord(`${marker}\r\nPS> visible`, marker),
+      '\r\nPS> visible',
+      'a visible ready line at the start of a winpty capture should open initialization'
+    )
+
+    const backend = new NodePtyBackend() as any
+    const encoded = backend.buildWindowsPowerShellEncodedCommand(
+      'windows-powershell-sidecar',
+      'C:/Temp/prompt.log',
+      'C:/Temp/request.b64',
+      'C:/Temp/output.txt',
+      runtimeToken,
+      'line'
+    ) as string
+    const decoded = Buffer.from(encoded, 'base64').toString('utf16le')
+    assertCondition(
+      decoded.includes(
+        `Write-Output ([Environment]::NewLine+$${`__gyshell_${runtimeToken}`}_ready_sequence)`
+      ) &&
+        decoded.includes(Buffer.from(marker, 'utf8').toString('base64')),
+      'the winpty bootstrap should render the token-bound marker through PowerShell output'
     )
   })
 

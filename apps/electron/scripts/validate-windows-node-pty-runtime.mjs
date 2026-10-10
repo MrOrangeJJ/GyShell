@@ -61,4 +61,12 @@ export default async function validateWindowsNodePtyRuntime(context) {
   if (!workerBootstrapSource.includes("app.asar.unpacked")) {
     throw new Error(`node-pty worker bootstrap was not patched for app.asar: ${workerBootstrapPath}`)
   }
+
+  const ptyAgentPath = path.join(nodePtyRoot, 'lib', 'windowsPtyAgent.js')
+  const ptyAgentSource = fs.readFileSync(ptyAgentPath, 'utf8')
+  if (!ptyAgentSource.includes('if (this._useConpty === undefined) {')) {
+    throw new Error(
+      `node-pty ConPTY selection was not patched to honor explicit useConpty: ${ptyAgentPath}`
+    )
+  }
 }
