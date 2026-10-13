@@ -794,6 +794,11 @@ export interface TerminalSessionBackend {
    */
   onExit(ptyId: string, callback: (code: number) => void): void
 
+  /** Ask the pseudoconsole to repaint its whole viewport (Windows ConPTY). */
+  requestRepaint?(ptyId: string): boolean
+  /** True when the runtime draws with absolute rows of its own viewport (ConPTY). */
+  usesPseudoconsoleViewport?(ptyId: string): boolean
+
   /**
    * Get current working directory for the session.
    */

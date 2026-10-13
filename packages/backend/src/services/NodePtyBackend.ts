@@ -1311,6 +1311,29 @@ export class NodePtyBackend implements TerminalBackend {
     }
   }
 
+  /**
+   * Windows pseudoconsoles position their cursor with absolute rows relative
+   * to their own viewport. Force a full ConPTY repaint (what a manual resize
+   * does) so the renderer viewport is redrawn from ConPTY's screen state.
+   */
+  usesPseudoconsoleViewport(ptyId: string): boolean {
+    return process.platform === 'win32' && this.ptys.has(ptyId)
+  }
+
+  requestRepaint(ptyId: string): boolean {
+    if (process.platform !== 'win32') return false
+    const instance = this.ptys.get(ptyId)
+    if (!instance) return false
+    const { cols, rows } = instance.pty
+    if (!(rows > 1)) return false
+    instance.pty.resize(cols, rows - 1)
+    setTimeout(() => {
+      if (this.ptys.get(ptyId) !== instance) return
+      instance.pty.resize(instance.pty.cols, rows)
+    }, 40)
+    return true
+  }
+
   kill(ptyId: string): void {
     const instance = this.ptys.get(ptyId)
     if (instance) {

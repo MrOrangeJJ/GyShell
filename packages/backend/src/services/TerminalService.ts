@@ -1,6 +1,10 @@
 import pkg from '@xterm/headless'
 import type { Terminal as TerminalType } from '@xterm/headless'
 const { Terminal } = pkg
+import {
+  buildPseudoconsoleRowRealignment,
+  buildPseudoconsoleViewportHandoff,
+} from './terminal/pseudoconsoleViewport'
 import path from 'path'
 import os from 'os'
 import type {
@@ -51,6 +55,8 @@ const MAX_BUFFER_SIZE = 200000 // 200KB
 const SCROLLBACK_SIZE = 5000 // Keep up to 5000 lines in virtual terminal
 const TERMINAL_OUTPUT_RETIRE_TIMEOUT_MS = 10_000
 const TERMINAL_HEADLESS_REPLAY_CHUNK_SIZE = 64 * 1024
+const PSEUDOCONSOLE_REALIGN_QUIET_MS = 80
+const PSEUDOCONSOLE_REALIGN_MAX_ATTEMPTS = 8
 const PERSIST_FLUSH_DELAY_MS = 120
 const PRIVATE_UNIX_ECHO_SCAN_SIZE = 4096
 const COMMAND_TASK_ID_ALLOCATION_MAX_ATTEMPTS = 32
@@ -384,6 +390,17 @@ export class TerminalService {
   private pendingResizeByTerminal: Map<string, TerminalResizeTarget> = new Map()
   private buffers: Map<string, RingBuffer> = new Map()
   private headlessPtys: Map<string, TerminalType> = new Map()
+  /**
+   * Windows ConPTY only: a headless screen fed with the RAW pseudoconsole
+   * bytes of the current runtime (including output hidden from the renderer),
+   * i.e. where ConPTY itself believes the cursor is.
+   */
+  private pseudoconsoleShadowByTerminal: Map<string, TerminalType> = new Map()
+  private pseudoconsoleRealignTimerByTerminal = new Map<
+    string,
+    ReturnType<typeof setTimeout>
+  >()
+  private pseudoconsoleRealigning = new Set<string>()
   private selectionByTerminal: Map<string, string> = new Map()
   private tasksByTerminal: Map<string, Record<string, CommandTask>> = new Map()
   private detachedTasksByTerminal: Map<string, Record<string, CommandTask>> = new Map()
@@ -1421,6 +1438,12 @@ export class TerminalService {
       // Inject the banner directly into the local display state without
       // routing it through command-output capture.
       this.appendSyntheticDisplayData(terminalId, banner)
+      // Once the shell is up the banner lands below the live prompt. Hand the
+      // viewport back to ConPTY so the prompt is redrawn below the banner.
+      const tab = this.terminals.get(terminalId)
+      if (tab && !tab.isInitializing && tab.runtimeState === 'ready') {
+        this.alignRendererWithPseudoconsole(terminalId, { newRuntime: false })
+      }
     }, 500)
   }
 
@@ -1971,6 +1994,8 @@ export class TerminalService {
           tab.isInitializing = false
           tab.runtimeState = 'ready'
           shouldPublishTabsChanged = true
+          // Must precede this first visible chunk of the new runtime.
+          this.alignRendererWithPseudoconsole(terminalId, { newRuntime: true })
         }
       }
 
@@ -1980,6 +2005,11 @@ export class TerminalService {
       if (shouldPublishTabsChanged) {
         this.publishTerminalTabsChanged()
       }
+    }
+    const pseudoconsoleShadow = this.pseudoconsoleShadowByTerminal.get(terminalId)
+    if (pseudoconsoleShadow && data && !tab?.isInitializing) {
+      pseudoconsoleShadow.write(data)
+      this.schedulePseudoconsoleRealign(terminalId)
     }
     const taskRawDisplaySuppressed = this.shouldSuppressRawTaskDisplay(terminalId)
     const suppressRawDisplay = taskRawDisplaySuppressed
@@ -2093,10 +2123,161 @@ export class TerminalService {
     )
   }
 
+  /**
+   * Root cause of the Windows "cursor jumps back into existing content" bug:
+   * ConPTY draws with absolute rows relative to ITS viewport, which starts
+   * cleared (startup Clear-Host; the clear itself is swallowed with the
+   * pre-ready bootstrap bytes). The renderer viewport, however, also holds
+   * lines ConPTY never saw (restored history, session spacing, banner, the
+   * previous runtime's screen on reconnect). The first absolute cursor move
+   * then lands that many rows too high and overwrites content; a manual
+   * resize "fixes" it only because ConPTY repaints.
+   *
+   * Hand the viewport over explicitly: scroll every renderer row that holds
+   * content into scrollback (keeping history and session markers intact),
+   * home the cursor so the renderer matches ConPTY's cleared screen, then ask
+   * ConPTY to repaint so both screens agree exactly.
+   */
+  private usesPseudoconsoleViewport(tab: TerminalTab): boolean {
+    if (tab.type !== 'local') return false
+    const backend = this.getBackend(tab.type)
+    return (
+      typeof backend.requestRepaint === 'function' &&
+      backend.usesPseudoconsoleViewport?.(tab.ptyId) === true
+    )
+  }
+
+  private alignRendererWithPseudoconsole(
+    terminalId: string,
+    options: { newRuntime: boolean },
+  ): void {
+    const tab = this.terminals.get(terminalId)
+    if (!tab || !this.usesPseudoconsoleViewport(tab)) {
+      if (options.newRuntime) this.disposePseudoconsoleShadow(terminalId)
+      return
+    }
+    const backend = this.getBackend(tab.type)
+    const rows = Math.max(1, tab.rows)
+    if (options.newRuntime) {
+      // A fresh runtime starts on ConPTY's cleared screen (startup Clear-Host),
+      // with the cursor home. Track it from here on.
+      this.disposePseudoconsoleShadow(terminalId)
+      this.pseudoconsoleShadowByTerminal.set(
+        terminalId,
+        new Terminal({
+          cols: Math.max(1, tab.cols),
+          rows,
+          scrollback: 0,
+          allowProposedApi: true,
+        }),
+      )
+    }
+    if (this.getCurrentOffset(terminalId) > 0) {
+      const headless = this.headlessPtys.get(terminalId)
+      const usedRows = headless
+        ? Math.min(rows, headless.buffer.active.cursorY + 1)
+        : rows
+      this.pseudoconsoleRealigning.add(terminalId)
+      try {
+        this.appendSyntheticDisplayData(
+          terminalId,
+          buildPseudoconsoleViewportHandoff(rows, usedRows),
+        )
+      } finally {
+        this.pseudoconsoleRealigning.delete(terminalId)
+      }
+    }
+    // Startup bytes (including any winpty readiness line) were discarded
+    // before readiness; a repaint makes ConPTY restate its exact screen.
+    backend.requestRepaint?.(tab.ptyId)
+  }
+
+  private disposePseudoconsoleShadow(terminalId: string): void {
+    const timer = this.pseudoconsoleRealignTimerByTerminal.get(terminalId)
+    if (timer) clearTimeout(timer)
+    this.pseudoconsoleRealignTimerByTerminal.delete(terminalId)
+    this.pseudoconsoleShadowByTerminal.get(terminalId)?.dispose()
+    this.pseudoconsoleShadowByTerminal.delete(terminalId)
+  }
+
+  /**
+   * Debounced: once the output is quiet, compare the renderer cursor row with
+   * ConPTY's and emit display-only bytes that put them back on the same row.
+   */
+  private schedulePseudoconsoleRealign(terminalId: string, attempt = 0): void {
+    if (
+      !this.pseudoconsoleShadowByTerminal.has(terminalId) ||
+      this.pseudoconsoleRealigning.has(terminalId)
+    ) {
+      return
+    }
+    const existing = this.pseudoconsoleRealignTimerByTerminal.get(terminalId)
+    if (existing) clearTimeout(existing)
+    const timer = setTimeout(() => {
+      this.pseudoconsoleRealignTimerByTerminal.delete(terminalId)
+      void this.realignPseudoconsoleRows(terminalId, attempt)
+    }, PSEUDOCONSOLE_REALIGN_QUIET_MS)
+    timer.unref?.()
+    this.pseudoconsoleRealignTimerByTerminal.set(terminalId, timer)
+  }
+
+  private async realignPseudoconsoleRows(
+    terminalId: string,
+    attempt: number,
+  ): Promise<void> {
+    const shadow = this.pseudoconsoleShadowByTerminal.get(terminalId)
+    const headless = this.headlessPtys.get(terminalId)
+    if (!shadow || !headless) return
+    const offsetBefore = this.getCurrentOffset(terminalId)
+    const drained = await Promise.all([
+      new Promise<void>((resolve) => shadow.write('', resolve)),
+      this.outputFlowControllerByTerminal.get(terminalId)?.waitForDrain(500) ??
+        Promise.resolve(true),
+    ]).then(([, ok]) => ok)
+    await new Promise<void>((resolve) => headless.write('', resolve))
+    if (
+      this.pseudoconsoleShadowByTerminal.get(terminalId) !== shadow ||
+      this.headlessPtys.get(terminalId) !== headless
+    ) {
+      return
+    }
+    if (!drained || this.getCurrentOffset(terminalId) !== offsetBefore) {
+      if (attempt + 1 < PSEUDOCONSOLE_REALIGN_MAX_ATTEMPTS) {
+        this.schedulePseudoconsoleRealign(terminalId, attempt + 1)
+      }
+      return
+    }
+    const rendererBuffer = headless.buffer.active
+    const shadowBuffer = shadow.buffer.active
+    if (
+      rendererBuffer.type !== 'normal' ||
+      shadowBuffer.type !== 'normal' ||
+      headless.rows !== shadow.rows ||
+      headless.cols !== shadow.cols
+    ) {
+      return
+    }
+    const realignment = buildPseudoconsoleRowRealignment({
+      rows: headless.rows,
+      rendererCursorY: rendererBuffer.cursorY,
+      pseudoconsoleCursorY: shadowBuffer.cursorY,
+      pseudoconsoleCursorX: shadowBuffer.cursorX,
+    })
+    if (!realignment) return
+    this.pseudoconsoleRealigning.add(terminalId)
+    try {
+      this.appendSyntheticDisplayData(terminalId, realignment)
+    } finally {
+      this.pseudoconsoleRealigning.delete(terminalId)
+    }
+  }
+
   private appendSyntheticDisplayData(terminalId: string, data: string): void {
     if (!data) {
       return
     }
+    // Renderer-only rows move the renderer cursor without moving ConPTY's.
+    this.schedulePseudoconsoleRealign(terminalId)
 
     const headless = this.headlessPtys.get(terminalId)
     let writeSeq = 0
@@ -3032,6 +3213,7 @@ export class TerminalService {
     ) {
       return
     }
+    this.disposePseudoconsoleShadow(terminalId)
     // Retire the live generation before any asynchronous drain or restart.
     // Leases captured for the exited process must fail immediately, while a
     // newly captured lease can still authorize close/reconnect on the retained
@@ -3736,6 +3918,9 @@ export class TerminalService {
     if (headless) {
       headless.resize(size.cols, size.rows)
     }
+    this.pseudoconsoleShadowByTerminal
+      .get(terminalId)
+      ?.resize(size.cols, size.rows)
   }
 
   kill(
@@ -3813,6 +3998,7 @@ export class TerminalService {
         headless.dispose()
         this.headlessPtys.delete(terminalId)
       }
+      this.disposePseudoconsoleShadow(terminalId)
 
       // Thoroughly clean up live runtime and UI state for this terminal.
       this.terminals.delete(terminalId)
