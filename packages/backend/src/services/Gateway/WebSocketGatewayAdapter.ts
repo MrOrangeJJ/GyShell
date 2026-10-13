@@ -1,4 +1,5 @@
 import { readOpaqueNonBlankWellFormedString } from "@gyshell/shared";
+import type { TerminalActivitySnapshot } from "@gyshell/shared";
 import type {
   IGatewayRuntime,
   StartTaskInput,
@@ -34,6 +35,7 @@ type WebSocketRpcMethod =
   | "terminal:reconnect"
   | "terminal:setSelection"
   | "terminal:getBufferDelta"
+  | "terminal:getActivities"
   | "terminal:generateCommandDraft"
   | "filesystem:list"
   | "filesystem:readTextFile"
@@ -176,6 +178,11 @@ export interface WebSocketGatewayAdapterOptions {
           remoteOs?: "unix" | "windows";
           windowsRelease?: string;
         }>;
+    getActivities?: (
+      terminalId: string,
+    ) =>
+      | { activities: TerminalActivitySnapshot[] }
+      | Promise<{ activities: TerminalActivitySnapshot[] }>;
     generateCommandDraft?: (
       terminalId: string,
       prompt: string,
@@ -1056,6 +1063,17 @@ export class WebSocketGatewayAdapter {
           Number.MAX_SAFE_INTEGER,
         );
         return await bridge.getBufferDelta(terminalId, fromOffset);
+      }
+      case "terminal:getActivities": {
+        const bridge = this.options.terminalBridge;
+        if (!bridge?.getActivities) {
+          throw new WebSocketRpcError(
+            "METHOD_NOT_FOUND",
+            "terminal:getActivities is not available on this websocket gateway.",
+          );
+        }
+        const terminalId = this.readStringParam(params, "terminalId");
+        return await bridge.getActivities(terminalId);
       }
       case "terminal:generateCommandDraft": {
         const bridge = this.options.terminalBridge;

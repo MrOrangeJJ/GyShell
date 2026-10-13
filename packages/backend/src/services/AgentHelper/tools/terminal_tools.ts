@@ -1,3 +1,4 @@
+import { describeTerminalConnectionStatus } from '@gyshell/shared'
 import { z } from 'zod'
 import type { ToolExecutionContext } from '../types'
 import type { CommandResult } from '../../../types'
@@ -37,7 +38,7 @@ const boundedCommandHistoryIdSchema = z
     }
   )
 
-export const execCommandSchema = z.object({
+const execCommandFields = {
   terminalId: terminalIdSchema,
   command: z
     .string()
@@ -48,12 +49,37 @@ export const execCommandSchema = z.object({
         'command must be one physical shell submission and cannot contain CR, LF, or NUL. For a multi-line script, use write_file in the terminal temporary directory, then execute that file with a one-line exec_command.',
     })
     .describe('One physical shell command to execute'),
+  intent: z
+    .string()
+    .max(40, 'intent must be at most 40 characters.')
+    .refine(
+      (value) => value.trim().length > 0,
+      'intent must not be empty.'
+    )
+    .refine(
+      (value) => !/[\u0000-\u001f\u007f-\u009f]/.test(value),
+      'intent must be plain text without control characters.'
+    )
+    .describe('A concise plain-text description of the command intent, at most 40 characters.'),
   waitMode: z
     .enum(['wait', 'nowait'])
     .optional()
     .default('wait')
     .describe('Execution mode: "wait" runs synchronously and waits for completion; "nowait" runs asynchronously and returns immediately.')
-}).strict()
+} as const
+
+/**
+ * Model-facing schema: intent is required so every new tool call carries a
+ * timeline label. The runtime schema below remains compatible with older
+ * persisted/replayed calls that predate the required activity label.
+ */
+export const execCommandSchema = z.object(execCommandFields).strict()
+const execCommandRuntimeSchema = z
+  .object({
+    ...execCommandFields,
+    intent: execCommandFields.intent.optional(),
+  })
+  .strict()
 
 export const readTerminalTabSchema = z.object({
   terminalId: terminalIdSchema,
@@ -321,15 +347,15 @@ function enqueueNowaitCompletionNotification(params: {
 }
 
 export async function runCommand(
-  args: z.infer<typeof execCommandSchema>,
+  args: z.input<typeof execCommandRuntimeSchema>,
   context: ToolExecutionContext,
   options?: RunCommandOptions
 ): Promise<string> {
-  const validation = execCommandSchema.safeParse(args)
+  const validation = execCommandRuntimeSchema.safeParse(args)
   if (!validation.success) {
     return `Parameter validation error for exec_command: ${validation.error.message}`
   }
-  const { terminalId, command } = validation.data
+  const { terminalId, command, intent } = validation.data
   const { terminalService, sessionId, messageId } = context
   
   abortIfNeeded(context.signal)
@@ -428,6 +454,12 @@ export async function runCommand(
         publishAsyncCompletion(finished)
       },
       runtimeGuard: resolved.runtimeGuard,
+      activityContext: {
+        actor: 'agent',
+        sessionId,
+        messageId,
+        ...(intent ? { intent } : {})
+      }
     })
     const historyCommandMatchId = result.history_command_match_id
     let executionState: CommandExecutionState =
@@ -612,12 +644,12 @@ export async function runCommand(
   }
 }
 
-export async function runCommandNowait(args: z.infer<typeof execCommandSchema>, context: ToolExecutionContext): Promise<string> {
-  const validation = execCommandSchema.safeParse(args)
+export async function runCommandNowait(args: z.input<typeof execCommandRuntimeSchema>, context: ToolExecutionContext): Promise<string> {
+  const validation = execCommandRuntimeSchema.safeParse(args)
   if (!validation.success) {
     return `Parameter validation error for exec_command: ${validation.error.message}`
   }
-  const { terminalId, command } = validation.data
+  const { terminalId, command, intent } = validation.data
   const { terminalService, sessionId, messageId } = context
   
   abortIfNeeded(context.signal)
@@ -696,7 +728,13 @@ export async function runCommandNowait(args: z.infer<typeof execCommandSchema>, 
         publishAsyncCompletion(finished)
       },
       context.signal,
-      resolved.runtimeGuard
+      resolved.runtimeGuard,
+      {
+        actor: 'agent',
+        sessionId,
+        messageId,
+        ...(intent ? { intent } : {})
+      }
     )
     const source = resolveCommandOutputSource({
       context,
@@ -813,7 +851,10 @@ export async function readTerminalTab(args: z.infer<typeof readTerminalTabSchema
   if (!finalSnapshot) {
     return `Error: Terminal tab ${JSON.stringify(bestMatch.id)} was closed while it was being read.`
   }
-  const finalResult = `${formatTerminalStatusHeader(finalSnapshot)}
+  const connectionNote = describeTerminalConnectionStatus(
+    terminalService.getTerminalConnectionStatus?.(bestMatch.id),
+  )
+  const finalResult = `${formatTerminalStatusHeader(finalSnapshot)}${connectionNote ? `\nConnection status: ${connectionNote}` : ''}
 The following is the current visible state of the terminal tab "${bestMatch.title || bestMatch.id}":
 <terminal_content>
 ${terminalContent}
@@ -864,8 +905,10 @@ export async function readCommandOutput(
       )
     : undefined
   const recordIsDetached = recordLocation === 'detached'
+  const recordIsPersisted = recordLocation === 'persisted'
+  const recordIsHistorical = recordIsDetached || recordIsPersisted
   const terminalResolution = resolveTerminalForTool(context, terminalId)
-  if (!terminalResolution.ok && !recordIsDetached) {
+  if (!terminalResolution.ok && !recordIsHistorical) {
     const errorText = terminalResolution.message
     sendEvent(sessionId, {
       messageId,

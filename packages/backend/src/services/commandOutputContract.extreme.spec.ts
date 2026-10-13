@@ -841,6 +841,7 @@ runCase('schemas reject ambiguous command and paging inputs before dispatch', ()
     execCommandSchema.safeParse({
       terminalId: 'local',
       command: "printf 'one\\ntwo'",
+      intent: 'Print two lines',
       waitMode: 'wait',
     }).success,
     'escaped newline text in one physical command remains valid'

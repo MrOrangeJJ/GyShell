@@ -15,6 +15,8 @@ export const DEFAULT_UI_SETTINGS: UiSettings = {
     fontSize: 14,
     lineHeight: 1.2,
     scrollback: 5000,
+    saveHistory: true,
+    viewMode: 'classic',
     cursorStyle: 'block',
     cursorBlink: true,
     copyOnSelect: true,
@@ -62,6 +64,12 @@ function normalizeUiSettings(settings: UiSettings): UiSettings {
   }
   if (typeof next.terminal.scrollback !== 'number' || next.terminal.scrollback < 0) {
     next.terminal.scrollback = 5000
+  }
+  if (typeof next.terminal.saveHistory !== 'boolean') {
+    next.terminal.saveHistory = true
+  }
+  if (next.terminal.viewMode !== 'classic' && next.terminal.viewMode !== 'block') {
+    next.terminal.viewMode = 'classic'
   }
   if (typeof next.terminal.commandDraftShortcut !== 'string') {
     next.terminal.commandDraftShortcut = 'Mod+O'

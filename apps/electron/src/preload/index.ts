@@ -136,6 +136,8 @@ interface UiSettings {
     fontSize: number;
     lineHeight: number;
     scrollback: number;
+    saveHistory: boolean;
+    viewMode: "classic" | "block";
     cursorStyle: "block" | "underline" | "bar";
     cursorBlink: boolean;
     copyOnSelect: boolean;
@@ -439,6 +441,49 @@ interface TerminalSummary {
   remoteOs?: "unix" | "windows";
   systemInfo?: TerminalSystemInfo;
   monitorIdentity?: string;
+  /** Transient connection progress/failure; runtime metadata only. */
+  connectionStatus?: TerminalConnectionStatus;
+}
+
+interface TerminalConnectionStatus {
+  phase: "connecting" | "failed";
+  lines: Array<{
+    level: "info" | "success" | "warning" | "error";
+    text: string;
+    at: number;
+  }>;
+  updatedAt: number;
+}
+
+interface TerminalActivitySnapshot {
+  id: string;
+  terminalId: string;
+  kind: "command";
+  actor: "user" | "agent";
+  origin: "interactive-shell" | "agent-exec-command";
+  status: "running" | "succeeded" | "failed" | "aborted" | "outcome-unknown";
+  revision: number;
+  startedAt: number;
+  updatedAt: number;
+  endedAt?: number;
+  command?: string;
+  intent?: string;
+  exitCode?: number;
+  startOffset: number;
+  endOffset?: number;
+  runtimeGeneration?: number;
+  shellSequence?: number;
+  sessionId?: string;
+  messageId?: string;
+}
+
+interface TerminalSessionBoundary {
+  id: string;
+  terminalId: string;
+  resumedAt: number;
+  offset: number;
+  lastCommand?: string;
+  exitCode?: number;
 }
 
 // Connection Config Types
@@ -658,6 +703,12 @@ export interface GyShellAPI {
       remoteOs?: "unix" | "windows";
       windowsRelease?: string;
     }>;
+    getActivities: (
+      terminalId: string,
+    ) => Promise<{ activities: TerminalActivitySnapshot[] }>;
+    getSessionBoundaries: (
+      terminalId: string,
+    ) => Promise<{ boundaries: TerminalSessionBoundary[] }>;
     attachOutputConsumer: (
       terminalId: string,
       consumerId: string,
@@ -667,6 +718,7 @@ export interface GyShellAPI {
       offset: number;
       remoteOs?: "unix" | "windows";
       windowsRelease?: string;
+      sessionBoundaries?: TerminalSessionBoundary[];
     }>;
     detachOutputConsumer: (terminalId: string, consumerId: string) => void;
     acknowledgeOutput: (
@@ -694,6 +746,9 @@ export interface GyShellAPI {
         outputSequence?: number;
         runtimeGeneration?: number;
       } & TerminalRenderMetadata) => void,
+    ) => () => void;
+    onActivity: (
+      callback: (data: { activity: TerminalActivitySnapshot }) => void,
     ) => () => void;
     onExit: (
       callback: (data: { terminalId: string; code: number }) => void,
@@ -1162,6 +1217,10 @@ const api: GyShellAPI = {
       ipcRenderer.invoke("terminal:setSelection", terminalId, selectionText),
     getBufferDelta: (terminalId, fromOffset) =>
       ipcRenderer.invoke("terminal:getBufferDelta", terminalId, fromOffset),
+    getActivities: (terminalId) =>
+      ipcRenderer.invoke("terminal:getActivities", terminalId),
+    getSessionBoundaries: (terminalId) =>
+      ipcRenderer.invoke("terminal:getSessionBoundaries", terminalId),
     attachOutputConsumer: (terminalId, consumerId) =>
       ipcRenderer.invoke(
         "terminal:attachOutputConsumer",
@@ -1220,6 +1279,14 @@ const api: GyShellAPI = {
       ) => callback(data);
       ipcRenderer.on("terminal:data", handler);
       return () => ipcRenderer.off("terminal:data", handler);
+    },
+    onActivity: (callback) => {
+      const handler = (
+        _: IpcRendererEvent,
+        data: { activity: TerminalActivitySnapshot },
+      ) => callback(data);
+      ipcRenderer.on("terminal:activity", handler);
+      return () => ipcRenderer.off("terminal:activity", handler);
     },
     onExit: (callback) => {
       const handler = (

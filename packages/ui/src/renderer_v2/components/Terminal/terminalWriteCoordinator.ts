@@ -13,6 +13,7 @@ interface DeferredTerminalWrite {
   transition?: TerminalWriteTransition
   completions: Array<() => void>
   failures: Array<(error: Error) => void>
+  checkpoint?: boolean
 }
 
 const MAX_XTERM_WRITE_CHUNK_CODE_UNITS = 64 * 1024
@@ -127,7 +128,8 @@ export class TerminalWriteCoordinator {
         data,
         transition,
         completions: completion ? [completion] : [],
-        failures: failure ? [failure] : []
+        failures: failure ? [failure] : [],
+        checkpoint: false
       })
       return
     }
@@ -138,6 +140,31 @@ export class TerminalWriteCoordinator {
       completion ? [completion] : [],
       failure ? [failure] : []
     )
+  }
+
+  /**
+   * Runs after every write accepted before this call and before any write
+   * accepted after it. Unlike waitForDrain(), this is an ordering fence: later
+   * writes cannot move the callback to the end of a continuously growing
+   * stream.
+   */
+  checkpoint(completion: () => void): void {
+    if (this.disposed || this.failed) return
+    if (
+      this.refitBarrierActive ||
+      this.pendingWriteCount > 0 ||
+      this.deferredWrites.length > 0 ||
+      this.chunkedWriteActive
+    ) {
+      this.deferredWrites.push({
+        data: '',
+        completions: [completion],
+        failures: [],
+        checkpoint: true
+      })
+      return
+    }
+    completion()
   }
 
   private dispatchWrite(
@@ -262,12 +289,17 @@ export class TerminalWriteCoordinator {
     }
 
     const first = this.deferredWrites.shift()!
+    if (first.checkpoint) {
+      this.dispatchWrite('', undefined, first.completions, first.failures)
+      return
+    }
     const groupKey = first.transition?.key ?? this.activeTransitionKey
     let data = first.data
     const completions = [...first.completions]
     const failures = [...first.failures]
     while (this.deferredWrites.length > 0) {
       const next = this.deferredWrites[0]
+      if (next.checkpoint) break
       const nextKey = next.transition?.key ?? groupKey
       if (nextKey !== groupKey) break
       const grouped = this.deferredWrites.shift()!

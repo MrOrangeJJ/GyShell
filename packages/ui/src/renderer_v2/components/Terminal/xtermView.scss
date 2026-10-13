@@ -13,6 +13,36 @@
   overflow: hidden;
 }
 
+/* --terminal-footer-height is set on .xterm-shell (terminalViewChrome.ts). */
+.xterm-shell:has(.xterm-classic-toolbar) .xterm-host {
+  height: calc(100% - var(--terminal-footer-height));
+}
+
+.xterm-shell.is-block-mode .xterm-host {
+  /* The Block view is a projection over the same terminal. Keep PTY
+     dimensions stable while switching views; the dock aperture clips it
+     without resizing the underlying xterm. */
+  position: absolute;
+  inset: 0;
+  height: 100%;
+  z-index: 1;
+}
+
+.xterm-shell.is-block-mode:not(.is-block-native):not(.is-block-input) .xterm-host {
+  opacity: 0;
+  pointer-events: none;
+}
+
+.xterm-shell.is-block-mode.is-block-input .xterm-host {
+  z-index: 6;
+  opacity: 1;
+  pointer-events: auto;
+}
+
+.xterm-shell.is-block-mode:not(.is-block-native) .xterm-command-draft-status {
+  display: none;
+}
+
 .xterm-host .xterm {
   height: 100%;
   background: var(--app-bg) !important;
@@ -92,4 +122,29 @@
 
 .xterm-command-draft-status-text {
   color: var(--fg);
+}
+
+/* "View in Terminal" landing: the command's rows glow briefly, then fade. */
+.terminal-reveal-flash {
+  pointer-events: none;
+  background: color-mix(in srgb, var(--accent) 24%, transparent);
+  box-shadow: inset 2px 0 0 var(--accent);
+  animation: terminal-reveal-flash var(--terminal-reveal-flash-duration)
+    ease-out forwards;
+}
+
+@keyframes terminal-reveal-flash {
+  0%,
+  45% {
+    opacity: 1;
+  }
+  100% {
+    opacity: 0;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .terminal-reveal-flash {
+    animation: none;
+  }
 }

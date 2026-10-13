@@ -9,7 +9,7 @@ const ELECTRON_RUNTIME_PACKAGE_NAME = "better-sqlite3-electron";
 
 type BetterSqlite3Constructor = typeof import("better-sqlite3");
 type BetterSqlite3OpenOptions = ConstructorParameters<BetterSqlite3Constructor>[1];
-type DatabaseHandle = InstanceType<typeof import("better-sqlite3")>;
+export type DatabaseHandle = InstanceType<typeof import("better-sqlite3")>;
 
 let cachedConstructor: BetterSqlite3Constructor | null = null;
 let cachedPackageName: string | null = null;
@@ -127,4 +127,13 @@ export function openBetterSqlite3Database(
       ].join("\n"),
     );
   }
+}
+
+/** Connection pragmas shared by every GyShell SQLite store. */
+export function applyStandardSqlitePragmas(db: DatabaseHandle): void {
+  db.pragma("foreign_keys = ON");
+  db.pragma("journal_mode = WAL");
+  db.pragma("synchronous = NORMAL");
+  db.pragma("temp_store = MEMORY");
+  db.pragma("cache_size = -32000");
 }

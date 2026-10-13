@@ -129,6 +129,32 @@ runCase('serializes distinct metadata transitions around their matching data', (
   )
 })
 
+runCase('keeps checkpoints between older and newer parser writes', () => {
+  const events: string[] = []
+  const callbacks: Array<() => void> = []
+  const coordinator = new TerminalWriteCoordinator((data, callback) => {
+    events.push(`write:${data}`)
+    callbacks.push(callback)
+  })
+
+  coordinator.write('before')
+  coordinator.checkpoint(() => events.push('checkpoint'))
+  coordinator.write('after-a')
+  coordinator.write('after-b')
+  assertEqual(
+    events.join('|'),
+    'write:before',
+    'the checkpoint and newer writes should wait for the older parser write'
+  )
+
+  callbacks.shift()?.()
+  assertEqual(
+    events.join('|'),
+    'write:before|checkpoint|write:after-aafter-b',
+    'the checkpoint must run before coalesced newer output'
+  )
+})
+
 runCase('dispose ignores later output and drain notifications', () => {
   const writes: string[] = []
   const coordinator = new TerminalWriteCoordinator((data, callback) => {

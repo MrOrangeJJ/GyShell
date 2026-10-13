@@ -4,8 +4,12 @@ import type {
   CommandOutputContractV1,
   ModelRequestParameters,
   TerminalConnectionCapabilities,
+  TerminalConnectionStatus,
+  TerminalConnectionStatusLine,
 } from '@gyshell/shared'
 export type {
+  TerminalConnectionStatus,
+  TerminalConnectionStatusLevel,
   CommandCaptureMetadata,
   CommandExecutionState,
   CommandOutputContractV1,
@@ -312,6 +316,9 @@ export const isSshConnectionConfig = (config: {
   type: string
 }): config is SSHConnectionConfig => config.type === 'ssh'
 
+/** A connection status line as emitted by a backend, before it is timestamped. */
+export type TerminalBackendStatusEvent = Omit<TerminalConnectionStatusLine, 'at'>
+
 export interface TerminalTab {
   id: string
   ptyId: string
@@ -325,6 +332,8 @@ export interface TerminalTab {
   lastExitCode?: number
   remoteOs?: 'unix' | 'windows'
   systemInfo?: TerminalSystemInfo
+  /** Transient, in-memory only connection status (never persisted). */
+  connectionStatus?: TerminalConnectionStatus
 }
 
 export interface TerminalSystemInfo {
@@ -393,11 +402,19 @@ export interface TerminalCommandTrackingUpdate {
   outputCaptureFailed?: boolean
 }
 
+export interface TerminalCommandActivityContext {
+  actor: 'agent'
+  sessionId?: string
+  messageId?: string
+  intent?: string
+}
+
 export interface CommandTask {
   id: string
   command: string
   wireCommand?: string
   completionTracking?: TerminalCommandTrackingToken
+  activityContext?: TerminalCommandActivityContext
   /** Manual input after this authenticated prompt belongs to a later command. */
   /** Human-input revision captured immediately before this task was dispatched. */
   inputRevisionAtDispatch?: number
@@ -407,6 +424,8 @@ export interface CommandTask {
   status: 'running' | 'finished' | 'aborted' | 'timeout'
   startOffset: number
   endOffset?: number
+  /** End boundary in the raw visible terminal stream used by UI markers. */
+  activityEndOffset?: number
   exitCode?: number
   output?: string
   capture?: CommandCaptureMetadata
@@ -782,7 +801,8 @@ export interface TerminalSessionBackend {
   kill(ptyId: string): void
 
   /**
-   * Subscribe to data events from the backend.
+   * Subscribe to data events from the backend. If output arrives before a
+   * subscriber is attached, the backend retains it and delivers it once.
    */
   onData(ptyId: string, callback: (data: string) => void): void
 
@@ -791,7 +811,8 @@ export interface TerminalSessionBackend {
   resumeOutput?(ptyId: string): void
 
   /**
-   * Subscribe to exit events.
+   * Subscribe to exit events. An exit that occurs before subscription is
+   * delivered once when the callback is attached.
    */
   onExit(ptyId: string, callback: (code: number) => void): void
 
@@ -799,6 +820,14 @@ export interface TerminalSessionBackend {
   requestRepaint?(ptyId: string): boolean
   /** True when the runtime draws with absolute rows of its own viewport (ConPTY). */
   usesPseudoconsoleViewport?(ptyId: string): boolean
+
+  /**
+   * Subscribe to transport/setup status lines ("Connecting to ...",
+   * "Connection failed: ..."). Status is runtime metadata and must never be
+   * emitted through onData, because terminal content is persisted and
+   * restored. Lines emitted before subscription are replayed once.
+   */
+  onStatus?(ptyId: string, callback: (event: TerminalBackendStatusEvent) => void): void
 
   /**
    * Get current working directory for the session.

@@ -266,6 +266,18 @@ export const TerminalPanel: React.FC<TerminalPanelProps> = ({
                 </div>
               </div>
 
+              {activeTerminal.connectionStatus?.lines.length ? (
+                <p
+                  className={
+                    activeTerminal.connectionStatus.phase === "failed"
+                      ? "terminal-reconnect-error"
+                      : "terminal-exit-hint"
+                  }
+                  role="status"
+                >
+                  {activeTerminal.connectionStatus.lines.at(-1)?.text}
+                </p>
+              ) : null}
               {canReconnect ? (
                 <p className="terminal-exit-hint">{t.terminal.sshExited}</p>
               ) : null}

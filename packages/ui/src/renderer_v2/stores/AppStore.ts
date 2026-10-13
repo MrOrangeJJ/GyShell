@@ -24,6 +24,7 @@ import type {
   FileTransferTaskSnapshot,
   ProxyEntry,
   TunnelEntry,
+  TerminalViewMode,
 } from "../lib/ipcTypes";
 import { applyAppThemeFromTerminalScheme } from "../theme/appTheme";
 import { resolveTheme } from "../theme/themes";
@@ -333,6 +334,8 @@ export interface TerminalTabModel {
   remoteOs?: TerminalListEntry["remoteOs"];
   systemInfo?: TerminalListEntry["systemInfo"];
   monitorIdentity?: string;
+  /** Transient runtime metadata from the backend; never persisted. */
+  connectionStatus?: TerminalListEntry["connectionStatus"];
 }
 type TerminalListPayload = Awaited<
   ReturnType<Window["gyshell"]["terminal"]["list"]>
@@ -513,6 +516,7 @@ export class AppStore {
       monitorTabs: computed,
       panelTabDisplayMode: computed,
       chatDisplayMode: computed,
+      terminalViewMode: computed,
       preventSleepWhileRunning: computed,
       agentSettingState: computed,
       commandDraftProfileId: computed,
@@ -529,6 +533,7 @@ export class AppStore {
       reconnectTerminal: action,
       closeTab: action,
       setActiveTerminal: action,
+      setTerminalViewMode: action,
       setTerminalSelection: action,
       setFileSystemClipboard: action,
       clearFileSystemClipboard: action,
@@ -1437,6 +1442,15 @@ export class AppStore {
     return this.settings?.chat?.displayMode ?? "classic";
   }
 
+  /**
+   * One view for every terminal tab and panel, so switching tabs never flips
+   * between Classic and Block. Persisted as `terminal.viewMode`, so the last
+   * choice survives a restart.
+   */
+  get terminalViewMode(): TerminalViewMode {
+    return this.settings?.terminal?.viewMode === "block" ? "block" : "classic";
+  }
+
   get preventSleepWhileRunning(): boolean {
     return this.settings?.runtime?.preventSleepWhileRunning !== false;
   }
@@ -1634,6 +1648,7 @@ export class AppStore {
           title,
           runtimeState: item.runtimeState,
           lastExitCode: item.lastExitCode,
+          connectionStatus: item.connectionStatus,
           remoteOs: item.remoteOs ?? existing.remoteOs,
           systemInfo: item.systemInfo ?? existing.systemInfo,
           monitorIdentity: item.monitorIdentity ?? existing.monitorIdentity,
@@ -1659,6 +1674,7 @@ export class AppStore {
         monitorIdentity: item.monitorIdentity,
         runtimeState: item.runtimeState,
         lastExitCode: item.lastExitCode,
+        connectionStatus: item.connectionStatus,
         remoteOs: item.remoteOs,
         systemInfo: item.systemInfo,
       };
@@ -3283,6 +3299,7 @@ export class AppStore {
       if (!current) return;
       current.runtimeState = "initializing";
       current.lastExitCode = undefined;
+      current.connectionStatus = undefined;
     });
 
     try {
@@ -3537,6 +3554,12 @@ export class AppStore {
       startMode,
     });
     return true;
+  }
+
+  /** Used by the terminal footer switch and Settings → General → Terminal. */
+  setTerminalViewMode(viewMode: TerminalViewMode): void {
+    if (this.settings?.terminal?.viewMode === viewMode) return;
+    void this.setTerminalSettings({ viewMode });
   }
 
   setActiveTerminal(id: string): void {

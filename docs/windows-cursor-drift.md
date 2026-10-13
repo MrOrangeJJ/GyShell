@@ -4,7 +4,8 @@
 
 In a local Windows PowerShell tab the cursor (where the terminal will write
 next) sometimes jumps up into rows that are already filled. After that, Enter
-or command output overwrites old content. Resizing the panel puts everything right again.
+or command output overwrites old content. The "Session Resumed" divider can
+end up on top of prompt lines. Resizing the panel puts everything right again.
 
 ## Root cause
 
@@ -20,6 +21,7 @@ has rows ConPTY never produced, and it lacks rows ConPTY did produce:
 | Where the screens diverge | Code | Effect on renderer vs. ConPTY rows |
 |---|---|---|
 | Startup bytes before the readiness marker, including ConPTY's own clear, are dropped (`Clear-Host` in `windowsPowerShellTracking.ts`; pre-ready buffering in `NodePtyBackend`) | renderer is not cleared | ConPTY is at row 1 while the renderer is below old content |
+| Restored durable history plus the session spacing (`restoreTerminalPersistence`) | renderer only | renderer is N rows lower |
 | Banner written on a 500 ms timer (`printBanner`) | renderer only | renderer is 7 rows lower |
 | Agent commands run through the PowerShell sidecar (`synthetic-transcript`): the raw dispatch echo is hidden and a synthetic transcript is written instead | rows differ both ways | either direction |
 | Local reconnect: a new ConPTY under the old renderer screen | renderer only | renderer is lower |
@@ -43,6 +45,12 @@ row. A resize "fixes" it only because ConPTY then redraws its whole viewport.
   - The same stream with no renderer-only rows renders correctly.
   - Renderer rows ≠ PTY rows with no injected lines also renders correctly.
   - So a size mismatch is **not** the cause.
+- `terminalPersistence.extreme.spec.ts`, case *"Windows ConPTY runtime is
+  realigned below restored history and synthetic rows"*, runs the real
+  `TerminalService` restore → ready → ConPTY output → synthetic transcript →
+  input path. With the fix disabled (the helpers made to return `''`), it fails:
+  - restored rows are overwritten: the first row becomes `PS C:\> dir`;
+  - after the transcript the renderer row is 7 while the ConPTY row is 4.
 
 ## Previous fix attempts (git history)
 
@@ -65,7 +73,7 @@ moved into scrollback instead:
    and `buildPseudoconsoleViewportHandoff`.
    - Every used renderer row is scrolled into scrollback and the cursor is
      moved home. The renderer then matches ConPTY's freshly cleared screen,
-     while earlier output stays intact above it.
+     while restored history and the divider stay intact above it.
    - Then a ConPTY repaint is requested (`NodePtyBackend.requestRepaint`), so
      ConPTY restates its exact screen. This does the same thing a manual
      resize did.
@@ -78,6 +86,27 @@ moved into scrollback instead:
      cursor onto ConPTY's row. Code: `buildPseudoconsoleRowRealignment`.
    - If the renderer is too low, older rows scroll into scrollback. If it is
      too high, blank rows are inserted at the top.
+3. **Divider spacing.** Two line breaks are always written at a session
+   boundary, so the divider row never shares a row with the first new prompt.
+   Before this change, the spacing was a single line break whenever the
+   restored text ended in `\n`.
 
 This applies only to local runtimes whose backend reports
 `usesPseudoconsoleViewport()` (Windows). macOS and Linux paths are unchanged.
+
+## Other "Session Resumed" placement fixes (item 2c)
+
+- **Clear-screen.** `cls`/`clear` (ED2) erased the rows under the divider,
+  and later output was then drawn on the divider row. The renderer now uses
+  `scrollOnEraseInDisplay`, the same behavior as Windows Terminal, iTerm and
+  Terminal.app: cleared rows move into scrollback with their divider. ED3
+  (clear scrollback) still removes both.
+- **The divider never hides content.** It is only drawn while its reserved
+  row is blank (`terminalSessionDividerPlacement.ts`). After an unexpected
+  full redraw it disappears instead of covering text.
+- **Fallback divider anchor.** Boundaries restored through `offsetAnchors`
+  pointed at the restored prompt row instead of the spacing row below it.
+  They are now shifted by one row, as `registerRestoreMarker(1)` does.
+- **Split SSH bootstrap clear.** A restored SSH tab dropped the reconnect clear
+  only if it arrived as one chunk. A clear split across chunks erased the
+  restored rows. Partial prefixes are now held until they are confirmed.

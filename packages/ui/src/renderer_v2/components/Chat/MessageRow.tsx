@@ -18,6 +18,7 @@ import {
   SeamlessToolGroupBanner,
 } from "./ChatBanner";
 import type { ChatBannerUiState } from "./chatBannerUiState";
+import { useCopyFeedback } from "../Common/useCopyFeedback";
 import { isSeamlessGroupRunning } from "./seamlessToolPresentation";
 
 interface MessageRowProps {
@@ -41,8 +42,6 @@ interface MessageRowProps {
   isSearchMatch?: boolean;
   isActiveSearchMatch?: boolean;
 }
-
-const COPY_FEEDBACK_MS = 1200;
 
 const extractNodeText = (node: React.ReactNode): string => {
   if (typeof node === "string" || typeof node === "number") return String(node);
@@ -83,28 +82,7 @@ export const MessageRow: React.FC<MessageRowProps> = observer(
     const session = store.chat.getSessionById(sessionId);
     const msg = session?.messagesById.get(messageId);
 
-    const [copiedKey, setCopiedKey] = React.useState<string | null>(null);
-    const copyTimerRef = React.useRef<ReturnType<typeof setTimeout> | null>(
-      null,
-    );
-
-    React.useEffect(() => {
-      return () => {
-        if (copyTimerRef.current) {
-          clearTimeout(copyTimerRef.current);
-        }
-      };
-    }, []);
-
-    const markCopied = React.useCallback((key: string) => {
-      setCopiedKey(key);
-      if (copyTimerRef.current) {
-        clearTimeout(copyTimerRef.current);
-      }
-      copyTimerRef.current = setTimeout(() => {
-        setCopiedKey((current) => (current === key ? null : current));
-      }, COPY_FEEDBACK_MS);
-    }, []);
+    const { copiedKey, markCopied } = useCopyFeedback();
 
     const normalizedAssistantGroupMessageIds = assistantGroupMessageIds.filter(
       (id) => typeof id === "string" && id.length > 0,

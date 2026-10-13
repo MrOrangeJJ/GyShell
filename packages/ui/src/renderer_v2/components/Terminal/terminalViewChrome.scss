@@ -1,0 +1,135 @@
+// Footer of both terminal views. Height comes from TERMINAL_FOOTER_HEIGHT_PX
+// (terminalViewChrome.ts) via --terminal-footer-height on .xterm-shell.
+.terminal-view-toolbar {
+  height: var(--terminal-footer-height);
+  min-height: var(--terminal-footer-height);
+  box-sizing: border-box;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0 8px;
+  border-top: 1px solid var(--border);
+  background: var(--app-bg);
+  color: var(--fg-muted);
+  font: 11px/1 var(--font-mono);
+  letter-spacing: 0;
+  user-select: none;
+  pointer-events: auto;
+}
+
+.terminal-classic-context {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  flex: 1;
+  min-width: 0;
+  height: 28px;
+  padding: 0 3px;
+  border: 0;
+  border-radius: 2px;
+  background: transparent;
+  color: var(--fg-muted);
+  font: inherit;
+  text-align: left;
+
+  > svg,
+  .terminal-classic-context-phase,
+  .terminal-classic-context-status {
+    flex: none;
+    white-space: nowrap;
+  }
+
+  .terminal-classic-context-title {
+    flex: 1;
+    min-width: 0;
+    color: var(--fg);
+    overflow: hidden;
+    white-space: nowrap;
+    text-overflow: ellipsis;
+  }
+
+  &.is-agent > svg:first-child {
+    color: var(--accent);
+  }
+  &.is-running .terminal-classic-context-phase {
+    color: var(--accent);
+  }
+  &.is-failed .terminal-classic-context-status,
+  &.is-aborted .terminal-classic-context-status {
+    color: var(--danger);
+  }
+  &.is-outcome-unknown .terminal-classic-context-status {
+    color: var(--warning);
+  }
+
+  &:enabled {
+    cursor: pointer;
+  }
+  &:enabled:hover {
+    background: color-mix(in srgb, var(--fg) 8%, var(--panel-bg));
+  }
+  &:focus-visible {
+    outline: 1px solid var(--accent);
+    outline-offset: -1px;
+  }
+}
+
+.terminal-view-toolbar-idle {
+  flex: 1;
+  min-width: 0;
+}
+
+.terminal-connection-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  flex: 1;
+  min-width: 0;
+  color: var(--warning);
+  white-space: nowrap;
+  text-transform: uppercase;
+}
+
+.terminal-connection-status > svg {
+  flex: none;
+  animation: terminal-connection-spin 1s linear infinite;
+}
+
+@keyframes terminal-connection-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.terminal-connection-status.is-exited {
+  color: var(--fg-faint);
+}
+
+// A failed connection keeps its reason in the footer after the card is
+// hidden; clicking it brings the card (and Reconnect) back.
+button.terminal-connection-status.is-failed {
+  height: 22px;
+  padding: 0 6px 0 0;
+  border: 0;
+  background: transparent;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+
+  > span:first-child {
+    flex: none;
+    color: var(--danger);
+  }
+
+  &:hover .terminal-connection-status-reason {
+    color: var(--fg);
+  }
+}
+
+.terminal-connection-status-reason {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--fg-muted);
+  text-transform: none;
+}

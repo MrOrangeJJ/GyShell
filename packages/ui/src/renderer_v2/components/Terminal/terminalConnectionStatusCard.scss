@@ -1,0 +1,171 @@
+// Floating connection card. Follows the panel find bar: square 2px corners,
+// strong border, panel surface, theme shadow, mono 11px chrome text. All
+// colors come from the runtime theme tokens so light and dark schemes match.
+.terminal-connection-card {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  z-index: 16;
+  box-sizing: border-box;
+  width: max-content;
+  max-width: min(420px, calc(100% - 16px));
+  border: 1px solid var(--border-strong);
+  border-radius: 2px;
+  background: var(--panel-bg);
+  box-shadow: var(--shadow);
+  color: var(--fg);
+  font: 11px/1.45 var(--font-mono);
+
+  &.is-connecting {
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
+    padding: 5px 8px;
+    pointer-events: none;
+  }
+
+  &.is-failed {
+    width: min(420px, calc(100% - 16px));
+    border-color: color-mix(in srgb, var(--danger) 45%, var(--border-strong));
+    border-left: 2px solid var(--danger);
+  }
+}
+
+.terminal-connection-step {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 17px;
+  min-width: 0;
+  color: var(--fg-muted);
+
+  > svg {
+    flex: none;
+    color: var(--success);
+  }
+
+  > span {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  &.is-current {
+    color: var(--fg);
+
+    > svg {
+      color: var(--accent);
+      animation: terminal-connection-card-spin 1s linear infinite;
+    }
+  }
+
+  &.is-warning,
+  &.is-warning > svg {
+    color: var(--warning);
+    animation: none;
+  }
+
+  &.is-error,
+  &.is-error > svg {
+    color: var(--danger);
+    animation: none;
+  }
+}
+
+.terminal-connection-card-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  height: 26px;
+  padding: 0 4px 0 8px;
+  border-bottom: 1px solid color-mix(in srgb, var(--danger) 20%, transparent);
+  background: color-mix(in srgb, var(--danger) 8%, var(--panel-bg));
+
+  > svg {
+    flex: none;
+    color: var(--danger);
+  }
+}
+
+.terminal-connection-card-title {
+  flex: 1;
+  min-width: 0;
+  color: var(--danger);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.6px;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.terminal-connection-card-action,
+.terminal-connection-card-close {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  height: 20px;
+  border: 0;
+  border-radius: 2px;
+  background: transparent;
+  color: var(--fg-muted);
+  font: inherit;
+  cursor: pointer;
+
+  &:hover {
+    background: color-mix(in srgb, var(--fg) 8%, transparent);
+    color: var(--fg);
+  }
+
+  &:focus-visible {
+    outline: 1px solid var(--accent);
+    outline-offset: 1px;
+  }
+}
+
+// Borderless: the card edge is a few px away and a second frame crowds it.
+// Accent text marks it as the card's action; hover gives it a surface.
+.terminal-connection-card-action {
+  padding: 0 6px;
+  color: var(--accent);
+  font-weight: 600;
+
+  &:hover {
+    background: color-mix(in srgb, var(--accent) 12%, transparent);
+    color: var(--accent);
+  }
+}
+
+.terminal-connection-card-close {
+  flex: none;
+  width: 20px;
+  padding: 0;
+}
+
+.terminal-connection-card-body {
+  max-height: 132px;
+  overflow: auto;
+  padding: 6px 8px 7px 10px;
+  user-select: text;
+
+  > p {
+    margin: 0;
+    overflow-wrap: anywhere;
+    white-space: pre-wrap;
+  }
+
+  > p.is-warning {
+    color: var(--warning);
+  }
+
+  > p + p {
+    margin-top: 2px;
+  }
+}
+
+@keyframes terminal-connection-card-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}

@@ -2,10 +2,15 @@ import type { PanelTabDisplayModePreference } from '@gyshell/shared'
 
 export type AppLanguage = 'en' | 'zh-CN'
 
+/** How terminal tabs are shown: the native terminal, or command blocks. */
+export type TerminalViewMode = 'classic' | 'block'
+
 export interface TerminalUiSettings {
   fontSize: number
   lineHeight: number
   scrollback: number
+  saveHistory: boolean
+  viewMode: TerminalViewMode
   cursorStyle: 'block' | 'underline' | 'bar'
   cursorBlink: boolean
   copyOnSelect: boolean

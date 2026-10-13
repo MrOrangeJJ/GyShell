@@ -1,4 +1,4 @@
-import { isObservable, isObservableArray } from "mobx";
+import { autorun, isObservable, isObservableArray } from "mobx";
 import { AppStore } from "./AppStore";
 import { ChatStore } from "./ChatStore";
 import type { LayoutTree } from "../layout";
@@ -342,6 +342,68 @@ const installBootstrapWindowMock = (
 };
 
 const run = async (): Promise<void> => {
+  await runCase(
+    "terminal view mode is one persisted setting (Classic/Block)",
+    async () => {
+      const originalWindow = (globalThis as any).window;
+      const writes: any[] = [];
+      try {
+        (globalThis as any).window = {
+          gyshell: {
+            uiSettings: {
+              set: async (patch: unknown) => {
+                writes.push(JSON.parse(JSON.stringify(patch)));
+              },
+            },
+          },
+        };
+        const store = new AppStore();
+        assertEqual(store.terminalViewMode, "classic", "no settings yet: Classic");
+
+        store.settings = {
+          terminal: { fontSize: 14, viewMode: "classic" },
+        } as any;
+        const seen: string[] = [];
+        const dispose = autorun(() => seen.push(store.terminalViewMode));
+
+        store.setTerminalViewMode("block");
+        assertEqual(store.terminalViewMode, "block", "switch to Block applies");
+        assertEqual(writes.length, 1, "switch is persisted once");
+        assertEqual(
+          writes[0].terminal.viewMode,
+          "block",
+          "persisted as terminal.viewMode=block",
+        );
+        assertEqual(
+          writes[0].terminal.fontSize,
+          14,
+          "other terminal settings are kept",
+        );
+        store.setTerminalViewMode("block");
+        assertEqual(writes.length, 1, "same mode again writes nothing");
+        assertEqual(
+          JSON.stringify(seen),
+          JSON.stringify(["classic", "block"]),
+          "views re-render on change",
+        );
+        dispose();
+
+        // A restart reads the persisted value back.
+        const restarted = new AppStore();
+        restarted.settings = { terminal: writes[0].terminal } as any;
+        assertEqual(restarted.terminalViewMode, "block", "restart keeps Block");
+        restarted.setTerminalViewMode("classic");
+        assertEqual(
+          writes[1]?.terminal.viewMode,
+          "classic",
+          "switch back persists Classic",
+        );
+      } finally {
+        (globalThis as any).window = originalWindow;
+      }
+    },
+  );
+
   await runCase(
     "agent setting operation result refreshes visible settings slices together",
     async () => {

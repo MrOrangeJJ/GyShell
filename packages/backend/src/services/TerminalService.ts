@@ -5,6 +5,7 @@ import {
   buildPseudoconsoleRowRealignment,
   buildPseudoconsoleViewportHandoff,
 } from './terminal/pseudoconsoleViewport'
+import { planSessionResume } from './terminal/sessionResumePlan'
 import path from 'path'
 import os from 'os'
 import type {
@@ -18,12 +19,19 @@ import type {
   TerminalFileSystemBackend,
   TerminalConfig,
   TerminalTab,
+  TerminalBackendStatusEvent,
   CommandResult,
   ConnectionType,
   FileStatInfo,
   FileSystemEntry,
-  CommandTask
+  CommandTask,
+  TerminalCommandActivityContext
 } from '../types'
+import type {
+  TerminalActivitySnapshot,
+  TerminalActivityStatus,
+  TerminalSessionBoundary,
+} from '@gyshell/shared'
 import {
   isLocalConnectionConfig,
   isSshConnectionConfig,
@@ -46,6 +54,18 @@ import {
 import { CommandTranscriptCapture } from './terminal/CommandTranscriptCapture'
 import { buildWindowsPowerShellDispatchRequest } from './windowsPowerShellTracking'
 import { TerminalOutputFlowController } from './terminal/TerminalOutputFlowController'
+import { TerminalActivityStore } from './terminal/TerminalActivityStore'
+import { buildPromptContinuationClear } from './terminal/promptLineReflow'
+import { SSH_INITIALIZATION_CLEAR_SEQUENCE } from './terminal/TerminalInitializationProtocol'
+import {
+  TerminalPersistenceStore,
+  type PersistedAgentCommandRecord,
+} from './terminal/TerminalPersistenceStore'
+import { TerminalPersistenceCorruptError } from './terminal/persistence/errors'
+import {
+  reduceConnectionStatus,
+  settleConnectionStatus as settleConnectionStatusValue,
+} from './terminal/connectionStatus'
 import {
   isolateUnixAgentCommand,
   shouldIsolateUnixAgentCommand,
@@ -55,9 +75,12 @@ const MAX_BUFFER_SIZE = 200000 // 200KB
 const SCROLLBACK_SIZE = 5000 // Keep up to 5000 lines in virtual terminal
 const TERMINAL_OUTPUT_RETIRE_TIMEOUT_MS = 10_000
 const TERMINAL_HEADLESS_REPLAY_CHUNK_SIZE = 64 * 1024
+const TAB_STATE_SAVE_DELAY_MS = 120
+const HISTORY_FLUSH_DELAY_MS = 120
+const HISTORY_FLUSH_MAX_WAIT_MS = 1000
+const HISTORY_FLUSH_MAX_PENDING_UTF8_BYTES = 1024 * 1024
 const PSEUDOCONSOLE_REALIGN_QUIET_MS = 80
 const PSEUDOCONSOLE_REALIGN_MAX_ATTEMPTS = 8
-const PERSIST_FLUSH_DELAY_MS = 120
 const PRIVATE_UNIX_ECHO_SCAN_SIZE = 4096
 const COMMAND_TASK_ID_ALLOCATION_MAX_ATTEMPTS = 32
 const UUID_V4_PATTERN =
@@ -102,6 +125,11 @@ function stripTerminalControlSequences(s: string): string {
     .replace(OTHER_CONTROL_CHAR_PATTERN, '')
 }
 
+/**
+ * Visible stream offsets use JavaScript UTF-16 code units so they stay
+ * compatible with renderer snapshots and string slicing. UTF-8 byte counts
+ * are retained separately and are used only for storage-budget pruning.
+ */
 interface RingBuffer {
   content: string
   offset: number
@@ -198,11 +226,14 @@ type TerminalTabSnapshot = {
   lastExitCode?: number
   remoteOs?: 'unix' | 'windows'
   systemInfo?: TerminalTab['systemInfo']
+  connectionStatus?: TerminalTab['connectionStatus']
   monitorIdentity?: string
 }
 
 interface TerminalServiceOptions {
   terminalStateStore?: TerminalStateStore | null
+  terminalPersistenceStore?: TerminalPersistenceStore | null
+  terminalHistoryEnabled?: boolean
 }
 
 interface TerminalResizeTarget {
@@ -401,10 +432,23 @@ export class TerminalService {
     ReturnType<typeof setTimeout>
   >()
   private pseudoconsoleRealigning = new Set<string>()
+  private heldRestoredSshClearPrefixByTerminal = new Map<string, string>()
   private selectionByTerminal: Map<string, string> = new Map()
   private tasksByTerminal: Map<string, Record<string, CommandTask>> = new Map()
   private detachedTasksByTerminal: Map<string, Record<string, CommandTask>> = new Map()
   private activeTaskByTerminal: Map<string, string> = new Map()
+  private readonly terminalActivityStore = new TerminalActivityStore(
+    (activity) => {
+      this.sendToRenderer('terminal:activity', { activity })
+      this.persistActivitySnapshot(activity)
+    }
+  )
+  private readonly activeManualActivityByTerminal = new Map<string, string>()
+  private readonly pendingManualActivityStartByTerminal = new Map<
+    string,
+    { offset: number; startedAt: number }
+  >()
+  private readonly lastUserInputAtByTerminal = new Map<string, number>()
   private commandStartReservationByTerminal: Map<string, CommandStartReservation> = new Map()
   private deferredWritesDuringCommandStartByTerminal: Map<string, string[]> = new Map()
   private deferredWritesUntilTaskFinishByTaskId: Map<string, string[]> = new Map()
@@ -486,7 +530,20 @@ export class TerminalService {
   private primaryLocalTerminalId: string | null = null
   private rawEventPublisher: RawEventPublisher | null = null
   private persistTimer: ReturnType<typeof setTimeout> | null = null
+  private historyFlushTimer: ReturnType<typeof setTimeout> | null = null
+  private historyPendingSince: number | null = null
+  private persistenceClosed = false
   private readonly terminalStateStore: TerminalStateStore | null
+  private readonly terminalPersistenceStore: TerminalPersistenceStore | null
+  private terminalHistoryEnabled: boolean
+  /** Keep unread history intact when a transient restore failure starts a new stream. */
+  private readonly historySuspendedTerminalIds = new Set<string>()
+  /**
+   * A failed close purge must complete before a reused terminal id can restore
+   * history; otherwise the replacement could inherit the closed tab's rows.
+   */
+  private readonly pendingTerminalHistoryPurgeByTerminal = new Set<string>()
+  private readonly pendingRestoredSshClearByTerminal = new Set<string>()
   /**
    * Persisted configurations whose runtime could not be restored yet. These
    * records stay durable across flushes until a live terminal supersedes them
@@ -514,6 +571,26 @@ export class TerminalService {
     this.backends.set('local', new NodePtyBackend())
     this.backends.set('ssh', new SSHBackend())
     this.terminalStateStore = options?.terminalStateStore ?? null
+    this.terminalPersistenceStore = options?.terminalPersistenceStore ?? null
+    this.terminalHistoryEnabled = options?.terminalHistoryEnabled !== false
+    if (!this.terminalHistoryEnabled) {
+      this.terminalPersistenceStore?.clearAll()
+    }
+  }
+
+  /** Disabling history erases it; repeated settings notifications are ignored. */
+  setTerminalHistoryEnabled(enabled: boolean): void {
+    const normalizedEnabled = enabled === true
+    if (this.terminalHistoryEnabled === normalizedEnabled) return
+    this.terminalHistoryEnabled = normalizedEnabled
+    if (!normalizedEnabled) {
+      this.clearHistoryFlushTimer()
+      this.terminalPersistenceStore?.clearAll()
+    }
+  }
+
+  isTerminalHistoryEnabled(): boolean {
+    return this.terminalHistoryEnabled
   }
 
   setRawEventPublisher(publisher: RawEventPublisher): void {
@@ -538,6 +615,9 @@ export class TerminalService {
       lastExitCode: terminal.lastExitCode,
       remoteOs: terminal.remoteOs,
       systemInfo: terminal.systemInfo,
+      ...(terminal.connectionStatus
+        ? { connectionStatus: terminal.connectionStatus }
+        : {}),
       monitorIdentity: this.getMonitorIdentity(terminal.id) ?? undefined
     }))
   }
@@ -968,29 +1048,106 @@ export class TerminalService {
   }
 
   private persistTerminalStateNow(): void {
-    if (!this.terminalStateStore) return
-    this.terminalStateStore.save(this.getPersistableRecords())
+    if (this.terminalStateStore) {
+      this.terminalStateStore.save(this.getPersistableRecords())
+    }
+  }
+
+  private flushHistoryNow(): void {
+    this.clearHistoryFlushTimer()
+    this.terminalPersistenceStore?.flush()
   }
 
   private schedulePersistTerminalState(): void {
-    if (!this.terminalStateStore) return
-    if (this.persistTimer) {
-      clearTimeout(this.persistTimer)
-      this.persistTimer = null
-    }
+    if (!this.terminalStateStore || this.persistenceClosed) return
+    if (this.persistTimer) clearTimeout(this.persistTimer)
     this.persistTimer = setTimeout(() => {
       this.persistTimer = null
-      this.persistTerminalStateNow()
-    }, PERSIST_FLUSH_DELAY_MS)
+      try {
+        this.persistTerminalStateNow()
+      } catch (error) {
+        console.error('[TerminalService] Failed to save terminal tab state:', error)
+      }
+    }, TAB_STATE_SAVE_DELAY_MS)
+  }
+
+  private scheduleHistoryFlush(): void {
+    const store = this.terminalPersistenceStore
+    if (!store || this.persistenceClosed) return
+    const now = Date.now()
+    this.historyPendingSince ??= now
+    const remainingWait =
+      this.historyPendingSince + HISTORY_FLUSH_MAX_WAIT_MS - now
+    if (
+      store.getPendingUtf8Bytes() >= HISTORY_FLUSH_MAX_PENDING_UTF8_BYTES ||
+      remainingWait <= 0
+    ) {
+      this.flushHistorySafely()
+      return
+    }
+    if (this.historyFlushTimer) clearTimeout(this.historyFlushTimer)
+    this.historyFlushTimer = setTimeout(
+      () => this.flushHistorySafely(),
+      Math.min(HISTORY_FLUSH_DELAY_MS, remainingWait),
+    )
+  }
+
+  private flushHistorySafely(): void {
+    try {
+      this.flushHistoryNow()
+    } catch (error) {
+      console.error('[TerminalService] Failed to flush terminal history:', error)
+      const store = this.terminalPersistenceStore
+      if (
+        store &&
+        !this.persistenceClosed &&
+        store.hasPendingWrites()
+      ) {
+        this.historyPendingSince = Date.now()
+        if (this.historyFlushTimer) clearTimeout(this.historyFlushTimer)
+        this.historyFlushTimer = setTimeout(
+          () => this.flushHistorySafely(),
+          HISTORY_FLUSH_MAX_WAIT_MS,
+        )
+      }
+    }
+  }
+
+  private clearHistoryFlushTimer(): void {
+    if (this.historyFlushTimer) {
+      clearTimeout(this.historyFlushTimer)
+      this.historyFlushTimer = null
+    }
+    this.historyPendingSince = null
   }
 
   flushPersistedState(): void {
-    if (!this.terminalStateStore) return
+    if (this.persistenceClosed) return
     if (this.persistTimer) {
       clearTimeout(this.persistTimer)
       this.persistTimer = null
     }
-    this.persistTerminalStateNow()
+    try {
+      this.persistTerminalStateNow()
+    } finally {
+      this.flushHistoryNow()
+    }
+  }
+
+  closePersistedState(): void {
+    if (this.persistenceClosed) return
+    try {
+      this.flushPersistedState()
+    } catch (error) {
+      console.error('[TerminalService] Failed to flush terminal persistence on close:', error)
+    } finally {
+      this.persistenceClosed = true
+      try {
+        this.terminalPersistenceStore?.close()
+      } catch (error) {
+        console.error('[TerminalService] Failed to close terminal persistence:', error)
+      }
+    }
   }
 
   private getTerminalLifecycleEpoch(terminalId: string): number {
@@ -1176,6 +1333,7 @@ export class TerminalService {
     this.windowsPromptSequenceFloorByTerminal.delete(terminalId)
     this.windowsPowerShellBracketedPasteByTerminal.delete(terminalId)
     this.terminalInputRevisionByTerminal.delete(terminalId)
+    this.pendingManualActivityStartByTerminal.delete(terminalId)
     this.windowsInputRevisionCommitByTerminal.delete(terminalId)
     // A stale sequence owns its captured Set. Replacing the map entry means
     // its eventual finally block cannot delete reservations for this runtime.
@@ -1341,6 +1499,10 @@ export class TerminalService {
         )
       }
     })
+    backend.onStatus?.(ptyId, (event) => {
+      if (!isCurrentRuntime()) return
+      this.recordConnectionStatus(terminalId, event)
+    })
     backend.onExit(ptyId, (code: number) => {
       if (!isCurrentRuntime()) return
       runtimeExited = true
@@ -1385,6 +1547,7 @@ export class TerminalService {
 
     const records = this.terminalStateStore.load()
     if (records.length === 0) {
+      this.terminalPersistenceStore?.retainTerminals([])
       return { restored: [], failed: [] }
     }
 
@@ -1414,6 +1577,9 @@ export class TerminalService {
       }
     }
 
+    this.terminalPersistenceStore?.retainTerminals(
+      records.map((record) => record.id),
+    )
     this.persistTerminalStateNow()
 
     return { restored, failed }
@@ -1488,6 +1654,102 @@ export class TerminalService {
     )
     this.forgetPendingPersistedTerminal(normalizedConfig.id)
     return runtime
+  }
+
+  private async restoreTerminalPersistence(
+    terminalId: string,
+    headless: TerminalType,
+    config: TerminalConfig,
+    expectedEpoch: number,
+  ): Promise<boolean> {
+    const store = this.terminalPersistenceStore
+    if (!this.terminalHistoryEnabled || !store) return false
+    const assertCurrent = (): void => {
+      if (
+        !this.isTerminalLifecycleCurrent(terminalId, expectedEpoch) ||
+        this.headlessPtys.get(terminalId) !== headless
+      ) {
+        throw new TerminalRuntimeChangedError(terminalId, false, 'terminal history restore')
+      }
+    }
+    if (this.pendingTerminalHistoryPurgeByTerminal.has(terminalId)) {
+      assertCurrent()
+      try {
+        store.deleteTerminalVisibleHistory(terminalId)
+        this.pendingTerminalHistoryPurgeByTerminal.delete(terminalId)
+      } catch (error) {
+        this.historySuspendedTerminalIds.add(terminalId)
+        console.warn(
+          `[TerminalService] Failed to finish deleting durable visual history for reused terminal ${terminalId}.`,
+          error,
+        )
+        return false
+      }
+    }
+    try {
+      const restored = store.restoreTerminal(terminalId, {
+        maxVisibleCharacters: MAX_BUFFER_SIZE,
+      })
+      this.buffers.set(terminalId, {
+        content: restored.visible.data,
+        offset: restored.visible.endOffset,
+      })
+      this.terminalActivityStore.clearTerminal(terminalId)
+      this.terminalActivityStore.hydrate(
+        restored.activities.map(({ runtimeGeneration: _generation, ...activity }) => activity),
+      )
+      await this.replayIntoHeadlessTerminal(headless, restored.visible.data)
+      assertCurrent()
+      const plan = planSessionResume({
+        terminalId,
+        visible: restored.visible,
+        activities: restored.activities,
+        previousBoundary: store.listSessionBoundaries(terminalId).at(-1),
+        latestAgentCommand: store.getLatestAgentCommand(terminalId),
+        now: Date.now(),
+        boundaryId: uuidv4(),
+      })
+      if (plan.kind === 'fresh') return false
+      store.recordSessionBoundary(plan.boundary)
+      if (plan.kind === 'new-boundary') {
+        this.appendSyntheticDisplayData(terminalId, plan.spacing)
+        await this.replayIntoHeadlessTerminal(headless, plan.spacing)
+        assertCurrent()
+      }
+      if (config.type === 'ssh') {
+        this.pendingRestoredSshClearByTerminal.add(terminalId)
+      }
+      return true
+    } catch (error) {
+      // A close during asynchronous replay owns cleanup. Never republish its
+      // buffer or write a boundary for the cancelled runtime.
+      assertCurrent()
+      console.warn(
+        `[TerminalService] Failed to restore durable terminal history for ${config.id}.`,
+        error,
+      )
+      headless.reset()
+      this.buffers.set(terminalId, { content: '', offset: 0 })
+      this.terminalActivityStore.clearTerminal(terminalId)
+      this.pendingRestoredSshClearByTerminal.delete(terminalId)
+      this.heldRestoredSshClearPrefixByTerminal.delete(terminalId)
+      if (error instanceof TerminalPersistenceCorruptError) {
+        try {
+          store.deleteTerminalVisibleHistory(terminalId)
+        } catch (deleteError) {
+          this.historySuspendedTerminalIds.add(terminalId)
+          console.warn(
+            `[TerminalService] Failed to discard corrupt terminal history for ${config.id}.`,
+            deleteError,
+          )
+        }
+      } else {
+        // Busy/read-only storage and replay failures must not erase durable
+        // history. Suspend this new offset-zero stream until the tab closes.
+        this.historySuspendedTerminalIds.add(terminalId)
+      }
+      return false
+    }
   }
 
   private async createTerminalWithinLifecycle(
@@ -1633,6 +1895,18 @@ export class TerminalService {
     this.releaseReservedTitleForTerminal(config.id, reservedTitle)
     this.buffers.set(config.id, { content: '', offset: 0 })
     this.headlessPtys.set(config.id, headless)
+    const restoredHistoryAvailable = await this.restoreTerminalPersistence(
+      config.id,
+      headless,
+      config,
+      expectedEpoch,
+    )
+    if (
+      !this.isTerminalLifecycleCurrent(config.id, expectedEpoch) ||
+      this.terminals.get(config.id) !== tab
+    ) {
+      throw new TerminalRuntimeChangedError(config.id, false, 'terminal restore binding')
+    }
     if (config.type === 'local' && !this.primaryLocalTerminalId) {
       this.primaryLocalTerminalId = config.id
     }
@@ -1641,8 +1915,11 @@ export class TerminalService {
 
     this.hydrateTerminalRuntimeMetadata(config.id)
 
-    // Print banner for the first local terminal.
-    if (config.type === 'local' && this.primaryLocalTerminalId === config.id) {
+    if (
+      config.type === 'local' &&
+      this.primaryLocalTerminalId === config.id &&
+      !restoredHistoryAvailable
+    ) {
       this.printBanner(
         config.id,
         this.createTerminalRuntimeGuard(config.id)
@@ -1752,6 +2029,7 @@ export class TerminalService {
     tab.isInitializing = true
     tab.runtimeState = 'initializing'
     tab.lastExitCode = undefined
+    tab.connectionStatus = undefined
     tab.capabilities = resolveTerminalConnectionCapabilities(reconnectConfig)
     this.terminalConfigs.set(terminalId, reconnectConfig)
     this.publishTerminalTabsChanged()
@@ -1802,6 +2080,12 @@ export class TerminalService {
       tab.remoteOs = undefined
       tab.systemInfo = undefined
       this.terminalConfigs.set(terminalId, nextConfig)
+      if (
+        nextConfig.type === 'ssh' &&
+        (this.buffers.get(terminalId)?.offset || 0) > 0
+      ) {
+        this.pendingRestoredSshClearByTerminal.add(terminalId)
+      }
 
       const headless = this.headlessPtys.get(terminalId)
       if (headless) {
@@ -1870,6 +2154,7 @@ export class TerminalService {
     tab.isInitializing = true
     tab.runtimeState = 'initializing'
     tab.lastExitCode = undefined
+    tab.connectionStatus = undefined
     tab.capabilities = resolveTerminalConnectionCapabilities(restartConfig)
     this.terminalConfigs.set(terminalId, restartConfig)
     this.publishTerminalTabsChanged()
@@ -1965,162 +2250,39 @@ export class TerminalService {
     )
   }
 
-  private handleData(
+  /**
+   * Connection status is transient runtime metadata: it is published with the
+   * tab snapshot, never appended to the visible stream, and therefore never
+   * persisted or restored.
+   */
+  private recordConnectionStatus(
     terminalId: string,
-    data: string,
-    isCurrentRuntime: () => boolean
+    event: TerminalBackendStatusEvent,
   ): void {
     const tab = this.terminals.get(terminalId)
-    if (tab) {
-      let shouldPublishTabsChanged = false
-
-      // Sync initialization state and remote OS
-      if (tab.isInitializing) {
-        if (tab.type === 'ssh') {
-          const backend = this.getBackend('ssh') as SSHBackend
-          const initState = backend.getInitializationState(tab.ptyId)
-          if (initState === 'ready') {
-            tab.isInitializing = false
-            tab.runtimeState = 'ready'
-            shouldPublishTabsChanged = true
-          } else if (initState === 'failed') {
-            tab.isInitializing = false
-            tab.runtimeState = 'exited'
-            tab.lastExitCode = -1
-            shouldPublishTabsChanged = true
-          }
-        } else {
-          // For local silence mode, first meaningful output means shell is ready.
-          tab.isInitializing = false
-          tab.runtimeState = 'ready'
-          shouldPublishTabsChanged = true
-          // Must precede this first visible chunk of the new runtime.
-          this.alignRendererWithPseudoconsole(terminalId, { newRuntime: true })
-        }
-      }
-
-      shouldPublishTabsChanged =
-        this.hydrateTerminalRuntimeMetadata(terminalId) || shouldPublishTabsChanged
-
-      if (shouldPublishTabsChanged) {
-        this.publishTerminalTabsChanged()
-      }
-    }
-    const pseudoconsoleShadow = this.pseudoconsoleShadowByTerminal.get(terminalId)
-    if (pseudoconsoleShadow && data && !tab?.isInitializing) {
-      pseudoconsoleShadow.write(data)
-      this.schedulePseudoconsoleRealign(terminalId)
-    }
-    const taskRawDisplaySuppressed = this.shouldSuppressRawTaskDisplay(terminalId)
-    const suppressRawDisplay = taskRawDisplaySuppressed
-    const headless = this.headlessPtys.get(terminalId)
-    let writeSeq = 0
-    let headlessData = ''
-    if (!suppressRawDisplay && headless && data) {
-      writeSeq = (this.headlessWriteSeqByTerminal.get(terminalId) || 0) + 1
-      this.headlessWriteSeqByTerminal.set(terminalId, writeSeq)
-      headlessData = data
-    }
-
-    // Process OSC markers and strip markers from visual output
-    const cleanedData = this.processIncomingData(terminalId, data, writeSeq)
-    const displayFilteredTaskData = taskRawDisplaySuppressed
-    if (displayFilteredTaskData && headless && cleanedData) {
-      writeSeq = (this.headlessWriteSeqByTerminal.get(terminalId) || 0) + 1
-      this.headlessWriteSeqByTerminal.set(terminalId, writeSeq)
-      headlessData = cleanedData
-    }
-    let visibleOffset = 0
-    if (
-      (!suppressRawDisplay || displayFilteredTaskData) &&
-      cleanedData
-    ) {
-      const buffer = this.buffers.get(terminalId)
-      if (buffer) {
-        buffer.content += cleanedData
-        buffer.offset += cleanedData.length
-        visibleOffset = buffer.offset
-
-        if (buffer.content.length > MAX_BUFFER_SIZE) {
-          const trimAmount = buffer.content.length - MAX_BUFFER_SIZE
-          buffer.content = buffer.content.slice(trimAmount)
-        }
-      }
-
-    }
-    const hasVisibleData =
-      (!suppressRawDisplay || displayFilteredTaskData) && Boolean(cleanedData)
-    if (headlessData || hasVisibleData) {
-      const runtimeGeneration =
-        this.backendRuntimeGenerationByTerminal.get(terminalId)
-      const outputController = this.outputFlowControllerByTerminal.get(terminalId)
-      outputController?.enqueue({
-        sourceCost: data.length,
-        headlessData,
-        hasVisibleData,
-        onHeadlessDrained: writeSeq > 0
-          ? () => {
-              if (!isCurrentRuntime()) return
-              const flushed = Math.max(
-                this.headlessFlushedSeqByTerminal.get(terminalId) || 0,
-                writeSeq
-              )
-              this.headlessFlushedSeqByTerminal.set(terminalId, flushed)
-              this.tryFlushPendingTaskFinish(terminalId)
-            }
-          : undefined,
-        publishVisible: hasVisibleData
-          ? (outputSequence, controllerGeneration) => {
-              if (
-                controllerGeneration !== runtimeGeneration ||
-                !isCurrentRuntime()
-              ) {
-                return
-              }
-              const published = this.sendToRenderer('terminal:data', {
-                terminalId,
-                data: cleanedData,
-                offset: visibleOffset,
-                outputSequence,
-                runtimeGeneration: controllerGeneration,
-                ...this.getRenderMetadata(terminalId)
-              })
-              if (!published) {
-                throw new Error('visible terminal output publisher unavailable')
-              }
-            }
-          : undefined
-      })
-    }
-    const currentTerminal = this.terminals.get(terminalId)
-    if (
-      currentTerminal !== undefined &&
-      this.usesPowerShellCommandLifecycle(currentTerminal) &&
-      currentTerminal.runtimeState === 'ready' &&
-      !this.activeTaskByTerminal.has(terminalId) &&
-      !this.commandStartReservationByTerminal.has(terminalId) &&
-      this.shellInputStateByTerminal.get(terminalId) !== 'idle'
-    ) {
-      // The in-band PowerShell fallback settles through its OSC marker. A
-      // sidecar runtime returns a verified out-of-band baseline here.
-      void this.ensureWindowsPromptBaseline(terminalId)
-    }
-  }
-
-  private getActiveTask(terminalId: string): CommandTask | undefined {
-    const taskId = this.activeTaskByTerminal.get(terminalId)
-    if (!taskId) {
-      return undefined
-    }
-    return this.getTaskMap(terminalId)[taskId]
-  }
-
-  private shouldSuppressRawTaskDisplay(terminalId: string): boolean {
-    const task = this.getActiveTask(terminalId)
-    return (
-      task?.displayMode === 'synthetic-transcript' ||
-      this.pendingUnixCommandDisplayByTerminal.has(terminalId)
+    if (!tab || !event?.text) return
+    const next = reduceConnectionStatus(
+      tab.connectionStatus,
+      { level: event.level, text: event.text, at: Date.now() },
+      tab.runtimeState === 'ready',
     )
+    if (next === tab.connectionStatus) return
+    tab.connectionStatus = next
+    this.publishTerminalTabsChanged()
+  }
+
+  /** Clear progress on success; keep only the failure reason on failure. */
+  private settleConnectionStatus(
+    tab: TerminalTab,
+    outcome: 'ready' | 'failed',
+  ): void {
+    const next = settleConnectionStatusValue(
+      tab.connectionStatus,
+      outcome,
+      Date.now(),
+    )
+    if (next === tab.connectionStatus) return
+    tab.connectionStatus = next
   }
 
   /**
@@ -2272,6 +2434,203 @@ export class TerminalService {
     }
   }
 
+  private stripRestoredSshInitializationClear(
+    terminalId: string,
+    data: string,
+  ): string {
+    if (!data || !this.pendingRestoredSshClearByTerminal.has(terminalId)) {
+      return data
+    }
+    // The clear may be split across transport chunks. Hold a strict prefix
+    // until it is either completed (and dropped) or disproved (and released),
+    // otherwise a split clear would erase the restored rows under the divider.
+    const held = this.heldRestoredSshClearPrefixByTerminal.get(terminalId) ?? ''
+    this.heldRestoredSshClearPrefixByTerminal.delete(terminalId)
+    const combined = held + data
+    if (combined.startsWith(SSH_INITIALIZATION_CLEAR_SEQUENCE)) {
+      this.pendingRestoredSshClearByTerminal.delete(terminalId)
+      this.heldRestoredSshClearPrefixByTerminal.delete(terminalId)
+      return combined.slice(SSH_INITIALIZATION_CLEAR_SEQUENCE.length)
+    }
+    if (SSH_INITIALIZATION_CLEAR_SEQUENCE.startsWith(combined)) {
+      this.heldRestoredSshClearPrefixByTerminal.set(terminalId, combined)
+      return ''
+    }
+    this.pendingRestoredSshClearByTerminal.delete(terminalId)
+    return combined
+  }
+
+  private handleData(
+    terminalId: string,
+    data: string,
+    isCurrentRuntime: () => boolean
+  ): void {
+    data = this.stripRestoredSshInitializationClear(terminalId, data)
+    const tab = this.terminals.get(terminalId)
+    if (tab) {
+      let shouldPublishTabsChanged = false
+
+      // Sync initialization state and remote OS
+      if (tab.isInitializing) {
+        if (tab.type === 'ssh') {
+          const backend = this.getBackend('ssh') as SSHBackend
+          const initState = backend.getInitializationState(tab.ptyId)
+          if (initState === 'ready') {
+            tab.isInitializing = false
+            tab.runtimeState = 'ready'
+            this.settleConnectionStatus(tab, 'ready')
+            shouldPublishTabsChanged = true
+          } else if (initState === 'failed') {
+            tab.isInitializing = false
+            tab.runtimeState = 'exited'
+            tab.lastExitCode = -1
+            this.settleConnectionStatus(tab, 'failed')
+            shouldPublishTabsChanged = true
+          }
+        } else {
+          // For local silence mode, first meaningful output means shell is ready.
+          tab.isInitializing = false
+          tab.runtimeState = 'ready'
+          shouldPublishTabsChanged = true
+          // Must precede this first visible chunk of the new runtime.
+          this.alignRendererWithPseudoconsole(terminalId, { newRuntime: true })
+        }
+      }
+
+      shouldPublishTabsChanged =
+        this.hydrateTerminalRuntimeMetadata(terminalId) || shouldPublishTabsChanged
+
+      if (shouldPublishTabsChanged) {
+        this.publishTerminalTabsChanged()
+      }
+    }
+    const pseudoconsoleShadow = this.pseudoconsoleShadowByTerminal.get(terminalId)
+    if (pseudoconsoleShadow && data && !tab?.isInitializing) {
+      pseudoconsoleShadow.write(data)
+      this.schedulePseudoconsoleRealign(terminalId)
+    }
+    const taskRawDisplaySuppressed = this.shouldSuppressRawTaskDisplay(terminalId)
+    const suppressRawDisplay = taskRawDisplaySuppressed
+    const headless = this.headlessPtys.get(terminalId)
+    let writeSeq = 0
+    let headlessData = ''
+    if (!suppressRawDisplay && headless && data) {
+      writeSeq = (this.headlessWriteSeqByTerminal.get(terminalId) || 0) + 1
+      this.headlessWriteSeqByTerminal.set(terminalId, writeSeq)
+      headlessData = data
+    }
+
+    // Process OSC markers and strip markers from visual output
+    const cleanedData = this.processIncomingData(terminalId, data, writeSeq)
+    const displayFilteredTaskData = taskRawDisplaySuppressed
+    if (displayFilteredTaskData && headless && cleanedData) {
+      writeSeq = (this.headlessWriteSeqByTerminal.get(terminalId) || 0) + 1
+      this.headlessWriteSeqByTerminal.set(terminalId, writeSeq)
+      headlessData = cleanedData
+    }
+    let visibleOffset = 0
+    let visibleStartOffset: number | undefined
+    if (
+      (!suppressRawDisplay || displayFilteredTaskData) &&
+      cleanedData
+    ) {
+      const buffer = this.buffers.get(terminalId)
+      if (buffer) {
+        visibleStartOffset = buffer.offset
+        buffer.content += cleanedData
+        buffer.offset += cleanedData.length
+        visibleOffset = buffer.offset
+
+        if (buffer.content.length > MAX_BUFFER_SIZE) {
+          const trimAmount = buffer.content.length - MAX_BUFFER_SIZE
+          buffer.content = buffer.content.slice(trimAmount)
+        }
+      }
+
+    }
+    const hasVisibleData =
+      (!suppressRawDisplay || displayFilteredTaskData) && Boolean(cleanedData)
+    if (hasVisibleData && visibleStartOffset !== undefined) {
+      this.persistVisibleStream(
+        terminalId,
+        visibleStartOffset,
+        cleanedData,
+        this.backendRuntimeGenerationByTerminal.get(terminalId),
+      )
+    }
+    if (headlessData || hasVisibleData) {
+      const runtimeGeneration =
+        this.backendRuntimeGenerationByTerminal.get(terminalId)
+      const outputController = this.outputFlowControllerByTerminal.get(terminalId)
+      outputController?.enqueue({
+        sourceCost: data.length,
+        headlessData,
+        hasVisibleData,
+        onHeadlessDrained: writeSeq > 0
+          ? () => {
+              if (!isCurrentRuntime()) return
+              const flushed = Math.max(
+                this.headlessFlushedSeqByTerminal.get(terminalId) || 0,
+                writeSeq
+              )
+              this.headlessFlushedSeqByTerminal.set(terminalId, flushed)
+              this.tryFlushPendingTaskFinish(terminalId)
+            }
+          : undefined,
+        publishVisible: hasVisibleData
+          ? (outputSequence, controllerGeneration) => {
+              if (
+                controllerGeneration !== runtimeGeneration ||
+                !isCurrentRuntime()
+              ) {
+                return
+              }
+              const published = this.sendToRenderer('terminal:data', {
+                terminalId,
+                data: cleanedData,
+                offset: visibleOffset,
+                outputSequence,
+                runtimeGeneration: controllerGeneration,
+                ...this.getRenderMetadata(terminalId)
+              })
+              if (!published) {
+                throw new Error('visible terminal output publisher unavailable')
+              }
+            }
+          : undefined
+      })
+    }
+    const currentTerminal = this.terminals.get(terminalId)
+    if (
+      currentTerminal !== undefined &&
+      this.usesPowerShellCommandLifecycle(currentTerminal) &&
+      currentTerminal.runtimeState === 'ready' &&
+      !this.activeTaskByTerminal.has(terminalId) &&
+      !this.commandStartReservationByTerminal.has(terminalId) &&
+      this.shellInputStateByTerminal.get(terminalId) !== 'idle'
+    ) {
+      // The in-band PowerShell fallback settles through its OSC marker. A
+      // sidecar runtime returns a verified out-of-band baseline here.
+      void this.ensureWindowsPromptBaseline(terminalId)
+    }
+  }
+
+  private getActiveTask(terminalId: string): CommandTask | undefined {
+    const taskId = this.activeTaskByTerminal.get(terminalId)
+    if (!taskId) {
+      return undefined
+    }
+    return this.getTaskMap(terminalId)[taskId]
+  }
+
+  private shouldSuppressRawTaskDisplay(terminalId: string): boolean {
+    const task = this.getActiveTask(terminalId)
+    return (
+      task?.displayMode === 'synthetic-transcript' ||
+      this.pendingUnixCommandDisplayByTerminal.has(terminalId)
+    )
+  }
+
   private appendSyntheticDisplayData(terminalId: string, data: string): void {
     if (!data) {
       return
@@ -2288,7 +2647,9 @@ export class TerminalService {
 
     const buffer = this.buffers.get(terminalId)
     let currentOffset = 0
+    let visibleStartOffset: number | undefined
     if (buffer) {
+      visibleStartOffset = buffer.offset
       buffer.content += data
       buffer.offset += data.length
       currentOffset = buffer.offset
@@ -2297,6 +2658,15 @@ export class TerminalService {
         const trimAmount = buffer.content.length - MAX_BUFFER_SIZE
         buffer.content = buffer.content.slice(trimAmount)
       }
+    }
+
+    if (visibleStartOffset !== undefined) {
+      this.persistVisibleStream(
+        terminalId,
+        visibleStartOffset,
+        data,
+        this.backendRuntimeGenerationByTerminal.get(terminalId),
+      )
     }
 
     const terminalAtWrite = this.terminals.get(terminalId)
@@ -2571,7 +2941,14 @@ export class TerminalService {
         const pendingUnixEchoTask = this.getActiveTask(terminalId)
         const pendingUnixDisplay =
           this.pendingUnixCommandDisplayByTerminal.get(terminalId)
-        this.handleShellBoundaryMarker(terminalId, event.marker, writeSeq)
+        const visibleBoundaryOffset =
+          this.getCurrentOffset(terminalId) + cleanedData.length
+        this.handleShellBoundaryMarker(
+          terminalId,
+          event.marker,
+          writeSeq,
+          visibleBoundaryOffset
+        )
         if (!pendingUnixDisplay) {
           continue
         }
@@ -2689,7 +3066,8 @@ export class TerminalService {
   private handleShellBoundaryMarker(
     terminalId: string,
     marker: GyShellBoundaryMarker,
-    writeSeq: number
+    writeSeq: number,
+    visibleBoundaryOffset: number
   ): void {
     const terminal = this.terminals.get(terminalId)
     const task = this.getActiveTask(terminalId)
@@ -2776,6 +3154,14 @@ export class TerminalService {
       this.activeShellBoundaryByTerminal.set(terminalId, boundary)
       this.shellInputStateByTerminal.set(terminalId, 'busy')
 
+      if (!task) {
+        this.startManualCommandActivity(
+          terminalId,
+          marker,
+          Date.now(),
+          visibleBoundaryOffset
+        )
+      }
       if (!task || task.status !== 'running' || task.captureBoundaryState !== 'awaiting-start') {
         return
       }
@@ -2903,6 +3289,7 @@ export class TerminalService {
           this.shellInputStateByTerminal.set(terminalId, 'idle')
         }
         this.applyVerifiedShellMetadata(terminalId, marker)
+        task.activityEndOffset = visibleBoundaryOffset
         this.scheduleTaskFinishAfterHeadlessFlush(terminalId, marker.exitCode, writeSeq)
         return
       }
@@ -2933,6 +3320,27 @@ export class TerminalService {
           this.shellInputStateByTerminal.set(terminalId, 'idle')
         }
         this.applyVerifiedShellMetadata(terminalId, marker)
+        const activeManualActivityId =
+          this.activeManualActivityByTerminal.get(terminalId)
+        const activeManualActivity = activeManualActivityId
+          ? this.terminalActivityStore.get(activeManualActivityId)
+          : undefined
+        const completesActiveManualActivity =
+          activeManualActivity !== undefined &&
+          (activeManualActivity.shellSequence === undefined ||
+            marker.sequence === undefined ||
+            marker.sequence >= activeManualActivity.shellSequence)
+        if (completesActiveManualActivity) {
+          this.finishManualCommandActivity(terminalId, marker.exitCode, {
+            endOffset: visibleBoundaryOffset
+          })
+        } else if (advancesPrompt) {
+          this.recordCompletedManualCommand(
+            terminalId,
+            marker,
+            visibleBoundaryOffset
+          )
+        }
       }
       return
     }
@@ -2948,6 +3356,7 @@ export class TerminalService {
           previous === undefined ||
           marker.sequence === previous)
       ) {
+        this.pendingManualActivityStartByTerminal.delete(terminalId)
         if (previous === undefined && marker.sequence !== undefined) {
           this.lastShellSequenceByTerminal.set(terminalId, marker.sequence)
         }
@@ -2979,6 +3388,7 @@ export class TerminalService {
         this.promoteUnverifiedUnixCapture(terminalId, terminal, task)
         this.getTaskCapture(task.id)?.markUnknown('tracking_unavailable')
         this.syncTaskCaptureMetadata(task)
+        task.activityEndOffset = visibleBoundaryOffset
         this.scheduleTaskFinishAfterHeadlessFlush(terminalId, marker.exitCode, writeSeq)
       }
       return
@@ -3003,6 +3413,11 @@ export class TerminalService {
     }
     this.applyVerifiedShellMetadata(terminalId, marker)
 
+    if (!task) {
+      this.finishManualCommandActivity(terminalId, marker.exitCode, {
+        endOffset: visibleBoundaryOffset
+      })
+    }
     if (
       !task ||
       task.status !== 'running' ||
@@ -3022,6 +3437,7 @@ export class TerminalService {
     }
 
     task.captureBoundaryState = 'sealed'
+    task.activityEndOffset = visibleBoundaryOffset
     const capture = this.getTaskCapture(task.id)
     if (boundary.legacy || marker.legacy) {
       capture?.markUnknown('tracking_unavailable')
@@ -3213,6 +3629,7 @@ export class TerminalService {
     ) {
       return
     }
+    this.settleConnectionStatus(terminalAtExit, 'failed')
     this.disposePseudoconsoleShadow(terminalId)
     // Retire the live generation before any asynchronous drain or restart.
     // Leases captured for the exited process must fail immediately, while a
@@ -3277,6 +3694,9 @@ export class TerminalService {
     })
     const tab = this.terminals.get(terminalId)
     this.flushCommandProtocolOnRuntimeExit(terminalId)
+    this.finishManualCommandActivity(terminalId, undefined, {
+      outcomeUnknown: true
+    })
     
     // Mark active task as aborted if terminal exits unexpectedly. A nowait
     // caller relies on its completion callback to retire the background
@@ -3327,6 +3747,7 @@ export class TerminalService {
         }
       }
       if (task && task.status !== 'running') {
+        this.finishAgentCommandActivity(terminalId, task)
         this.compactFinalizedTask(task)
       }
       this.enforceCommandCaptureRetention()
@@ -3409,14 +3830,22 @@ export class TerminalService {
     const message =
       '\r\n\x1b[31m✘ Terminal output parser failed and this runtime was stopped to prevent data loss. Reconnect the terminal to continue.\x1b[0m\r\n'
     const buffer = this.buffers.get(terminalId)
+    let visibleStartOffset = 0
     let offset = 0
     if (buffer) {
+      visibleStartOffset = buffer.offset
       buffer.content += message
       buffer.offset += message.length
       offset = buffer.offset
       if (buffer.content.length > MAX_BUFFER_SIZE) {
         buffer.content = buffer.content.slice(-MAX_BUFFER_SIZE)
       }
+      this.persistVisibleStream(
+        terminalId,
+        visibleStartOffset,
+        message,
+        runtimeGeneration,
+      )
     }
     this.sendToRenderer('terminal:data', {
       terminalId,
@@ -3589,12 +4018,26 @@ export class TerminalService {
       options?.inputOwner === 'active-task' &&
       activeTask?.status === 'running' &&
       activeTask.observedShellPromptSequence === undefined
+    const shouldCaptureManualActivityStart =
+      options?.inputOwner !== 'active-task' &&
+      !activeTask &&
+      !this.activeManualActivityByTerminal.has(terminalId) &&
+      !this.pendingManualActivityStartByTerminal.has(terminalId)
+    if (shouldCaptureManualActivityStart) {
+      this.pendingManualActivityStartByTerminal.set(terminalId, {
+        offset: this.getCurrentOffset(terminalId),
+        startedAt: Date.now(),
+      })
+    }
     // Treat the state transition and backend write as one transaction. Marking
     // first prevents a synchronously delivered prompt marker from being
     // overwritten; a rejected write restores the exact previous gate state.
     this.shellInputStateByTerminal.set(terminalId, 'busy')
     try {
       backend.write(ptyId, data)
+      if (options?.inputOwner !== 'active-task') {
+        this.lastUserInputAtByTerminal.set(terminalId, Date.now())
+      }
       const inputRevision =
         (this.terminalInputRevisionByTerminal.get(terminalId) || 0) + 1
       this.terminalInputRevisionByTerminal.set(
@@ -3605,6 +4048,9 @@ export class TerminalService {
         activeTask.inputRevisionAtDispatch = inputRevision
       }
     } catch (error) {
+      if (shouldCaptureManualActivityStart) {
+        this.pendingManualActivityStartByTerminal.delete(terminalId)
+      }
       if (hadPreviousState && previousState) {
         this.shellInputStateByTerminal.set(terminalId, previousState)
       } else {
@@ -3759,6 +4205,13 @@ export class TerminalService {
             restoreIdleOnCompletion: /[\r\n\x03]$/.test(input),
           }
         )
+        if (options?.inputOwner !== 'active-task') {
+          this.startManualCommandActivity(
+            terminalId,
+            { sequence: minimumPromptSequence },
+            this.lastUserInputAtByTerminal.get(terminalId) ?? Date.now()
+          )
+        }
         this.commitWindowsPowerShellInputRevision(
           terminal,
           backend,
@@ -3901,6 +4354,7 @@ export class TerminalService {
       return
     }
 
+    const previousCols = terminal.cols
     terminal.cols = size.cols
     terminal.rows = size.rows
     const config = this.terminalConfigs.get(terminalId)
@@ -3911,16 +4365,53 @@ export class TerminalService {
         rows: size.rows
       } as TerminalConfig)
     }
-    const backend = this.getBackend(terminal.type)
-    backend.resize(terminal.ptyId, size.cols, size.rows)
-
+    // Mirror first: the prompt-line clear is computed on the new geometry
+    // and must reach every replica before the shell's SIGWINCH redraw.
     const headless = this.headlessPtys.get(terminalId)
     if (headless) {
       headless.resize(size.cols, size.rows)
     }
+    if (headless && size.cols > previousCols) {
+      this.clearPromptContinuationRows(terminal, headless)
+    }
+    const backend = this.getBackend(terminal.type)
+    backend.resize(terminal.ptyId, size.cols, size.rows)
+
     this.pseudoconsoleShadowByTerminal
       .get(terminalId)
       ?.resize(size.cols, size.rows)
+  }
+
+  /**
+   * Widening while a wrapped command is being typed: blank the line's old
+   * continuation rows so the shell's redraw does not leave a stale tail
+   * (see promptLineReflow.ts). Only when shell integration has seen a prompt
+   * and no command has started since (typing at the prompt is fine), and the
+   * mirror is caught up; never while a program owns the screen, and never on
+   * ConPTY, which repaints its own viewport.
+   */
+  private clearPromptContinuationRows(
+    tab: TerminalTab,
+    headless: TerminalType
+  ): void {
+    const terminalId = tab.id
+    if (
+      tab.runtimeState !== 'ready' ||
+      this.usesPseudoconsoleViewport(tab) ||
+      !this.lastShellSequenceByTerminal.has(terminalId) ||
+      this.activeShellBoundaryByTerminal.has(terminalId) ||
+      this.commandStartReservationByTerminal.has(terminalId) ||
+      this.getActiveTask(terminalId) ||
+      (this.headlessWriteSeqByTerminal.get(terminalId) || 0) !==
+        (this.headlessFlushedSeqByTerminal.get(terminalId) || 0)
+    ) {
+      return
+    }
+    const sequence = buildPromptContinuationClear(
+      headless.buffer.active,
+      headless.rows
+    )
+    if (sequence) this.appendSyntheticDisplayData(terminalId, sequence)
   }
 
   kill(
@@ -3942,6 +4433,8 @@ export class TerminalService {
     // Guard admission must precede every state mutation. A stale Agent close
     // must not erase pending geometry or fence a same-ID replacement.
     this.pendingResizeByTerminal.delete(terminalId)
+    this.pendingRestoredSshClearByTerminal.delete(terminalId)
+    this.heldRestoredSshClearPrefixByTerminal.delete(terminalId)
     // Synchronously fence every queued or in-flight spawn for this public ID.
     // A stale spawn is stopped before any later create/reconnect can run.
     this.invalidateTerminalLifecycle(terminalId)
@@ -3987,6 +4480,9 @@ export class TerminalService {
 
       this.outputFlowControllerByTerminal.get(terminalId)?.dispose()
       this.outputFlowControllerByTerminal.delete(terminalId)
+      this.finishManualCommandActivity(terminalId, undefined, {
+        outcomeUnknown: true
+      })
       // Visible consumers belong to the retained renderer runtime, not to one
       // backend process. Renderer detach/webContents teardown removes them;
       // keeping the registry here lets a quickly reused terminal id attach its
@@ -4027,11 +4523,16 @@ export class TerminalService {
           activeTask.endOffset =
             activeTask.startOffset + (activeTask.output?.length || 0)
         }
+        if (activeTask) {
+          this.finishAgentCommandActivity(terminalId, activeTask)
+        }
         this.stopCommandTrackingWatcher(activeTaskId)
       }
       this.activeTaskByTerminal.delete(terminalId)
       this.cancelCommandStartReservation(terminalId)
       this.terminalInputSequenceTailByTerminal.delete(terminalId)
+      this.pendingManualActivityStartByTerminal.delete(terminalId)
+      this.lastUserInputAtByTerminal.delete(terminalId)
       const activeTaskCloseResult: CommandResult | undefined = activeTaskId
         ? {
             stdoutDelta: activeTask?.output || '',
@@ -4072,6 +4573,7 @@ export class TerminalService {
         const nextLocal = Array.from(this.terminals.values()).find((item) => item.type === 'local')
         this.primaryLocalTerminalId = nextLocal?.id || null
       }
+      this.terminalActivityStore.clearTerminal(terminalId)
       this.notifyTerminalClosed(terminalId)
       if (
         activeTaskCloseResult &&
@@ -4092,6 +4594,19 @@ export class TerminalService {
       }
       this.enforceCommandCaptureRetention()
     }
+    if (this.terminalPersistenceStore) {
+      try {
+        this.terminalPersistenceStore.deleteTerminalVisibleHistory(terminalId)
+        this.pendingTerminalHistoryPurgeByTerminal.delete(terminalId)
+      } catch (error) {
+        this.pendingTerminalHistoryPurgeByTerminal.add(terminalId)
+        console.warn(
+          `[TerminalService] Failed to delete durable visual history for ${terminalId}.`,
+          error,
+        )
+      }
+    }
+    this.historySuspendedTerminalIds.delete(terminalId)
     this.publishTerminalTabsChanged()
     this.schedulePersistTerminalState()
     this.tryReleaseTerminalLifecycleEpoch(terminalId)
@@ -5062,6 +5577,10 @@ export class TerminalService {
     return buffer?.offset || 0
   }
 
+  getTerminalSessionBoundaries(terminalId: string): TerminalSessionBoundary[] {
+    return this.terminalPersistenceStore?.listSessionBoundaries(terminalId) || []
+  }
+
   attachOutputConsumer(
     terminalId: string,
     consumerId: string
@@ -5071,6 +5590,7 @@ export class TerminalService {
     offset: number
     remoteOs?: 'unix' | 'windows'
     windowsRelease?: string
+    sessionBoundaries?: TerminalSessionBoundary[]
   } {
     if (!terminalId || !consumerId) {
       return { data: '', offset: 0 }
@@ -5093,7 +5613,8 @@ export class TerminalService {
         this.backendRuntimeGenerationByTerminal.get(terminalId),
       data: buffer?.content || '',
       offset: buffer?.offset || 0,
-      ...this.getRenderMetadata(terminalId)
+      ...this.getRenderMetadata(terminalId),
+      sessionBoundaries: this.getTerminalSessionBoundaries(terminalId),
     }
   }
 
@@ -5426,6 +5947,13 @@ export class TerminalService {
     return Array.from(this.terminals.values())
   }
 
+  /** Transient connection status (in-memory runtime metadata only). */
+  getTerminalConnectionStatus(
+    terminalId: string,
+  ): TerminalTab['connectionStatus'] {
+    return this.terminals.get(terminalId)?.connectionStatus
+  }
+
   getAllTerminals(): TerminalTab[] {
     return Array.from(this.terminals.values()).filter((t) => !t.isInitializing && t.runtimeState === 'ready')
   }
@@ -5473,59 +6001,95 @@ export class TerminalService {
     )
   }
 
-  getCommandTask(terminalId: string, commandId: string): CommandTask | undefined {
-    const task =
-      this.tasksByTerminal.get(terminalId)?.[commandId] ||
-      this.detachedTasksByTerminal.get(terminalId)?.[commandId]
-    if (!task) return undefined
-    const snapshot = this.getCommandOutputSnapshot(terminalId, commandId)
-    return snapshot
-      ? { ...task, output: snapshot.output, capture: snapshot.capture }
-      : { ...task }
+  private persistVisibleStream(
+    terminalId: string,
+    startOffset: number,
+    data: string,
+    runtimeGeneration?: number,
+  ): void {
+    if (
+      !this.terminalHistoryEnabled || !this.terminalPersistenceStore ||
+      this.historySuspendedTerminalIds.has(terminalId)
+    ) return
+    this.terminalPersistenceStore.appendVisibleStream(
+      terminalId,
+      startOffset,
+      data,
+      runtimeGeneration,
+    )
+    this.scheduleHistoryFlush()
   }
 
-  getCommandRecordLocation(
-    terminalId: string,
-    commandId: string
-  ): 'active' | 'detached' | undefined {
-    if (this.tasksByTerminal.get(terminalId)?.[commandId]) {
-      return 'active'
-    }
-    if (this.detachedTasksByTerminal.get(terminalId)?.[commandId]) {
-      return 'detached'
-    }
-    return undefined
+  private persistActivitySnapshot(activity: TerminalActivitySnapshot): void {
+    if (
+      !this.terminalHistoryEnabled || !this.terminalPersistenceStore ||
+      this.historySuspendedTerminalIds.has(activity.terminalId)
+    ) return
+    this.terminalPersistenceStore.saveActivity(activity)
+    this.scheduleHistoryFlush()
   }
 
-  getCommandOutputSnapshot(
-    terminalId: string,
-    commandId: string
-  ): CommandOutputSnapshot | undefined {
-    const task =
-      this.tasksByTerminal.get(terminalId)?.[commandId] ||
-      this.detachedTasksByTerminal.get(terminalId)?.[commandId]
-    if (!task) return undefined
-    const capture = this.captureByTaskId.get(commandId)
-    const output = capture?.getText() ?? task.output ?? ''
-    const captureMetadata = capture?.getMetadata() ?? task.capture ?? {
-      state: 'unknown' as const,
-      reason: 'tracking_unavailable' as const,
-      observedUtf8Bytes: Buffer.byteLength(output, 'utf8'),
-      retainedUtf8Bytes: Buffer.byteLength(output, 'utf8'),
-      availableLineCount: output
-        ? output.split('\n').length - (output.endsWith('\n') ? 1 : 0)
-        : 0,
-      revision: 0,
-      terminalControlsObserved: false,
+  private buildTaskFromPersistedCommand(
+    record: PersistedAgentCommandRecord,
+  ): CommandTask {
+    return {
+      id: record.commandId,
+      command: record.command,
+      type: 'nowait',
+      status: record.status,
+      startOffset: record.startOffset,
+      ...(record.endOffset !== undefined
+        ? { endOffset: record.endOffset }
+        : {}),
+      ...(record.activityEndOffset !== undefined
+        ? { activityEndOffset: record.activityEndOffset }
+        : {}),
+      ...(record.exitCode !== undefined ? { exitCode: record.exitCode } : {}),
+      output: record.output,
+      capture: { ...record.capture },
+      runtimeBoundary: record.runtimeBoundary,
+      outcomeUnknown: record.outcomeUnknown,
+      ...(record.terminalStatus
+        ? { terminalStatus: record.terminalStatus }
+        : {}),
+      startTime: record.startedAt,
+      ...(record.endedAt !== undefined ? { endTime: record.endedAt } : {}),
     }
+  }
+
+  private buildCommandOutputSnapshot(
+    task: CommandTask,
+    persisted?: PersistedAgentCommandRecord,
+  ): CommandOutputSnapshot {
+    const capture = this.captureByTaskId.get(task.id)
+    const output =
+      capture?.getText() ??
+      task.output ??
+      (persisted && persisted.commandId === task.id ? persisted.output : '')
+    const captureMetadata =
+      capture?.getMetadata() ??
+      task.capture ??
+      (persisted && persisted.commandId === task.id
+        ? persisted.capture
+        : {
+            state: 'unknown' as const,
+            reason: 'tracking_unavailable' as const,
+            observedUtf8Bytes: Buffer.byteLength(output, 'utf8'),
+            retainedUtf8Bytes: Buffer.byteLength(output, 'utf8'),
+            availableLineCount: output
+              ? output.split('\n').length - (output.endsWith('\n') ? 1 : 0)
+              : 0,
+            revision: 0,
+            terminalControlsObserved: false,
+          })
     const executionState: CommandOutputSnapshot['executionState'] =
       task.runtimeBoundary || task.outcomeUnknown
-      ? 'outcome_unknown'
-      : task.status === 'finished'
-        ? 'finished'
-        : task.status === 'aborted'
-          ? 'aborted'
-          : 'running'
+        ? 'outcome_unknown'
+        : task.status === 'finished'
+          ? 'finished'
+          : task.status === 'aborted'
+            ? 'aborted'
+            : 'running'
     return {
       taskId: task.id,
       command: task.command,
@@ -5538,14 +6102,245 @@ export class TerminalService {
     }
   }
 
+  private persistAgentCommandRecord(
+    terminalId: string,
+    task: CommandTask,
+  ): void {
+    if (!this.terminalHistoryEnabled || !this.terminalPersistenceStore) return
+    const snapshot = this.buildCommandOutputSnapshot(task)
+    const executionState = snapshot.executionState
+    this.terminalPersistenceStore.saveAgentCommand({
+      commandId: task.id,
+      terminalId,
+      command: task.command,
+      status: task.status,
+      executionState,
+      ...(task.exitCode !== undefined ? { exitCode: task.exitCode } : {}),
+      runtimeBoundary: task.runtimeBoundary === true,
+      outcomeUnknown: task.outcomeUnknown === true,
+      ...(task.terminalStatus
+        ? { terminalStatus: task.terminalStatus }
+        : {}),
+      startOffset: task.startOffset,
+      ...(task.endOffset !== undefined ? { endOffset: task.endOffset } : {}),
+      ...(task.activityEndOffset !== undefined
+        ? { activityEndOffset: task.activityEndOffset }
+        : {}),
+      startedAt: task.startTime,
+      ...(task.endTime !== undefined ? { endedAt: task.endTime } : {}),
+      capture: { ...snapshot.capture },
+      output: snapshot.output,
+    })
+    this.scheduleHistoryFlush()
+  }
+
+  private findTaskTerminalId(taskId: string): string | undefined {
+    for (const [terminalId, tasks] of this.tasksByTerminal) {
+      if (tasks[taskId]) return terminalId
+    }
+    for (const [terminalId, tasks] of this.detachedTasksByTerminal) {
+      if (tasks[taskId]) return terminalId
+    }
+    return undefined
+  }
+
+  getCommandTask(terminalId: string, commandId: string): CommandTask | undefined {
+    const task =
+      this.tasksByTerminal.get(terminalId)?.[commandId] ||
+      this.detachedTasksByTerminal.get(terminalId)?.[commandId]
+    const persisted =
+      task || !this.terminalHistoryEnabled
+        ? undefined
+        : this.terminalPersistenceStore?.getAgentCommand(
+            terminalId,
+            commandId,
+          )
+    if (!task && !persisted) return undefined
+    const resolvedTask = task || this.buildTaskFromPersistedCommand(persisted!)
+    const snapshot = this.getCommandOutputSnapshot(terminalId, commandId)
+    return snapshot
+      ? { ...resolvedTask, output: snapshot.output, capture: snapshot.capture }
+      : { ...resolvedTask }
+  }
+
+  getCommandRecordLocation(
+    terminalId: string,
+    commandId: string
+  ): 'active' | 'detached' | 'persisted' | undefined {
+    if (this.tasksByTerminal.get(terminalId)?.[commandId]) {
+      return 'active'
+    }
+    if (this.detachedTasksByTerminal.get(terminalId)?.[commandId]) {
+      return 'detached'
+    }
+    if (
+      this.terminalHistoryEnabled &&
+      this.terminalPersistenceStore?.getAgentCommand(terminalId, commandId)
+    ) {
+      return 'persisted'
+    }
+    return undefined
+  }
+
+  getCommandOutputSnapshot(
+    terminalId: string,
+    commandId: string
+  ): CommandOutputSnapshot | undefined {
+    const task =
+      this.tasksByTerminal.get(terminalId)?.[commandId] ||
+      this.detachedTasksByTerminal.get(terminalId)?.[commandId]
+    const persisted = this.terminalHistoryEnabled
+      ? this.terminalPersistenceStore?.getAgentCommand(
+          terminalId,
+          commandId,
+        )
+      : undefined
+    if (!task && !persisted) return undefined
+    const resolvedTask = task || this.buildTaskFromPersistedCommand(persisted!)
+    return this.buildCommandOutputSnapshot(resolvedTask, persisted)
+  }
+
   getCommandTasks(terminalId: string): CommandTask[] {
-    const activeTasks = Object.values(this.tasksByTerminal.get(terminalId) || {})
-    const detachedTasks = Object.values(
-      this.detachedTasksByTerminal.get(terminalId) || {}
-    )
-    return [...activeTasks, ...detachedTasks].sort(
+    const byId = new Map<string, CommandTask>()
+    for (const task of Object.values(this.tasksByTerminal.get(terminalId) || {})) {
+      byId.set(task.id, task)
+    }
+    for (const task of Object.values(
+      this.detachedTasksByTerminal.get(terminalId) || {},
+    )) {
+      byId.set(task.id, task)
+    }
+    for (const record of (this.terminalHistoryEnabled
+      ? this.terminalPersistenceStore?.listAgentCommands(terminalId)
+      : []) || []) {
+      if (!byId.has(record.commandId)) {
+        byId.set(record.commandId, this.buildTaskFromPersistedCommand(record))
+      }
+    }
+    return Array.from(byId.values()).sort(
       (a, b) => b.startTime - a.startTime
     )
+  }
+
+  getTerminalActivities(terminalId: string): TerminalActivitySnapshot[] {
+    const activities = this.terminalActivityStore.list(terminalId)
+    return activities.length > 0 ||
+      !this.terminalHistoryEnabled ||
+      !this.terminalPersistenceStore
+      ? activities
+      : this.terminalPersistenceStore.readActivities(terminalId)
+  }
+
+  private startAgentCommandActivity(
+    terminalId: string,
+    task: CommandTask
+  ): void {
+    const context = task.activityContext
+    this.terminalActivityStore.start({
+      id: task.id,
+      terminalId,
+      actor: context?.actor ?? 'agent',
+      origin: 'agent-exec-command',
+      command: task.command,
+      startedAt: task.startTime,
+      startOffset: task.startOffset,
+      runtimeGeneration:
+        this.backendRuntimeGenerationByTerminal.get(terminalId),
+      ...(context?.intent ? { intent: context.intent } : {}),
+      ...(context?.sessionId ? { sessionId: context.sessionId } : {}),
+      ...(context?.messageId ? { messageId: context.messageId } : {})
+    })
+  }
+
+  private finishAgentCommandActivity(
+    terminalId: string,
+    task: CommandTask
+  ): void {
+    const status: Exclude<TerminalActivityStatus, 'running'> =
+      task.runtimeBoundary || task.outcomeUnknown
+        ? 'outcome-unknown'
+        : task.status === 'aborted'
+          ? 'aborted'
+          : task.exitCode === 0
+            ? 'succeeded'
+            : 'failed'
+    this.terminalActivityStore.finish({
+      terminalId,
+      activityId: task.id,
+      status,
+      endedAt: task.endTime ?? Date.now(),
+      endOffset:
+        task.activityEndOffset ?? this.getCurrentOffset(terminalId),
+      ...(task.exitCode !== undefined ? { exitCode: task.exitCode } : {})
+    })
+  }
+
+  private startManualCommandActivity(
+    terminalId: string,
+    boundary: { sequence?: number },
+    startedAt = Date.now(),
+    startOffset?: number
+  ): void {
+    if (this.activeManualActivityByTerminal.has(terminalId)) return
+    const pendingStart = this.pendingManualActivityStartByTerminal.get(terminalId)
+    if (!pendingStart) return
+    this.pendingManualActivityStartByTerminal.delete(terminalId)
+    const activityId = uuidv4()
+    this.activeManualActivityByTerminal.set(terminalId, activityId)
+    this.terminalActivityStore.start({
+      id: activityId,
+      terminalId,
+      actor: 'user',
+      origin: 'interactive-shell',
+      startedAt: pendingStart?.startedAt ?? startedAt,
+      startOffset:
+        pendingStart?.offset ?? startOffset ?? this.getCurrentOffset(terminalId),
+      runtimeGeneration:
+        this.backendRuntimeGenerationByTerminal.get(terminalId),
+      ...(boundary.sequence !== undefined
+        ? { shellSequence: boundary.sequence }
+        : {})
+    })
+  }
+
+  private finishManualCommandActivity(
+    terminalId: string,
+    exitCode: number | undefined,
+    options?: { outcomeUnknown?: boolean; endOffset?: number }
+  ): void {
+    const activityId = this.activeManualActivityByTerminal.get(terminalId)
+    if (!activityId) return
+    this.activeManualActivityByTerminal.delete(terminalId)
+    const status: Exclude<TerminalActivityStatus, 'running'> =
+      options?.outcomeUnknown || exitCode === undefined
+        ? 'outcome-unknown'
+        : exitCode === 0
+          ? 'succeeded'
+          : 'failed'
+    this.terminalActivityStore.finish({
+      terminalId,
+      activityId,
+      status,
+      endedAt: Date.now(),
+      endOffset: options?.endOffset ?? this.getCurrentOffset(terminalId),
+      ...(exitCode !== undefined ? { exitCode } : {})
+    })
+  }
+
+  private recordCompletedManualCommand(
+    terminalId: string,
+    marker: GyShellBoundaryMarker,
+    visibleBoundaryOffset = this.getCurrentOffset(terminalId)
+  ): void {
+    this.startManualCommandActivity(
+      terminalId,
+      marker,
+      this.lastUserInputAtByTerminal.get(terminalId) ?? Date.now(),
+      visibleBoundaryOffset
+    )
+    this.finishManualCommandActivity(terminalId, marker.exitCode, {
+      endOffset: visibleBoundaryOffset
+    })
   }
 
   setSelection(terminalId: string, selectionText: string): void {
@@ -5583,7 +6378,8 @@ export class TerminalService {
     command: string,
     onFinished?: (result: CommandResult) => void,
     signal?: AbortSignal,
-    runtimeGuard?: TerminalRuntimeGuard
+    runtimeGuard?: TerminalRuntimeGuard,
+    activityContext?: TerminalCommandActivityContext
   ): Promise<string> {
     const taskId = await this.executeCommandInternal(
       terminalId,
@@ -5591,7 +6387,8 @@ export class TerminalService {
       'nowait',
       onFinished,
       signal,
-      runtimeGuard
+      runtimeGuard,
+      activityContext
     )
     return taskId
   }
@@ -6319,6 +7116,7 @@ export class TerminalService {
       shouldSkip?: () => boolean;
       suppressFinishCallback?: boolean;
       runtimeGuard?: TerminalRuntimeGuard;
+      activityContext?: TerminalCommandActivityContext;
     }
   ): Promise<CommandResult> {
     const taskId = await this.executeCommandInternal(
@@ -6327,7 +7125,8 @@ export class TerminalService {
       'wait',
       opts?.onFinished,
       opts?.signal,
-      opts?.runtimeGuard
+      opts?.runtimeGuard,
+      opts?.activityContext
     )
     return this.waitForTask(terminalId, taskId, opts)
   }
@@ -6467,7 +7266,8 @@ export class TerminalService {
     type: 'wait' | 'nowait',
     onFinished?: (result: CommandResult) => void,
     signal?: AbortSignal,
-    runtimeGuard?: TerminalRuntimeGuard
+    runtimeGuard?: TerminalRuntimeGuard,
+    activityContext?: TerminalCommandActivityContext
   ): Promise<string> {
     throwIfTerminalOperationAborted(signal)
     const terminal = runtimeGuard
@@ -6513,7 +7313,8 @@ export class TerminalService {
         onFinished,
         signal,
         reservationToken,
-        runtimeGuard
+        runtimeGuard,
+        activityContext
       )
       return startedTaskId
     } finally {
@@ -6738,7 +7539,8 @@ export class TerminalService {
     onFinished: ((result: CommandResult) => void) | undefined,
     signal: AbortSignal | undefined,
     reservationToken: symbol,
-    runtimeGuard?: TerminalRuntimeGuard
+    runtimeGuard?: TerminalRuntimeGuard,
+    activityContext?: TerminalCommandActivityContext
   ): Promise<string> {
     const terminalId = terminal.id
     const runtimePtyId = terminal.ptyId
@@ -6772,7 +7574,6 @@ export class TerminalService {
 
     assertPlannedRuntime('command preparation')
     const taskId = this.createUniqueCommandTaskId()
-    const startOffset = this.getCurrentOffset(terminalId)
     // Preparation can mutate shared prompt-marker state and is not
     // cancellable. Keep the start reservation until it settles, then honor
     // stop before any dispatch.
@@ -6976,6 +7777,10 @@ export class TerminalService {
     const capture = new CommandTranscriptCapture()
     const unverifiedCapture = new CommandTranscriptCapture()
     const lastShellSequence = this.lastShellSequenceByTerminal.get(terminalId)
+    // Preparation and isolation may await filesystem/model work while
+    // unrelated background PTY output remains visible. Anchor the activity
+    // only once the command is ready to become the active terminal task.
+    const startOffset = this.getCurrentOffset(terminalId)
     const task: CommandTask = {
       id: taskId,
       command,
@@ -6988,6 +7793,7 @@ export class TerminalService {
       startOffset,
       startTime: Date.now(),
       output: '',
+      ...(activityContext ? { activityContext: { ...activityContext } } : {}),
       capture: capture.getMetadata(),
       captureBoundaryState: usesSyntheticTranscript
         ? 'awaiting-start'
@@ -7012,6 +7818,10 @@ export class TerminalService {
     this.unverifiedCaptureByTaskId.set(taskId, unverifiedCapture)
     this.runtimeGuardByTaskId.set(taskId, commandRuntimeGuard)
     this.activeTaskByTerminal.set(terminalId, taskId)
+    let activityStarted = false
+    this.startAgentCommandActivity(terminalId, task)
+    this.persistAgentCommandRecord(terminalId, task)
+    activityStarted = true
     if (usesSyntheticCommandEcho && lastShellSequence !== undefined) {
       const privateDispatcherName = wireCommand.split(' ', 1)[0] || wireCommand
       const runtimeTokenSuffix = privateDispatcherName
@@ -7107,11 +7917,19 @@ export class TerminalService {
         this.activeTaskByTerminal.delete(terminalId)
       }
       this.onTaskFinishedCallbacks.delete(taskId)
+      this.terminalPersistenceStore?.deleteAgentCommand(terminalId, taskId)
+      this.scheduleHistoryFlush()
       if (
         this.pendingUnixCommandDisplayByTerminal.get(terminalId)?.taskId ===
         taskId
       ) {
         this.pendingUnixCommandDisplayByTerminal.delete(terminalId)
+      }
+      if (activityStarted) {
+        task.status = 'aborted'
+        task.endTime = Date.now()
+        task.exitCode = -1
+        this.finishAgentCommandActivity(terminalId, task)
       }
       throw error
     }
@@ -7280,6 +8098,7 @@ export class TerminalService {
         )
       }
     }
+    this.finishAgentCommandActivity(terminalId, task)
     this.compactFinalizedTask(task)
     this.enforceCommandCaptureRetention()
   }
@@ -7428,6 +8247,7 @@ export class TerminalService {
     this.deferredWritesUntilTaskFinishByTaskId.delete(taskId)
     if (syntheticDisplay) {
       this.appendSyntheticDisplayData(terminalId, syntheticDisplay)
+      task.activityEndOffset = this.getCurrentOffset(terminalId)
     }
 
     // Input that arrived while this hidden request was starting belongs to
@@ -7459,6 +8279,7 @@ export class TerminalService {
         ...(task.runtimeBoundary ? { runtimeBoundary: true } : {})
       })
     }
+    this.finishAgentCommandActivity(terminalId, task)
     this.compactFinalizedTask(task)
     this.enforceCommandCaptureRetention()
   }
@@ -7686,15 +8507,21 @@ export class TerminalService {
     this.pendingTaskFinishByTerminal.delete(terminalId)
     this.deferredWritesUntilTaskFinishByTaskId.delete(taskId)
     this.onTaskFinishedCallbacks.delete(taskId)
+    this.finishAgentCommandActivity(terminalId, task)
     this.compactFinalizedTask(task)
     this.enforceCommandCaptureRetention()
   }
 
   private compactFinalizedTask(task: CommandTask): void {
     if (task.status === 'running') return
+    const terminalId = this.findTaskTerminalId(task.id)
+    if (terminalId) {
+      this.persistAgentCommandRecord(terminalId, task)
+    }
     task.command = this.takeTaskCommandPreview(task.command, 4096)
     delete task.output
     delete task.wireCommand
+    delete task.activityEndOffset
     delete task.completionTracking
     delete task.capturedOutput
     delete task.capturedOutputObservedUtf8Bytes
@@ -7790,6 +8617,10 @@ export class TerminalService {
         revision: metadata.revision + 1,
         terminalControlsObserved: metadata.terminalControlsObserved,
       }
+      const expiredTerminalId = this.findTaskTerminalId(expired.task.id)
+      if (expiredTerminalId) {
+        this.persistAgentCommandRecord(expiredTerminalId, expired.task)
+      }
     }
 
     const tombstones: Array<{
@@ -7818,6 +8649,11 @@ export class TerminalService {
       const expired = tombstones.shift()
       if (!expired) break
       delete expired.tasks[expired.task.id]
+      this.terminalPersistenceStore?.deleteAgentCommand(
+        expired.terminalId,
+        expired.task.id,
+      )
+      this.scheduleHistoryFlush()
       this.unverifiedCaptureByTaskId.delete(expired.task.id)
       this.deferredWritesUntilTaskFinishByTaskId.delete(expired.task.id)
       if (

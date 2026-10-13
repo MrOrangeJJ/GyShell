@@ -83,7 +83,12 @@ runCase('all model-visible terminal schemas reject legacy or mixed selectors', (
   }> = [
     {
       schema: execCommandSchema,
-      canonical: { terminalId: 'exact', command: 'pwd', waitMode: 'wait' }
+      canonical: {
+        terminalId: 'exact',
+        command: 'pwd',
+        intent: 'inspect current directory',
+        waitMode: 'wait'
+      }
     },
     {
       schema: readTerminalTabSchema,

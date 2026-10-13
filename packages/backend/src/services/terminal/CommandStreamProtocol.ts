@@ -376,6 +376,8 @@ export const buildUnixCommandDispatcherScript = (
     `      PROMPT_COMMAND="${precmdBeginHookName}\${${cleanPromptCommandsName}:+; $${cleanPromptCommandsName}}; ${precmdHookName}"`,
     `      unset ${cleanPromptCommandsName}`,
     '    fi',
+    // Reattaching runtime-local hooks must not export them to child shells.
+    '    export -n PROMPT_COMMAND',
     '  fi',
     `  ${currentIntTrapName}="$(builtin trap -p INT)"`,
     `  case "$${currentIntTrapName}" in *${interruptName}*) builtin trap - INT; if [ -n "\${${savedIntTrapName}-}" ]; then builtin eval -- "$${savedIntTrapName}"; fi ;; esac`,

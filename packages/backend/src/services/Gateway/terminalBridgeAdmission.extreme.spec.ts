@@ -29,17 +29,24 @@ for (const invalidSelector of [
 }
 
 const currentDir = dirname(fileURLToPath(import.meta.url));
-for (const runtimePath of [
-  join(currentDir, "../../runtimes/gybackend/startGyBackend.ts"),
-  join(currentDir, "../../../../electron/src/main/startElectronMain.ts"),
-]) {
+// Both runtime bridges require a registered terminal for Activity reads too.
+// Exited SSH tabs remain registered so their persisted timeline is still
+// available to a reconnecting client; unknown or closed IDs are rejected.
+const runtimeExpectations = new Map([
+  [
+    join(currentDir, "../../runtimes/gybackend/startGyBackend.ts"),
+    7,
+  ],
+  [join(currentDir, "../../../../electron/src/main/startElectronMain.ts"), 7],
+]);
+for (const [runtimePath, expectedGuardCount] of runtimeExpectations) {
   const source = readFileSync(runtimePath, "utf8");
   assert.equal(
     source.match(
       /requireLiveTerminalBridgeTarget\(terminalService, terminalId\)/g,
     )?.length,
-    6,
-    `${runtimePath} should guard every non-reconnect terminal bridge operation`,
+    expectedGuardCount,
+    `${runtimePath} should guard every live terminal bridge operation`,
   );
 }
 

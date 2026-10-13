@@ -929,6 +929,7 @@ export class ElectronGatewayIpcAdapter {
             rows: terminal.rows,
             runtimeState: terminal.runtimeState,
             lastExitCode: terminal.lastExitCode,
+            connectionStatus: terminal.connectionStatus,
             remoteOs: terminal.remoteOs,
             systemInfo: terminal.systemInfo,
             monitorIdentity:
@@ -993,6 +994,21 @@ export class ElectronGatewayIpcAdapter {
           ...this.terminalService.getRenderMetadata(terminalId),
         };
       },
+    );
+
+    ipcMain.handle(
+      "terminal:getActivities",
+      async (_: any, terminalId: string) => ({
+        activities: this.terminalService.getTerminalActivities(terminalId),
+      }),
+    );
+
+    ipcMain.handle(
+      "terminal:getSessionBoundaries",
+      async (_: any, terminalId: string) => ({
+        boundaries:
+          this.terminalService.getTerminalSessionBoundaries(terminalId),
+      }),
     );
 
     ipcMain.handle(

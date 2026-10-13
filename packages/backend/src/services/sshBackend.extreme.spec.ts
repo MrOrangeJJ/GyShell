@@ -10,6 +10,7 @@ import {
   buildPowerShellInitializationReadySequence,
 } from "./terminal/CommandStreamProtocol";
 import { PrivateShellInitializationGate } from "./terminal/PrivateShellInitializationGate";
+import { SSH_INITIALIZATION_CLEAR_SEQUENCE } from "./terminal/TerminalInitializationProtocol";
 import { WINDOWS_POWERSHELL_INITIAL_PROMPT_SEQUENCE } from "./windowsPowerShellTracking";
 
 const assertEqual = <T>(actual: T, expected: T, message: string): void => {
@@ -310,10 +311,15 @@ const run = async (): Promise<void> => {
       });
 
       const output: string[] = [];
+      const statusErrors: string[] = [];
       let exits = 0;
       backend.onData(terminalId, (data: string) => {
         output.push(data);
         throw new Error("simulated downstream xterm failure");
+      });
+      backend.onStatus(terminalId, (event: { level: string; text: string }) => {
+        if (event.level === "error") statusErrors.push(event.text);
+        throw new Error("simulated downstream status failure");
       });
       backend.onExit(terminalId, () => {
         exits += 1;
@@ -338,15 +344,96 @@ const run = async (): Promise<void> => {
       assertEqual(client.destroys, 1, "fatal transport should be destroyed once");
       assertEqual(exits, 1, "fatal transport should emit one terminal exit");
       assertEqual(
-        output.length,
+        statusErrors.length,
         1,
-        "repeated protocol errors should collapse into one visible diagnostic",
+        "repeated protocol errors should collapse into one status diagnostic",
+      );
+      assertCondition(
+        statusErrors[0]?.includes("fatal transport error"),
+        "the fatal diagnostic should be reported as connection status",
+      );
+      assertEqual(
+        output.join("").includes("fatal transport error"),
+        false,
+        "connection diagnostics must never be emitted as terminal content",
       );
       await new Promise((resolve) => setTimeout(resolve, 70));
       assertEqual(
         client.connects,
         0,
         "a pre-connect fatal error must cancel the delayed connection pipeline",
+      );
+    },
+  );
+
+  await runCase(
+    "late SSH subscribers receive output and exit state from a completed session",
+    () => {
+      const backend = new SSHBackend() as any;
+      const session = createSession();
+      session.pendingData = "early SSH output\r\n";
+      session.exitEmitted = true;
+      session.exitCode = 23;
+      backend.completedSessions.set("late-ssh-runtime", session);
+      const output: string[] = [];
+      const exits: number[] = [];
+
+      backend.onData("late-ssh-runtime", (data: string) => output.push(data));
+      backend.onExit("late-ssh-runtime", (code: number) => exits.push(code));
+
+      assertEqual(
+        output.join(""),
+        "early SSH output\r\n",
+        "late SSH data subscribers should receive buffered session output",
+      );
+      assertEqual(
+        exits[0],
+        23,
+        "late SSH exit subscribers should receive the completed exit code",
+      );
+    },
+  );
+
+  await runCase(
+    "SSH initialization clear is emitted once across readiness callbacks",
+    () => {
+      const backend = new SSHBackend() as any;
+      const session = createSession();
+      const emitted: string[] = [];
+      const emit = (data: string) => emitted.push(data);
+
+      backend.emitInitializationClearOnce(session, emit);
+      backend.emitInitializationClearOnce(session, emit);
+
+      assertEqual(
+        emitted.join(""),
+        SSH_INITIALIZATION_CLEAR_SEQUENCE,
+        "repeated connection and shell readiness must not clear the screen twice",
+      );
+      assertEqual(
+        emitted.length,
+        1,
+        "the initialization clear sequence must be a single event",
+      );
+    },
+  );
+
+  await runCase(
+    "completed SSH sessions are evicted after their bounded retention window",
+    async () => {
+      const backend = new SSHBackend() as any;
+      backend.completedRuntimeRetentionMs = 10;
+      const session = createSession();
+      backend.retainCompletedSession("expired-ssh-runtime", session);
+      assertCondition(
+        backend.completedSessions.has("expired-ssh-runtime"),
+        "completed SSH session should remain addressable during retention",
+      );
+
+      await new Promise((resolve) => setTimeout(resolve, 30));
+      assertCondition(
+        !backend.completedSessions.has("expired-ssh-runtime"),
+        "completed SSH session should be removed after retention expires",
       );
     },
   );
@@ -484,13 +571,15 @@ const run = async (): Promise<void> => {
       backend.waitForShellInitializationDelay = async () => true;
       backend.getShellInitRetryIntervalMs = () => 10;
       const emitted: string[] = [];
+      session.statusCallbacks = new Set([
+        (event: { text: string }) => emitted.push(event.text),
+      ]);
       let exitCount = 0;
 
       await backend.runShellInitializationAttempts(
         "retry-pty",
         session,
         stream,
-        (data: string) => emitted.push(data),
         () => {
           exitCount += 1;
         },
@@ -581,7 +670,6 @@ const run = async (): Promise<void> => {
         "powershell-retry-pty",
         session,
         stream,
-        () => {},
         () => {
           throw new Error("a successful PowerShell retry must not exit");
         },
@@ -694,7 +782,6 @@ const run = async (): Promise<void> => {
       "failed-pty",
       session,
       stream,
-      () => {},
       () => {
         exitCount += 1;
       },

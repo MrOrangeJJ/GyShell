@@ -26,6 +26,9 @@ import {
 } from "../../services/Gateway/toolingSummary";
 import { ImageAttachmentService } from "../../services/ImageAttachmentService";
 import { TerminalStateStore } from "../../services/terminal/TerminalStateStore";
+import {
+  openTerminalPersistenceStore,
+} from "../../services/terminal/TerminalPersistenceStore";
 import { createAutoTerminalConfig } from "../../services/terminal/terminalConnectionSupport";
 import { TerminalCommandDraftService } from "../../services/TerminalCommandDraftService";
 import { HistoryStorageMigration } from "../../services/history/HistoryStorageMigration";
@@ -93,8 +96,12 @@ export async function startGyBackend(): Promise<void> {
   const terminalStateStore = new TerminalStateStore(
     path.join(dataDir, "terminal-tabs-state.json"),
   );
+  const terminalPersistenceStore = openTerminalPersistenceStore(
+    path.join(dataDir, "terminal-persistence.sqlite"),
+  );
   const terminalService = new TerminalService({
     terminalStateStore,
+    terminalPersistenceStore,
   });
   const fileSystemService = new FileSystemService(terminalService);
   const fileTransferService = new FileTransferService(
@@ -103,7 +110,7 @@ export async function startGyBackend(): Promise<void> {
   );
   const historyStore = new HistorySqliteStore();
   process.once("exit", () => {
-    terminalService.flushPersistedState();
+    terminalService.closePersistedState();
     historyStore.close();
   });
   const uiHistoryService = new UIHistoryService({ store: historyStore });
@@ -232,6 +239,7 @@ export async function startGyBackend(): Promise<void> {
               rows: terminal.rows,
               runtimeState: terminal.runtimeState,
               lastExitCode: terminal.lastExitCode,
+              connectionStatus: terminal.connectionStatus,
               monitorIdentity:
                 terminalService.getMonitorIdentity(terminal.id) ?? undefined,
             })),
@@ -276,6 +284,12 @@ export async function startGyBackend(): Promise<void> {
               data,
               offset,
               ...terminalService.getRenderMetadata(terminalId),
+            };
+          },
+          getActivities: async (terminalId) => {
+            requireLiveTerminalBridgeTarget(terminalService, terminalId);
+            return {
+              activities: terminalService.getTerminalActivities(terminalId),
             };
           },
           generateCommandDraft: async (terminalId, prompt, profileId) => {

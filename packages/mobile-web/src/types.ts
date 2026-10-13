@@ -1,4 +1,4 @@
-import type { CommandOutputContractV1 } from '@gyshell/shared'
+import type { CommandOutputContractV1, TerminalConnectionStatus } from '@gyshell/shared'
 
 export type MessageType =
   | 'text'
@@ -160,6 +160,8 @@ export interface GatewayTerminalSummary {
   rows?: number
   runtimeState?: 'initializing' | 'ready' | 'exited'
   lastExitCode?: number
+  /** Transient connection progress/failure; never part of terminal output. */
+  connectionStatus?: TerminalConnectionStatus
 }
 
 export type GatewayProxyType = 'socks5' | 'http'

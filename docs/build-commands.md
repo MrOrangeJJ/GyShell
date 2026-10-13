@@ -55,6 +55,10 @@ This page maps root scripts, packaging targets, and release helpers to their run
 - `npm run test:backend-regression`
 - `npm run test:backend-extreme`
 - `npm run test:layout-ui-extreme`
+- `npm run test:terminal-block`
+  - Verify Block buffer projection, responsive layout, stream following, and the prompt dock.
+- `npm run test:terminal-render-extreme`
+  - Verify Activity recovery, marker ownership, session dividers, output replay, and Windows renderer behavior.
 - `npm run test:backend-unit-extreme`
 - `npm run test:desktop-cli-distribution`
   - Verify SEA packaging ownership, installer/PATH rules, setup collision handling, and bounded legacy cleanup.

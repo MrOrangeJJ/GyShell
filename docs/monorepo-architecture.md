@@ -74,6 +74,7 @@ GyShell/
 - Owns the workspace layout system, detachable sub-window behavior, cross-window drag/drop, file editor, and monitor panel.
 - UI stores consume gateway updates, terminal inventory, and monitor snapshot streams.
 - Handles gateway/mobile-web settings state and profile-lock/readiness sync in chat state.
+- Owns Classic and Block terminal presentation over one retained xterm runtime; see [Terminal Views and History](./terminal-views.md) for renderer and persistence contracts.
 
 ### `packages/tui`
 
@@ -101,7 +102,7 @@ GyShell/
 ### `packages/shared`
 
 - Shared cross-surface models and utilities.
-- Currently includes shared theme definitions and terminal connection capability models used by backend, desktop UI, and packaging flows.
+- Includes shared theme definitions, terminal connection capability models, Activity snapshots, session boundaries, and transient connection status used across backend, desktop UI, and packaging flows.
 
 ### `apps/*`
 
@@ -129,6 +130,7 @@ The desktop runtime chain is intentionally layered:
   - `SESSION_PROFILE_LOCKED`
   - `SESSION_READY`
 - Terminal tab operations are exposed through transport bridges (`terminal:list`, `terminal:createTab`, `terminal:kill`, etc.).
+- Terminal Activity and session-boundary metadata are runtime-independent domain projections. Electron exposes both to the desktop renderer; websocket/mobile clients continue to use the read-only `terminal:getBufferDelta` stream and transient terminal connection status.
 - Monitor snapshots are produced in backend and published to interested desktop windows; the renderer only subscribes, stores, and presents them.
 
 ## WebSocket Access Policy

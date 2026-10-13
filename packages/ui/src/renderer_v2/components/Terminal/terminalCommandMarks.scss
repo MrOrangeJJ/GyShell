@@ -1,0 +1,61 @@
+// Classic view gutter; stops above the footer (--terminal-footer-height).
+.terminal-command-marks {
+  position: absolute;
+  inset: 0 auto var(--terminal-footer-height) 0;
+  width: 10px;
+  pointer-events: none;
+  overflow: hidden;
+}
+.terminal-command-mark {
+  position: absolute;
+  left: 0;
+  width: 10px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  pointer-events: auto;
+  cursor: pointer;
+  color: color-mix(in srgb, var(--fg) 68%, var(--fg-muted));
+  display: grid;
+  place-items: center;
+  box-sizing: border-box;
+  margin: 0;
+  border-radius: 0;
+  > span {
+    display: block;
+    width: 4px;
+    border: 1px solid currentColor;
+    border-radius: 1px;
+    box-sizing: border-box;
+    opacity: 0.8;
+  }
+  &.is-agent {
+    color: color-mix(in srgb, var(--accent) 80%, var(--fg-muted));
+    > span {
+      background: currentColor;
+    }
+  }
+  &.is-user > span {
+    width: 5px;
+  }
+  &.is-running > span {
+    opacity: 1;
+  }
+  &.is-selected {
+    background: color-mix(in srgb, var(--accent) 16%, transparent);
+    > span {
+      width: 6px;
+      opacity: 1;
+    }
+  }
+  &:hover,
+  &:focus-visible {
+    background: color-mix(in srgb, var(--fg) 8%, var(--panel-bg));
+    outline: none;
+    > span {
+      opacity: 1;
+      outline: 1px solid currentColor;
+      outline-offset: 1px;
+    }
+  }
+}

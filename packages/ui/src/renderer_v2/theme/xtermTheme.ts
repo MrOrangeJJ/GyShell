@@ -2,7 +2,7 @@ import type { ITheme } from '@xterm/xterm'
 import type { TerminalColorScheme } from './terminalColorSchemes'
 
 // Copied from Tabby (`tabby-terminal/src/frontends/xtermFrontend.ts`)
-const COLOR_NAMES: Array<keyof ITheme> = [
+export const COLOR_NAMES: Array<keyof ITheme> = [
   'black',
   'red',
   'green',

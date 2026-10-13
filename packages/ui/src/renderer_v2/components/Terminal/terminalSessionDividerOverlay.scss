@@ -1,0 +1,86 @@
+.terminal-session-dividers {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  overflow: hidden;
+  z-index: 4;
+}
+
+.terminal-session-divider {
+  position: absolute;
+  left: 0;
+  right: 0;
+  width: 100%;
+  padding: 0 16px;
+  box-sizing: border-box;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  pointer-events: none;
+  user-select: none;
+
+  .terminal-session-divider-rule {
+    flex: 1;
+    height: 1.5px;
+    border-radius: 1px;
+
+    &.is-left {
+      background: linear-gradient(
+        90deg,
+        transparent 0%,
+        color-mix(in srgb, var(--accent) 12%, transparent) 6%,
+        color-mix(in srgb, var(--accent) 65%, transparent) 100%
+      );
+    }
+
+    &.is-right {
+      background: linear-gradient(
+        90deg,
+        color-mix(in srgb, var(--accent) 65%, transparent) 0%,
+        color-mix(in srgb, var(--accent) 12%, transparent) 94%,
+        transparent 100%
+      );
+    }
+  }
+
+  .terminal-session-divider-content {
+    flex-shrink: 0;
+    display: inline-flex;
+    align-items: center;
+    gap: 7px;
+    margin: 0 12px;
+    padding: 0;
+    background: transparent;
+    pointer-events: auto;
+    cursor: default;
+    line-height: 1;
+    user-select: none;
+  }
+
+  .terminal-session-divider-title {
+    font-family: var(--font-mono);
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 0.6px;
+    text-transform: uppercase;
+    color: var(--fg);
+    opacity: 0.9;
+    line-height: 1;
+  }
+
+  .terminal-session-divider-dot {
+    color: var(--fg-faint);
+    opacity: 0.7;
+    font-size: 10px;
+    line-height: 1;
+  }
+
+  .terminal-session-divider-time {
+    font-family: var(--font-mono);
+    font-size: 10px;
+    color: var(--fg-muted);
+    letter-spacing: 0.25px;
+    opacity: 0.8;
+    line-height: 1;
+  }
+}

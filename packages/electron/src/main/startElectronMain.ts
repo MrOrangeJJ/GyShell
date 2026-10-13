@@ -50,6 +50,9 @@ import {
   buildBuiltInToolStatusSummary,
 } from "../../../backend/src/services/Gateway/toolingSummary";
 import { TerminalStateStore } from "../../../backend/src/services/terminal/TerminalStateStore";
+import {
+  openTerminalPersistenceStore,
+} from "../../../backend/src/services/terminal/TerminalPersistenceStore";
 import { createAutoTerminalConfig } from "../../../backend/src/services/terminal/terminalConnectionSupport";
 import { MobileWebServerService } from "../services/MobileWebServerService";
 import { ResourceMonitorService } from "../../../backend/src/services/ResourceMonitorService";
@@ -575,9 +578,22 @@ export async function startElectronMain(): Promise<void> {
         const terminalStateStore = new TerminalStateStore(
           join(userDataDir, "terminal-tabs-state.json"),
         );
+        const terminalPersistenceStore = openTerminalPersistenceStore(
+          join(userDataDir, "terminal-persistence.sqlite"),
+        );
         terminalService = new TerminalService({
           terminalStateStore,
+          terminalPersistenceStore,
+          terminalHistoryEnabled:
+            uiSettingsStore.getSettings().terminal.saveHistory,
         });
+        const unsubscribeTerminalHistorySettings = uiSettingsStore.onChange(
+          (settings) => {
+            terminalService?.setTerminalHistoryEnabled(
+              settings.terminal.saveHistory,
+            );
+          },
+        );
         fileSystemService = new FileSystemService(terminalService);
         fileTransferService = new FileTransferService(
           fileSystemService,
@@ -658,8 +674,10 @@ export async function startElectronMain(): Promise<void> {
           },
         );
         app.once("before-quit", () => {
+          terminalService?.closePersistedState();
           unsubscribeRunState();
           unsubscribeSleepBlockerSettings();
+          unsubscribeTerminalHistorySettings();
           sleepBlockerService?.dispose();
           sleepBlockerService = null;
         });
@@ -723,6 +741,7 @@ export async function startElectronMain(): Promise<void> {
                     rows: terminal.rows,
                     runtimeState: terminal.runtimeState,
                     lastExitCode: terminal.lastExitCode,
+                    connectionStatus: terminal.connectionStatus,
                   })),
                 createTab: async (config) => {
                   const snapshot = terminalService.getDisplayTerminals();
@@ -771,6 +790,13 @@ export async function startElectronMain(): Promise<void> {
                     data,
                     offset,
                     ...terminalService.getRenderMetadata(terminalId),
+                  };
+                },
+                getActivities: async (terminalId) => {
+                  requireLiveTerminalBridgeTarget(terminalService, terminalId);
+                  return {
+                    activities:
+                      terminalService.getTerminalActivities(terminalId),
                   };
                 },
                 generateCommandDraft: async (terminalId, prompt, profileId) => {
@@ -1520,7 +1546,7 @@ app.on("child-process-gone", (_event, details) => {
 
 app.on("window-all-closed", async () => {
   if (terminalService) {
-    terminalService.flushPersistedState();
+    terminalService.closePersistedState();
   }
   if (uiHistoryService) {
     try {

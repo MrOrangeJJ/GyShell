@@ -11,6 +11,7 @@ import type {
 } from '../../types'
 import { TerminalService } from '../TerminalService'
 import { TerminalStateStore } from './TerminalStateStore'
+import { TerminalPersistenceStore } from './TerminalPersistenceStore'
 import { createAutoTerminalConfig } from './terminalConnectionSupport'
 
 const assertCondition = (condition: unknown, message: string): void => {
@@ -273,6 +274,45 @@ class FakeTerminalBackend implements TerminalBackend {
     session.dataCallbacks.forEach((callback) => callback(data))
   }
 
+  pseudoconsole = false
+  readonly repaintRequests: string[] = []
+
+  usesPseudoconsoleViewport(): boolean {
+    return this.pseudoconsole
+  }
+
+  requestRepaint(ptyId: string): boolean {
+    if (!this.pseudoconsole) return false
+    this.repaintRequests.push(ptyId)
+    return true
+  }
+
+  private readonly statusCallbacksByPtyId = new Map<
+    string,
+    Array<(event: { level: 'info' | 'success' | 'warning' | 'error'; text: string }) => void>
+  >()
+
+  onStatus(
+    ptyId: string,
+    callback: (event: { level: 'info' | 'success' | 'warning' | 'error'; text: string }) => void,
+  ): void {
+    const callbacks = this.statusCallbacksByPtyId.get(ptyId) ?? []
+    callbacks.push(callback)
+    this.statusCallbacksByPtyId.set(ptyId, callbacks)
+  }
+
+  emitStatusForTerminalId(
+    terminalId: string,
+    level: 'info' | 'success' | 'warning' | 'error',
+    text: string,
+  ): void {
+    for (const callback of this.statusCallbacksByPtyId.get(
+      this.getPtyIdForTerminalId(terminalId),
+    ) ?? []) {
+      callback({ level, text })
+    }
+  }
+
   emitExitForTerminalId(terminalId: string, code: number): void {
     const ptyId = this.getPtyIdForTerminalId(terminalId)
     const session = this.sessions.get(ptyId)
@@ -522,9 +562,16 @@ class FakeTerminalOnlyBackend implements TerminalBackend {
   }
 }
 
-const createService = (stateFilePath: string, backend: FakeTerminalBackend): TerminalService => {
+const createService = (
+  stateFilePath: string,
+  backend: FakeTerminalBackend,
+  persistenceFilePath?: string,
+): TerminalService => {
   const service = new TerminalService({
-    terminalStateStore: new TerminalStateStore(stateFilePath)
+    terminalStateStore: new TerminalStateStore(stateFilePath),
+    terminalPersistenceStore: persistenceFilePath
+      ? new TerminalPersistenceStore(persistenceFilePath)
+      : undefined,
   })
   ;(service as any).backends.set('local', backend)
   ;(service as any).backends.set('ssh', backend)
@@ -771,6 +818,422 @@ const run = async (): Promise<void> => {
         service2.getDisplayTerminals().some((item) => item.id === 'local-restore-a'),
         'restored terminal must exist in display list'
       )
+    })
+
+    await runCase('terminal service restores durable visible output before registering the live runtime', async () => {
+      const persistenceFilePath = path.join(tempDir, 'terminal-persistence.sqlite')
+      const backend1 = new FakeTerminalBackend()
+      const service1 = createService(stateFilePath, backend1, persistenceFilePath)
+      const terminalId = 'durable-visible-restore'
+      await service1.createTerminal({
+        type: 'local',
+        id: terminalId,
+        title: 'Durable Visible Restore',
+        cols: 80,
+        rows: 24
+      })
+      backend1.emitDataForTerminalId(terminalId, 'persisted visible output\r\n')
+      await sleep(180)
+      service1.flushPersistedState()
+      service1.closePersistedState()
+
+      const backend2 = new FakeTerminalBackend()
+      const service2 = createService(stateFilePath, backend2, persistenceFilePath)
+      const restore = await service2.restorePersistedTerminals()
+      assertCondition(
+        restore.restored.includes(terminalId),
+        'durable terminal should still be restored from the state store'
+      )
+      assertCondition(
+        service2.getBufferDelta(terminalId, 0).includes('persisted visible output'),
+        'visible output should be hydrated into the bounded backend buffer before live output'
+      )
+      const restoredHeadless = (service2 as any).headlessPtys.get(terminalId)
+      assertCondition(
+        restoredHeadless?.buffer.active.length > 0,
+        'headless xterm should be replayed from the durable visible stream'
+      )
+      service2.kill(terminalId)
+      service2.closePersistedState()
+    })
+
+    await runCase('a failed close purge cannot leak history into a reused terminal id', async () => {
+      const persistenceFilePath = path.join(tempDir, 'terminal-reuse-purge.sqlite')
+      const backend = new FakeTerminalBackend()
+      const service = createService(stateFilePath, backend, persistenceFilePath)
+      const terminalId = 'terminal-reuse-purge'
+      const config: TerminalConfig = {
+        type: 'local',
+        id: terminalId,
+        title: 'Terminal Reuse Purge',
+        cols: 80,
+        rows: 24
+      }
+      await service.createTerminal(config)
+
+      const persistenceStore = (service as any).terminalPersistenceStore as TerminalPersistenceStore
+      persistenceStore.appendVisibleStream(terminalId, 0, 'closed tab history\\r\\n')
+      persistenceStore.flush()
+      const originalDelete = persistenceStore.deleteTerminalVisibleHistory.bind(persistenceStore)
+      let failDelete = true
+      ;(persistenceStore as any).deleteTerminalVisibleHistory = (id: string): void => {
+        if (failDelete) throw new Error('simulated close purge failure')
+        originalDelete(id)
+      }
+
+      service.kill(terminalId)
+      failDelete = false
+      await service.createTerminal(config)
+      assertCondition(
+        !service.getBufferDelta(terminalId, 0).includes('closed tab history'),
+        'a reused terminal must not restore history left by a failed close purge'
+      )
+      service.kill(terminalId)
+      service.closePersistedState()
+    })
+
+    await runCase('terminal history can be disabled and cleared without deleting tab configuration', async () => {
+      const persistenceFilePath = path.join(tempDir, 'terminal-history-toggle.sqlite')
+      const backend = new FakeTerminalBackend()
+      const service = createService(stateFilePath, backend, persistenceFilePath)
+      const terminalId = 'terminal-history-toggle'
+      await service.createTerminal({
+        type: 'local',
+        id: terminalId,
+        title: 'History Toggle',
+        cols: 80,
+        rows: 24
+      })
+      backend.emitDataForTerminalId(terminalId, 'history before disable\r\n')
+      await sleep(180)
+      service.flushPersistedState()
+      service.setTerminalHistoryEnabled(false)
+
+      const stateStore = new TerminalStateStore(stateFilePath)
+      assertCondition(
+        stateStore.load().some((record) => record.id === terminalId),
+        'disabling history must preserve the terminal tab configuration'
+      )
+      const clearedStore = new TerminalPersistenceStore(persistenceFilePath)
+      const restored = clearedStore.restoreTerminal(terminalId)
+      assertEqual(
+        restored.visible.data,
+        '',
+        'disabling history must delete the durable visible stream'
+      )
+      assertEqual(
+        restored.activities.length,
+        0,
+        'disabling history must delete durable Activity metadata'
+      )
+      assertEqual(
+        clearedStore.listAgentCommands(terminalId).length,
+        0,
+        'disabling history must delete durable Agent command records'
+      )
+      clearedStore.close()
+      service.kill(terminalId)
+      service.closePersistedState()
+    })
+
+    await runCase('Windows ConPTY runtime is realigned below restored history and synthetic rows', async () => {
+      const persistenceFilePath = path.join(tempDir, 'conpty-realign.sqlite')
+      const terminalId = 'conpty-realign'
+      const config = {
+        type: 'local',
+        id: terminalId,
+        title: 'ConPTY',
+        cols: 40,
+        rows: 12
+      } as TerminalConfig
+      const backend1 = new FakeTerminalBackend()
+      backend1.setCommandShellFamilyForTerminalId(terminalId, 'powershell')
+      const service1 = createService(stateFilePath, backend1, persistenceFilePath)
+      await service1.createTerminal(config)
+      backend1.emitDataForTerminalId(terminalId, 'PS C:\\> old\r\nold output\r\nPS C:\\> ')
+      await sleep(180)
+      service1.flushPersistedState()
+      service1.closePersistedState()
+
+      const backend2 = new FakeTerminalBackend()
+      backend2.pseudoconsole = true
+      backend2.setCommandShellFamilyForTerminalId(terminalId, 'powershell')
+      const service2 = createService(stateFilePath, backend2, persistenceFilePath)
+      await service2.restorePersistedTerminals()
+      const tab = (service2 as any).terminals.get(terminalId)
+      tab.isInitializing = true
+      // ConPTY after Clear-Host: absolute rows from the top of ITS viewport.
+      backend2.emitDataForTerminalId(terminalId, '\x1b[1;1HPS C:\\> ')
+      assertEqual(backend2.repaintRequests.length, 1, 'new runtime requests one ConPTY repaint')
+      await sleep(250)
+      backend2.emitDataForTerminalId(terminalId, 'dir\r\n\x1b[3;1HDirectory: C:\\\r\n\x1b[5;1HPS C:\\> ')
+      await sleep(250)
+      const headless = (service2 as any).headlessPtys.get(terminalId)
+      const shadow = (service2 as any).pseudoconsoleShadowByTerminal.get(terminalId)
+      assertCondition(shadow, 'ConPTY shadow screen should exist for the runtime')
+      const rows = (): string[] => {
+        const out: string[] = []
+        for (let i = 0; i < headless.buffer.active.length; i += 1) {
+          out.push(headless.buffer.active.getLine(i)?.translateToString(true) ?? '')
+        }
+        return out
+      }
+      const before = rows()
+      assertCondition(
+        before.includes('PS C:\\> old') &&
+          before.includes('old output') &&
+          before.includes('PS C:\\> dir') &&
+          before.indexOf('PS C:\\> dir') > before.indexOf('old output'),
+        `restored history survives absolute ConPTY rows: ${JSON.stringify(before)}`
+      )
+      assertEqual(
+        headless.buffer.active.cursorY,
+        shadow.buffer.active.cursorY,
+        'renderer cursor row equals ConPTY row after restore'
+      )
+
+      // Renderer-only rows (agent transcript) followed by ConPTY's own prompt.
+      ;(service2 as any).appendSyntheticDisplayData(
+        terminalId,
+        'agent transcript 1\r\nagent transcript 2\r\nagent transcript 3\r\n'
+      )
+      await sleep(400)
+      assertEqual(
+        headless.buffer.active.cursorY,
+        shadow.buffer.active.cursorY,
+        'renderer cursor row is realigned to ConPTY after synthetic rows'
+      )
+      backend2.emitDataForTerminalId(terminalId, '\x1b[5;9Hls')
+      await sleep(250)
+      const after = rows()
+      for (const line of ['old output', 'agent transcript 1', 'agent transcript 3', 'Directory: C:\\']) {
+        assertCondition(after.some((row) => row.includes(line)), `${line} must not be overwritten: ${JSON.stringify(after)}`)
+      }
+      assertCondition(
+        after[headless.buffer.active.baseY + headless.buffer.active.cursorY].endsWith('ls'),
+        'typed input lands on the live row'
+      )
+      service2.kill(terminalId)
+      service2.closePersistedState()
+    })
+
+    await runCase('ssh connection status is transient tab metadata, never terminal content', async () => {
+      const persistenceFilePath = path.join(tempDir, 'ssh-connection-status.sqlite')
+      const sshConfig = (id: string): TerminalConfig => ({
+        type: 'ssh',
+        id,
+        title: id,
+        host: '10.0.0.9',
+        port: 22,
+        username: 'root',
+        authMethod: 'password',
+        password: 'secret',
+        cols: 80,
+        rows: 24
+      } as TerminalConfig)
+      const backend = new FakeTerminalBackend()
+      const service = createService(stateFilePath, backend, persistenceFilePath)
+      const statusOf = (id: string) => service.getTerminalConnectionStatus(id)
+
+      // Success: progress is visible while connecting and cleared when ready.
+      const okId = 'ssh-status-ok'
+      backend.setInitializationStateForTerminalId(okId, 'initializing')
+      await service.createTerminal(sshConfig(okId))
+      backend.emitStatusForTerminalId(okId, 'info', 'Connecting to 10.0.0.9:22...')
+      backend.emitStatusForTerminalId(okId, 'success', 'Connection established.')
+      assertEqual(statusOf(okId)?.phase, 'connecting', 'progress phase while connecting')
+      assertEqual(statusOf(okId)?.lines.length, 2, 'progress lines accumulate')
+      backend.setInitializationStateForTerminalId(okId, 'ready')
+      backend.emitDataForTerminalId(okId, 'remote prompt$ ')
+      assertEqual(statusOf(okId), undefined, 'status clears once the shell is ready')
+      backend.emitStatusForTerminalId(okId, 'info', 'late progress')
+      assertEqual(statusOf(okId), undefined, 'late progress after ready is ignored')
+
+      // Failure: only the failure reason remains; progress is dropped.
+      const failId = 'ssh-status-fail'
+      backend.setInitializationStateForTerminalId(failId, 'initializing')
+      await service.createTerminal(sshConfig(failId))
+      backend.emitStatusForTerminalId(failId, 'info', 'Connecting to 10.0.0.9:22...')
+      backend.emitStatusForTerminalId(
+        failId,
+        'error',
+        'SSH connection closed after a fatal transport error: Timed out while waiting for handshake',
+      )
+      backend.emitExitForTerminalId(failId, -1)
+      await sleep(20)
+      const failed = statusOf(failId)
+      assertEqual(failed?.phase, 'failed', 'failed phase after exit')
+      assertCondition(
+        failed?.lines.every((line) => line.level === 'error') &&
+          failed.lines[0].text.includes('Timed out'),
+        'failed status keeps only the failure reason',
+      )
+      for (const id of [okId, failId]) {
+        const visible = service.getBufferDelta(id, 0)
+        assertCondition(
+          !/Connecting to|Connection established|fatal transport/.test(visible),
+          `status text must never enter the visible stream (${id})`,
+        )
+      }
+      service.flushPersistedState()
+      service.closePersistedState()
+
+      // Restart: nothing about the old connection status is restored.
+      const backend2 = new FakeTerminalBackend()
+      const service2 = createService(stateFilePath, backend2, persistenceFilePath)
+      await service2.restorePersistedTerminals()
+      for (const id of [okId, failId]) {
+        assertEqual(
+          service2.getTerminalConnectionStatus(id),
+          undefined,
+          `connection status must not be restored after restart (${id})`,
+        )
+        assertCondition(
+          !/Connecting to|fatal transport/.test(service2.getBufferDelta(id, 0)),
+          `restored history must not contain status text (${id})`,
+        )
+        service2.kill(id)
+      }
+      service2.closePersistedState()
+    })
+
+    await runCase('a resume that printed nothing reuses the previous session divider', async () => {
+      const persistenceFilePath = path.join(tempDir, 'empty-resume.sqlite')
+      const terminalId = 'empty-resume'
+      const config = {
+        type: 'ssh' as const,
+        id: terminalId,
+        title: 'Empty Resume',
+        host: '10.0.0.9',
+        port: 22,
+        username: 'root',
+        authMethod: 'password' as const,
+        password: 'secret',
+        cols: 80,
+        rows: 24,
+      }
+      const backend1 = new FakeTerminalBackend()
+      const service1 = createService(stateFilePath, backend1, persistenceFilePath)
+      await service1.createTerminal(config)
+      backend1.emitDataForTerminalId(terminalId, 'history line\r\n')
+      await sleep(180)
+      service1.flushPersistedState()
+      service1.closePersistedState()
+
+      // Second launch: the connection never produces output.
+      const service2 = createService(stateFilePath, new FakeTerminalBackend(), persistenceFilePath)
+      await service2.restorePersistedTerminals()
+      const first = service2.getTerminalSessionBoundaries(terminalId)
+      const afterSecond = service2.getBufferDelta(terminalId, 0)
+      assertEqual(first.length, 1, 'first resume records one boundary')
+      service2.flushPersistedState()
+      service2.closePersistedState()
+      await sleep(5)
+
+      // Third launch: still nothing printed since the previous divider.
+      const service3 = createService(stateFilePath, new FakeTerminalBackend(), persistenceFilePath)
+      await service3.restorePersistedTerminals()
+      const second = service3.getTerminalSessionBoundaries(terminalId)
+      assertEqual(second.length, 1, 'empty session must not stack another divider')
+      assertEqual(second[0].id, first[0].id, 'the existing boundary is reused')
+      assertCondition(second[0].resumedAt > first[0].resumedAt, 'reused boundary shows the newest resume time')
+      assertEqual(
+        service3.getBufferDelta(terminalId, 0),
+        afterSecond,
+        'no extra spacing rows are appended for an empty session',
+      )
+      service3.flushPersistedState()
+      service3.closePersistedState()
+
+      // A session with real output gets its own divider.
+      const backend4 = new FakeTerminalBackend()
+      const service4 = createService(stateFilePath, backend4, persistenceFilePath)
+      await service4.restorePersistedTerminals()
+      backend4.setInitializationStateForTerminalId(terminalId, 'ready')
+      backend4.emitDataForTerminalId(terminalId, 'root@host:~# \r\n')
+      await sleep(180)
+      service4.flushPersistedState()
+      service4.closePersistedState()
+      const service5 = createService(stateFilePath, new FakeTerminalBackend(), persistenceFilePath)
+      await service5.restorePersistedTerminals()
+      assertEqual(
+        service5.getTerminalSessionBoundaries(terminalId).length,
+        2,
+        'a session with output keeps its own divider',
+      )
+      service5.kill(terminalId)
+      service5.closePersistedState()
+    })
+
+    await runCase('restored ssh history survives bootstrap clear and receives the session divider', async () => {
+      const persistenceFilePath = path.join(tempDir, 'ssh-history-recovery.sqlite')
+      const terminalId = 'ssh-history-recovery'
+      const backend1 = new FakeTerminalBackend()
+      const service1 = createService(stateFilePath, backend1, persistenceFilePath)
+      await service1.createTerminal({
+        type: 'ssh',
+        id: terminalId,
+        title: 'SSH History Recovery',
+        host: '10.0.0.8',
+        port: 22,
+        username: 'root',
+        authMethod: 'password',
+        password: 'secret',
+        cols: 80,
+        rows: 24
+      })
+      backend1.emitDataForTerminalId(terminalId, 'ssh history before restart\r\n')
+      await sleep(180)
+      service1.flushPersistedState()
+      service1.closePersistedState()
+
+      const backend2 = new FakeTerminalBackend()
+      const service2 = createService(stateFilePath, backend2, persistenceFilePath)
+      const restore = await service2.restorePersistedTerminals()
+      assertCondition(
+        restore.restored.includes(terminalId),
+        'SSH terminal should restore from the tab state store'
+      )
+      const restoredBeforeReady = service2.getBufferDelta(terminalId, 0)
+      assertCondition(
+        restoredBeforeReady.includes('ssh history before restart'),
+        'SSH durable history should be present before initialization completes'
+      )
+      const boundaries = service2.getTerminalSessionBoundaries(terminalId)
+      assertCondition(
+        boundaries.length > 0,
+        'restoration should record a structured session boundary'
+      )
+      assertCondition(
+        boundaries[0].terminalId === terminalId,
+        'session boundary should match restored terminal id'
+      )
+      assertCondition(
+        !restoredBeforeReady.includes('Session Resumed'),
+        'restoration should not pollute the raw stream with ASCII session divider text'
+      )
+
+      backend2.setInitializationStateForTerminalId(terminalId, 'ready')
+      // The transport may split the bootstrap clear across chunks.
+      backend2.emitDataForTerminalId(terminalId, '\x1b[2')
+      backend2.emitDataForTerminalId(terminalId, 'J\x1b[H')
+      backend2.emitDataForTerminalId(terminalId, 'ssh output after reconnect\r\n')
+      await sleep(20)
+      const restoredAfterReady = service2.getBufferDelta(terminalId, 0)
+      assertCondition(
+        restoredAfterReady.includes('ssh history before restart'),
+        'SSH bootstrap clear must not erase restored history'
+      )
+      assertCondition(
+        restoredAfterReady.includes('ssh output after reconnect'),
+        'SSH runtime should continue streaming after restored history'
+      )
+      assertCondition(
+        !restoredAfterReady.includes('\x1b[2J\x1b[H'),
+        'SSH bootstrap clear should remain an internal initialization control sequence'
+      )
+      service2.kill(terminalId)
+      service2.closePersistedState()
     })
 
     await runCase('restored idle windows terminals publish runtime metadata before any new output', async () => {
@@ -1832,6 +2295,52 @@ const run = async (): Promise<void> => {
         service.getRecentOutput(terminalId, 200).includes('after-parser-restart'),
         'replacement headless parser must continue consuming the new runtime output'
       )
+    })
+
+    await runCase('parser failure diagnostics survive durable terminal restore', async () => {
+      const parserStatePath = path.join(tempDir, 'parser-terminal-tabs-state.json')
+      const parserDatabasePath = path.join(tempDir, 'parser-terminal-persistence.sqlite')
+      const terminalId = 'durable-parser-diagnostic'
+      const backend1 = new FakeTerminalBackend()
+      const service1 = createService(parserStatePath, backend1, parserDatabasePath)
+      await service1.createTerminal({
+        type: 'local',
+        id: terminalId,
+        title: 'Durable Parser Diagnostic',
+        cols: 80,
+        rows: 24
+      })
+      backend1.emitDataForTerminalId(terminalId, 'before-durable-parser-failure\r\n')
+      await (service1 as any).outputFlowControllerByTerminal
+        .get(terminalId)
+        .waitForDrain(2_000)
+      const retiringHeadless = (service1 as any).headlessPtys.get(terminalId)
+      const originalWrite = retiringHeadless.write.bind(retiringHeadless)
+      retiringHeadless.write = (data: string, callback?: () => void): void => {
+        if (data.includes('durable-trigger-parser-failure')) {
+          throw new Error('simulated durable headless parser failure')
+        }
+        originalWrite(data, callback)
+      }
+      backend1.emitDataForTerminalId(terminalId, 'durable-trigger-parser-failure\r\n')
+      await sleep(180)
+      service1.flushPersistedState()
+      service1.closePersistedState()
+
+      const backend2 = new FakeTerminalBackend()
+      const service2 = createService(parserStatePath, backend2, parserDatabasePath)
+      const restore = await service2.restorePersistedTerminals()
+      assertCondition(
+        restore.restored.includes(terminalId),
+        'parser diagnostic terminal should restore from the tab state store'
+      )
+      assertCondition(
+        service2.getRecentOutput(terminalId, 500).includes('Terminal output parser failed'),
+        'parser failure diagnostic should be present after durable restore'
+      )
+      service1.kill(terminalId)
+      service2.kill(terminalId)
+      service2.closePersistedState()
     })
 
     await runCase('local auto-restart never publishes the dead runtime as command-ready', async () => {

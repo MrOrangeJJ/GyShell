@@ -5,14 +5,33 @@ import React, {
   useRef,
   useState,
 } from "react";
+import { ArrowUpRight, LoaderCircle, Sparkles, UserRound } from "lucide-react";
+import type { TerminalConnectionStatus } from "@gyshell/shared";
+import {
+  TerminalConnectionStatusCard,
+  type TerminalConnectionCardLabels,
+} from "./TerminalConnectionStatusCard";
+import { TerminalSessionDividerOverlay } from "./TerminalSessionDividerOverlay";
+import { TerminalCommandMarks } from "./TerminalCommandMarks";
+import { useTerminalBlockDock } from "./block/useTerminalBlockDock";
+import { resolveTerminalDockAnchor } from "./block/terminalDockModel";
+import {
+  TerminalCommandNavigator,
+  type TerminalCommandNavigatorLabels,
+} from "./TerminalCommandNavigator";
+import { getNavigableTerminalAnnotations } from "./terminalCommandNavigation";
 import { Terminal } from "@xterm/xterm";
-import type { FontWeight, ITheme } from "@xterm/xterm";
+import type { IMarker, ITheme } from "@xterm/xterm";
+import type {
+  TerminalActivitySnapshot,
+  TerminalSessionBoundary,
+} from "@gyshell/shared";
 import { FitAddon } from "@xterm/addon-fit";
 import { SearchAddon } from "@xterm/addon-search";
 import { WebLinksAddon } from "@xterm/addon-web-links";
 import "@xterm/xterm/css/xterm.css";
 import "./xtermView.scss";
-import type { TerminalConfig } from "../../lib/ipcTypes";
+import type { TerminalConfig, TerminalViewMode } from "../../lib/ipcTypes";
 import {
   TerminalCommandDraft,
   type TerminalCommandDraftLabels,
@@ -62,14 +81,50 @@ import {
   hasTerminalLiveOffsetGap,
   mergeTerminalInitialReplay,
 } from "./terminalInitialReplay";
+import {
+  selectTerminalActivityContext,
+} from "./terminalActivityModel";
+import { createTerminalActivityRuntime } from "./terminalActivityRuntime";
+import {
+  loadTerminalRecoveryMetadata,
+  type TerminalRecoveryMetadata,
+} from "./terminalRecoveryMetadata";
+import { createTerminalMarkerRegistry } from "./terminalMarkerRegistry";
+import {
+  useTerminalActivities,
+  type TerminalActivityMarkerRange,
+} from "./useTerminalActivities";
+import {
+  TerminalViewSwitch,
+  type TerminalViewModeLabels,
+} from "./TerminalViewSwitch";
+import {
+  commandFromPromptLine,
+  readTerminalBlockLogicalLine,
+  type TerminalCommandAnnotation,
+} from "./block/terminalBlockModel";
+import { resolveTerminalRevealTop } from "./terminalReveal";
+import { TerminalBlockView } from "./block/TerminalBlockView";
+import {
+  blockStatusText,
+  type TerminalBlockLabels,
+} from "./block/blockLabels";
+import {
+  applyTerminalFontOptions,
+  resolveTerminalFontOptions,
+} from "./terminalFontOptions";
+import {
+  TERMINAL_FOOTER_HEIGHT_PX,
+  TERMINAL_REVEAL_FLASH_MS,
+  TERMINAL_VIEW_CHROME_STYLE,
+} from "./terminalViewChrome";
+import "./terminalViewChrome.scss";
 
 const SCROLLBAR_HIDE_DELAY = 2000; // ms
 const RUNTIME_RELEASE_DELAY = 4000; // ms
 const TERMINAL_WRITE_RECOVERY_DRAIN_TIMEOUT_MS = 10_000;
 const COMMAND_DRAFT_SPINNER_FRAMES = ["|", "/", "-", "\\"];
 const COMMAND_DRAFT_FAILURE_VISIBILITY_MS = 1000;
-const TERMINAL_FONT_WEIGHT: FontWeight = 500;
-const TERMINAL_FONT_WEIGHT_BOLD: FontWeight = "bold";
 const TERMINAL_SEARCH_OPTIONS = {
   caseSensitive: false,
   decorations: {
@@ -103,6 +158,12 @@ interface XTermViewProps {
   config: TerminalConfig;
   theme: ITheme;
   terminalSettings?: TerminalSettings;
+  runtimeState?: "initializing" | "ready" | "exited";
+  connectionStatusLabel: string;
+  connectionStatus?: TerminalConnectionStatus;
+  disconnectedStatusLabel: string;
+  connectionCardLabels?: TerminalConnectionCardLabels;
+  onReconnect?: () => void;
   commandDraftLabels?: TerminalCommandDraftLabels;
   commandDraftShortcut?: string;
   commandDraftProfileId?: string;
@@ -124,6 +185,20 @@ interface XTermViewProps {
     resultCount: number;
     resultIndex: number;
   }) => void;
+  terminalViewMode: TerminalViewMode;
+  blockLabels: TerminalBlockLabels;
+  commandNavigatorLabels: TerminalCommandNavigatorLabels;
+  viewModeLabels: TerminalViewModeLabels;
+  dividerLabels: {
+    title: string;
+    resumedAt: string;
+    lastCommand: string;
+    exitCode: (code: number) => string;
+  };
+  locale: "en" | "zh-CN";
+  sessionTitleLookup?: (sessionId: string) => string | undefined;
+  commandSessionTitleLookup?: (sessionId: string) => string | undefined;
+  onTerminalViewModeChange?: (mode: TerminalViewMode) => void;
 }
 
 interface TerminalRuntime {
@@ -142,6 +217,20 @@ interface TerminalRuntime {
   refCount: number;
   releaseTimer: number | null;
   scrollHideTimer: number | null;
+  activityMarkers: Map<string, TerminalActivityMarkerRange>;
+  sessionMarkers: Map<string, IMarker>;
+  offsetAnchors: Map<number, IMarker>;
+  recoveryMetadata?: TerminalRecoveryMetadata;
+  markerRegistry: ReturnType<typeof createTerminalMarkerRegistry>;
+  scheduleActivityMarker: (
+    activity: TerminalActivitySnapshot,
+    edge: "start" | "end",
+  ) => void;
+  clearActivityMarker: (activityId: string) => void;
+  activityMetadataListener?: (
+    metadata: TerminalRecoveryMetadata,
+  ) => void;
+  activityMarkerLayoutListener?: () => void;
   cleanupBackendData: () => void;
   cleanupContextMenuListener: () => void;
   inputDispose: () => void;
@@ -158,6 +247,12 @@ interface TerminalRuntime {
   writeCoordinator: TerminalWriteCoordinator;
 }
 
+interface PendingTerminalActivityMarker {
+  activityId: string;
+  edge: "start" | "end";
+  offset: number;
+}
+
 interface TerminalRenderMetadata {
   remoteOs?: TerminalRemoteOs;
   windowsRelease?: string;
@@ -172,6 +267,46 @@ interface BufferedTerminalOutputEvent extends TerminalRenderMetadata {
 
 const runtimePool = new Map<string, TerminalRuntime>();
 let terminalRecoveryEpoch = 0;
+
+const registerTerminalActivityMarker = (
+  runtime: TerminalRuntime,
+  activityId: string,
+  edge: "start" | "end",
+  targetLine?: number,
+  targetAtLineStart?: boolean,
+): void => {
+  if (runtime.term.buffer.active.type !== "normal") return;
+  const range = runtime.activityMarkers.get(activityId) || {};
+  if (range[edge] && !range[edge]?.isDisposed) return;
+  const cursorLine =
+    runtime.term.buffer.active.baseY + runtime.term.buffer.active.cursorY;
+  const marker = runtime.term.registerMarker(
+    Number.isFinite(targetLine)
+      ? Math.floor(targetLine as number) - cursorLine
+      : 0,
+  );
+  if (!marker) return;
+  range[edge] = marker;
+  if (edge === "end") {
+    range.endAtLineStart = Number.isFinite(targetLine)
+      ? targetAtLineStart === true
+      : runtime.term.buffer.active.cursorX === 0;
+  }
+  runtime.activityMarkers.set(activityId, range);
+  marker.onDispose(() => {
+    const current = runtime.activityMarkers.get(activityId);
+    if (!current || current[edge] !== marker) return;
+    current[edge] = undefined;
+    if (!current.start && !current.end) {
+      runtime.activityMarkers.delete(activityId);
+    }
+    runtime.activityMarkerLayoutListener?.();
+  });
+};
+
+/** Typed commands have no recorded text: show what follows the prompt. */
+const resolvePromptPreview = (line: string | undefined): string | undefined =>
+  commandFromPromptLine(line) ?? (line?.trim() || undefined);
 
 const toPlainConfig = (config: TerminalConfig): TerminalConfig =>
   JSON.parse(JSON.stringify(config)) as TerminalConfig;
@@ -363,6 +498,8 @@ const disposeRuntime = (runtime: TerminalRuntime): void => {
   clearAnimationFrame(runtime.settleRefitFrame);
   runtime.releaseTimer = null;
   runtime.scrollHideTimer = null;
+  runtime.activityMarkers.clear();
+  runtime.markerRegistry.dispose();
   runtime.refitFrame = null;
   runtime.settleRefitFrame = null;
   runtime.cleanupBackendData();
@@ -391,12 +528,9 @@ const installRuntimeWriteCoordinatorDrainHandler = (
 
 const replaceRuntimeWriteCoordinator = (runtime: TerminalRuntime): void => {
   runtime.writeCoordinator.dispose();
-  runtime.writeCoordinator = new TerminalWriteCoordinator(
-    (data, callback) => {
-      runtime.term.write(data, callback);
-    },
-    "unknown",
-  );
+  runtime.writeCoordinator = new TerminalWriteCoordinator((data, callback) => {
+    runtime.term.write(data, callback);
+  }, "unknown");
   installRuntimeWriteCoordinatorDrainHandler(runtime);
 };
 
@@ -413,13 +547,15 @@ const createRuntime = (
     allowTransparency: true,
     cursorBlink: settings?.cursorBlink ?? true,
     cursorStyle: settings?.cursorStyle ?? "block",
-    fontSize: settings?.fontSize ?? 14,
-    fontWeight: TERMINAL_FONT_WEIGHT,
-    fontWeightBold: TERMINAL_FONT_WEIGHT_BOLD,
-    lineHeight: Math.max(1, settings?.lineHeight ?? 1.2),
+    ...resolveTerminalFontOptions(settings),
     scrollback: settings?.scrollback ?? 5000,
     theme,
     windowsPty,
+    // Like Windows Terminal/ConPTY, iTerm and Terminal.app: a clear-screen
+    // (ED2) pushes the viewport into scrollback instead of erasing it, so
+    // restored history and its "Session Resumed" divider stay intact and in
+    // place. ED3 (clear scrollback) still removes them.
+    scrollOnEraseInDisplay: true,
     allowProposedApi: true,
   });
 
@@ -447,6 +583,7 @@ const createRuntime = (
     // ignore transient DOM/layout issues
   }
 
+  const markerRegistry = createTerminalMarkerRegistry(term);
   const runtime: TerminalRuntime = {
     terminalId: config.id,
     term,
@@ -463,6 +600,14 @@ const createRuntime = (
     refCount: 0,
     releaseTimer: null,
     scrollHideTimer: null,
+    markerRegistry,
+    activityMarkers: new Map(),
+    sessionMarkers: markerRegistry.boundaryMarkers,
+    offsetAnchors: markerRegistry.offsetAnchors,
+    scheduleActivityMarker: () => {},
+    clearActivityMarker: () => {},
+    activityMetadataListener: undefined,
+    activityMarkerLayoutListener: undefined,
     cleanupBackendData: () => {},
     cleanupContextMenuListener: () => {},
     inputDispose: () => {},
@@ -663,34 +808,18 @@ const createRuntime = (
   let writeCoordinatorRuntimeGeneration: number | undefined;
   let failedWriteCoordinatorGeneration: number | undefined;
   let failedCoordinatorRecoveryInFlight = false;
-  const terminalFlowApi = window.gyshell.terminal as typeof window.gyshell.terminal & {
-    attachOutputConsumer?: (
-      terminalId: string,
-      consumerId: string,
-    ) => Promise<{
-      runtimeGeneration?: number;
-      data: string;
-      offset: number;
-      remoteOs?: TerminalRemoteOs;
-      windowsRelease?: string;
-    }>;
-    detachOutputConsumer?: (terminalId: string, consumerId: string) => void;
-    acknowledgeOutput?: (
-      terminalId: string,
-      consumerId: string,
-      runtimeGeneration: number,
-      outputSequence: number,
-    ) => void;
-    reportOutputFailure?: (
-      terminalId: string,
-      consumerId: string,
-      runtimeGeneration: number,
-      errorMessage: string,
-    ) => void;
+  const pendingActivityMarkers = new Map<
+    string,
+    PendingTerminalActivityMarker
+  >();
+  const rememberActivityOffsetAnchor = (offset: number): void => {
+    runtime.markerRegistry.rememberOffsetAnchor(offset);
   };
-  const installWriteCoordinatorFailureHandler = (
-    generation?: number,
-  ): void => {
+  const clearActivityOffsetAnchors = (): void => {
+    runtime.markerRegistry.clearOffsetAnchors();
+  };
+  const terminalFlowApi = window.gyshell.terminal;
+  const installWriteCoordinatorFailureHandler = (generation?: number): void => {
     const coordinator = runtime.writeCoordinator;
     coordinator.setFailureHandler((error) => {
       const failureGeneration = Number.isSafeInteger(generation)
@@ -728,6 +857,83 @@ const createRuntime = (
     return false;
   };
   installWriteCoordinatorFailureHandler();
+
+  const commitActivityMarkers = (
+    boundaries: PendingTerminalActivityMarker[],
+  ): void => {
+    for (const boundary of boundaries) {
+      registerTerminalActivityMarker(
+        runtime,
+        boundary.activityId,
+        boundary.edge,
+      );
+    }
+    runtime.activityMarkerLayoutListener?.();
+  };
+  const clearActivityMarker = (activityId: string): void => {
+    pendingActivityMarkers.delete(`${activityId}:start`);
+    pendingActivityMarkers.delete(`${activityId}:end`);
+    const range = runtime.activityMarkers.get(activityId);
+    if (!range) return;
+    runtime.activityMarkers.delete(activityId);
+    range.start?.dispose();
+    range.end?.dispose();
+  };
+
+  runtime.clearActivityMarker = clearActivityMarker;
+  runtime.scheduleActivityMarker = (activity, edge) => {
+    const offset = edge === "start" ? activity.startOffset : activity.endOffset;
+    if (!Number.isFinite(offset)) return;
+    if (
+      Number.isSafeInteger(activity.runtimeGeneration) &&
+      Number.isSafeInteger(attachedRuntimeGeneration) &&
+      activity.runtimeGeneration !== attachedRuntimeGeneration
+    ) {
+      return;
+    }
+    const range = runtime.activityMarkers.get(activity.id);
+    if (range?.[edge] && !range[edge]?.isDisposed) return;
+    const boundary: PendingTerminalActivityMarker = {
+      activityId: activity.id,
+      edge,
+      offset: Math.max(0, Math.floor(offset as number)),
+    };
+    const key = `${activity.id}:${edge}`;
+    const anchor = runtime.markerRegistry.getOffsetAnchor(boundary.offset);
+    if (anchor) {
+      pendingActivityMarkers.delete(key);
+      registerTerminalActivityMarker(
+        runtime,
+        boundary.activityId,
+        boundary.edge,
+        anchor.marker.line,
+        anchor.atLineStart,
+      );
+      runtime.activityMarkerLayoutListener?.();
+      return;
+    }
+    if (boundary.offset < lastCommittedBufferOffset) {
+      // Once xterm has parsed bytes beyond a boundary, ANSI rewrites and
+      // wrapping make retroactive byte-to-row reconstruction unsafe.
+      return;
+    }
+    if (boundary.offset <= lastBufferOffset) {
+      pendingActivityMarkers.delete(key);
+      runtime.writeCoordinator.checkpoint(() => {
+        commitActivityMarkers([boundary]);
+      });
+      return;
+    }
+    pendingActivityMarkers.set(key, boundary);
+  };
+
+  const activityRuntime = createTerminalActivityRuntime(
+    runtime,
+    typeof terminalFlowApi.onActivity === "function"
+      ? terminalFlowApi.onActivity
+      : undefined,
+  );
+
   const writeDataWithOffset = (
     data: string,
     offset?: number,
@@ -739,12 +945,7 @@ const createRuntime = (
     const transition = createRuntimeWindowsPtyTransition(runtime, metadata);
     if (!data) {
       if (applyMetadataWhenDuplicate) {
-        runtime.writeCoordinator.write(
-          "",
-          transition,
-          completion,
-          failure,
-        );
+        runtime.writeCoordinator.write("", transition, completion, failure);
       } else {
         completion?.();
       }
@@ -757,6 +958,7 @@ const createRuntime = (
 
     const normalizedOffset = Math.max(0, Math.floor(offset as number));
     const completeAtOffset = (): void => {
+      rememberActivityOffsetAnchor(normalizedOffset);
       lastCommittedBufferOffset = Math.max(
         lastCommittedBufferOffset,
         normalizedOffset,
@@ -766,39 +968,90 @@ const createRuntime = (
     const chunkStart = Math.max(0, normalizedOffset - data.length);
     if (normalizedOffset <= lastBufferOffset) {
       if (applyMetadataWhenDuplicate) {
-        runtime.writeCoordinator.write(
-          "",
-          transition,
-          completeAtOffset,
-          failure,
-        );
+        runtime.writeCoordinator.write("", transition, completion, failure);
       } else {
         completion?.();
       }
       return;
     }
-    if (chunkStart < lastBufferOffset) {
-      const overlap = lastBufferOffset - chunkStart;
-      const nextChunk = data.slice(Math.max(0, overlap));
-      if (nextChunk) {
+    const overlap = Math.max(0, lastBufferOffset - chunkStart);
+    const nextChunk = data.slice(overlap);
+    const nextChunkStart = chunkStart + overlap;
+    const boundaries = [...pendingActivityMarkers.entries()]
+      .filter(([, boundary]) => boundary.offset <= normalizedOffset)
+      .sort((left, right) => left[1].offset - right[1].offset);
+    for (const [key, boundary] of boundaries) {
+      pendingActivityMarkers.delete(key);
+      if (boundary.offset < nextChunkStart) {
+        // The retained ring buffer no longer contains this boundary.
+        continue;
+      }
+    }
+    const visibleBoundaries = boundaries
+      .map(([, boundary]) => boundary)
+      .filter((boundary) => boundary.offset >= nextChunkStart);
+    let cursorOffset = nextChunkStart;
+    let cursorIndex = 0;
+    let transitionPending = transition;
+    let completionScheduled = false;
+    let boundaryIndex = 0;
+    while (boundaryIndex < visibleBoundaries.length) {
+      const boundaryOffset = visibleBoundaries[boundaryIndex].offset;
+      const sameOffset: PendingTerminalActivityMarker[] = [];
+      while (
+        boundaryIndex < visibleBoundaries.length &&
+        visibleBoundaries[boundaryIndex].offset === boundaryOffset
+      ) {
+        sameOffset.push(visibleBoundaries[boundaryIndex]);
+        boundaryIndex += 1;
+      }
+      const endIndex = Math.max(
+        cursorIndex,
+        Math.min(nextChunk.length, boundaryOffset - nextChunkStart),
+      );
+      const prefix = nextChunk.slice(cursorIndex, endIndex);
+      const isFinalBoundary =
+        boundaryOffset >= normalizedOffset &&
+        boundaryIndex >= visibleBoundaries.length;
+      const boundaryCompletion = () => {
+        commitActivityMarkers(sameOffset);
+        if (isFinalBoundary) completeAtOffset();
+      };
+      if (prefix) {
+        runtime.writeCoordinator.write(
+          prefix,
+          transitionPending,
+          undefined,
+          failure,
+        );
+        transitionPending = undefined;
+      }
+      runtime.writeCoordinator.checkpoint(boundaryCompletion);
+      completionScheduled = completionScheduled || isFinalBoundary;
+      cursorIndex = endIndex;
+      cursorOffset = boundaryOffset;
+    }
+    const suffix = nextChunk.slice(cursorIndex);
+    if (suffix) {
+      runtime.writeCoordinator.write(
+        suffix,
+        transitionPending,
+        completeAtOffset,
+        failure,
+      );
+      completionScheduled = true;
+    } else if (!completionScheduled) {
+      if (cursorOffset < normalizedOffset) {
         runtime.writeCoordinator.write(
           nextChunk,
-          transition,
+          transitionPending,
           completeAtOffset,
           failure,
         );
       } else {
-        completeAtOffset();
+        runtime.writeCoordinator.checkpoint(completeAtOffset);
       }
-      lastBufferOffset = normalizedOffset;
-      return;
     }
-    runtime.writeCoordinator.write(
-      data,
-      transition,
-      completeAtOffset,
-      failure,
-    );
     lastBufferOffset = normalizedOffset;
   };
 
@@ -850,6 +1103,7 @@ const createRuntime = (
       offset: number;
       remoteOs?: TerminalRemoteOs;
       windowsRelease?: string;
+      sessionBoundaries?: readonly TerminalSessionBoundary[];
     },
     replayEvents: BufferedTerminalOutputEvent[],
     failureGeneration?: number,
@@ -873,6 +1127,14 @@ const createRuntime = (
       );
     const replayMetadata: TerminalRenderMetadata = latestMetadata || initial;
 
+    const boundaries = initial.sessionBoundaries || [];
+    const registerRestoreMarker = (
+      boundary: TerminalSessionBoundary,
+    ): void => {
+      runtime.markerRegistry.registerBoundary(boundary.id, 1);
+      runtime.activityMarkerLayoutListener?.();
+    };
+
     const acknowledgeReplay = (): void => {
       replayEvents.forEach(acknowledgeBufferedEvent);
       if (recoveringFailedCoordinator) {
@@ -887,8 +1149,9 @@ const createRuntime = (
       }
       const latestEventGeneration = [...replayEvents]
         .reverse()
-        .find((event) => Number.isSafeInteger(event.runtimeGeneration))
-        ?.runtimeGeneration;
+        .find((event) =>
+          Number.isSafeInteger(event.runtimeGeneration),
+        )?.runtimeGeneration;
       const generation = Number.isSafeInteger(latestEventGeneration)
         ? latestEventGeneration
         : Number.isSafeInteger(failureGeneration)
@@ -917,14 +1180,65 @@ const createRuntime = (
       return;
     }
 
-    writeDataWithOffset(
-      replay.data,
-      replay.offset,
-      replayMetadata,
-      true,
-      acknowledgeReplay,
-      reportReplayFailure,
-    );
+    const dataStartOffset = Math.max(0, replay.offset - replay.data.length);
+    const visibleBoundaries = boundaries
+      .filter(
+        (boundary) =>
+          Number.isFinite(boundary.offset) &&
+          boundary.offset >= dataStartOffset &&
+          boundary.offset <= replay.offset,
+      )
+      .sort((left, right) => left.offset - right.offset);
+    const latestVisibleBoundary =
+      visibleBoundaries[visibleBoundaries.length - 1];
+
+    const writeReplayThroughBoundaries = (
+      cursorIndex: number,
+      boundaryIndex: number,
+    ): void => {
+      if (boundaryIndex >= visibleBoundaries.length) {
+        writeDataWithOffset(
+          replay.data.slice(cursorIndex),
+          replay.offset,
+          replayMetadata,
+          boundaryIndex === 0,
+          acknowledgeReplay,
+          reportReplayFailure,
+        );
+        return;
+      }
+
+      const boundaryOffset = visibleBoundaries[boundaryIndex].offset;
+      const boundaryDataIndex = Math.max(
+        cursorIndex,
+        Math.min(replay.data.length, boundaryOffset - dataStartOffset),
+      );
+      const boundaryGroup: TerminalSessionBoundary[] = [];
+      let nextBoundaryIndex = boundaryIndex;
+      while (
+        nextBoundaryIndex < visibleBoundaries.length &&
+        visibleBoundaries[nextBoundaryIndex].offset === boundaryOffset
+      ) {
+        boundaryGroup.push(visibleBoundaries[nextBoundaryIndex]);
+        nextBoundaryIndex += 1;
+      }
+      const isHistorical =
+        latestVisibleBoundary !== undefined &&
+        boundaryOffset <= latestVisibleBoundary.offset;
+      writeDataWithOffset(
+        replay.data.slice(cursorIndex, boundaryDataIndex),
+        dataStartOffset + boundaryDataIndex,
+        isHistorical ? initial : replayMetadata,
+        true,
+        () => {
+          boundaryGroup.forEach((boundary) => registerRestoreMarker(boundary));
+          writeReplayThroughBoundaries(boundaryDataIndex, nextBoundaryIndex);
+        },
+        reportReplayFailure,
+      );
+    };
+
+    writeReplayThroughBoundaries(0, 0);
   };
 
   const beginFailedCoordinatorRecovery = (
@@ -960,6 +1274,7 @@ const createRuntime = (
         // Reset the parser and rebuild the visible tail from the same bounded
         // backend buffer used to recover the headless xterm.
         runtime.term.reset();
+        clearActivityOffsetAnchors();
         replaceRuntimeWriteCoordinator(runtime);
         lastBufferOffset = 0;
         lastCommittedBufferOffset = 0;
@@ -972,14 +1287,20 @@ const createRuntime = (
           0,
         );
         if (outputConsumerDisposed) return;
+        const metadata = await loadTerminalRecoveryMetadata(
+          window.gyshell.terminal,
+          config.id,
+        );
+        activityRuntime.recover(metadata);
         const replayEvents = pendingLiveEvents.splice(
           0,
           pendingLiveEvents.length,
         );
         const latestGeneration = [...replayEvents]
           .reverse()
-          .find((event) => Number.isSafeInteger(event.runtimeGeneration))
-          ?.runtimeGeneration;
+          .find((event) =>
+            Number.isSafeInteger(event.runtimeGeneration),
+          )?.runtimeGeneration;
         const replayGeneration = Number.isSafeInteger(latestGeneration)
           ? (latestGeneration as number)
           : currentGeneration;
@@ -987,7 +1308,10 @@ const createRuntime = (
         writeCoordinatorRuntimeGeneration = replayGeneration;
         installWriteCoordinatorFailureHandler(replayGeneration);
         replayBufferedOutput(
-          initial,
+          {
+            ...initial,
+            sessionBoundaries: metadata.sessionBoundaries,
+          },
           replayEvents,
           replayGeneration,
           true,
@@ -1084,13 +1408,17 @@ const createRuntime = (
       }
     },
   );
-  let outputAttachmentPromise: Promise<{
-    runtimeGeneration?: number;
-    data: string;
-    offset: number;
-    remoteOs?: TerminalRemoteOs;
-    windowsRelease?: string;
-  } | undefined> = Promise.resolve(undefined);
+  let outputAttachmentPromise: Promise<
+    | {
+        runtimeGeneration?: number;
+        data: string;
+        offset: number;
+        remoteOs?: TerminalRemoteOs;
+        windowsRelease?: string;
+        sessionBoundaries?: TerminalSessionBoundary[];
+      }
+    | undefined
+  > = Promise.resolve(undefined);
   if (typeof terminalFlowApi.attachOutputConsumer === "function") {
     outputAttachmentPromise = (async () => {
       let attempt = 0;
@@ -1101,10 +1429,7 @@ const createRuntime = (
             outputConsumerId,
           );
           if (outputConsumerDisposed) {
-            terminalFlowApi.detachOutputConsumer?.(
-              config.id,
-              outputConsumerId,
-            );
+            terminalFlowApi.detachOutputConsumer?.(config.id, outputConsumerId);
             return undefined;
           }
           if (Number.isSafeInteger(result?.runtimeGeneration)) {
@@ -1148,27 +1473,37 @@ const createRuntime = (
       const attachment = await outputAttachmentPromise;
       if (outputConsumerDisposed) return;
       const initial =
-        attachment ||
-        (await window.gyshell.terminal.getBufferDelta(config.id, 0));
+        attachment || {
+          ...(await window.gyshell.terminal.getBufferDelta(config.id, 0)),
+          sessionBoundaries: undefined,
+        };
+      const metadata = await loadTerminalRecoveryMetadata(
+        window.gyshell.terminal,
+        config.id,
+      );
+      activityRuntime.recover(metadata);
       const replayEvents = pendingLiveEvents.splice(
         0,
         pendingLiveEvents.length,
       );
       const latestGeneration = [...replayEvents]
         .reverse()
-        .find((event) => Number.isSafeInteger(event.runtimeGeneration))
-        ?.runtimeGeneration;
+        .find((event) =>
+          Number.isSafeInteger(event.runtimeGeneration),
+        )?.runtimeGeneration;
       replayBufferedOutput(
-        initial,
+        {
+          ...initial,
+          sessionBoundaries:
+            initial.sessionBoundaries ?? metadata.sessionBoundaries,
+        },
         replayEvents,
         Number.isSafeInteger(latestGeneration)
           ? latestGeneration
           : attachedRuntimeGeneration,
       );
     } catch (error) {
-      const failureGeneration = Number.isSafeInteger(
-        attachedRuntimeGeneration,
-      )
+      const failureGeneration = Number.isSafeInteger(attachedRuntimeGeneration)
         ? (attachedRuntimeGeneration as number)
         : [...pendingLiveEvents]
             .reverse()
@@ -1195,13 +1530,12 @@ const createRuntime = (
   void syncBufferedOutput();
 
   runtime.cleanupBackendData = () => {
+    activityRuntime.dispose();
     cleanup();
+    clearActivityOffsetAnchors();
     outputConsumerDisposed = true;
     if (outputConsumerAttached) {
-      terminalFlowApi.detachOutputConsumer?.(
-        config.id,
-        outputConsumerId,
-      );
+      terminalFlowApi.detachOutputConsumer?.(config.id, outputConsumerId);
       outputConsumerAttached = false;
     }
   };
@@ -1302,14 +1636,14 @@ export const XTermView = React.forwardRef<XTermSearchHandle, XTermViewProps>(
     const searchHandleRef = useRef<XTermSearchHandle | null>(null);
     const onSearchResultsChangeRef = useRef<
       TerminalSearchResultsChangeHandler | undefined
-    >(
-      props.onSearchResultsChange,
-    );
+    >(props.onSearchResultsChange);
     const aliveRef = useRef(true);
     const isActiveRef = useRef(props.isActive !== false);
     const commandDraftFailureTimerRef = useRef<number | null>(null);
     const lastHandledDraftRequestIdRef = useRef(0);
     const lastPointerRef = useRef<{ x: number; y: number } | null>(null);
+    const [hiddenConnectionFailureAt, setHiddenConnectionFailureAt] =
+      useState<number | null>(null);
     const [commandDraftOpen, setCommandDraftOpen] = useState(false);
     const [commandDraftInput, setCommandDraftInput] = useState("");
     const [commandDraftPending, setCommandDraftPending] = useState(false);
@@ -1320,6 +1654,47 @@ export const XTermView = React.forwardRef<XTermSearchHandle, XTermViewProps>(
       width?: number;
     } | null>(null);
     const [commandDraftSpinnerFrame, setCommandDraftSpinnerFrame] = useState(0);
+    // The runtime's xterm, as state so both views re-render when it changes.
+    const [runtimeTerminal, setRuntimeTerminal] = useState<Terminal | null>(
+      null,
+    );
+    const {
+      activities,
+      sessionBoundaries,
+      blockFocusRequest,
+      selectedCommandId,
+      activityLayoutRevision,
+      setBlockFocusRequest,
+      setSelectedCommandId,
+    } = useTerminalActivities(runtimeRef, props.config.id, runtimeTerminal);
+    const [blockNative, setBlockNative] = useState(false);
+    const pendingRevealRef = useRef<{ activityId: string }>();
+    const revealFlashRef = useRef<() => void>();
+    // The Block view always docks the active prompt (the real xterm) at the
+    // bottom; only the alternate-screen fallback shows the full terminal.
+    // A disconnected session has no prompt to dock (connecting keeps it:
+    // SSH password and host-key prompts are answered there).
+    const dockVisible =
+      props.terminalViewMode === "block" &&
+      !blockNative &&
+      props.runtimeState !== "exited" &&
+      props.isActive !== false;
+    const dockActivitiesRef = useRef(activities);
+    dockActivitiesRef.current = activities;
+    const getDockAnchor = useCallback(
+      () =>
+        resolveTerminalDockAnchor(dockActivitiesRef.current, (activityId) =>
+          runtimeRef.current?.activityMarkers.get(activityId),
+        ),
+      [],
+    );
+    const dockHeight = useTerminalBlockDock(
+      runtimeTerminal,
+      hostRef.current,
+      dockVisible,
+      TERMINAL_FOOTER_HEIGHT_PX,
+      getDockAnchor,
+    );
     const resolvedCommandDraftShortcut =
       props.commandDraftShortcut ?? getDefaultCommandDraftShortcut();
 
@@ -1563,6 +1938,8 @@ export const XTermView = React.forwardRef<XTermSearchHandle, XTermViewProps>(
       runtime.isActive = props.isActive ?? false;
       runtimeRef.current = runtime;
       attachRuntimeToHost(runtime, hostEl);
+      setRuntimeTerminal(runtime.term);
+      setBlockNative(false);
 
       const handleResize = () => {
         const activeRuntime = runtimeRef.current;
@@ -1747,19 +2124,24 @@ export const XTermView = React.forwardRef<XTermSearchHandle, XTermViewProps>(
       runtime.term.options.theme = props.theme;
     }, [props.theme, props.config.id]);
 
+    // Shared with the Block view so its rows match the docked prompt.
+    const terminalFont = React.useMemo(
+      () =>
+        resolveTerminalFontOptions({
+          fontSize: props.terminalSettings?.fontSize,
+          lineHeight: props.terminalSettings?.lineHeight,
+        }),
+      [props.terminalSettings?.fontSize, props.terminalSettings?.lineHeight],
+    );
+
     // Live-update terminal settings
     useEffect(() => {
       const runtime = runtimeRef.current;
       if (!runtime) return;
       runtime.settings = props.terminalSettings;
       const options = runtime.term.options;
-      if (props.terminalSettings?.fontSize)
-        options.fontSize = props.terminalSettings.fontSize;
-      if (props.terminalSettings?.lineHeight)
-        options.lineHeight = Math.max(1, props.terminalSettings.lineHeight);
-      options.fontWeight = TERMINAL_FONT_WEIGHT;
-      options.fontWeightBold = TERMINAL_FONT_WEIGHT_BOLD;
-      if (props.terminalSettings?.scrollback)
+      applyTerminalFontOptions(runtime.term, terminalFont);
+      if (props.terminalSettings?.scrollback !== undefined)
         options.scrollback = props.terminalSettings.scrollback;
       if (props.terminalSettings?.cursorStyle)
         options.cursorStyle = props.terminalSettings.cursorStyle;
@@ -1775,8 +2157,7 @@ export const XTermView = React.forwardRef<XTermSearchHandle, XTermViewProps>(
         scheduleRuntimeRefit(activeRuntime);
       });
     }, [
-      props.terminalSettings?.fontSize,
-      props.terminalSettings?.lineHeight,
+      terminalFont,
       props.terminalSettings?.scrollback,
       props.terminalSettings?.cursorStyle,
       props.terminalSettings?.cursorBlink,
@@ -1797,10 +2178,301 @@ export const XTermView = React.forwardRef<XTermSearchHandle, XTermViewProps>(
       });
     }, [props.isActive, props.layoutSignature, props.config.id]);
 
+    const blockLabels = props.blockLabels;
+    const connectionFailureReason =
+      props.connectionStatus?.phase === "failed"
+        ? props.connectionStatus.lines.map((line) => line.text).join(" · ")
+        : "";
+    const usesNormalBuffer =
+      runtimeRef.current?.term.buffer.active.type === "normal";
+    const contextActivity = selectTerminalActivityContext(activities);
+    const contextMarker = contextActivity
+      ? runtimeRef.current?.activityMarkers.get(contextActivity.id)?.start
+      : undefined;
+    const contextStatus = contextActivity
+      ? blockStatusText(contextActivity, blockLabels)
+      : "";
+
+    const commandAnnotations = React.useMemo<
+      TerminalCommandAnnotation[]
+    >(() => {
+      const runtime = runtimeRef.current;
+      if (!runtime) return [];
+      return activities.flatMap((activity) => {
+        const range = runtime.activityMarkers.get(activity.id);
+        if (!range?.start || range.start.isDisposed) return [];
+        return [
+          {
+            id: activity.id,
+            startLine: range.start.line,
+            endLine:
+              range.end && !range.end.isDisposed
+                ? range.end.line + (range.endAtLineStart ? 0 : 1)
+                : undefined,
+            endSharesNextRow:
+              !!range.end && !range.end.isDisposed && !range.endAtLineStart,
+            activity,
+            bufferPreview: !activity.command
+              ? resolvePromptPreview(
+                  readTerminalBlockLogicalLine(
+                    runtime.term.buffer.normal,
+                    range.start.line,
+                    runtime.term.buffer.normal.length,
+                    runtime.term.cols,
+                  )?.text,
+                )
+              : undefined,
+          },
+        ];
+      });
+    }, [activities, activityLayoutRevision]);
+    const navigableAnnotations = React.useMemo(
+      () => getNavigableTerminalAnnotations(commandAnnotations),
+      [commandAnnotations],
+    );
+
+    // A rewritten prompt can share a marker row with an older command. Match
+    // the Block projection's last-boundary-wins rule before offering a jump.
+    const canInspectContext = Boolean(
+      contextMarker &&
+      !contextMarker.isDisposed &&
+      props.onTerminalViewModeChange &&
+      commandAnnotations
+        .filter((entry) => entry.startLine === contextMarker.line)
+        .at(-1)?.id === contextActivity?.id,
+    );
+
+    const contextTitle = contextActivity
+      ? contextActivity.intent ||
+        contextActivity.command ||
+        commandAnnotations.find((entry) => entry.id === contextActivity.id)
+          ?.bufferPreview ||
+        blockLabels.output
+      : "";
+
+    const inspectCommand = (activityId: string) => {
+      setSelectedCommandId(activityId);
+      setBlockFocusRequest((current) => ({
+        activityId,
+        revision: (current?.revision || 0) + 1,
+      }));
+      props.onTerminalViewModeChange?.("block");
+    };
+    /** Viewport top that shows the command row near the top, with a little
+     *  of the previous output above it; undefined when it cannot be shown. */
+    const resolveCommandRevealTop = (activityId: string): number | undefined => {
+      const runtime = runtimeRef.current;
+      const marker = runtime?.activityMarkers.get(activityId)?.start;
+      if (
+        !runtime ||
+        runtime.term.buffer.active.type !== "normal" ||
+        !marker ||
+        marker.isDisposed
+      ) {
+        return undefined;
+      }
+      return resolveTerminalRevealTop({
+        commandLine: marker.line,
+        viewportRows: runtime.term.rows,
+        maxTop: runtime.term.buffer.active.baseY,
+      });
+    };
+    /** Briefly tints the command's rows so the eye lands on them. */
+    const flashCommandRows = (activityId: string) => {
+      const runtime = runtimeRef.current;
+      const marker = runtime?.activityMarkers.get(activityId)?.start;
+      revealFlashRef.current?.();
+      revealFlashRef.current = undefined;
+      if (!runtime || !marker || marker.isDisposed) return;
+      const { term } = runtime;
+      const buffer = term.buffer.normal;
+      const echo = readTerminalBlockLogicalLine(
+        buffer,
+        marker.line,
+        Math.min(buffer.length, marker.line + 16),
+        term.cols,
+      );
+      const height = Math.max(1, (echo?.endLine ?? marker.line + 1) - marker.line);
+      // Own marker: disposing the flash must never touch the Activity marker.
+      const flashMarker = term.registerMarker(
+        marker.line - (buffer.baseY + buffer.cursorY),
+      );
+      if (!flashMarker) return;
+      const decoration = term.registerDecoration({
+        marker: flashMarker,
+        width: term.cols,
+        height,
+        layer: "top",
+      });
+      decoration?.onRender((element) =>
+        element.classList.add("terminal-reveal-flash"),
+      );
+      const timer = window.setTimeout(() => dispose(), TERMINAL_REVEAL_FLASH_MS);
+      const dispose = () => {
+        window.clearTimeout(timer);
+        decoration?.dispose();
+        flashMarker.dispose();
+      };
+      revealFlashRef.current = dispose;
+    };
+    const revealCommandInTerminal = (activityId: string) => {
+      setSelectedCommandId(activityId);
+      props.onTerminalViewModeChange?.("classic");
+      // Leaving the Block view refits xterm a frame or two later, and xterm
+      // re-syncs its scroll position after a resize (shifting it by the row
+      // delta). Hold the landing until the layout has been stable for a few
+      // frames; a wheel by the user cancels it (see the effect below).
+      const token = { activityId };
+      pendingRevealRef.current = token;
+      const startedAt = performance.now();
+      let stableFrames = 0;
+      let flashed = false;
+      const step = () => {
+        const runtime = runtimeRef.current;
+        if (!runtime || pendingRevealRef.current !== token) return;
+        const top = resolveCommandRevealTop(activityId);
+        if (top === undefined) {
+          pendingRevealRef.current = undefined;
+          return;
+        }
+        if (runtime.term.buffer.active.viewportY !== top) {
+          runtime.term.scrollToLine(top);
+          stableFrames = 0;
+        } else {
+          stableFrames += 1;
+        }
+        if (!flashed) {
+          flashed = true;
+          flashCommandRows(activityId);
+        }
+        if (stableFrames < 6 && performance.now() - startedAt < 1000) {
+          requestAnimationFrame(step);
+        } else {
+          pendingRevealRef.current = undefined;
+        }
+      };
+      requestAnimationFrame(step);
+    };
+    // A user scroll ends a pending landing; unmount clears the flash.
+    useEffect(() => {
+      const host = hostRef.current;
+      const cancel = () => {
+        pendingRevealRef.current = undefined;
+      };
+      host?.addEventListener("wheel", cancel, { passive: true });
+      return () => {
+        host?.removeEventListener("wheel", cancel);
+        pendingRevealRef.current = undefined;
+        revealFlashRef.current?.();
+        revealFlashRef.current = undefined;
+      };
+    }, []);
+
+    // Connecting / disconnected state for either footer (Terminal or Block).
+    const connectionStatusNode =
+      props.runtimeState === "initializing" ? (
+        <span className="terminal-connection-status" aria-live="polite">
+          <LoaderCircle size={13} aria-hidden="true" />
+          <span>
+            {props.connectionStatusLabel}
+          </span>
+        </span>
+      ) : props.runtimeState === "exited" ? (
+        connectionFailureReason ? (
+          <button
+            type="button"
+            className="terminal-connection-status is-exited is-failed"
+            title={connectionFailureReason}
+            onClick={() => setHiddenConnectionFailureAt(null)}
+          >
+            <span>{props.disconnectedStatusLabel}</span>
+            <span className="terminal-connection-status-reason">
+              {connectionFailureReason}
+            </span>
+          </button>
+        ) : (
+          <span className="terminal-connection-status is-exited">
+            {props.disconnectedStatusLabel}
+          </span>
+        )
+      ) : null;
+
+    // Classic view only: the Block view is itself the command list (gutter
+    // jumps and the footer context still open a block there).
+    const commandNavigator = () => (
+      <TerminalCommandNavigator
+        annotations={navigableAnnotations}
+        labels={props.commandNavigatorLabels}
+        selectedId={selectedCommandId}
+        disabled={
+          !usesNormalBuffer ||
+          props.isActive === false ||
+          props.terminalViewMode === "block"
+        }
+        onNavigate={revealCommandInTerminal}
+      />
+    );
+
+    React.useLayoutEffect(() => {
+      const mount = runtimeRef.current?.mountEl;
+      if (!mount) return;
+      const reading =
+        props.terminalViewMode === "block" && !blockNative && !dockVisible;
+      mount.inert = reading;
+      if (reading) runtimeRef.current?.term.blur();
+      return () => {
+        mount.inert = false;
+      };
+    }, [props.terminalViewMode, blockNative, runtimeTerminal, dockVisible]);
+
+    useEffect(() => {
+      const runtime = runtimeRef.current;
+      if (!runtime || runtime.terminalId !== props.config.id) return;
+      const frame = window.requestAnimationFrame(() => {
+        scheduleRuntimeRefit(runtime);
+      });
+      return () => window.cancelAnimationFrame(frame);
+    }, [props.config.id, props.isActive, props.terminalViewMode]);
+
     return (
       <>
-        <div className="xterm-shell">
+        <div
+          className={`xterm-shell${props.terminalViewMode === "block" ? ` is-block-mode${blockNative ? " is-block-native" : ""}${dockVisible ? " is-block-input" : ""}` : ""}`}
+          style={TERMINAL_VIEW_CHROME_STYLE}
+        >
           <div className="xterm-host" ref={hostRef} />
+          {runtimeTerminal && props.terminalViewMode === "classic" ? (
+            <TerminalCommandMarks
+              terminal={runtimeTerminal}
+              annotations={navigableAnnotations}
+              selectedId={selectedCommandId}
+              labels={blockLabels}
+              onInspect={inspectCommand}
+            />
+          ) : null}
+          <TerminalConnectionStatusCard
+            status={props.connectionStatus}
+            hidden={
+              props.connectionStatus?.phase === "failed" &&
+              hiddenConnectionFailureAt === props.connectionStatus.updatedAt
+            }
+            labels={props.connectionCardLabels}
+            onReconnect={props.onReconnect}
+            onHide={() =>
+              setHiddenConnectionFailureAt(
+                props.connectionStatus?.updatedAt ?? null,
+              )
+            }
+          />
+          {runtimeTerminal && props.terminalViewMode === "classic" ? (
+            <TerminalSessionDividerOverlay
+              terminal={runtimeTerminal}
+              boundaries={sessionBoundaries}
+              markers={runtimeRef.current?.sessionMarkers || new Map()}
+              labels={props.dividerLabels}
+              locale={props.locale}
+            />
+          ) : null}
           {commandDraftPending || commandDraftFailed ? (
             <div
               className={
@@ -1821,6 +2493,94 @@ export const XTermView = React.forwardRef<XTermSearchHandle, XTermViewProps>(
                   : props.commandDraftLabels?.failed || "draft failed"}
               </span>
             </div>
+          ) : null}
+          {runtimeTerminal ? (
+            <TerminalBlockView
+              key={props.config.id}
+              terminal={runtimeTerminal}
+              annotations={commandAnnotations}
+              theme={props.theme}
+              font={terminalFont}
+              labels={blockLabels}
+              visible={props.terminalViewMode === "block"}
+              isActive={
+                props.isActive !== false && props.terminalViewMode === "block"
+              }
+              focusRequest={blockFocusRequest}
+              onSelectActivity={setSelectedCommandId}
+              onNativeModeChange={setBlockNative}
+              onSelectionChange={props.onSelectionChange}
+              copyOnSelect={props.terminalSettings?.copyOnSelect}
+              rightClickToPaste={
+                dockVisible && props.terminalSettings?.rightClickToPaste
+              }
+              viewModeLabels={props.viewModeLabels}
+              onViewModeChange={props.onTerminalViewModeChange}
+              dockHeight={dockVisible ? dockHeight : 0}
+              onRevealInTerminal={revealCommandInTerminal}
+              sessionTitleLookup={props.sessionTitleLookup}
+              commandSessionTitleLookup={props.commandSessionTitleLookup}
+              footerStatus={connectionStatusNode}
+              sessionState={
+                props.runtimeState === "exited"
+                  ? "disconnected"
+                  : props.runtimeState === "initializing"
+                    ? "connecting"
+                    : undefined
+              }
+            />
+          ) : null}
+          {props.terminalViewMode === "classic" ? (
+            <footer className="terminal-view-toolbar xterm-classic-toolbar">
+              {connectionStatusNode ? (
+                connectionStatusNode
+              ) : contextActivity ? (
+                <button
+                  type="button"
+                  className={`terminal-classic-context is-${contextActivity.actor} is-${contextActivity.status}`}
+                  disabled={!canInspectContext}
+                  title={`${canInspectContext ? blockLabels.openBlock : blockLabels.outputUnavailable}\n${contextTitle}`}
+                  aria-label={`${canInspectContext ? blockLabels.openBlock : blockLabels.outputUnavailable}: ${contextTitle}`}
+                  onClick={() => inspectCommand(contextActivity.id)}
+                >
+                  {contextActivity.actor === "agent" ? (
+                    <Sparkles size={13} aria-label={blockLabels.agent} />
+                  ) : (
+                    <UserRound size={13} aria-label={blockLabels.user} />
+                  )}
+                  <span className="terminal-classic-context-phase">
+                    {contextActivity.status === "running"
+                      ? blockLabels.running
+                      : blockLabels.lastCommand}
+                  </span>
+                  <span className="terminal-classic-context-title">
+                    {contextTitle}
+                  </span>
+                  {contextActivity.status !== "running" ? (
+                    <span className="terminal-classic-context-status">
+                      {contextStatus}
+                    </span>
+                  ) : null}
+                  {canInspectContext ? (
+                    <ArrowUpRight size={12} aria-hidden="true" />
+                  ) : null}
+                </button>
+              ) : (
+                <span className="terminal-view-toolbar-idle">
+                  {usesNormalBuffer
+                    ? props.viewModeLabels.classic
+                    : blockLabels.alternate}
+                </span>
+              )}
+              {props.onTerminalViewModeChange ? commandNavigator() : null}
+              {props.onTerminalViewModeChange ? (
+                <TerminalViewSwitch
+                  value="classic"
+                  labels={props.viewModeLabels}
+                  onChange={props.onTerminalViewModeChange}
+                />
+              ) : null}
+            </footer>
           ) : null}
         </div>
         <TerminalCommandDraft

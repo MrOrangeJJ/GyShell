@@ -21,4 +21,6 @@ export enum PortForwardType {
 }
 
 export type AppLanguage = UiSettings['language']
+/** Classic (native xterm) or Block (command blocks above a docked prompt). */
+export type TerminalViewMode = UiSettings['terminal']['viewMode']
 export type ModelDefinition = BackendSettings['models']['items'][number]

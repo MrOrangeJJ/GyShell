@@ -1,4 +1,5 @@
 import * as pty from 'node-pty'
+import { buildLocalShellEnvironment } from './terminal/localShellEnvironment'
 import {
   buildPackagedCliFishInitCommand,
   buildPackagedCliNushellInitCommand,
@@ -61,14 +62,23 @@ import {
   buildUnixCommandDispatcherScript,
   consumeInitializationReadyRecord,
 } from './terminal/CommandStreamProtocol'
+import {
+  DEFAULT_COMPLETED_RUNTIME_RETENTION_MS,
+  deleteCompletedRuntime,
+  scheduleCompletedRuntimeEviction,
+  type CompletedRuntimeWithEviction,
+} from './terminal/completedRuntimeRetention'
 
 const execFileAsync = promisify(execFile)
 
-interface PtyInstance {
+interface PtyInstance extends CompletedRuntimeWithEviction {
   pty: pty.IPty
   dataCallbacks: Set<(data: string) => void>
   exitCallbacks: Set<(code: number) => void>
   pendingData: string
+  exitCode?: number
+  exitEmitted?: boolean
+  discardOnExit?: boolean
   isInitializing?: boolean
   buffer?: string
 }
@@ -81,6 +91,14 @@ interface BoundedCommandOutput {
 
 export class NodePtyBackend implements TerminalBackend {
   private ptys: Map<string, PtyInstance> = new Map()
+  /**
+   * A runtime can finish while TerminalService is replaying durable history.
+   * Keep that completed instance addressable until late subscribers receive
+   * its buffered data and exit state.
+   */
+  private completedPtys: Map<string, PtyInstance> = new Map()
+  private completedRuntimeRetentionMs =
+    DEFAULT_COMPLETED_RUNTIME_RETENTION_MS
   private tmpPathsByPtyId: Map<string, string> = new Map()
   private cwdByPtyId: Map<string, string> = new Map()
   private homeDirByPtyId: Map<string, string> = new Map()
@@ -651,13 +669,14 @@ export class NodePtyBackend implements TerminalBackend {
     if (!isLocalConnectionConfig(config)) {
       throw new Error('NodePtyBackend only supports local connections')
     }
+    deleteCompletedRuntime(this.completedPtys, config.id)
     const localConfig = config
 
     const shell = this.pickShell(localConfig.shell)
     const commandShellFamily = this.resolveCommandShellFamily(shell)
     const cwdCandidate = localConfig.cwd || os.homedir()
     const cwd = fs.existsSync(cwdCandidate) ? cwdCandidate : os.homedir()
-    const env = this.getSafeEnv()
+    const env = buildLocalShellEnvironment(this.getSafeEnv())
 
     // Fix for Chinese characters rendering issues in packaged apps
     // Setting LC_ALL and LANG to UTF-8 ensures the shell and sub-processes use UTF-8 encoding
@@ -729,6 +748,26 @@ export class NodePtyBackend implements TerminalBackend {
       buffer: '',
     }
 
+    // Register the instance and its runtime metadata before attaching process
+    // callbacks. node-pty can report a very short-lived process exit during
+    // the callback setup window.
+    this.ptys.set(config.id, instance)
+    if (tmpPath) this.tmpPathsByPtyId.set(config.id, tmpPath)
+    if (commandTrackingMode) this.commandTrackingModeByPtyId.set(config.id, commandTrackingMode)
+    if (promptMarkerPath) this.promptMarkerPathByPtyId.set(config.id, promptMarkerPath)
+    if (commandRequestPath) this.commandRequestPathByPtyId.set(config.id, commandRequestPath)
+    if (commandOutputPath) this.commandOutputPathByPtyId.set(config.id, commandOutputPath)
+    this.commandProtocolAvailabilityByPtyId.set(
+      config.id,
+      this.shellSupportsCommandProtocol(shell)
+    )
+    if (commandProtocolToken) {
+      this.commandProtocolTokenByPtyId.set(config.id, commandProtocolToken)
+    }
+    if (commandShellFamily) {
+      this.commandShellFamilyByPtyId.set(config.id, commandShellFamily)
+    }
+
     ptyProcess.onData((data) => {
       const chunk = data.toString()
       if (instance.isInitializing) {
@@ -751,6 +790,8 @@ export class NodePtyBackend implements TerminalBackend {
     })
 
     ptyProcess.onExit(({ exitCode }) => {
+      instance.exitEmitted = true
+      instance.exitCode = exitCode
       // TerminalService can synchronously auto-restart a local terminal from
       // an exit callback using the same public pty id. Retire this exact
       // instance before notifying consumers so the old callback cannot erase
@@ -760,26 +801,16 @@ export class NodePtyBackend implements TerminalBackend {
         this.cwdByPtyId.delete(config.id)
         this.homeDirByPtyId.delete(config.id)
         this.cleanupTempArtifacts(config.id)
+        if (!instance.discardOnExit) {
+          this.retainCompletedPty(config.id, instance)
+        }
+      } else if (!this.ptys.has(config.id) && !instance.discardOnExit) {
+        // Covers the narrow case where node-pty emitted exit before the
+        // instance was visible in the active map.
+        this.retainCompletedPty(config.id, instance)
       }
       instance.exitCallbacks.forEach((callback) => callback(exitCode))
     })
-
-    this.ptys.set(config.id, instance)
-    if (tmpPath) this.tmpPathsByPtyId.set(config.id, tmpPath)
-    if (commandTrackingMode) this.commandTrackingModeByPtyId.set(config.id, commandTrackingMode)
-    if (promptMarkerPath) this.promptMarkerPathByPtyId.set(config.id, promptMarkerPath)
-    if (commandRequestPath) this.commandRequestPathByPtyId.set(config.id, commandRequestPath)
-    if (commandOutputPath) this.commandOutputPathByPtyId.set(config.id, commandOutputPath)
-    this.commandProtocolAvailabilityByPtyId.set(
-      config.id,
-      this.shellSupportsCommandProtocol(shell)
-    )
-    if (commandProtocolToken) {
-      this.commandProtocolTokenByPtyId.set(config.id, commandProtocolToken)
-    }
-    if (commandShellFamily) {
-      this.commandShellFamilyByPtyId.set(config.id, commandShellFamily)
-    }
     return config.id
   }
 
@@ -1088,6 +1119,8 @@ export class NodePtyBackend implements TerminalBackend {
         'else',
         `  PROMPT_COMMAND="${precmdBeginHookName}\${PROMPT_COMMAND:+; $PROMPT_COMMAND}; ${precmdHookName}"`,
         'fi',
+        // Our callbacks only exist in this shell, never in a child Bash.
+        'export -n PROMPT_COMMAND',
         '',
       ].join('\n')
       fs.writeFileSync(rcPath, script, 'utf8')
@@ -1337,16 +1370,31 @@ export class NodePtyBackend implements TerminalBackend {
   kill(ptyId: string): void {
     const instance = this.ptys.get(ptyId)
     if (instance) {
+      instance.discardOnExit = true
       instance.pty.kill()
-      this.ptys.delete(ptyId)
+      if (this.ptys.get(ptyId) === instance) {
+        this.ptys.delete(ptyId)
+      }
     }
+    deleteCompletedRuntime(this.completedPtys, ptyId)
     this.cwdByPtyId.delete(ptyId)
     this.homeDirByPtyId.delete(ptyId)
     this.cleanupTempArtifacts(ptyId)
   }
 
+  private retainCompletedPty(ptyId: string, instance: PtyInstance): void {
+    deleteCompletedRuntime(this.completedPtys, ptyId)
+    this.completedPtys.set(ptyId, instance)
+    scheduleCompletedRuntimeEviction(
+      this.completedPtys,
+      ptyId,
+      instance,
+      this.completedRuntimeRetentionMs,
+    )
+  }
+
   onData(ptyId: string, callback: (data: string) => void): void {
-    const instance = this.ptys.get(ptyId)
+    const instance = this.ptys.get(ptyId) || this.completedPtys.get(ptyId)
     if (instance) {
       instance.dataCallbacks.add(callback)
       if (instance.pendingData) {
@@ -1374,9 +1422,13 @@ export class NodePtyBackend implements TerminalBackend {
   }
 
   onExit(ptyId: string, callback: (code: number) => void): void {
-    const instance = this.ptys.get(ptyId)
+    const instance = this.ptys.get(ptyId) || this.completedPtys.get(ptyId)
     if (instance) {
-      instance.exitCallbacks.add(callback)
+      if (instance.exitEmitted) {
+        callback(instance.exitCode ?? -1)
+      } else {
+        instance.exitCallbacks.add(callback)
+      }
     }
   }
 

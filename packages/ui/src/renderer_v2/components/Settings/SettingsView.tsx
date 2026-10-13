@@ -25,7 +25,7 @@ import {
 } from "lucide-react";
 import { observer } from "mobx-react-lite";
 import type { AppStore } from "../../stores/AppStore";
-import type { ModelDefinition } from "../../lib/ipcTypes";
+import type { ModelDefinition, TerminalViewMode } from "../../lib/ipcTypes";
 import { BUILTIN_THEMES } from "../../theme/themes";
 import type { AppTheme } from "../../theme/themes";
 import "./settings.scss";
@@ -912,15 +912,38 @@ export const SettingsView: React.FC<{ store: AppStore }> = observer(
                 </div>
               </div>
 
-                <div
-                  className="settings-section-header"
-                  style={{ marginTop: 24 }}
-                >
+              <div
+                className="settings-section-header"
+                style={{ marginTop: 24 }}
+              >
                 <div className="settings-section-title">
                   {t.settings.terminal}
                 </div>
               </div>
               <div className="settings-rows">
+                <div className="settings-row">
+                  <div className="settings-row-label-with-info">
+                    <label>{t.settings.terminalViewMode}</label>
+                    <InfoTooltip content={t.settings.tooltips.terminalViewMode} />
+                  </div>
+                  <Select
+                    className="settings-native-select"
+                    value={store.terminalViewMode}
+                    onChange={(value) =>
+                      store.setTerminalViewMode(value as TerminalViewMode)
+                    }
+                    options={[
+                      {
+                        value: "classic",
+                        label: t.terminal.viewModes.classic,
+                      },
+                      {
+                        value: "block",
+                        label: t.terminal.viewModes.block,
+                      },
+                    ]}
+                  />
+                </div>
                 <div className="settings-row">
                   <div className="settings-row-label-with-info">
                     <label>{t.settings.fontSize}</label>
@@ -929,10 +952,10 @@ export const SettingsView: React.FC<{ store: AppStore }> = observer(
                   <NumericInput
                     className="settings-inline-input"
                     style={{ width: 80 }}
-                    value={store.settings?.terminal?.fontSize || 14}
-                      onChange={(val) =>
-                        store.setTerminalSettings({ fontSize: val })
-                      }
+                    value={store.settings?.terminal?.fontSize ?? 14}
+                    onChange={(val) =>
+                      store.setTerminalSettings({ fontSize: val })
+                    }
                     min={6}
                     max={100}
                   />
@@ -945,10 +968,10 @@ export const SettingsView: React.FC<{ store: AppStore }> = observer(
                   <NumericInput
                     className="settings-inline-input"
                     style={{ width: 80 }}
-                    value={store.settings?.terminal?.lineHeight || 1.2}
-                      onChange={(val) =>
-                        store.setTerminalSettings({ lineHeight: val })
-                      }
+                    value={store.settings?.terminal?.lineHeight ?? 1.2}
+                    onChange={(val) =>
+                      store.setTerminalSettings({ lineHeight: val })
+                    }
                     allowFloat
                     min={1}
                     max={5}
@@ -962,13 +985,35 @@ export const SettingsView: React.FC<{ store: AppStore }> = observer(
                   <NumericInput
                     className="settings-inline-input"
                     style={{ width: 80 }}
-                    value={store.settings?.terminal?.scrollback || 5000}
-                      onChange={(val) =>
-                        store.setTerminalSettings({ scrollback: val })
-                      }
+                    value={store.settings?.terminal?.scrollback ?? 5000}
+                    onChange={(val) =>
+                      store.setTerminalSettings({ scrollback: val })
+                    }
                     min={0}
                     max={1000000}
                   />
+                </div>
+                <div className="settings-row">
+                  <div className="settings-row-label-with-info">
+                    <label>{t.settings.saveTerminalHistory}</label>
+                    <InfoTooltip
+                      content={t.settings.tooltips.saveTerminalHistory}
+                    />
+                  </div>
+                  <label className="switch">
+                    <input
+                      type="checkbox"
+                      checked={
+                        store.settings?.terminal?.saveHistory ?? true
+                      }
+                      onChange={(e) =>
+                        store.setTerminalSettings({
+                          saveHistory: e.target.checked,
+                        })
+                      }
+                    />
+                    <span className="switch-slider" />
+                  </label>
                 </div>
                 <div className="settings-row">
                   <div className="settings-row-label-with-info">
@@ -977,20 +1022,20 @@ export const SettingsView: React.FC<{ store: AppStore }> = observer(
                   </div>
                   <Select
                     className="settings-native-select"
-                      value={store.settings?.terminal?.cursorStyle || "block"}
-                      onChange={(v) =>
-                        store.setTerminalSettings({ cursorStyle: v as any })
-                      }
+                    value={store.settings?.terminal?.cursorStyle ?? "block"}
+                    onChange={(v) =>
+                      store.setTerminalSettings({ cursorStyle: v as any })
+                    }
                     options={[
-                        {
-                          value: "block",
-                          label: t.settings.cursorStyles.block,
-                        },
-                        {
-                          value: "underline",
-                          label: t.settings.cursorStyles.underline,
-                        },
-                        { value: "bar", label: t.settings.cursorStyles.bar },
+                      {
+                        value: "block",
+                        label: t.settings.cursorStyles.block,
+                      },
+                      {
+                        value: "underline",
+                        label: t.settings.cursorStyles.underline,
+                      },
+                      { value: "bar", label: t.settings.cursorStyles.bar },
                     ]}
                   />
                 </div>
@@ -1003,11 +1048,11 @@ export const SettingsView: React.FC<{ store: AppStore }> = observer(
                     <input
                       type="checkbox"
                       checked={store.settings?.terminal?.cursorBlink ?? true}
-                        onChange={(e) =>
-                          store.setTerminalSettings({
-                            cursorBlink: e.target.checked,
-                          })
-                        }
+                      onChange={(e) =>
+                        store.setTerminalSettings({
+                          cursorBlink: e.target.checked,
+                        })
+                      }
                     />
                     <span className="switch-slider" />
                   </label>
@@ -1020,14 +1065,14 @@ export const SettingsView: React.FC<{ store: AppStore }> = observer(
                   <label className="switch">
                     <input
                       type="checkbox"
-                        checked={
-                          store.settings?.terminal?.copyOnSelect ?? false
-                        }
-                        onChange={(e) =>
-                          store.setTerminalSettings({
-                            copyOnSelect: e.target.checked,
-                          })
-                        }
+                      checked={
+                        store.settings?.terminal?.copyOnSelect ?? false
+                      }
+                      onChange={(e) =>
+                        store.setTerminalSettings({
+                          copyOnSelect: e.target.checked,
+                        })
+                      }
                     />
                     <span className="switch-slider" />
                   </label>
@@ -1035,21 +1080,21 @@ export const SettingsView: React.FC<{ store: AppStore }> = observer(
                 <div className="settings-row">
                   <div className="settings-row-label-with-info">
                     <label>{t.settings.rightClickToPaste}</label>
-                      <InfoTooltip
-                        content={t.settings.tooltips.rightClickToPaste}
-                      />
+                    <InfoTooltip
+                      content={t.settings.tooltips.rightClickToPaste}
+                    />
                   </div>
                   <label className="switch">
                     <input
                       type="checkbox"
-                        checked={
-                          store.settings?.terminal?.rightClickToPaste ?? false
-                        }
-                        onChange={(e) =>
-                          store.setTerminalSettings({
-                            rightClickToPaste: e.target.checked,
-                          })
-                        }
+                      checked={
+                        store.settings?.terminal?.rightClickToPaste ?? false
+                      }
+                      onChange={(e) =>
+                        store.setTerminalSettings({
+                          rightClickToPaste: e.target.checked,
+                        })
+                      }
                     />
                     <span className="switch-slider" />
                   </label>

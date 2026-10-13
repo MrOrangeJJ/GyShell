@@ -66,6 +66,7 @@ function toolHistoryFixture(content: string, messageId = 'exec-message') {
         args: {
           terminalId: 'local-terminal',
           command: 'printf durable',
+          intent: 'Run printf durable',
           waitMode: 'nowait'
         }
       }
@@ -354,6 +355,7 @@ await runCase('a wait command switched to background defers its same-terminal ta
           args: {
             terminalId: 'local-terminal',
             command: 'server',
+            intent: 'Run server',
             waitMode: 'wait'
           }
         },
@@ -404,6 +406,7 @@ await runCase('a terminal exit during wait defers its same-terminal tail', async
           args: {
             terminalId: 'local-terminal',
             command: 'may-have-run',
+            intent: 'Run may-have-run',
             waitMode: 'wait'
           }
         },
@@ -498,12 +501,12 @@ await runCase('a parallel command switched to background defers its parent-batch
         {
           id: 'command-a',
           name: 'exec_command',
-          args: { terminalId: 'A', command: 'server', waitMode: 'wait' }
+          args: { terminalId: 'A', command: 'server', intent: 'Run server', waitMode: 'wait' }
         },
         {
           id: 'command-b',
           name: 'exec_command',
-          args: { terminalId: 'B', command: 'check', waitMode: 'wait' }
+          args: { terminalId: 'B', command: 'check', intent: 'Run check', waitMode: 'wait' }
         },
         {
           id: 'edit-a',
@@ -554,6 +557,7 @@ await runCase('an existing active terminal task defers the preserved mutation ta
           args: {
             terminalId: 'local-terminal',
             command: 'next',
+            intent: 'Run next',
             waitMode: 'wait'
           }
         },
@@ -1045,6 +1049,7 @@ await runCase('specialized built-in nodes fail closed when disabled after routin
         args: {
           terminalId: 'local-terminal',
           command: 'touch /tmp/should-not-run',
+          intent: 'Run touch /tmp/should-not-run',
           waitMode: 'nowait'
         },
         node: () => (agent as any).createCommandToolsNode(),
@@ -1170,6 +1175,7 @@ await runCase(
         args: {
           terminalId: 'local-terminal',
           command: 'printf durable',
+          intent: 'Run printf durable',
           waitMode: 'nowait'
         }
       }
@@ -1479,6 +1485,7 @@ await runCase(
         args: {
           terminalId: 'local-terminal',
           command: 'long-running',
+          intent: 'Run long-running',
           waitMode: 'wait'
         }
       }

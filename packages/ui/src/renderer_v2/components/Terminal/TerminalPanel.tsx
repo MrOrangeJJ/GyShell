@@ -3,6 +3,7 @@ import { createPortal } from "react-dom";
 import { GripVertical, MoreVertical, X } from "lucide-react";
 import { observer } from "mobx-react-lite";
 import type { AppStore, TerminalTabModel } from "../../stores/AppStore";
+import type { TerminalViewMode } from "../../lib/ipcTypes";
 import "./terminal.scss";
 import { PanelFindBar } from "../Common/PanelFindBar";
 import { XTermView } from "./XTermView";
@@ -10,9 +11,11 @@ import type { XTermSearchHandle } from "./terminalSearchHandle";
 import { resolveFloatingMenuPlacement } from "../../lib/menuPlacement";
 import {
   getTerminalConnectionIconKind,
+  canReconnectTerminalRuntime,
   resolveTerminalRuntimeIndicatorState,
 } from "../../lib/terminalConnectionModel";
 import { isLinux, isWindows } from "../../platform/platform";
+import { useTerminalSessionTitles } from "./useTerminalSessionTitles";
 import { CompactPanelTabSelect } from "../Layout/CompactPanelTabSelect";
 import { TerminalAddButton } from "./TerminalAddButton";
 import { resolvePanelTabBarMode } from "../Layout/panelHeaderPresentation";
@@ -66,6 +69,16 @@ export const TerminalPanel: React.FC<TerminalPanelProps> = observer(
       React.CSSProperties | undefined
     >(undefined);
     const t = store.i18n.t;
+    const { all: sessionTitleMap, active: activeSessionTitleMap } =
+      useTerminalSessionTitles(store.chat?.sessions || []);
+    const sessionTitleLookup = React.useCallback(
+      (id: string): string | undefined => sessionTitleMap.get(id),
+      [sessionTitleMap],
+    );
+    const commandSessionTitleLookup = React.useCallback(
+      (id: string): string | undefined => activeSessionTitleMap.get(id),
+      [activeSessionTitleMap],
+    );
     const isLayoutDragSource =
       store.layout.isDragging && store.layout.draggingPanelId === panelId;
     const panelRect = store.layout.getPanelRect(panelId);
@@ -99,6 +112,11 @@ export const TerminalPanel: React.FC<TerminalPanelProps> = observer(
     const commandDraftShortcutHint = resolvedCommandDraftShortcut
       ? t.terminal.commandDraftShortcutHint(commandDraftShortcutLabel)
       : t.terminal.commandDraftShortcutDisabledHint;
+    const terminalViewMode = store.terminalViewMode;
+    const setTerminalViewMode = React.useCallback(
+      (mode: TerminalViewMode) => store.setTerminalViewMode(mode),
+      [store],
+    );
     const menuPlatformClassName = React.useMemo(() => {
       if (isWindows()) return "is-platform-windows";
       if (isLinux()) return "is-platform-linux";
@@ -147,9 +165,7 @@ export const TerminalPanel: React.FC<TerminalPanelProps> = observer(
       const onMouseDown = (event: MouseEvent) => {
         const target = event.target as Node | null;
         if (!target) return;
-        if (
-          moreMenuRef.current?.contains(target)
-        ) {
+        if (moreMenuRef.current?.contains(target)) {
           return;
         }
         if (moreMenuButtonRef.current?.contains(target)) {
@@ -191,9 +207,11 @@ export const TerminalPanel: React.FC<TerminalPanelProps> = observer(
     }, []);
 
     const openFind = React.useCallback(() => {
+      // Find searches the xterm buffer, which the Classic view shows.
+      setTerminalViewMode("classic");
       setFindOpen(true);
       focusSearchInput();
-    }, [focusSearchInput]);
+    }, [focusSearchInput, setTerminalViewMode]);
 
     const clearAllTerminalSearches = React.useCallback(() => {
       Object.values(terminalViewRefs.current).forEach((handle) => {
@@ -509,6 +527,24 @@ export const TerminalPanel: React.FC<TerminalPanelProps> = observer(
                         terminalViewRefs.current[tab.id] = handle;
                       }}
                       config={tab.config}
+                      runtimeState={tab.runtimeState || "initializing"}
+                      connectionStatusLabel={t.terminal.connecting}
+                      connectionStatus={tab.connectionStatus}
+                      disconnectedStatusLabel={t.terminal.disconnected}
+                      connectionCardLabels={{
+                        connecting: t.terminal.connecting,
+                        failed: t.terminal.connectionFailed,
+                        reconnect: t.layout.reconnectTab,
+                        hide: t.terminal.connectionHide,
+                      }}
+                      onReconnect={
+                        canReconnectTerminalRuntime(
+                          tab.config,
+                          tab.runtimeState,
+                        )
+                          ? () => void store.reconnectTerminal(tab.id)
+                          : undefined
+                      }
                       theme={store.xtermTheme}
                       terminalSettings={store.settings?.terminal}
                       commandDraftLabels={{
@@ -568,6 +604,18 @@ export const TerminalPanel: React.FC<TerminalPanelProps> = observer(
                         }
                         setSearchResultCount(payload.resultCount);
                         setSearchResultIndex(payload.resultIndex);
+                      }}
+                      terminalViewMode={terminalViewMode}
+                      blockLabels={t.terminal.block}
+                      commandNavigatorLabels={t.terminal.commandNavigator}
+                      viewModeLabels={t.terminal.viewModes}
+                      dividerLabels={t.terminal.divider}
+                      locale={store.i18n.locale}
+                      sessionTitleLookup={sessionTitleLookup}
+                      commandSessionTitleLookup={commandSessionTitleLookup}
+                      onTerminalViewModeChange={(mode) => {
+                        closeFind();
+                        setTerminalViewMode(mode);
                       }}
                     />
                   </div>

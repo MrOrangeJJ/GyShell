@@ -974,6 +974,9 @@ const run = async (): Promise<void> => {
 
     const first = service.runCommandNoWait('reserved-start', 'printf first')
     const competing = service.runCommandNoWait('reserved-start', 'printf second')
+    backend.emitData('reserved-start', 'BACKGROUND-BEFORE-DISPATCH\r\n')
+    const visibleOffsetAfterPreparationOutput =
+      service.getCurrentOffset('reserved-start')
     gate.resolve()
     const outcomes = await Promise.allSettled([first, competing])
 
@@ -983,6 +986,11 @@ const run = async (): Promise<void> => {
       service.getCommandTasks('reserved-start').length,
       1,
       'only one same-terminal task may be registered'
+    )
+    assertEqual(
+      service.getTerminalActivities('reserved-start')[0]?.startOffset,
+      visibleOffsetAfterPreparationOutput,
+      'activity start must exclude output emitted during asynchronous preparation'
     )
     assertEqual(
       backend.getWrites('reserved-start').slice(-1)[0],
@@ -1408,6 +1416,17 @@ const run = async (): Promise<void> => {
       'Start-Sleep -Seconds 5',
       '\r',
     ])
+    const runningManualActivity = service.getTerminalActivities(terminalId)[0]
+    assertEqual(
+      runningManualActivity?.status,
+      'running',
+      'PowerShell manual activity must begin when the submission is accepted'
+    )
+    assertEqual(
+      runningManualActivity?.actor,
+      'user',
+      'PowerShell manual activity must retain human ownership'
+    )
     await new Promise((resolve) => setTimeout(resolve, 30))
     assertEqual(
       service.getTerminalRuntimeSnapshot(terminalId)?.shellInputState,
@@ -1424,6 +1443,11 @@ const run = async (): Promise<void> => {
     await waitUntil(
       () => service.getTerminalRuntimeSnapshot(terminalId)?.canRunCommand === true,
       'the long manual command should recover when its prompt finally arrives'
+    )
+    assertEqual(
+      service.getTerminalActivities(terminalId)[0]?.status,
+      'succeeded',
+      'the advancing PowerShell prompt must finish the existing manual activity'
     )
     service.kill(terminalId)
   })
@@ -2329,6 +2353,109 @@ const run = async (): Promise<void> => {
       service.getTerminalRuntimeSnapshot(terminalId)?.canRunCommand,
       true,
       'the prompt for the submitted typeahead command should restore idle'
+    )
+    service.kill(terminalId)
+  })
+
+  await runCase('Unix manual activity preserves boundaries inside one PTY chunk', async () => {
+    const terminalId = 'unix-manual-activity-one-chunk'
+    const runtimeToken = '59595959595959595959595959595959'
+    const backend = createUnixBackend()
+    backend.setCommandProtocol(true, runtimeToken)
+    backend.setCommandShellFamily('unix')
+    const service = createService(backend)
+    await createLocalTerminal(service, terminalId)
+    backend.emitData(
+      terminalId,
+      tokenizedUnixBoundary(runtimeToken, 'precmd', 0, 'initial_manual_prompt')
+    )
+
+    service.write(terminalId, "printf 'VISIBLE'\n")
+    const nonce = 'manual_activity_chunk_0001'
+    backend.emitData(
+      terminalId,
+      tokenizedUnixBoundary(runtimeToken, 'preexec', 1, nonce) +
+        'VISIBLE' +
+        tokenizedUnixBoundary(runtimeToken, 'preend', 1, nonce) +
+        tokenizedUnixBoundary(runtimeToken, 'precmd', 1, nonce)
+    )
+
+    const activity = service
+      .getTerminalActivities(terminalId)
+      .find((candidate) => candidate.actor === 'user')
+    assertEqual(activity?.status, 'succeeded', 'the manual activity should finish')
+    assertEqual(
+      Boolean(
+        activity?.endOffset !== undefined &&
+          activity.endOffset - activity.startOffset >= 'VISIBLE'.length
+      ),
+      true,
+      'same-chunk manual markers must retain the visible output range'
+    )
+    service.kill(terminalId)
+  })
+
+  await runCase('Unix manual activity starts before the echoed human command', async () => {
+    const terminalId = 'unix-manual-activity-human-input-start'
+    const runtimeToken = '5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a'
+    const backend = createUnixBackend()
+    backend.setCommandProtocol(true, runtimeToken)
+    backend.setCommandShellFamily('unix')
+    const service = createService(backend)
+    await createLocalTerminal(service, terminalId)
+    backend.emitData(
+      terminalId,
+      'prompt$ ' +
+        tokenizedUnixBoundary(runtimeToken, 'precmd', 0, 'manual_start_prompt')
+    )
+    const expectedStartOffset = service.getCurrentOffset(terminalId)
+
+    service.write(terminalId, "printf 'VISIBLE'\n")
+    backend.emitData(terminalId, "printf 'VISIBLE'\r\n")
+    const nonce = 'manual_activity_human_start_0001'
+    backend.emitData(
+      terminalId,
+      tokenizedUnixBoundary(runtimeToken, 'preexec', 1, nonce) +
+        'VISIBLE\r\n' +
+        tokenizedUnixBoundary(runtimeToken, 'preend', 1, nonce) +
+        tokenizedUnixBoundary(runtimeToken, 'precmd', 1, nonce)
+    )
+
+    const activity = service
+      .getTerminalActivities(terminalId)
+      .find((candidate) => candidate.actor === 'user')
+    assertEqual(
+      activity?.startOffset,
+      expectedStartOffset,
+      'manual activity must include the echoed command instead of starting at output'
+    )
+    service.kill(terminalId)
+  })
+
+  await runCase('Unix shell bootstrap cannot masquerade as human activity', async () => {
+    const terminalId = 'unix-bootstrap-is-not-human-activity'
+    const runtimeToken = '5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b'
+    const backend = createUnixBackend()
+    backend.setCommandProtocol(true, runtimeToken)
+    backend.setCommandShellFamily('unix')
+    const service = createService(backend)
+    await createLocalTerminal(service, terminalId)
+    const nonce = 'shell_bootstrap_internal_0001'
+
+    backend.emitData(
+      terminalId,
+      tokenizedUnixBoundary(runtimeToken, 'preexec', 1, nonce) +
+        'internal bootstrap output\r\n' +
+        tokenizedUnixBoundary(runtimeToken, 'preend', 1, nonce) +
+        tokenizedUnixBoundary(runtimeToken, 'precmd', 1, nonce)
+    )
+
+    assertEqual(
+      service
+        .getTerminalActivities(terminalId)
+        .filter((candidate) => candidate.actor === 'user').length,
+      0,
+      'shell-owned startup work must not be attributed to a human'
     )
     service.kill(terminalId)
   })
@@ -4595,6 +4722,17 @@ const run = async (): Promise<void> => {
       result.capture?.state,
       'complete',
       'a complete transcript must remain complete when only the exit outcome is uncertain'
+    )
+    const activity = service
+      .getTerminalActivities('win-sidecar-outcome-unknown')
+      .find((candidate) => candidate.id === taskId)
+    assertEqual(
+      Boolean(
+        activity?.endOffset !== undefined &&
+          activity.endOffset > activity.startOffset
+      ),
+      true,
+      'an Agent activity must include its synthetic visible completion display'
     )
     assertEqual(
       Boolean(result.terminalStatus?.includes('trustworthy exact exit code')),

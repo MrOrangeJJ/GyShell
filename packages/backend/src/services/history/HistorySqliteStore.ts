@@ -29,7 +29,10 @@ import {
   type UiMessageGeometryEntry,
   type UiMessageGeometryIndex,
 } from "@gyshell/shared";
-import { openBetterSqlite3Database } from "./betterSqlite3Runtime";
+import {
+  applyStandardSqlitePragmas,
+  openBetterSqlite3Database,
+} from "./betterSqlite3Runtime";
 import { resolveHistoryStoragePaths } from "./historyStoragePaths";
 
 type DatabaseHandle = InstanceType<typeof import("better-sqlite3")>;
@@ -1451,11 +1454,7 @@ export class HistorySqliteStore {
   }
 
   static initializeDatabase(db: DatabaseHandle): void {
-    db.pragma("foreign_keys = ON");
-    db.pragma("journal_mode = WAL");
-    db.pragma("synchronous = NORMAL");
-    db.pragma("temp_store = MEMORY");
-    db.pragma("cache_size = -32000");
+    applyStandardSqlitePragmas(db);
 
     db.exec(`
       CREATE TABLE IF NOT EXISTS history_meta (

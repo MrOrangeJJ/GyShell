@@ -3,6 +3,7 @@ import * as path from 'node:path'
 import * as os from 'node:os'
 import { COMMAND_CAPTURE_MAX_UTF8_BYTES } from '@gyshell/shared'
 import { NodePtyBackend } from './NodePtyBackend'
+import { buildLocalShellEnvironment } from './terminal/localShellEnvironment'
 import {
   buildInitializationReadyMarker,
   buildPowerShellInitializationReadyMarker,
@@ -40,6 +41,49 @@ const runCase = async (name: string, fn: () => Promise<void> | void): Promise<vo
 }
 
 const run = async (): Promise<void> => {
+  await runCase('new local terminals isolate parent cmux prompt state without changing CLI context', () => {
+    const integrations: Record<string, string>[] = [
+      { CMUX_SHELL_INTEGRATION: '1' },
+      { CMUX_SHELL_INTEGRATION_DIR: '/fixture/cmux/shell-integration' },
+      { CMUX_LOAD_GHOSTTY_BASH_INTEGRATION: '1' },
+      { CMUX_LOAD_GHOSTTY_ZSH_INTEGRATION: '1' },
+    ]
+    for (const integration of integrations) {
+      const inherited: Record<string, string> = {
+        ...integration,
+        PROMPT_COMMAND: '__bp_precmd_invoke_cmd; _cmux_prompt_command; __bp_interactive_mode',
+        CMUX_SOCKET_PATH: '/fixture/cmux.sock',
+        CMUX_WORKSPACE_ID: 'parent-workspace',
+        PATH: '/user/tools:/bin',
+        BASH_ENV: '/user/bash-env',
+        ENV: '/user/env',
+        ZDOTDIR: '/user/zsh',
+        GHOSTTY_RESOURCES_DIR: '/fixture/ghostty',
+      }
+      const env = buildLocalShellEnvironment(inherited)
+      assertEqual(env.PROMPT_COMMAND, undefined, 'parent prompt program must not cross PTY ownership')
+      for (const key of ['CMUX_SHELL_INTEGRATION', 'CMUX_LOAD_GHOSTTY_BASH_INTEGRATION', 'CMUX_LOAD_GHOSTTY_ZSH_INTEGRATION']) {
+        assertEqual(env[key], '0', `${key} must explicitly disable automatic loading`)
+      }
+      for (const key of ['CMUX_SOCKET_PATH', 'CMUX_WORKSPACE_ID', 'PATH', 'BASH_ENV', 'ENV', 'ZDOTDIR', 'GHOSTTY_RESOURCES_DIR']) {
+        assertEqual(env[key], inherited[key], `${key} must remain available`)
+      }
+      assertCondition(inherited.PROMPT_COMMAND.includes('_cmux_prompt_command'), 'parent environment must not be mutated')
+    }
+  })
+
+  await runCase('ordinary inherited user hooks and cmux CLI-only context remain unchanged', () => {
+    const inherited = {
+      PROMPT_COMMAND: 'printf "__bp_precmd_invoke_cmd is documentation"',
+      CMUX_SOCKET_PATH: '/fixture/cmux.sock',
+      CMUX_BUNDLE_ID: 'com.cmuxterm.app',
+      PATH: '/bin',
+    }
+    const env = buildLocalShellEnvironment(inherited)
+    assertEqual(JSON.stringify(env), JSON.stringify(inherited), 'CLI context alone must not imply shell integration')
+    assertCondition(env !== inherited, 'the launch environment must be a copy')
+  })
+
   await runCase('Windows prompt-file requests carry an explicit execution role', () => {
     const requestId = 'ABCDEF0123456789ABCDEF0123456789'
     const probe = buildWindowsPowerShellDispatchRequest({
@@ -922,6 +966,56 @@ const run = async (): Promise<void> => {
       'old exit cleanup must not delete replacement protocol state'
     )
     backend.kill(terminalId)
+  })
+
+  await runCase('late local subscribers receive output and exit state from a completed runtime', () => {
+    const backend = new NodePtyBackend() as any
+    const instance = {
+      dataCallbacks: new Set(),
+      exitCallbacks: new Set(),
+      pendingData: 'early local output\r\n',
+      exitEmitted: true,
+      exitCode: 17,
+    }
+    backend.completedPtys.set('late-local-runtime', instance)
+    const output: string[] = []
+    const exits: number[] = []
+    backend.onData('late-local-runtime', (data: string) => output.push(data))
+    backend.onExit('late-local-runtime', (code: number) => exits.push(code))
+
+    assertEqual(
+      output.join(''),
+      'early local output\r\n',
+      'late local data subscribers should receive buffered PTY output',
+    )
+    assertEqual(
+      exits[0],
+      17,
+      'late local exit subscribers should receive the completed exit code',
+    )
+  })
+
+  await runCase('completed local runtimes are evicted after their bounded retention window', async () => {
+    const backend = new NodePtyBackend() as any
+    backend.completedRuntimeRetentionMs = 10
+    const instance = {
+      dataCallbacks: new Set(),
+      exitCallbacks: new Set(),
+      pendingData: '',
+      exitEmitted: true,
+      exitCode: 0,
+    }
+    backend.retainCompletedPty('expired-local-runtime', instance)
+    assertCondition(
+      backend.completedPtys.has('expired-local-runtime'),
+      'completed local runtime should remain addressable during retention',
+    )
+
+    await new Promise((resolve) => setTimeout(resolve, 30))
+    assertCondition(
+      !backend.completedPtys.has('expired-local-runtime'),
+      'completed local runtime should be removed after retention expires',
+    )
   })
 
   await runCase('local command protocol capability fails closed for unsupported shells', () => {

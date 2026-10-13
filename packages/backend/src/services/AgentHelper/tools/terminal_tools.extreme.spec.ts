@@ -304,6 +304,75 @@ async function run(): Promise<void> {
   {
     const terminalService = new FakeTerminalService('ready')
     const { context } = createContext(terminalService)
+    ;(terminalService as any).runCommandAndWait = async (
+      _terminalId: string,
+      _command: string,
+      options: {
+        activityContext?: {
+          actor?: string
+          sessionId?: string
+          messageId?: string
+          intent?: string
+        }
+      }
+    ) => {
+      assertEqual(options.activityContext?.actor, 'agent', 'wait activity must identify the Agent')
+      assertEqual(
+        options.activityContext?.intent,
+        'Describe command',
+        'wait activity must forward the model-provided intent'
+      )
+      return {
+        stdoutDelta: 'done',
+        exitCode: 0,
+        history_command_match_id: 'wait-command-id',
+        executionState: 'finished'
+      }
+    }
+    await runCommand(
+      {
+        terminalId: 'ssh-disconnected',
+        command: 'printf described',
+        intent: 'Describe command',
+        waitMode: 'wait'
+      },
+      context
+    )
+  }
+
+  {
+    const terminalService = new FakeTerminalService('ready')
+    const { context } = createContext(terminalService)
+    ;(terminalService as any).runCommandNoWait = async (
+      _terminalId: string,
+      _command: string,
+      _onFinished: (result: any) => void,
+      _signal: AbortSignal | undefined,
+      _runtimeGuard: TerminalRuntimeGuard | undefined,
+      activityContext: { actor?: string; intent?: string }
+    ) => {
+      assertEqual(activityContext.actor, 'agent', 'nowait activity must identify the Agent')
+      assertEqual(
+        activityContext.intent,
+        'Run async command',
+        'nowait activity must forward the model-provided intent'
+      )
+      return 'nowait-activity-id'
+    }
+    await runCommandNowait(
+      {
+        terminalId: 'ssh-disconnected',
+        command: 'printf async-described',
+        intent: 'Run async command',
+        waitMode: 'nowait'
+      },
+      context
+    )
+  }
+
+  {
+    const terminalService = new FakeTerminalService('ready')
+    const { context } = createContext(terminalService)
     let terminalBoundaryCount = 0
     ;(terminalService as any).runCommandAndWait = async () => ({
       stdoutDelta: 'Terminal exited before command completion.',
