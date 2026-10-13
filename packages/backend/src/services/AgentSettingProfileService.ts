@@ -539,6 +539,7 @@ export class AgentSettingProfileService {
         experimental: {
           runtimeThinkingCorrectionEnabled:
             settings.experimental?.runtimeThinkingCorrectionEnabled !== false,
+          loopGuardEnabled: settings.experimental?.loopGuardEnabled !== false,
           taskFinishGuardEnabled:
             settings.experimental?.taskFinishGuardEnabled !== false,
           firstTurnThinkingModelEnabled:

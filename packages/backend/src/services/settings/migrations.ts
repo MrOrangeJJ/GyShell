@@ -61,6 +61,7 @@ export const DEFAULT_BACKEND_SETTINGS: BackendSettings = {
   debugMode: false,
   experimental: {
     runtimeThinkingCorrectionEnabled: true,
+    loopGuardEnabled: true,
     taskFinishGuardEnabled: true,
     firstTurnThinkingModelEnabled: false,
     execCommandActionModelEnabled: true,
@@ -162,6 +163,7 @@ function normalizeBackendSettings(settings: BackendSettings): BackendSettings {
   next.experimental = {
     runtimeThinkingCorrectionEnabled:
       next.experimental?.runtimeThinkingCorrectionEnabled !== false,
+    loopGuardEnabled: next.experimental?.loopGuardEnabled !== false,
     taskFinishGuardEnabled: next.experimental?.taskFinishGuardEnabled !== false,
     firstTurnThinkingModelEnabled:
       next.experimental?.firstTurnThinkingModelEnabled === true,

@@ -73,6 +73,7 @@ export const zh = {
     wsGatewayPort: "WebSocket 网关端口",
     experimentalFeatures: "试验性功能",
     runtimeThinkingCorrection: "运行时思考反思纠正",
+    loopGuard: "重复循环守卫",
     taskFinishGuard: "任务结束守卫",
     firstTurnThinkingModel: "首轮使用思考模型",
     execCommandActionModel: "Exec Command 二次审计",
@@ -278,6 +279,8 @@ export const zh = {
         "启动本地 HTTP 服务器，在局域网内提供移动端 Web 界面。需要 WebSocket 网关对网络可访问。",
       runtimeThinkingCorrection:
         "每 8 次 model 循环在后台运行一次思考模型审计。若判断路径偏离，会在后续一次模型请求前注入纠正约束。",
+      loopGuard:
+        "当一次模型回复开始重复相同的文本、思考或工具调用时，立即停止并丢弃该回复，然后静默地重新请求模型。只检查当前这一次回复。",
       taskFinishGuard:
         "在结束前执行严格完成度审计，确认任务确实完成。关闭后，当没有工具调用时可直接结束。",
       firstTurnThinkingModel:

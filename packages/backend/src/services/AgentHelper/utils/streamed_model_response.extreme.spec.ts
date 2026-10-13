@@ -948,6 +948,7 @@ const run = async (): Promise<void> => {
           metadata: {},
           lockedExperimentalFlags: {
             runtimeThinkingCorrectionEnabled: false,
+            loopGuardEnabled: true,
             taskFinishGuardEnabled: false,
             firstTurnThinkingModelEnabled: false,
             execCommandActionModelEnabled: true,
@@ -1031,6 +1032,7 @@ const run = async (): Promise<void> => {
           metadata: {},
           lockedExperimentalFlags: {
             runtimeThinkingCorrectionEnabled: false,
+            loopGuardEnabled: true,
             taskFinishGuardEnabled: false,
             firstTurnThinkingModelEnabled: false,
             execCommandActionModelEnabled: true,
@@ -1125,6 +1127,7 @@ const run = async (): Promise<void> => {
           metadata: {},
           lockedExperimentalFlags: {
             runtimeThinkingCorrectionEnabled: false,
+            loopGuardEnabled: true,
             taskFinishGuardEnabled: false,
             firstTurnThinkingModelEnabled: false,
             execCommandActionModelEnabled: true,
@@ -1355,6 +1358,7 @@ const run = async (): Promise<void> => {
           metadata: {},
           lockedExperimentalFlags: {
             runtimeThinkingCorrectionEnabled: false,
+            loopGuardEnabled: true,
             taskFinishGuardEnabled: false,
             firstTurnThinkingModelEnabled: false,
             execCommandActionModelEnabled: true,
@@ -1470,6 +1474,7 @@ const run = async (): Promise<void> => {
           metadata: {},
           lockedExperimentalFlags: {
             runtimeThinkingCorrectionEnabled: false,
+            loopGuardEnabled: true,
             taskFinishGuardEnabled: false,
             firstTurnThinkingModelEnabled: false,
             execCommandActionModelEnabled: true,
@@ -1788,6 +1793,7 @@ const run = async (): Promise<void> => {
           metadata: {},
           lockedExperimentalFlags: {
             runtimeThinkingCorrectionEnabled: false,
+            loopGuardEnabled: true,
             taskFinishGuardEnabled: false,
             firstTurnThinkingModelEnabled: false,
             execCommandActionModelEnabled: true,

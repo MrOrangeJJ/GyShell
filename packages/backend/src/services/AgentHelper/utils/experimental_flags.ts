@@ -6,6 +6,7 @@ function isRunExperimentalFlags(value: any): value is RunExperimentalFlags {
   return (
     value &&
     typeof value.runtimeThinkingCorrectionEnabled === 'boolean' &&
+    typeof value.loopGuardEnabled === 'boolean' &&
     typeof value.taskFinishGuardEnabled === 'boolean' &&
     typeof value.firstTurnThinkingModelEnabled === 'boolean' &&
     typeof value.execCommandActionModelEnabled === 'boolean' &&
@@ -16,6 +17,7 @@ function isRunExperimentalFlags(value: any): value is RunExperimentalFlags {
 export function getRunExperimentalFlagsFromSettings(settings: BackendSettings | null): RunExperimentalFlags {
   return {
     runtimeThinkingCorrectionEnabled: settings?.experimental?.runtimeThinkingCorrectionEnabled !== false,
+    loopGuardEnabled: settings?.experimental?.loopGuardEnabled !== false,
     taskFinishGuardEnabled: settings?.experimental?.taskFinishGuardEnabled !== false,
     firstTurnThinkingModelEnabled: settings?.experimental?.firstTurnThinkingModelEnabled === true,
     execCommandActionModelEnabled: settings?.experimental?.execCommandActionModelEnabled !== false,

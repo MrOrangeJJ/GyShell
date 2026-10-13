@@ -2046,6 +2046,25 @@ export const SettingsView: React.FC<{ store: AppStore }> = observer(
                   </div>
                   <div className="settings-row">
                     <div className="settings-row-label-with-info">
+                      <label>{t.settings.loopGuard}</label>
+                      <InfoTooltip content={t.settings.tooltips.loopGuard} />
+                    </div>
+                    <label className="switch">
+                      <input
+                        type="checkbox"
+                        checked={
+                          store.settings?.experimental?.loopGuardEnabled !==
+                          false
+                        }
+                        onChange={(e) =>
+                          store.setLoopGuardEnabled(e.target.checked)
+                        }
+                      />
+                      <span className="switch-slider" />
+                    </label>
+                  </div>
+                  <div className="settings-row">
+                    <div className="settings-row-label-with-info">
                       <label>{t.settings.taskFinishGuard}</label>
                       <InfoTooltip
                         content={t.settings.tooltips.taskFinishGuard}

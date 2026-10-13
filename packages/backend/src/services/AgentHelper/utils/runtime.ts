@@ -115,6 +115,25 @@ export function isContextWindowExceededError(error: unknown): boolean {
   return false
 }
 
+/** Wait `delayMs`, rejecting with an AbortError as soon as `signal` aborts. */
+export function delayUnlessAborted(delayMs: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const onAbort = () => {
+      clearTimeout(timer)
+      reject(new Error('AbortError'))
+    }
+    const timer = setTimeout(() => {
+      signal?.removeEventListener('abort', onAbort)
+      resolve()
+    }, delayMs)
+    if (signal?.aborted) {
+      onAbort()
+      return
+    }
+    signal?.addEventListener('abort', onAbort, { once: true })
+  })
+}
+
 export async function invokeWithRetry<T>(
   fn: (attempt: number) => Promise<T>,
   maxRetries: number = 4,
@@ -137,15 +156,7 @@ export async function invokeWithRetry<T>(
       if (attempt < maxRetries - 1) {
         const delay = delays[attempt]
         console.warn(`[AgentService] Model invocation failed (Attempt ${attempt + 1}/${maxRetries}). Error: ${error.message}. Retrying in ${delay}ms...`)
-        await new Promise((resolve, reject) => {
-          const timer = setTimeout(resolve, delay)
-          const onAbort = () => {
-            clearTimeout(timer)
-            reject(new Error('AbortError'))
-          }
-          if (signal?.aborted) onAbort()
-          signal?.addEventListener('abort', onAbort, { once: true })
-        })
+        await delayUnlessAborted(delay, signal)
         continue
       }
     }

@@ -73,6 +73,7 @@ export const en = {
     wsGatewayPort: "WebSocket Gateway Port",
     experimentalFeatures: "Experimental Features",
     runtimeThinkingCorrection: "Runtime Thinking Reflection Correction",
+    loopGuard: "Repetition Loop Guard",
     taskFinishGuard: "Task Finish Guard",
     firstTurnThinkingModel: "First-Turn Thinking Model",
     execCommandActionModel: "Exec Command Double Audit",
@@ -283,6 +284,8 @@ export const en = {
         "Start a local HTTP server to serve the mobile web interface on your local network. Requires the WebSocket gateway to be accessible from the network.",
       runtimeThinkingCorrection:
         "Run a background thinking-model audit every 8 model loops. If it detects the trajectory is off-track, it injects a correction constraint before a later model request.",
+      loopGuard:
+        "If a model response starts repeating the same text, reasoning, or tool call, stop it immediately, discard it, and silently ask the model again. Only the current response is checked.",
       taskFinishGuard:
         "Before ending, run a strict completion audit to verify the task is truly finished. If disabled, the agent can end immediately when no tool call is produced.",
       firstTurnThinkingModel:

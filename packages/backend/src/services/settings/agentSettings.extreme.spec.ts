@@ -33,6 +33,7 @@ const defaults = {
   recursionLimit: 200,
   experimental: {
     runtimeThinkingCorrectionEnabled: true,
+    loopGuardEnabled: true,
     taskFinishGuardEnabled: true,
     firstTurnThinkingModelEnabled: false,
     execCommandActionModelEnabled: true,

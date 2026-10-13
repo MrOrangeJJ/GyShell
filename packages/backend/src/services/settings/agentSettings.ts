@@ -94,6 +94,10 @@ export function normalizeExperimentalFlags(
       typeof source.runtimeThinkingCorrectionEnabled === 'boolean'
         ? source.runtimeThinkingCorrectionEnabled
         : defaults.runtimeThinkingCorrectionEnabled,
+    loopGuardEnabled:
+      typeof source.loopGuardEnabled === 'boolean'
+        ? source.loopGuardEnabled
+        : defaults.loopGuardEnabled,
     taskFinishGuardEnabled:
       typeof source.taskFinishGuardEnabled === 'boolean'
         ? source.taskFinishGuardEnabled

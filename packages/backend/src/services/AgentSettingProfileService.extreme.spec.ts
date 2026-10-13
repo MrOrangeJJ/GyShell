@@ -112,6 +112,7 @@ class MockSettingsService {
           recursionLimit: 300,
           experimental: {
             runtimeThinkingCorrectionEnabled: true,
+            loopGuardEnabled: true,
             taskFinishGuardEnabled: true,
             firstTurnThinkingModelEnabled: false,
             execCommandActionModelEnabled: true,
@@ -524,6 +525,7 @@ const run = async (): Promise<void> => {
         recursionLimit: 900,
         experimental: {
           runtimeThinkingCorrectionEnabled: false,
+          loopGuardEnabled: false,
           taskFinishGuardEnabled: false,
           firstTurnThinkingModelEnabled: true,
           execCommandActionModelEnabled: false,

@@ -59,6 +59,7 @@ export interface ModelProfile {
 
 export interface ExperimentalFlags {
   runtimeThinkingCorrectionEnabled: boolean
+  loopGuardEnabled: boolean
   taskFinishGuardEnabled: boolean
   firstTurnThinkingModelEnabled: boolean
   execCommandActionModelEnabled: boolean

@@ -45,7 +45,7 @@ interface RawToolCallGroup {
   unidentifiableFragmentCount: number;
 }
 
-interface CanonicalToolCall {
+export interface CanonicalToolCall {
   id: string;
   name: string;
   args: Record<string, unknown>;
@@ -768,13 +768,29 @@ function rebuildResponse(
   issues: string[],
   rawCallCount: number,
 ): any {
-  const additionalKwargs = {
-    ...(response?.additional_kwargs ?? {}),
+  return rebuildResponseWithToolCalls(response, calls, {
     [STREAM_TOOL_CALL_INTEGRITY_REPORT_KEY]: {
       status,
       issues: [...issues],
       rawCallCount,
     },
+  });
+}
+
+/**
+ * Rebuild an aggregated streamed response around an explicit tool-call list.
+ * Every provider-facing representation (`tool_calls`, `tool_call_chunks`,
+ * `additional_kwargs.tool_calls`) is derived from `calls`, so they cannot
+ * disagree.
+ */
+export function rebuildResponseWithToolCalls(
+  response: any,
+  calls: CanonicalToolCall[],
+  additionalKwargsPatch: Record<string, unknown> = {},
+): any {
+  const additionalKwargs = {
+    ...(response?.additional_kwargs ?? {}),
+    ...additionalKwargsPatch,
   };
   delete (additionalKwargs as any).tool_calls;
   delete (additionalKwargs as any).__raw_response;

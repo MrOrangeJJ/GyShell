@@ -110,6 +110,7 @@ interface BackendSettings {
   debugMode?: boolean;
   experimental?: {
     runtimeThinkingCorrectionEnabled: boolean;
+    loopGuardEnabled: boolean;
     taskFinishGuardEnabled: boolean;
     firstTurnThinkingModelEnabled: boolean;
     execCommandActionModelEnabled: boolean;

@@ -690,11 +690,18 @@ export class UIHistoryService {
     } else if (type === "say") {
       const lastMessage = session.messages[session.messages.length - 1];
       const delta = event.content || event.outputDelta || "";
+      // Text from a different model response never flows into a leftover
+      // streaming bubble; a response's retries reuse its id and still append.
+      const belongsToSameResponse =
+        !event.messageId ||
+        !lastMessage?.backendMessageId ||
+        lastMessage.backendMessageId === event.messageId;
       if (
         lastMessage &&
         lastMessage.role === "assistant" &&
         lastMessage.type === "text" &&
-        lastMessage.streaming
+        lastMessage.streaming &&
+        belongsToSameResponse
       ) {
         lastMessage.content += delta;
         actions.push({
@@ -1042,26 +1049,33 @@ export class UIHistoryService {
         });
       }
     } else if (type === "remove_message") {
-      const message = event.messageId
-        ? [...session.messages]
-            .reverse()
-            .find(
-              (entry) =>
-                entry.backendMessageId === event.messageId &&
-                entry.role === "assistant",
-            )
+      // One model response can render as several bubbles (text, a reasoning
+      // banner, more text), all sharing its backend id. Remove every text or
+      // reasoning bubble of that response; tool and command cards are never
+      // touched.
+      const removed = event.messageId
+        ? session.messages.filter(
+            (entry) =>
+              entry.backendMessageId === event.messageId &&
+              entry.role === "assistant" &&
+              (entry.type === "text" || entry.type === "reasoning"),
+          )
         : [...session.messages]
             .reverse()
-            .find((entry) => entry.role === "assistant");
-      if (message) {
+            .filter((entry) => entry.role === "assistant")
+            .slice(0, 1);
+      if (removed.length > 0) {
+        const removedIds = new Set(removed.map((entry) => entry.id));
         session.messages = session.messages.filter(
-          (entry) => entry.id !== message.id,
+          (entry) => !removedIds.has(entry.id),
         );
-        actions.push({
-          type: "REMOVE_MESSAGE",
-          sessionId,
-          messageId: message.id,
-        });
+        for (const entry of removed) {
+          actions.push({
+            type: "REMOVE_MESSAGE",
+            sessionId,
+            messageId: entry.id,
+          });
+        }
       }
     } else if (type === "done") {
       const stopAction = this.stopLatestStreaming(session, sessionId);

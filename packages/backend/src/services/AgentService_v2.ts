@@ -124,7 +124,21 @@ import {
 } from "./AgentHelper/tool_batch_planner";
 import { sanitizeCompressionAfterRollback } from "./AgentHelper/utils/history_compression_maintenance";
 import { cloneMessageWithPatch } from "./AgentHelper/utils/message_clone";
-import { isContextWindowExceededError } from "./AgentHelper/utils/runtime";
+import {
+  delayUnlessAborted,
+  isContextWindowExceededError,
+} from "./AgentHelper/utils/runtime";
+import {
+  LOOP_GUARD_MAX_ATTEMPTS,
+  LOOP_GUARD_RETRY_DELAYS_MS,
+  LoopGuardInterruption,
+  ResponseLoopMonitor,
+  buildExhaustedLoopGuardResponse,
+  createLoopGuardRedirectMessage,
+  isLoopGuardInterruption,
+  type LoopGuardTrip,
+  type ResponseLoopMonitorOptions,
+} from "./AgentHelper/utils/loop_guard";
 import {
   CONTINUE_INSTRUCTION_TAG,
   PASS_CHAT_HISTORY_TAG,
@@ -265,6 +279,10 @@ const StateAnnotation = Ann.Root({
     default: () => 0,
   }),
   runtimeThinkingCorrectionEnabled: Ann({
+    reducer: (x: boolean, y?: boolean) => (typeof y === "boolean" ? y : x),
+    default: () => true,
+  }),
+  loopGuardEnabled: Ann({
     reducer: (x: boolean, y?: boolean) => (typeof y === "boolean" ? y : x),
     default: () => true,
   }),
@@ -1758,6 +1776,7 @@ export class AgentService_v2 {
       const sessionBinding = this.getSessionModelBinding(sessionId);
       const runtimeThinkingCorrectionEnabled =
         state.runtimeThinkingCorrectionEnabled !== false;
+      const loopGuardEnabled = state.loopGuardEnabled !== false;
 
       let fullHistoryMessages: BaseMessage[] = [
         ...(state.messages as BaseMessage[]),
@@ -1840,20 +1859,39 @@ export class AgentService_v2 {
         buildToolArgumentContracts(toolsForThisPass);
       const modelWithTools = baseModel.bindTools(toolsForThisPass);
 
-      const messageId = uuidv4();
-
       let reasoningContent = "";
       let debugRawChunks: any[] = [];
       let modelRequestProducedChunk = false;
-      const requestMainModel = async (modelInputMessages: BaseMessage[]) =>
-        await invokeWithRetryAndSanitizedInput({
+      // One loop-guard attempt: its own UI bubble id and, when the guard is
+      // enabled, the options for that attempt's ResponseLoopMonitor.
+      type MainModelAttempt = {
+        messageId: string;
+        loopGuard: ResponseLoopMonitorOptions | null;
+      };
+      const requestMainModel = async (
+        modelInputMessages: BaseMessage[],
+        attempt: MainModelAttempt,
+      ) => {
+        const messageId = attempt.messageId;
+        // Every transport retry of this attempt shares `messageId`, so a loop
+        // retraction must also remove the banners of earlier transport tries.
+        const openedReasoningBannerIds: string[] = [];
+        return await invokeWithRetryAndSanitizedInput({
           helpers: this.helpers,
           messages: modelInputMessages,
           modelSupportsImage: sessionBinding.readFileSupport.image,
           signal: config?.signal,
           operation: async (streamInputMessages) => {
+            const loopMonitor = attempt.loopGuard
+              ? new ResponseLoopMonitor(attempt.loopGuard)
+              : null;
+            // Lets the loop guard stop this stream without signalling a user
+            // stop; a user stop still reaches the stream through config.signal.
+            const loopAbortController = new AbortController();
             const stream = await modelWithTools.stream(streamInputMessages, {
-              signal: config?.signal,
+              signal: config?.signal
+                ? AbortSignal.any([config.signal, loopAbortController.signal])
+                : loopAbortController.signal,
             });
 
             let response: any = null;
@@ -1862,10 +1900,22 @@ export class AgentService_v2 {
             const attemptDebugRawChunks: any[] = [];
             let attemptPartialText = "";
             let activeReasoningBannerId: string | null = null;
+            // Set from inside the stream loop; read after it ends.
+            const loopGuardState: { trip: LoopGuardTrip | null } = {
+              trip: null,
+            };
+
+            const tripLoopGuard = (trip: LoopGuardTrip | null): boolean => {
+              if (!trip) return false;
+              loopGuardState.trip = trip;
+              loopAbortController.abort();
+              return true;
+            };
 
             const startReasoningBanner = () => {
               if (activeReasoningBannerId) return;
               activeReasoningBannerId = uuidv4();
+              openedReasoningBannerIds.push(activeReasoningBannerId);
               this.helpers.sendEvent(sessionId, {
                 messageId: activeReasoningBannerId,
                 type: "sub_tool_started",
@@ -1934,6 +1984,21 @@ export class AgentService_v2 {
               }
             };
 
+            // A looping attempt is discarded whole: nothing is captured for
+            // persistence and everything it showed is retracted from the UI.
+            const interruptForLoop = (
+              trip: LoopGuardTrip,
+            ): LoopGuardInterruption => {
+              loopAbortController.abort();
+              finishReasoningBanner();
+              this.retractModelResponseFromUi(
+                sessionId,
+                messageId,
+                openedReasoningBannerIds,
+              );
+              return new LoopGuardInterruption(trip);
+            };
+
             try {
               for await (const chunk of stream) {
                 modelRequestProducedChunk = true;
@@ -1958,30 +2023,75 @@ export class AgentService_v2 {
                 if (rawDelta) {
                   attemptPartialText += rawDelta;
                 }
+                // Each delta is checked before it is shown, so the delta that
+                // completes a loop never reaches the UI.
                 if (extracted.reasoning) {
+                  if (
+                    tripLoopGuard(
+                      loopMonitor?.observeReasoning(extracted.reasoning) ??
+                        null,
+                    )
+                  ) {
+                    break;
+                  }
                   appendReasoningDelta(extracted.reasoning);
                 } else {
                   finishReasoningBanner();
                 }
                 if (extracted.content) {
+                  if (
+                    tripLoopGuard(
+                      loopMonitor?.observeContent(extracted.content) ?? null,
+                    )
+                  ) {
+                    break;
+                  }
                   this.helpers.sendEvent(sessionId, {
                     messageId,
                     type: "say",
                     content: extracted.content,
                   });
                 }
+                if (
+                  tripLoopGuard(
+                    loopMonitor?.observeToolCallChunks(
+                      (chunk as any)?.tool_call_chunks,
+                    ) ?? null,
+                  )
+                ) {
+                  break;
+                }
+              }
+              if (loopGuardState.trip) {
+                return interruptForLoop(loopGuardState.trip);
               }
               const pendingContent =
                 streamReasoningExtractor.flushPendingContent();
-              if (pendingContent) {
+              if (
+                pendingContent &&
+                !tripLoopGuard(
+                  loopMonitor?.observeContent(pendingContent) ?? null,
+                )
+              ) {
                 this.helpers.sendEvent(sessionId, {
                   messageId,
                   type: "say",
                   content: pendingContent,
                 });
               }
+              if (!loopGuardState.trip) {
+                tripLoopGuard(loopMonitor?.finish() ?? null);
+              }
+              if (loopGuardState.trip) {
+                return interruptForLoop(loopGuardState.trip);
+              }
               finishReasoningBanner();
             } catch (err) {
+              // Cancelling a stream the guard just stopped may surface as an
+              // abort; it is still a loop interruption, not a user stop.
+              if (loopGuardState.trip) {
+                return interruptForLoop(loopGuardState.trip);
+              }
               finishReasoningBanner();
               captureInterruptedAttempt();
               throw err;
@@ -2003,6 +2113,11 @@ export class AgentService_v2 {
               toolArgumentContracts,
             );
             response = streamIntegrity.response;
+            if (loopMonitor) {
+              const review = loopMonitor.reviewToolCalls(response);
+              if ("trip" in review) return interruptForLoop(review.trip);
+              response = review.response;
+            }
             if (streamIntegrity.status === "malformed_with_identity") {
               console.warn(
                 `[AgentService_v2] Preserved ${streamIntegrity.rawCallCount} malformed streamed tool call(s) as explicit error results (sessionId=${sessionId}).`,
@@ -2072,9 +2187,25 @@ export class AgentService_v2 {
                   invokeRawChunks,
                 )
               ) {
+                let invokeResult = invokeIntegrity.response;
                 const invokeText = this.helpers.extractText(
-                  invokeIntegrity.response.content,
+                  invokeResult.content,
                 );
+                if (attempt.loopGuard) {
+                  // The fallback reply replaces the streamed one and never
+                  // streamed, so it is checked whole before it is shown.
+                  const fallbackMonitor = new ResponseLoopMonitor(
+                    attempt.loopGuard,
+                  );
+                  const textTrip = invokeText
+                    ? (fallbackMonitor.observeContent(invokeText) ??
+                      fallbackMonitor.finish())
+                    : null;
+                  if (textTrip) return interruptForLoop(textTrip);
+                  const review = fallbackMonitor.reviewToolCalls(invokeResult);
+                  if ("trip" in review) return interruptForLoop(review.trip);
+                  invokeResult = review.response;
+                }
                 if (invokeText) {
                   this.helpers.sendEvent(sessionId, {
                     messageId,
@@ -2082,7 +2213,7 @@ export class AgentService_v2 {
                     content: invokeText,
                   });
                 }
-                response = invokeIntegrity.response;
+                response = invokeResult;
               }
             }
 
@@ -2119,19 +2250,81 @@ export class AgentService_v2 {
           terminalReferenceMigrationResolver:
             this.terminalReferenceMigrationResolver,
         });
+      };
 
-      const mainModelResult = await this.invokeMainModelWithContextRecovery({
-        sessionId,
-        historyMessages: fullHistoryMessages,
-        modelSupportsImage: sessionBinding.readFileSupport.image,
-        maxTokens: mainRequestMaxTokens,
-        physicalRunId,
-        signal: config?.signal,
-        canRecover: () => !modelRequestProducedChunk,
-        request: requestMainModel,
-      });
-      fullHistoryMessages = mainModelResult.historyMessages;
-      const fullResponse = mainModelResult.response;
+      // Loop guard: a looping attempt comes back as a LoopGuardInterruption.
+      // It is re-requested with the same history plus one hidden redirect note
+      // (replaced, never stacked), at most LOOP_GUARD_MAX_ATTEMPTS times.
+      let messageId = uuidv4();
+      let loopGuardRedirect: HumanMessage | null = null;
+      let fullResponse: any;
+      for (let loopAttempt = 1; ; loopAttempt += 1) {
+        const attempt: MainModelAttempt = {
+          messageId,
+          loopGuard: loopGuardEnabled
+            ? { finalAttempt: loopAttempt >= LOOP_GUARD_MAX_ATTEMPTS }
+            : null,
+        };
+        modelRequestProducedChunk = false;
+        reasoningContent = "";
+        debugRawChunks = [];
+        const redirect = loopGuardRedirect;
+        const mainModelResult = await this.invokeMainModelWithContextRecovery({
+          sessionId,
+          historyMessages: fullHistoryMessages,
+          modelSupportsImage: sessionBinding.readFileSupport.image,
+          maxTokens: mainRequestMaxTokens,
+          physicalRunId,
+          signal: config?.signal,
+          canRecover: () => !modelRequestProducedChunk,
+          // The redirect note is added to the request only, after any context
+          // compaction, so it never enters history and no later request
+          // inherits it.
+          request: (requestMessages) =>
+            requestMainModel(
+              redirect ? [...requestMessages, redirect] : requestMessages,
+              attempt,
+            ),
+        });
+        fullHistoryMessages = mainModelResult.historyMessages;
+        if (!isLoopGuardInterruption(mainModelResult.response)) {
+          fullResponse = mainModelResult.response;
+          break;
+        }
+
+        const { trip } = mainModelResult.response;
+        // The discarded attempt supersedes any failed transport attempt that
+        // was captured for stop persistence.
+        if (physicalRunId) {
+          this.abortedMessagesByRunId.delete(physicalRunId);
+        }
+        console.warn(
+          `[AgentService_v2] Loop guard discarded a looping model response (sessionId=${sessionId}, kind=${trip.kind}, attempt=${loopAttempt}/${LOOP_GUARD_MAX_ATTEMPTS}): ${trip.detail}.`,
+        );
+        if (loopAttempt >= LOOP_GUARD_MAX_ATTEMPTS) {
+          fullResponse = buildExhaustedLoopGuardResponse(trip);
+          if (!fullResponse) {
+            throw new Error(
+              `Model stream ended with an empty unusable response (the model kept repeating itself in ${LOOP_GUARD_MAX_ATTEMPTS} attempts).`,
+            );
+          }
+          this.helpers.sendEvent(sessionId, {
+            messageId,
+            type: "say",
+            content: this.helpers.extractText(fullResponse.content),
+          });
+          break;
+        }
+        loopGuardRedirect = createLoopGuardRedirectMessage(
+          trip,
+          loopAttempt + 1,
+        );
+        messageId = uuidv4();
+        await delayUnlessAborted(
+          LOOP_GUARD_RETRY_DELAYS_MS[loopAttempt - 1] ?? 0,
+          config?.signal,
+        );
+      }
 
       // A successful attempt supersedes any interrupted attempt captured under
       // the same physical run. Keeping the stale bundle would let a later stop
@@ -3555,6 +3748,24 @@ export class AgentService_v2 {
       this.unfinishedBackgroundFileTransferProvider?.(sessionId, agentRunId) ||
       []
     );
+  }
+
+  /** Remove every bubble a discarded model response showed in the UI. */
+  private retractModelResponseFromUi(
+    sessionId: string,
+    messageId: string,
+    reasoningBannerIds: readonly string[],
+  ): void {
+    for (const bannerId of reasoningBannerIds) {
+      this.helpers.sendEvent(sessionId, {
+        type: "remove_message",
+        messageId: bannerId,
+      });
+    }
+    this.helpers.sendEvent(sessionId, {
+      type: "remove_message",
+      messageId,
+    });
   }
 
   private emitRemoveMessageIfPresent(
@@ -6390,6 +6601,7 @@ export class AgentService_v2 {
       startup_mode: startMode,
       runtimeThinkingCorrectionEnabled:
         runExperimentalFlags.runtimeThinkingCorrectionEnabled,
+      loopGuardEnabled: runExperimentalFlags.loopGuardEnabled,
       taskFinishGuardEnabled: runExperimentalFlags.taskFinishGuardEnabled,
       firstTurnThinkingModelEnabled:
         runExperimentalFlags.firstTurnThinkingModelEnabled,

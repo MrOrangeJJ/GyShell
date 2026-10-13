@@ -2479,6 +2479,7 @@ export class AppStore {
     return {
       runtimeThinkingCorrectionEnabled:
         this.settings?.experimental?.runtimeThinkingCorrectionEnabled !== false,
+      loopGuardEnabled: this.settings?.experimental?.loopGuardEnabled !== false,
       taskFinishGuardEnabled:
         this.settings?.experimental?.taskFinishGuardEnabled !== false,
       firstTurnThinkingModelEnabled:
@@ -2510,6 +2511,12 @@ export class AppStore {
   async setRuntimeThinkingCorrectionEnabled(enabled: boolean): Promise<void> {
     await this.updateExperimentalSettings({
       runtimeThinkingCorrectionEnabled: enabled,
+    });
+  }
+
+  async setLoopGuardEnabled(enabled: boolean): Promise<void> {
+    await this.updateExperimentalSettings({
+      loopGuardEnabled: enabled,
     });
   }
 
