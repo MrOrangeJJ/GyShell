@@ -1,9 +1,9 @@
 {
   "name": "gyshell",
-  "version": "1.7.0",
+  "version": "2.0.0",
   "description": "GyShell - AI-Native Terminal App",
   "main": "./out/main/index.js",
-  "author": "TUOTUO <tuotuo@gyshell.com>",
+  "author": "TUOTUO",
   "private": true,
   "type": "module",
   "workspaces": [
