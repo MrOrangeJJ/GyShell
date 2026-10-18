@@ -1,7 +1,7 @@
 # <img src="./demo_imgs/icon.png" width="40" height="40" align="center" style="margin-right: 10px;"> GyShell
 
 > [!WARNING]
-> **Recommendation for newer, more capable models:** For current smarter models (for example, `gpt-5.6-sol`, `claude opus 5`, and `kimi-k3`), we recommend going to **Settings → Workflow** and disabling every switch except **First-Turn Thinking Model**. Testing shows that newer models no longer need these mechanisms as auxiliary constraints; leaving them enabled may slow task completion and can even reduce result quality.
+> **Recommendation for newer, more capable models:** For current smarter models (for example, `gpt-5.6-sol`, `claude opus 5`, and `kimi-k3`), we recommend going to **Settings → Workflow** and disabling every switch except **First-Turn Thinking Model** and **Repetition Loop Guard**. Testing shows that newer models no longer need the other mechanisms as auxiliary constraints; leaving them enabled may slow task completion and can even reduce result quality.
 
 > **The AI-Native Terminal that thinks, executes, and collaborates with you.**
 
@@ -10,13 +10,13 @@
 [![Shell](https://img.shields.io/badge/Shell-Zsh%20%7C%20Bash%20%7C%20PowerShell-orange)](#key-capabilities)
 
 English README | [中文 README](./README.zh-CN.md)  
-Latest release notes: [`changelogs/v1.7.0.md`](./changelogs/v1.7.0.md)
+Latest release notes: [`changelogs/v2.0.0.md`](./changelogs/v2.0.0.md)
 
 > [!IMPORTANT]
-> 🚀 **v1.7.0 headline upgrade: dramatically faster GyShell Agent execution.** GyShell safely runs supported, compatible tool calls in parallel, significantly reducing wait time in multi-tool and multi-machine tasks while keeping conflicting operations strictly ordered.
+> 🚀 **v2.0.0 headline feature: Terminal Block view.** Every command and its output become a clear block, with the live prompt docked below. Agent commands are titled by their **intent**, such as "Reproduce the failing test" or "Verify the fix", so you can see what the Agent did and why at a glance.
 
 > [!TIP]
-> **New in v1.7.0: `gyll` command CLI.** Let other agents control GyShell through stable JSON commands using the standalone executable included with desktop releases. **[Open the `gyll` installation and usage tutorial ->](./docs/cli-usage.md)**
+> **Try it:** click the **Block** icon in any terminal footer, or go to **Settings → General → Terminal View**. Classic view also gains command marks and a searchable **Find command** navigator. **[Read the v2.0.0 release notes ->](./changelogs/v2.0.0.md)**
 
 If you have any suggestions or questions, please feel free to submit them in [GitHub Discussions](https://github.com/MrOrangeJJ/GyShell/discussions).
 
@@ -32,10 +32,10 @@ Usage guides:
 > **v1.4.0 upgrade note**: the first launch after upgrading from a pre-1.4.0 version may briefly block while GyShell migrates legacy JSON history into SQLite and writes timestamped backup files. v1.4.3 has no additional migration step.
 
 <p align="center">
-  <img src="./demo_imgs/v1.6.0_dark.png" width="100%" alt="GyShell dark theme demo">
+  <img src="./demo_imgs/v2.0.0_block_view_dark.png" width="100%" alt="GyShell dark theme: the Agent fixes a failing test while each command appears as an intent-labeled block">
 </p>
 <p align="center">
-  <img src="./demo_imgs/v1.6.0_light.png" width="100%" alt="GyShell light theme demo">
+  <img src="./demo_imgs/v2.0.0_block_view_light.png" width="100%" alt="GyShell light theme: the same Agent run in Block view">
 </p>
 <p align="center">
   <video controls width="100%" src="https://github.com/user-attachments/assets/f9daf884-bda0-4a58-8a6d-934db0eddeb5"></video>
@@ -51,6 +51,7 @@ GyShell is built for **persistent execution in your real terminal runtime**:
 
 - **Persistent execution loop**: observe output -> reason -> continue.
 - **Human-in-the-loop by design**: intervene anytime without breaking flow.
+- **Readable command history**: Block view shows every command as a labeled block, and Agent commands are titled by their intent.
 - **Multi-tab orchestration**: compile, inspect logs, and run fixes in parallel tabs.
 - **Global tab inventory**: scan, reopen, drag, close, and create terminal/chat tabs from a dedicated list panel.
 - **Workspace persistence**: terminal tabs, panel layout, and saved layout slots can survive restarts and restore quickly.
@@ -75,19 +76,22 @@ GyShell is built for **persistent execution in your real terminal runtime**:
 - **For multi-device and agent flow**: desktop + command CLI + mobile-web with shared gateway semantics.
 - **For multimodal workflows**: text and image inputs can be combined in one execution turn.
 
-## v1.7.0 Key Highlights
+## v2.0.0 Key Highlights
 
-- 🚀 **Headline performance upgrade — dramatically faster Agent execution**: supported tool calls now run safely in parallel, significantly accelerating multi-tool and multi-machine tasks without sacrificing execution safety.
-- **[`gyll` command CLI](./docs/cli-usage.md)**: control chats, approvals, terminals, profiles, tools, Skills, memory, and policies through stable JSON commands from a standalone executable.
-- **Live session rename**: rename a chat from the desktop Tab List or `gyll` and see the saved title update across connected clients.
-- **Agent-managed terminal tabs**: opt-in experimental tools let the Agent create Local/SSH tabs and close existing tabs.
-- **Direct SSH transfers**: large single files can move directly between compatible Unix SSH hosts, with automatic relay fallback.
-- **Per-model request parameters**: add validated OpenAI-compatible request-body overrides without exposing runtime-owned fields.
-- **Reliable command-output semantics**: complete, partial, and display-truncated output are explicit, with continuation for retained long results.
-- **Cleaner Seamless activity**: inspect tool work through compact, multi-level disclosure with accurate warning and failure states.
-- **Auto-saved Agent Settings**: edits made while a profile is active are written back automatically.
-- **Clearer tools and Skills**: tool descriptions are shorter, and Skill discovery is limited to GyShell's managed folder plus `~/.agents/skills`.
-- **Reliability fixes**: streamed multi-tool calls stay intact, terminal and SSH recovery is more defensive, background SSH tabs remain monitorable, Windows terminal resizing stays synchronized, and chat panels preserve their selected session.
+- 🚀 **Terminal Block view**: every command becomes a readable block with exit status, duration, and folded output. Open a block for full details, including whether you or the Agent ran it.
+- **Intent-first Agent commands**: Agent commands are titled by what they are meant to do, with the real command and the name of the chat that ran it underneath.
+- **A live tail that stays put**: running output streams into the prompt dock without duplicate lines or scroll jitter. **Jump to latest** shows how many new lines arrived.
+- **Find command in Classic view**: gutter marks plus a searchable navigator with an **Issues only** filter and Agent/user/running markers.
+- **Terminal history across restarts**: output, activity, and Agent command records survive restarts, with a marker where the previous session ended. It is on by default and controlled by **Save Terminal History**.
+- **Repetition Loop Guard**: looping text, reasoning, or tool calls are stopped, removed from the chat, and silently retried. It is on by default.
+- **Bounded long runs**: token-budget compaction keeps long autonomous runs under the context limit. In replay tests, 1,000 rounds stayed under the limit; previously they grew past one million tokens.
+- **Fast, huge chat histories**: paged loading and a virtualized list keep very long sessions quick to open and smooth to scroll.
+- **Self-healing window**: a crashed or frozen window reloads automatically while sessions keep running. Repeated failures fall back to safe mode.
+- **Reliability fixes**: smoother macOS Full Disk Access setup, Skills from symlinked folders, multi-file mentions on drop, exact terminal IDs in `gyll`, and more reliable Windows PowerShell and ConPTY sessions.
+
+<p align="center">
+  <img src="./demo_imgs/v2.0.0_live_block.png" width="100%" alt="A running Agent build streams live into the prompt dock under its Block">
+</p>
 
 ---
 
@@ -100,6 +104,8 @@ GyShell is built for **persistent execution in your real terminal runtime**:
 - Supported, compatible tool calls—including read-only tools and commands targeting different machines—can execute safely in parallel to significantly accelerate Agent tasks.
 - Per-profile model routing for `Global`, `Thinking`, `Action`, and `Compaction` roles.
 - Reusable Agent Setting profiles for model profile, security policy, tools, skills, memory, recursion, and experimental workflow flags, with automatic write-back while a profile is active.
+- Silent Repetition Loop Guard stops and retries model responses whose text, reasoning, or tool calls start looping.
+- Token-budget history compaction keeps long autonomous runs within the context limit even when no new user message arrives.
 - Long-session context quality with dedicated compaction models, dynamic summaries, visible `[CTX COMPACTED]` boundary markers, efficient exit-only checkpoint serialization, and durable-frontier recovery for histories that still exceed the emergency context budget.
 - SQLite-backed conversation history with automatic one-time migration from legacy JSON storage.
 - AI-assisted terminal command drafting from recent tab context, with paste-before-run control.
@@ -118,6 +124,9 @@ GyShell is built for **persistent execution in your real terminal runtime**:
 ### Terminal + SSH + File Management
 
 - Shell support: Zsh, Bash, PowerShell.
+- **Two terminal views**: Classic keeps the native terminal, and the opt-in Block view shows each command as a block with its exit status, duration, intent, and origin, with the live prompt docked below.
+- Classic view command marks and a **Find command** navigator with search, an issues filter, and running/Agent/user markers.
+- **Save Terminal History** (on by default) keeps terminal output, activity, and Agent command records across app restarts, with a **Session Resumed** divider.
 - Older Windows PowerShell environments now use more reliable sidecar-based command completion tracking for local and SSH sessions.
 - Windows PTY output, cursor geometry, and panel refits stay synchronized during continuous output and resizing.
 - SSH support: password/key auth, proxy chaining, bastion workflows.
@@ -140,6 +149,8 @@ GyShell is built for **persistent execution in your real terminal runtime**:
 ### Workspace + Monitoring
 
 - Detach panels into dedicated sub-windows and move tabs or whole panels across windows.
+- Crashed or unresponsive windows reload automatically while sessions keep running; repeated failures fall back to safe mode.
+- Very long chat sessions load in bounded pages and render through a virtualized list.
 - Use the global Tab List panel to scan terminal/chat inventory, rename chat sessions, restore unhosted tabs, drag tabs across layout targets, close tabs, and create new chat/local/SSH tabs without forcing a terminal panel to appear.
 - Save up to three workspace layout slots and restore them from the rail.
 - Optionally keep the computer awake while any chat session is running, with the system-sleep block released automatically when runs finish.
@@ -272,7 +283,8 @@ See:
 
 ## Read More
 
-- Release notes: [`changelogs/v1.7.0.md`](./changelogs/v1.7.0.md)
+- Release notes: [`changelogs/v2.0.0.md`](./changelogs/v2.0.0.md)
+- Terminal Classic and Block views: [`docs/terminal-views.md`](./docs/terminal-views.md)
 - `gyll` installation and usage: [`docs/cli-usage.md`](./docs/cli-usage.md)
 - Build matrix and packaging: `docs/build-commands.md`
 - Monorepo boundaries and runtime flow: `docs/monorepo-architecture.md`
