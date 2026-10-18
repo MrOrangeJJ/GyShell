@@ -26,7 +26,7 @@ interface SSHConnectionEntry {
 }
 
 interface BackendSettings {
-  schemaVersion: 5;
+  schemaVersion: 6;
   commandPolicyMode: "safe" | "standard" | "smart";
   memory?: {
     enabled: boolean;

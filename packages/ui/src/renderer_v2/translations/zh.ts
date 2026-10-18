@@ -66,8 +66,6 @@ export const zh = {
     shortcutListening: "请按下快捷键...",
     cursorStyle: "光标样式",
     cursorBlink: "光标闪烁",
-    recursionLimit: "Agent 递归上限",
-    recursionLimitInf: "无限制",
     debugMode: "调试模式",
     chatDisplayMode: "对话显示模式",
     preventSleepWhileRunning: "运行时阻止系统睡眠",
@@ -265,8 +263,6 @@ export const zh = {
         "点击右侧快捷键字段后开始录制，用来设置在 terminal tab 中打开命令草稿悬浮窗的前端快捷键。录制时按 Esc 会直接禁用这个快捷键。",
       cursorStyle: "选择终端光标的视觉样式。",
       cursorBlink: "终端光标是否以动画形式闪烁。",
-      recursionLimit:
-        "Agent 在单个任务中允许执行的最大步数。如果经常遇到“递归上限”错误，请调高此值。拉到最右侧为无限制。",
       debugMode:
         "开启调试相关的持久化与诊断能力。目前会在后端导出消息中保留 additional_kwargs.__raw_response；但发送给模型前仍会自动剥离这些原始字段。",
       chatDisplayMode:

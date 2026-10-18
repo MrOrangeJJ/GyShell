@@ -185,7 +185,7 @@ export interface WsGatewaySettings {
 
 export interface BackendSettings {
   /** Settings schema version, used for migrations */
-  schemaVersion: 5
+  schemaVersion: 6
 
   /** Command policy mode */
   commandPolicyMode: CommandPolicyMode
@@ -240,7 +240,10 @@ export interface BackendSettings {
     savedLayouts?: unknown
     activeSavedLayoutId?: string | null
   }
-  /** Agent recursion limit */
+  /**
+   * Agent recursion limit. Not user-configurable: settings normalization pins
+   * it to AGENT_RECURSION_LIMIT (INF) and the runtime reads that constant.
+   */
   recursionLimit?: number
   /** Global memory injection control */
   memory?: {

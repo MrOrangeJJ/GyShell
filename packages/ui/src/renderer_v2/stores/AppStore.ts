@@ -585,7 +585,6 @@ export class AppStore {
       setBuiltInToolEnabled: action,
       setSkillEnabled: action,
       setMemoryEnabled: action,
-      setRecursionLimit: action,
       setDebugMode: action,
       mobileWebStatus: observable,
       setMobileWebStatus: action,
@@ -2272,15 +2271,6 @@ export class AppStore {
         enabled,
       },
     });
-  }
-
-  async setRecursionLimit(limit: number): Promise<void> {
-    runInAction(() => {
-      if (this.settings) {
-        this.settings.recursionLimit = limit;
-      }
-    });
-    await window.gyshell.settings.set({ recursionLimit: limit });
   }
 
   async setDebugMode(enabled: boolean): Promise<void> {

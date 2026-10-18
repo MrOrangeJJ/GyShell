@@ -99,7 +99,7 @@ GyShell 的定位是“运行在真实终端中的持续执行系统”：
 - 基于终端上下文和选中资源的上下文感知。
 - 受支持且互不冲突的工具调用（包括只读工具和面向不同机器的命令）可安全并行执行，大幅提升 Agent 任务运行速度。
 - 支持按 Profile 分配 `Global`、`Thinking`、`Action`、`Compaction` 四类模型角色。
-- 支持可复用 Agent Setting 配置档，保存模型 Profile、安全策略、工具、Skills、memory、递归和实验 workflow flags；Profile 激活期间的更改会自动写回。
+- 支持可复用 Agent Setting 配置档，保存模型 Profile、安全策略、工具、Skills、memory 和实验 workflow flags；Profile 激活期间的更改会自动写回。
 - 静默的重复循环守卫会中止并重试开始循环的模型回复（文本、推理或工具调用）。
 - 按 token 预算压缩历史，即使没有新的用户消息，长时间自主运行也会保持在上下文上限以内。
 - 长会话智能压缩、独立压缩模型链路、可见的 `[CTX COMPACTED]` 压缩边界标记、高效的退出时 checkpoint 序列化，以及历史仍超过紧急上下文预算时可从持久化阅读进度继续的恢复机制。

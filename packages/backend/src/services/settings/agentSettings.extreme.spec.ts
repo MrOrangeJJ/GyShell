@@ -1,5 +1,10 @@
-import { migrateBackendSettings } from './migrations'
 import {
+  BACKEND_SETTINGS_SCHEMA_VERSION,
+  DEFAULT_BACKEND_SETTINGS,
+  migrateBackendSettings,
+} from './migrations'
+import {
+  AGENT_RECURSION_LIMIT,
   getAgentSettingProfileId,
   normalizeAgentSettingState,
 } from './agentSettings'
@@ -30,7 +35,6 @@ const runCase = (name: string, fn: () => void): void => {
 }
 
 const defaults = {
-  recursionLimit: 200,
   experimental: {
     runtimeThinkingCorrectionEnabled: true,
     loopGuardEnabled: true,
@@ -41,14 +45,14 @@ const defaults = {
   },
 }
 
-runCase('migrates v3 settings to schema v5 with empty agent settings', () => {
+runCase('migrates v3 settings to the current schema with empty agent settings', () => {
   const migrated = migrateBackendSettings({
     schemaVersion: 3,
     commandPolicyMode: 'safe',
     memory: { enabled: false },
   })
 
-  assertEqual(migrated.schemaVersion, 5, 'schema version should be v5')
+  assertEqual(migrated.schemaVersion, 6, 'schema version should be v6')
   assertDeepEqual(
     migrated.agentSettings,
     { profiles: [], activeProfileId: null },
@@ -85,7 +89,7 @@ runCase('normalizes model request parameters during schema migration', () => {
     },
   } as any)
 
-  assertEqual(migrated.schemaVersion, 5, 'model parameter migration should reach v5')
+  assertEqual(migrated.schemaVersion, 6, 'model parameter migration should reach v6')
   assertDeepEqual(
     migrated.models.items[0].requestParameters,
     { temperature: 0.65, max_completion_tokens: 2048 },
@@ -169,6 +173,178 @@ runCase('normalizes malformed profiles and stale active ids', () => {
       .runtimeThinkingCorrectionEnabled,
     true,
     'missing experimental flag should use default',
+  )
+})
+
+const profileWithRecursionLimit = (recursionLimit: number) => ({
+  id: getAgentSettingProfileId(1),
+  slotNumber: 1,
+  name: 'Slot 1',
+  createdAt: 1,
+  updatedAt: 1,
+  snapshot: {
+    version: 1,
+    security: {
+      commandPolicyMode: 'safe',
+      commandPolicyLists: { allowlist: [], denylist: [], asklist: [] },
+    },
+    tools: { builtIn: {}, mcp: {} },
+    skills: {},
+    memory: { enabled: true },
+    workflow: { recursionLimit, experimental: {} },
+    model: { activeProfileId: '' },
+  },
+})
+
+runCase('v6 upgrade forces INF over any stored recursion limit', () => {
+  for (const stored of [200, 640, 1, 2147483647, -5, 'abc', null]) {
+    const migrated = migrateBackendSettings({
+      schemaVersion: 5,
+      commandPolicyMode: 'standard',
+      recursionLimit: stored,
+      agentSettings: {
+        profiles: [profileWithRecursionLimit(500)],
+        activeProfileId: getAgentSettingProfileId(1),
+      },
+    } as any)
+    assertEqual(
+      migrated.recursionLimit,
+      AGENT_RECURSION_LIMIT,
+      `stored recursion limit ${String(stored)} should become INF`,
+    )
+    assertEqual(
+      migrated.agentSettings!.profiles[0].snapshot.workflow.recursionLimit,
+      AGENT_RECURSION_LIMIT,
+      'saved profile snapshot recursion limit should become INF',
+    )
+    assertEqual(
+      migrated.agentSettings!.activeProfileId,
+      getAgentSettingProfileId(1),
+      'upgrade must keep the saved profile itself',
+    )
+  }
+})
+
+runCase('recursion limit stays INF after upgrade, whatever is patched in', () => {
+  const migrated = migrateBackendSettings({
+    schemaVersion: BACKEND_SETTINGS_SCHEMA_VERSION,
+    recursionLimit: 300,
+    agentSettings: {
+      profiles: [profileWithRecursionLimit(300)],
+      activeProfileId: null,
+    },
+  } as any)
+  assertEqual(
+    migrated.recursionLimit,
+    AGENT_RECURSION_LIMIT,
+    'a current-schema write must still pin the limit',
+  )
+  assertEqual(
+    migrated.agentSettings!.profiles[0].snapshot.workflow.recursionLimit,
+    AGENT_RECURSION_LIMIT,
+    'a current-schema profile snapshot must still pin the limit',
+  )
+})
+
+runCase('fresh installs default Command Policy Mode to smart', () => {
+  assertEqual(
+    DEFAULT_BACKEND_SETTINGS.commandPolicyMode,
+    'smart',
+    'store defaults should use smart mode',
+  )
+  assertEqual(
+    DEFAULT_BACKEND_SETTINGS.recursionLimit,
+    AGENT_RECURSION_LIMIT,
+    'store defaults should use the INF recursion limit',
+  )
+  // Electron: no backend store and no legacy file.
+  const electronFresh = migrateBackendSettings(undefined, undefined)
+  assertEqual(electronFresh.commandPolicyMode, 'smart', 'electron fresh install')
+  assertEqual(
+    electronFresh.recursionLimit,
+    AGENT_RECURSION_LIMIT,
+    'electron fresh install recursion limit',
+  )
+  // Headless node backend: normalize(undefined) migrates an empty object, and
+  // env bootstrap may add model fields without a schema version.
+  assertEqual(
+    migrateBackendSettings({}).commandPolicyMode,
+    'smart',
+    'node fresh install',
+  )
+  assertEqual(
+    migrateBackendSettings({
+      model: 'm',
+      models: { items: [], profiles: [], activeProfileId: '' },
+    }).commandPolicyMode,
+    'smart',
+    'node fresh install with env bootstrap',
+  )
+  // Electron constructs the store with defaults after migration; re-reading
+  // the persisted result must not flip the mode.
+  assertEqual(
+    migrateBackendSettings(electronFresh).commandPolicyMode,
+    'smart',
+    'second start after a fresh install',
+  )
+})
+
+runCase('upgrades keep the Command Policy Mode the user ran with', () => {
+  for (const mode of ['safe', 'standard', 'smart'] as const) {
+    for (const fromVersion of [3, 4, 5]) {
+      assertEqual(
+        migrateBackendSettings({ schemaVersion: fromVersion, commandPolicyMode: mode })
+          .commandPolicyMode,
+        mode,
+        `stored ${mode} at v${fromVersion} should be kept`,
+      )
+    }
+    assertEqual(
+      migrateBackendSettings(undefined, { commandPolicyMode: mode }).commandPolicyMode,
+      mode,
+      `legacy-only stored ${mode} should be kept`,
+    )
+  }
+  assertEqual(
+    migrateBackendSettings({ schemaVersion: 5 }).commandPolicyMode,
+    'standard',
+    'an upgrading store without a mode keeps the pre-v6 default',
+  )
+  assertEqual(
+    migrateBackendSettings({ schemaVersion: 5, commandPolicyMode: 'yolo' } as any)
+      .commandPolicyMode,
+    'standard',
+    'an upgrading store with an invalid mode keeps the pre-v6 default',
+  )
+  assertEqual(
+    migrateBackendSettings(undefined, { schemaVersion: 2, memory: { enabled: true } })
+      .commandPolicyMode,
+    'standard',
+    'a legacy store without a mode keeps the pre-v6 default',
+  )
+  assertEqual(
+    migrateBackendSettings(undefined, { memory: { enabled: true } }).commandPolicyMode,
+    'standard',
+    'an unversioned legacy store is still an upgrade',
+  )
+  assertEqual(
+    migrateBackendSettings(
+      { schemaVersion: 5, commandPolicyMode: 'safe' },
+      { commandPolicyMode: 'smart' },
+    ).commandPolicyMode,
+    'safe',
+    'the current store wins over the legacy store',
+  )
+  const upgraded = migrateBackendSettings({ schemaVersion: 5, commandPolicyMode: 'standard' })
+  assertEqual(
+    migrateBackendSettings(upgraded).commandPolicyMode,
+    'standard',
+    'later starts must not flip an upgraded user to smart',
+  )
+  assertEqual(
+    migrateBackendSettings({ ...upgraded, commandPolicyMode: 'smart' }).commandPolicyMode,
+    'smart',
+    'users can still choose a mode after upgrading',
   )
 })
 

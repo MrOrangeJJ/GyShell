@@ -62,6 +62,7 @@ import {
   buildCreateTerminalTabDescription,
   buildTerminalConfigFromSavedConnection,
 } from "./AgentHelper/tools";
+import { AGENT_RECURSION_LIMIT } from "./settings/agentSettings";
 import type { ToolExecutionContext } from "./AgentHelper/types";
 import {
   EDIT_FILE_TOOL_NAME,
@@ -6566,7 +6567,6 @@ export class AgentService_v2 {
       lockedProfileId,
     );
     const currentRunMaxTokens = sessionBinding.globalMaxTokens;
-    const recursionLimit = this.settings?.recursionLimit ?? 200;
     const loadedSession = this.loadRuntimeChatSession(sessionId);
     let baseMessages: BaseMessage[] = [];
     if (loadedSession) {
@@ -6614,7 +6614,7 @@ export class AgentService_v2 {
     this.activePhysicalRunIds.add(physicalRunId);
     try {
       const result = await this.graph.invoke(initialState, {
-        recursionLimit: recursionLimit,
+        recursionLimit: AGENT_RECURSION_LIMIT,
         signal,
         durability: "exit",
         configurable: { thread_id: sessionId },

@@ -6,7 +6,10 @@ import { NodeSettingsService } from '../adapters/node/NodeSettingsService'
 import { AgentSettingProfileService } from './AgentSettingProfileService'
 import { migrateBackendSettings } from './settings/migrations'
 import { deepMerge } from './settings/objectMerge'
-import { getAgentSettingProfileId } from './settings/agentSettings'
+import {
+  AGENT_RECURSION_LIMIT,
+  getAgentSettingProfileId,
+} from './settings/agentSettings'
 import {
   assertSettingsPatchDoesNotEnableExperimentalTools,
   isExperimentalToolConfirmationRequired,
@@ -69,6 +72,9 @@ class MockSettingsService {
     this.settings = migrateBackendSettings(
       deepMerge(
         {
+          // Explicit, so cases that switch modes don't depend on the
+          // fresh-install default.
+          commandPolicyMode: 'standard',
           models: {
             items: [
               {
@@ -588,7 +594,11 @@ const run = async (): Promise<void> => {
         'profile-fast',
         'saved active model profile should apply',
       )
-      assertEqual(settings.recursionLimit, 300, 'recursion limit should apply')
+      assertEqual(
+        settings.recursionLimit,
+        AGENT_RECURSION_LIMIT,
+        'applying a profile must keep the fixed INF recursion limit',
+      )
       assertEqual(
         settings.experimental?.writeStdinActionModelEnabled,
         false,
@@ -681,7 +691,12 @@ const run = async (): Promise<void> => {
 
       await harness.service.applySettingsPatch({
         commandPolicyMode: 'smart',
+        // Older clients may still send a finite limit; it must be pinned.
         recursionLimit: 720,
+        experimental: {
+          ...harness.settingsService.getSettings().experimental!,
+          firstTurnThinkingModelEnabled: true,
+        },
         models: {
           ...harness.settingsService.getSettings().models,
           activeProfileId: 'profile-deep',
@@ -727,9 +742,19 @@ const run = async (): Promise<void> => {
         'skill changes should auto-save into the active profile',
       )
       assertEqual(
-        profile!.snapshot.workflow.recursionLimit,
-        720,
+        profile!.snapshot.workflow.experimental.firstTurnThinkingModelEnabled,
+        true,
         'workflow changes should auto-save into the active profile',
+      )
+      assertEqual(
+        profile!.snapshot.workflow.recursionLimit,
+        AGENT_RECURSION_LIMIT,
+        'a patched recursion limit must not reach the profile snapshot',
+      )
+      assertEqual(
+        harness.settingsService.getSettings().recursionLimit,
+        AGENT_RECURSION_LIMIT,
+        'a patched recursion limit must not reach settings',
       )
       assertEqual(
         profile!.snapshot.model.activeProfileId,
@@ -764,7 +789,12 @@ const run = async (): Promise<void> => {
         })
 
         await service.saveCurrent()
-        await service.applySettingsPatch({ recursionLimit: 880 })
+        await service.applySettingsPatch({
+          experimental: {
+            ...settingsService.getSettings().experimental!,
+            firstTurnThinkingModelEnabled: true,
+          },
+        })
         await service.setMcpToolEnabled('search', false)
 
         const reloadedSettings = new NodeSettingsService(dataDir).getSettings()
@@ -776,8 +806,9 @@ const run = async (): Promise<void> => {
           'saved profile should reload from disk',
         )
         assertEqual(
-          reloadedProfile!.snapshot.workflow.recursionLimit,
-          880,
+          reloadedProfile!.snapshot.workflow.experimental
+            .firstTurnThinkingModelEnabled,
+          true,
           'reloaded profile should keep the last workflow edit',
         )
         assertEqual(

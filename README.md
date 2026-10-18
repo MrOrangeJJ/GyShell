@@ -103,7 +103,7 @@ GyShell is built for **persistent execution in your real terminal runtime**:
 - Context-aware responses from terminal state and selected resources.
 - Supported, compatible tool calls—including read-only tools and commands targeting different machines—can execute safely in parallel to significantly accelerate Agent tasks.
 - Per-profile model routing for `Global`, `Thinking`, `Action`, and `Compaction` roles.
-- Reusable Agent Setting profiles for model profile, security policy, tools, skills, memory, recursion, and experimental workflow flags, with automatic write-back while a profile is active.
+- Reusable Agent Setting profiles for model profile, security policy, tools, skills, memory, and experimental workflow flags, with automatic write-back while a profile is active.
 - Silent Repetition Loop Guard stops and retries model responses whose text, reasoning, or tool calls start looping.
 - Token-budget history compaction keeps long autonomous runs within the context limit even when no new user message arrives.
 - Long-session context quality with dedicated compaction models, dynamic summaries, visible `[CTX COMPACTED]` boundary markers, efficient exit-only checkpoint serialization, and durable-frontier recovery for histories that still exceed the emergency context budget.

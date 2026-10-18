@@ -511,7 +511,7 @@ const run = async (): Promise<void> => {
                             enabled: false,
                           },
                           workflow: {
-                            recursionLimit: 500,
+                            recursionLimit: 2147483647,
                             experimental: {},
                           },
                           model: {
@@ -657,7 +657,6 @@ const run = async (): Promise<void> => {
       settingsUpdatedHandler!({
         schemaVersion: 4,
         commandPolicyMode: "smart",
-        recursionLimit: 640,
         models: {
           items: [],
           profiles: [
@@ -702,7 +701,7 @@ const run = async (): Promise<void> => {
                   enabled: false,
                 },
                 workflow: {
-                  recursionLimit: 640,
+                  recursionLimit: 2147483647,
                   experimental: {},
                 },
                 model: {
@@ -734,11 +733,6 @@ const run = async (): Promise<void> => {
         store.settings?.models.activeProfileId,
         "profile-deep",
         "settings broadcast should update active model profile",
-      );
-      assertEqual(
-        store.settings?.recursionLimit,
-        640,
-        "settings broadcast should update workflow recursion limit",
       );
       assertEqual(
         store.agentSettingState.activeProfileId,

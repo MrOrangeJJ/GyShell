@@ -13,6 +13,14 @@ export const MAX_AGENT_SETTING_PROFILES = 5
 export const AGENT_SETTING_SLOT_NUMBERS = [1, 2, 3, 4, 5] as const
 export const AGENT_SETTING_SNAPSHOT_VERSION = 1
 
+/**
+ * Fixed LangGraph recursion limit for every Agent run ("INF").
+ * The limit is no longer user-configurable: settings, Agent Setting profile
+ * snapshots and the runtime all pin to this value. 2^31 - 1 is the sentinel the
+ * former settings slider stored for "Infinite".
+ */
+export const AGENT_RECURSION_LIMIT = 2147483647
+
 export const getAgentSettingProfileId = (
   slotNumber: AgentSettingSlotNumber,
 ): string => `agent-setting-slot-${slotNumber}`
@@ -119,7 +127,7 @@ export function normalizeExperimentalFlags(
 
 export function normalizeAgentSettingSnapshot(
   value: unknown,
-  defaults: { recursionLimit: number; experimental: ExperimentalFlags },
+  defaults: { experimental: ExperimentalFlags },
 ): AgentSettingSnapshot | null {
   if (!isObject(value)) return null
   const security = isObject(value.security) ? value.security : {}
@@ -127,7 +135,6 @@ export function normalizeAgentSettingSnapshot(
   const memory = isObject(value.memory) ? value.memory : {}
   const workflow = isObject(value.workflow) ? value.workflow : {}
   const model = isObject(value.model) ? value.model : {}
-  const rawRecursionLimit = Number(workflow.recursionLimit)
 
   return {
     version: AGENT_SETTING_SNAPSHOT_VERSION,
@@ -146,10 +153,9 @@ export function normalizeAgentSettingSnapshot(
       enabled: memory.enabled !== false,
     },
     workflow: {
-      recursionLimit:
-        Number.isFinite(rawRecursionLimit) && rawRecursionLimit > 0
-          ? Math.floor(rawRecursionLimit)
-          : defaults.recursionLimit,
+      // Older snapshots may carry a finite limit; applying them must not
+      // reintroduce it.
+      recursionLimit: AGENT_RECURSION_LIMIT,
       experimental: normalizeExperimentalFlags(
         workflow.experimental,
         defaults.experimental,
@@ -179,7 +185,7 @@ export function sortAgentSettingProfiles(
 
 export function normalizeAgentSettingState(
   value: unknown,
-  defaults: { recursionLimit: number; experimental: ExperimentalFlags },
+  defaults: { experimental: ExperimentalFlags },
 ): AgentSettingState {
   const source = isObject(value) ? value : {}
   const seenSlots = new Set<AgentSettingSlotNumber>()

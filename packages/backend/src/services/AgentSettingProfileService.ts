@@ -19,6 +19,7 @@ import type { McpServerSummary } from './McpToolService'
 import type { SkillInfo } from './SkillService'
 import type { MemorySnapshot } from '../memory/FileMemoryStore'
 import {
+  AGENT_RECURSION_LIMIT,
   getAgentSettingProfileId,
   getFirstAvailableAgentSettingSlotNumber,
   normalizeAgentSettingState,
@@ -473,7 +474,6 @@ export class AgentSettingProfileService {
     settings: BackendSettings,
   ): AgentSettingState {
     return normalizeAgentSettingState(settings.agentSettings, {
-      recursionLimit: settings.recursionLimit ?? 200,
       experimental: settings.experimental!,
     })
   }
@@ -535,7 +535,7 @@ export class AgentSettingProfileService {
         enabled: settings.memory?.enabled !== false,
       },
       workflow: {
-        recursionLimit: settings.recursionLimit ?? 200,
+        recursionLimit: AGENT_RECURSION_LIMIT,
         experimental: {
           runtimeThinkingCorrectionEnabled:
             settings.experimental?.runtimeThinkingCorrectionEnabled !== false,
@@ -667,7 +667,6 @@ export class AgentSettingProfileService {
       memory: {
         enabled: snapshot.memory.enabled,
       },
-      recursionLimit: snapshot.workflow.recursionLimit,
       experimental: snapshot.workflow.experimental,
       models: {
         ...currentSettings.models,
@@ -703,7 +702,6 @@ export class AgentSettingProfileService {
       commandPolicyMode: nextSettings.commandPolicyMode,
       tools: nextSettings.tools,
       memory: nextSettings.memory,
-      recursionLimit: nextSettings.recursionLimit,
       experimental: nextSettings.experimental,
       models: nextSettings.models,
       agentSettings: nextState,

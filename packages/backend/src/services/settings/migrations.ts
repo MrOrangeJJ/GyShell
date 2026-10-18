@@ -1,10 +1,22 @@
-import type { BackendSettings, WsGatewayAccess } from "../../types";
+import type {
+  BackendSettings,
+  CommandPolicyMode,
+  WsGatewayAccess,
+} from "../../types";
 import { normalizeModelRequestParameters } from "@gyshell/shared";
 import { BUILTIN_TOOL_INFO } from "../AgentHelper/builtInToolMetadata";
-import { normalizeAgentSettingState } from "./agentSettings";
+import {
+  AGENT_RECURSION_LIMIT,
+  normalizeAgentSettingState,
+} from "./agentSettings";
 import { deepMerge, isObject } from "./objectMerge";
 
-export const BACKEND_SETTINGS_SCHEMA_VERSION = 5;
+export const BACKEND_SETTINGS_SCHEMA_VERSION = 6;
+
+/** Command Policy Mode for new installs (schema v6+). */
+const DEFAULT_COMMAND_POLICY_MODE: CommandPolicyMode = "smart";
+/** Default every pre-v6 install ran with; kept for upgrades that never stored a mode. */
+const PRE_V6_DEFAULT_COMMAND_POLICY_MODE: CommandPolicyMode = "standard";
 
 const DEFAULT_BUILTIN_TOOLS = BUILTIN_TOOL_INFO.reduce(
   (acc: Record<string, boolean>, tool) => {
@@ -16,7 +28,7 @@ const DEFAULT_BUILTIN_TOOLS = BUILTIN_TOOL_INFO.reduce(
 
 export const DEFAULT_BACKEND_SETTINGS: BackendSettings = {
   schemaVersion: BACKEND_SETTINGS_SCHEMA_VERSION,
-  commandPolicyMode: "standard",
+  commandPolicyMode: DEFAULT_COMMAND_POLICY_MODE,
   tools: {
     builtIn: DEFAULT_BUILTIN_TOOLS,
     skills: {},
@@ -50,7 +62,7 @@ export const DEFAULT_BACKEND_SETTINGS: BackendSettings = {
     savedLayouts: [],
     activeSavedLayoutId: null,
   },
-  recursionLimit: 200,
+  recursionLimit: AGENT_RECURSION_LIMIT,
   memory: {
     enabled: true,
   },
@@ -142,19 +154,15 @@ function normalizeBackendSettings(settings: BackendSettings): BackendSettings {
   next.baseUrl = activeModel?.baseUrl || "";
   next.apiKey = activeModel?.apiKey || "";
 
-  next.recursionLimit =
-    typeof next.recursionLimit === "number" &&
-    Number.isFinite(next.recursionLimit) &&
-    next.recursionLimit > 0
-      ? next.recursionLimit
-      : 200;
+  // Not user-configurable: any stored, patched or profile-applied value is
+  // pinned back to INF.
+  next.recursionLimit = AGENT_RECURSION_LIMIT;
 
   next.memory = {
     enabled: next.memory?.enabled !== false,
   };
 
   next.agentSettings = normalizeAgentSettingState(next.agentSettings, {
-    recursionLimit: next.recursionLimit,
     experimental: next.experimental ?? DEFAULT_BACKEND_SETTINGS.experimental!,
   });
 
@@ -241,6 +249,35 @@ function migrateBackendToV5(
   return { ...(settings as any), schemaVersion: 5 };
 }
 
+function isCommandPolicyMode(value: unknown): value is CommandPolicyMode {
+  return value === "safe" || value === "standard" || value === "smart";
+}
+
+/**
+ * v6 (GyShell 2.0.0)
+ * - The Agent recursion limit is no longer a setting: every upgrading install
+ *   is forced to INF, whatever it stored before. Saved Agent Setting profile
+ *   snapshots are pinned by normalizeAgentSettingState in the same pass.
+ * - New installs default Command Policy Mode to "smart". `settings` already
+ *   carries that new default, so an upgrade must restore the mode the user
+ *   actually ran with: the stored one, else the pre-v6 default.
+ */
+function migrateBackendToV6(
+  settings: Partial<BackendSettings>,
+  upgrade: { storedCommandPolicyMode: CommandPolicyMode | undefined } | null,
+): Partial<BackendSettings> {
+  const next: Partial<BackendSettings> = {
+    ...(settings as any),
+    recursionLimit: AGENT_RECURSION_LIMIT,
+    schemaVersion: 6,
+  };
+  if (upgrade) {
+    next.commandPolicyMode =
+      upgrade.storedCommandPolicyMode ?? PRE_V6_DEFAULT_COMMAND_POLICY_MODE;
+  }
+  return next;
+}
+
 export function migrateBackendSettings(
   raw: unknown,
   legacyRaw?: unknown,
@@ -261,6 +298,11 @@ export function migrateBackendSettings(
   merged = deepMerge(merged, rawSnapshot);
 
   const fromVersion = Math.max(rawVersion, legacyVersion);
+  // A versioned store or a legacy settings file means an existing install;
+  // absent or unversioned input is a fresh install that takes the new defaults.
+  const isUpgrade =
+    fromVersion > 0 ||
+    (isObject(legacyRaw) && Object.keys(legacyRaw).length > 0);
   if (fromVersion < 3) {
     merged = deepMerge(merged, migrateBackendToV3(merged as any) as any);
   }
@@ -269,6 +311,19 @@ export function migrateBackendSettings(
   }
   if (fromVersion < 5) {
     merged = deepMerge(merged, migrateBackendToV5(merged as any) as any);
+  }
+  if (fromVersion < 6) {
+    const storedCommandPolicyMode = [
+      rawSnapshot.commandPolicyMode,
+      legacySnapshot.commandPolicyMode,
+    ].find(isCommandPolicyMode);
+    merged = deepMerge(
+      merged,
+      migrateBackendToV6(
+        merged as any,
+        isUpgrade ? { storedCommandPolicyMode } : null,
+      ) as any,
+    );
   }
 
   return normalizeBackendSettings(merged);

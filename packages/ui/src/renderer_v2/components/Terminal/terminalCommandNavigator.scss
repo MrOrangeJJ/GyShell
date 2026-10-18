@@ -1,3 +1,43 @@
+// Borderless icon chrome shared by the inline trigger and the popover's header
+// buttons. The popover is portalled to <body>, so its buttons sit outside
+// .terminal-command-navigator and need their own selector, not a nested one.
+// $hover-base is the surface the hover tint is mixed into.
+@mixin navigator-icon-button($hover-base: transparent) {
+  display: grid;
+  place-items: center;
+  flex: none;
+  width: 28px;
+  height: 28px;
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+  gap: 0;
+  border: 0;
+  border-radius: 2px;
+  background: transparent;
+  color: var(--fg-muted);
+  cursor: pointer;
+  line-height: 1;
+
+  > svg {
+    display: block;
+    margin: 0;
+  }
+
+  &:enabled:hover {
+    background: color-mix(in srgb, var(--fg) 8%, #{$hover-base});
+    color: var(--fg);
+  }
+  &:disabled {
+    opacity: 0.35;
+    cursor: default;
+  }
+  &:focus-visible {
+    outline: 1px solid var(--accent);
+    outline-offset: -1px;
+  }
+}
+
 .terminal-command-navigator {
   display: flex;
   align-items: center;
@@ -8,50 +48,13 @@
   pointer-events: auto;
   letter-spacing: 0;
 
-  button.terminal-command-navigator-trigger,
-  button.terminal-command-navigator-icon {
-    display: grid;
-    place-items: center;
-    flex: none;
-    width: 28px;
-    height: 28px;
-    box-sizing: border-box;
-    margin: 0;
-    padding: 0;
-    gap: 0;
-    border: 0;
-    border-radius: 2px;
-    background: transparent;
-    color: var(--fg-muted);
-    cursor: pointer;
-    line-height: 1;
+  button.terminal-command-navigator-trigger {
+    @include navigator-icon-button(var(--panel-bg));
 
-    > svg {
-      display: block;
-      margin: 0;
-    }
-
-    &:enabled:hover {
-      background: color-mix(in srgb, var(--fg) 8%, var(--panel-bg));
-      color: var(--fg);
-    }
-    &[aria-pressed="true"] {
-      color: var(--warning);
-      background: color-mix(in srgb, var(--warning) 10%, transparent);
-    }
     &[aria-expanded="true"] {
       color: var(--accent);
       background: color-mix(in srgb, var(--accent) 10%, transparent);
     }
-    &:disabled {
-      opacity: 0.35;
-      cursor: default;
-    }
-  }
-
-  button:focus-visible {
-    outline: 1px solid var(--accent);
-    outline-offset: -1px;
   }
 }
 
@@ -73,6 +76,18 @@
   font: 11px/1.4 var(--font-mono);
   text-align: left;
   user-select: none;
+}
+
+// "Issues only" and close: just the icon on the popover background. The
+// pressed filter reads as a neutral tint, never a status color or a border.
+.terminal-command-navigator-popover button.terminal-command-navigator-icon {
+  @include navigator-icon-button;
+
+  &[aria-pressed="true"],
+  &[aria-pressed="true"]:enabled:hover {
+    background: color-mix(in srgb, var(--fg) 12%, transparent);
+    color: var(--fg);
+  }
 }
 
 .terminal-command-navigator-count {

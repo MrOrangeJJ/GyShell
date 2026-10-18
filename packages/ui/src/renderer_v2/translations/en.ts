@@ -66,8 +66,6 @@ export const en = {
     shortcutListening: "Press shortcut...",
     cursorStyle: "Cursor Style",
     cursorBlink: "Cursor Blink",
-    recursionLimit: "Agent Recursion Limit",
-    recursionLimitInf: "Infinite",
     debugMode: "Debug Mode",
     chatDisplayMode: "Chat Display Mode",
     preventSleepWhileRunning: "Prevent Sleep While Running",
@@ -270,8 +268,6 @@ export const en = {
         "Click the shortcut field to record a binding for opening Command Draft in terminal tabs. Press Esc while recording to disable the shortcut entirely.",
       cursorStyle: "The visual appearance of the terminal cursor.",
       cursorBlink: "Whether the terminal cursor should blink.",
-      recursionLimit:
-        'The maximum number of steps the Agent can take in a single task. Increase this if you encounter "Recursion limit reached" errors. Setting to maximum enables infinite steps.',
       debugMode:
         "Enable debug-oriented persistence and diagnostics. Currently this keeps additional_kwargs.__raw_response in backend exported messages; outgoing model inputs still strip raw payloads.",
       chatDisplayMode:
