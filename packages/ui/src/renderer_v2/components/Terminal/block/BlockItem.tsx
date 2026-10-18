@@ -38,6 +38,11 @@ interface BlockItemProps {
   roving: boolean;
   /** Newest block or still running: shown like the active Classic terminal. */
   live: boolean;
+  /**
+   * End (exclusive) of the rows listed here; a running block stops where the
+   * dock shows the rest live. Copy and details still use the full range.
+   */
+  listedEnd: number;
   /** Buffer revision for live blocks; 0 for settled ones (memo key). */
   version: number;
   expanded: boolean;
@@ -57,10 +62,13 @@ interface BlockItemProps {
 }
 
 /**
- * One command in the stream: a sticky header (actor/session glyph, intent or
- * command, session, duration, status) over its output. Success is a quiet
- * check; failure/abort get a red pill and a red left rule. Folded output is
- * counted by a passive "+N" on the header rather than costing a row.
+ * One command in the stream: a sticky header over its output. A command with
+ * an intent leads with it as the block's title (wrapped, not cut off), with the
+ * command and session on a quieter line below; a command without one shows the
+ * command on a single line. Duration and status sit on the right of the first
+ * line. Success is a quiet check; failure/abort get a red pill and a red left
+ * rule. Folded output is counted by a passive "+N" on the header rather than
+ * costing a row.
  */
 export const BlockItem: React.FC<BlockItemProps> = ({
   terminal,
@@ -71,6 +79,7 @@ export const BlockItem: React.FC<BlockItemProps> = ({
   sessionTitle,
   roving,
   live,
+  listedEnd,
   version,
   expanded,
   inspected,
@@ -89,11 +98,11 @@ export const BlockItem: React.FC<BlockItemProps> = ({
   const wasInspected = React.useRef(false);
   const output = resolveBlockOutputWindow({
     outputStart: range.outputStart,
-    end: range.end,
+    end: listedEnd,
     live,
     expanded,
   });
-  const hasOutput = range.end > range.outputStart;
+  const hasOutput = listedEnd > range.outputStart;
   const command = resolveBlockCommand(terminal, annotation);
   // Same one-line preview as elsewhere, also for commands read from the prompt.
   const commandPreview = getTerminalActivityCommandPreview({
@@ -101,8 +110,24 @@ export const BlockItem: React.FC<BlockItemProps> = ({
     command,
   });
   const isAgent = activity.actor === "agent";
+  const intent = activity.intent?.trim();
   const duration = formatBlockDuration(activity);
   const inlineDetails = placement === "inline" && inspected;
+  // Open in place, the meta strip right below carries session, duration and
+  // status, and the transcript carries the command: the header keeps the title.
+  const session =
+    isAgent && sessionTitle && !inlineDetails ? (
+      <span className="terminal-block-session">{sessionTitle}</span>
+    ) : null;
+  const subline =
+    intent && !inlineDetails && (commandPreview || session) ? (
+      <span className="terminal-block-subline">
+        {commandPreview ? (
+          <code className="terminal-block-secondary">{commandPreview}</code>
+        ) : null}
+        {session}
+      </span>
+    ) : null;
   const reveal = onRevealInTerminal
     ? () => onRevealInTerminal(annotation.id)
     : undefined;
@@ -160,23 +185,19 @@ export const BlockItem: React.FC<BlockItemProps> = ({
               <SquareTerminal size={12} strokeWidth={1.8} aria-hidden="true" />
             )}
           </span>
-          <span className="terminal-block-title">
-            {activity.intent ? (
-              <span className="terminal-block-intent">{activity.intent}</span>
-            ) : (
+          {intent ? (
+            <span className="terminal-block-title has-intent">
+              <span className="terminal-block-intent">{intent}</span>
+              {subline}
+            </span>
+          ) : (
+            <span className="terminal-block-title">
               <code className="terminal-block-command">
                 {commandPreview || labels.command}
               </code>
-            )}
-            {activity.intent && commandPreview ? (
-              <code className="terminal-block-secondary">{commandPreview}</code>
-            ) : null}
-          </span>
-          {/* Open in place, the meta strip right below carries session,
-              duration and status; the header keeps just the command. */}
-          {isAgent && sessionTitle && !inlineDetails ? (
-            <span className="terminal-block-session">{sessionTitle}</span>
-          ) : null}
+            </span>
+          )}
+          {intent ? null : session}
           {duration && !inlineDetails ? (
             <span className="terminal-block-duration">{duration}</span>
           ) : null}
@@ -247,7 +268,7 @@ export const BlockItem: React.FC<BlockItemProps> = ({
               <BlockOutputRows
                 terminal={terminal}
                 start={output.start}
-                end={range.end}
+                end={listedEnd}
                 cols={terminal.cols}
                 theme={theme}
                 version={version}

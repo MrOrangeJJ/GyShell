@@ -1,7 +1,9 @@
 import assert from "node:assert/strict";
 import {
+  EMPTY_TERMINAL_DOCK_STATE,
   TERMINAL_DOCK_IDLE_ROWS,
   TERMINAL_DOCK_MAX_ROWS,
+  resolveListedBlockEnd,
   resolveTerminalDockAnchor,
   resolveTerminalDockWindow,
   terminalDockGeometry,
@@ -276,6 +278,60 @@ for (const hostHeight of [0, 100, 280, 800, 1200]) {
   );
 }
 
+// --- Listed rows: the running block stops where the dock begins (the dock
+// shows the rest live), so no row is ever on screen twice.
+{
+  const block = { outputStart: 100, end: 160 };
+  // Rows 148.. are in the dock; the list ends right above them.
+  assert.equal(
+    resolveListedBlockEnd({ ...block, running: true, dockTopLine: 148 }),
+    148,
+  );
+  // Everything still fits in the dock: header only, no listed rows.
+  assert.equal(
+    resolveListedBlockEnd({ ...block, running: true, dockTopLine: 100 }),
+    100,
+  );
+  // Dock starts at the command echo (above the output): never below start.
+  assert.equal(
+    resolveListedBlockEnd({ ...block, running: true, dockTopLine: 99 }),
+    100,
+  );
+  // Dock below the block (a completion menu, stale runner): list it all.
+  assert.equal(
+    resolveListedBlockEnd({ ...block, running: true, dockTopLine: 400 }),
+    160,
+  );
+  // Settled blocks always list everything; the dock then shows the prompt.
+  assert.equal(
+    resolveListedBlockEnd({ ...block, running: false, dockTopLine: 148 }),
+    160,
+  );
+  // No dock (hidden, native screen, other view mode): list everything.
+  assert.equal(
+    resolveListedBlockEnd({
+      ...block,
+      running: true,
+      dockTopLine: EMPTY_TERMINAL_DOCK_STATE.topLine,
+    }),
+    160,
+  );
+  assert.equal(EMPTY_TERMINAL_DOCK_STATE.height, 0);
+  assert.ok(Object.isFrozen(EMPTY_TERMINAL_DOCK_STATE));
+  // Invariant over every split point: listed + docked = the whole output,
+  // with no overlap and no gap.
+  for (let top = 90; top <= 170; top += 1) {
+    const listed = resolveListedBlockEnd({
+      ...block,
+      running: true,
+      dockTopLine: top,
+    });
+    assert.ok(listed >= block.outputStart && listed <= block.end);
+    const dockedFrom = Math.min(Math.max(top, block.outputStart), block.end);
+    assert.equal(listed, dockedFrom);
+  }
+}
+
 console.log(
-  "PASS docked prompt: idle/running/wrapped/completion windows, footer-safe geometry, and Activity anchors",
+  "PASS docked prompt: idle/running/wrapped/completion windows, footer-safe geometry, Activity anchors, and running blocks listed only above the dock",
 );

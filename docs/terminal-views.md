@@ -8,6 +8,7 @@ Both views share the same xterm runtime, PTY stream, keyboard input, selection s
 
 - Classic displays the native terminal with command marks, a command navigator, and session dividers.
 - Block displays command/output blocks above the real terminal prompt. Selecting a block expands it in place in narrow panels or opens a details pane in wide panels. The command navigator is hidden.
+- The prompt dock is the real xterm, revealed through a bottom aperture (never a separate text field). While a command runs, the dock is that block's live tail: the block lists its rows only down to the dock's first row, so no row is shown twice. A short history sits directly on the dock. The dock itself never scrolls; the wheel over it scrolls the block stream (applications that track the mouse still receive it).
 - Block follows new output until the user scrolls back, navigates to an older block, or selects text. Typing into the prompt or choosing “Jump to latest” resumes following.
 - Alternate-screen applications use the native terminal. Initializing sessions retain the prompt dock; disconnected sessions hide it.
 

@@ -1688,7 +1688,7 @@ export const XTermView = React.forwardRef<XTermSearchHandle, XTermViewProps>(
         ),
       [],
     );
-    const dockHeight = useTerminalBlockDock(
+    const dock = useTerminalBlockDock(
       runtimeTerminal,
       hostRef.current,
       dockVisible,
@@ -2516,7 +2516,7 @@ export const XTermView = React.forwardRef<XTermSearchHandle, XTermViewProps>(
               }
               viewModeLabels={props.viewModeLabels}
               onViewModeChange={props.onTerminalViewModeChange}
-              dockHeight={dockVisible ? dockHeight : 0}
+              dock={dockVisible ? dock : undefined}
               onRevealInTerminal={revealCommandInTerminal}
               sessionTitleLookup={props.sessionTitleLookup}
               commandSessionTitleLookup={props.commandSessionTitleLookup}

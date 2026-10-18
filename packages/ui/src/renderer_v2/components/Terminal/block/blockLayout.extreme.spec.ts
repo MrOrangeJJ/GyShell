@@ -50,9 +50,19 @@ for (let width = BLOCK_DETAILS_SIDE_MIN_WIDTH_PX; width <= 4000; width += 37) {
   assert.equal(long.collapsible, false);
   const opened = win(56, false, true);
   assert.deepEqual(opened, { start: 100, hidden: 0, expandable: false, collapsible: true });
-  const latest = win(120, true, false);
+  assert.equal(BLOCK_LIVE_ROW_LIMIT, 25, "the newest block is not opened in full by default");
+  assert.ok(BLOCK_LIVE_ROW_LIMIT > BLOCK_FOLD_THRESHOLD_ROWS);
+  const latest = win(BLOCK_LIVE_ROW_LIMIT, true, false);
   assert.deepEqual(latest, { start: 100, hidden: 0, expandable: false, collapsible: false },
-    "the newest / running block reads like a terminal");
+    "the newest / running block shows short output in full");
+  const latestLong = win(120, true, false);
+  assert.deepEqual(
+    latestLong,
+    { start: 220 - BLOCK_LIVE_ROW_LIMIT, hidden: 120 - BLOCK_LIVE_ROW_LIMIT, expandable: true, collapsible: false },
+    "the newest / running block shows only its latest rows; opening it shows the rest",
+  );
+  const latestOpen = win(120, true, true);
+  assert.deepEqual(latestOpen, { start: 100, hidden: 0, expandable: false, collapsible: true });
   const huge = win(BLOCK_LIVE_ROW_LIMIT + 50, true, false);
   assert.equal(huge.hidden, 50);
   assert.equal(huge.expandable, true);
@@ -62,7 +72,7 @@ for (let width = BLOCK_DETAILS_SIDE_MIN_WIDTH_PX; width <= 4000; width += 37) {
   assert.equal(hugeOpen.collapsible, true);
   assert.deepEqual(win(0, false, false), { start: 100, hidden: 0, expandable: false, collapsible: false });
   // Invariant: rendered + hidden rows always equal the block's output rows.
-  for (const rows of [0, 1, 3, 10, 11, 57, 400, 3000]) {
+  for (const rows of [0, 1, 3, 10, 11, 24, 25, 26, 57, 400, 3000]) {
     for (const live of [false, true]) {
       for (const expanded of [false, true]) {
         const w = win(rows, live, expanded);

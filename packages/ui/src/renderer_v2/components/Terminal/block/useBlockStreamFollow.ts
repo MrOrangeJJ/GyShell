@@ -24,6 +24,7 @@ export const useBlockStreamFollow = ({
   streamRef,
   enabled,
   visible,
+  rowHeight,
 }: {
   terminal: Terminal;
   streamRef: React.RefObject<HTMLElement>;
@@ -31,6 +32,8 @@ export const useBlockStreamFollow = ({
   enabled: boolean;
   /** Watch text selection in the stream (view shown). */
   visible: boolean;
+  /** Line-mode wheel deltas are in rows. */
+  rowHeight: number;
 }) => {
   const [follow, setFollow] = React.useState(INITIAL_BLOCK_FOLLOW_STATE);
   // Whether anything is below the viewport; the "N new" pill needs both
@@ -128,6 +131,21 @@ export const useBlockStreamFollow = ({
       dispatchFollow({ type: "scroll-up-intent" });
   };
 
+  /** A wheel from outside the stream (the dock) scrolls it like its own. */
+  const scrollByWheel = (event: WheelEvent) => {
+    const stream = streamRef.current;
+    if (!stream || !event.deltaY) return;
+    noteUserIntent();
+    if (event.deltaY < 0) noteScrollUpIntent();
+    const unit =
+      event.deltaMode === WheelEvent.DOM_DELTA_LINE
+        ? rowHeight
+        : event.deltaMode === WheelEvent.DOM_DELTA_PAGE
+          ? stream.clientHeight
+          : 1;
+    stream.scrollTop += event.deltaY * unit;
+  };
+
   const setPointerHeld = (held: boolean) => {
     pointerHeld.current = held;
   };
@@ -167,5 +185,6 @@ export const useBlockStreamFollow = ({
     noteScrollUpIntent,
     setPointerHeld,
     handleStreamScroll,
+    scrollByWheel,
   };
 };

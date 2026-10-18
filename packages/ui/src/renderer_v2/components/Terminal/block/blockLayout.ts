@@ -19,16 +19,17 @@ export const BLOCK_LIST_MAX_WIDTH_PX = 560;
 const BLOCK_LIST_WIDTH_RATIO = 0.4;
 /**
  * Output density. The stream reads like a terminal transcript: short output is
- * always shown in full, the newest (or a running) block is shown in full up
- * to a live limit, and only older LONG blocks fold to their tail. Folding never
- * overlays content; hidden rows are announced by an in-flow fold row.
+ * always shown in full, the newest (or a running) block shows its latest rows
+ * up to a small live limit, and older LONG blocks fold to a shorter tail.
+ * Nothing opens in full by default; opening a block shows all of it. Folding
+ * never overlays content; hidden rows are counted on the header.
  */
 /** Older blocks with more rows than this fold to their tail. */
 export const BLOCK_FOLD_THRESHOLD_ROWS = 10;
 /** Tail rows kept visible when an older block is folded. */
 export const BLOCK_FOLDED_TAIL_ROWS = 3;
-/** Rows shown for the newest / running block before folding the head. */
-export const BLOCK_LIVE_ROW_LIMIT = 200;
+/** Tail rows shown for the newest / running block before folding the head. */
+export const BLOCK_LIVE_ROW_LIMIT = 25;
 /** Hard cap on rows rendered for one expanded block or the details pane. */
 export const BLOCK_EXPANDED_ROW_LIMIT = 2400;
 

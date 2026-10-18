@@ -42,8 +42,9 @@ $block-transition: var(--terminal-view-transition) ease-out;
   min-width: 0;
   min-height: 0;
   box-sizing: border-box;
+  // Not animated: the dock moves by whole terminal rows, and the stream's
+  // last row must stay flush with the dock's first one (no seam lag).
   padding-bottom: var(--terminal-block-dock-height);
-  transition: padding-bottom $block-transition;
 }
 
 .terminal-block-stream-column {
@@ -61,6 +62,10 @@ $block-transition: var(--terminal-view-transition) ease-out;
 }
 
 .terminal-block-stream {
+  // Column so a short history sits on the dock (margin-top: auto below): the
+  // newest block always meets the prompt, like a terminal's last lines.
+  display: flex;
+  flex-direction: column;
   flex: 1;
   min-width: 0;
   min-height: 0;
@@ -73,7 +78,10 @@ $block-transition: var(--terminal-view-transition) ease-out;
 }
 
 .terminal-block-list {
-  margin: 0;
+  // Headers adapt to the list's own width (narrow panel or side layout).
+  container: terminal-block-list / inline-size;
+  flex: none;
+  margin: auto 0 0;
   padding: 0 0 4px;
   list-style: none;
 }
@@ -86,6 +94,11 @@ $block-transition: var(--terminal-view-transition) ease-out;
 
 // Output column starts under the command text: 8px pad + 14px icon + 6px gap.
 $block-output-indent: 28px;
+// Header rhythm: every first-line item (glyph, title, duration, status, +N)
+// is centred on one 16px line, so a wrapped intent grows the header downward
+// while the right-hand meta stays on the title's first line.
+$block-head-line: 16px;
+$block-head-pad: 3px;
 
 .terminal-block {
   position: relative;
@@ -108,21 +121,19 @@ $block-output-indent: 28px;
   top: 0;
   z-index: 1;
   display: flex;
-  align-items: center;
+  align-items: flex-start;
   min-width: 0;
-  height: 22px;
   background: var(--app-bg);
 }
 
 .terminal-block-header {
   display: flex;
   flex: 1;
-  align-items: center;
+  align-items: flex-start;
   gap: 6px;
   min-width: 0;
-  height: 100%;
   box-sizing: border-box;
-  padding: 0 8px;
+  padding: $block-head-pad 8px;
   cursor: pointer;
   user-select: none;
   outline: none;
@@ -171,41 +182,75 @@ $block-output-indent: 28px;
   flex: 0 0 14px;
   align-items: center;
   justify-content: center;
-  height: 14px;
+  height: $block-head-line;
   color: var(--fg-faint);
 }
 
 .terminal-block-title {
   display: flex;
   flex: 1;
+  align-items: center;
+  min-width: 0;
+  min-height: $block-head-line;
+  overflow: hidden;
+  white-space: nowrap;
+
+  // Intent first: the title line, then the command line under it.
+  &.has-intent {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 1px;
+    white-space: normal;
+  }
+}
+
+.terminal-block-command {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--fg);
+  font: 600 11px/#{$block-head-line} var(--font-mono);
+  text-overflow: ellipsis;
+}
+
+// The block's title. It wraps instead of being cut off: an intent within the
+// 40-character limit fits these lines down to the list's 320px minimum. Only
+// a legacy over-long intent or a narrower panel is clamped, and an open block
+// always shows it in full.
+.terminal-block-intent {
+  display: -webkit-box;
+  min-width: 0;
+  overflow: hidden;
+  color: var(--fg);
+  font: 600 12px/#{$block-head-line} var(--font-ui);
+  overflow-wrap: anywhere;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 6;
+  line-clamp: 6;
+}
+
+.terminal-block.is-inspected .terminal-block-intent {
+  display: block;
+  -webkit-line-clamp: unset;
+  line-clamp: none;
+}
+
+// Under the intent: the command as run, then the Agent session.
+.terminal-block-subline {
+  display: flex;
   align-items: baseline;
   gap: 8px;
   min-width: 0;
   overflow: hidden;
+  line-height: 14px;
   white-space: nowrap;
 }
 
-.terminal-block-command,
-.terminal-block-intent {
+.terminal-block-secondary {
   flex: 0 1 auto;
   min-width: 0;
   overflow: hidden;
-  color: var(--fg);
-  font: 600 11px/1 var(--font-mono);
-  text-overflow: ellipsis;
-}
-
-.terminal-block-intent {
-  font-family: var(--font-ui);
-  font-weight: 500;
-}
-
-.terminal-block-secondary {
-  flex: 1 1 0;
-  min-width: 0;
-  overflow: hidden;
   color: var(--fg-muted);
-  font: 10px/1 var(--font-mono);
+  font: 10px/14px var(--font-mono);
   text-overflow: ellipsis;
 }
 
@@ -215,15 +260,40 @@ $block-output-indent: 28px;
   overflow: hidden;
   color: color-mix(in srgb, var(--accent) 72%, var(--fg-muted));
   font-size: 10px;
+  line-height: $block-head-line;
   text-overflow: ellipsis;
   white-space: nowrap;
+
+  // Follows the command and gives way first when the line is short of
+  // room, down to a stub that still says an Agent session ran it.
+  .terminal-block-subline > & {
+    flex-shrink: 20;
+    min-width: 48px;
+    line-height: 14px;
+  }
 }
 
 .terminal-block-duration {
   flex: none;
   color: var(--fg-faint);
   font-size: 10px;
+  line-height: $block-head-line;
   font-variant-numeric: tabular-nums;
+}
+
+// Below the list's design width the title keeps the room: the duration and
+// then the status text step aside (both stay on the open block's meta line;
+// the status icon and its tooltip remain).
+@container terminal-block-list (max-width: 300px) {
+  .terminal-block-header .terminal-block-duration {
+    display: none;
+  }
+}
+
+@container terminal-block-list (max-width: 240px) {
+  .terminal-block-header .terminal-block-status > span {
+    display: none;
+  }
 }
 
 // Success is a quiet check; anything else names its outcome.
@@ -263,7 +333,7 @@ $block-output-indent: 28px;
 // itself is the control.
 .terminal-block-count {
   flex: none;
-  margin-right: 6px;
+  margin: $block-head-pad 6px 0 0;
   padding: 0 5px;
   border: 1px solid var(--border);
   border-radius: 2px;
@@ -339,9 +409,13 @@ $block-output-indent: 28px;
   padding-top: 1px;
 }
 
+// Details title: the intent leads the transcript, above the input as run.
 .terminal-block-input-intent {
-  color: var(--fg-muted);
-  font: 500 11px/1.35 var(--font-ui);
+  margin-bottom: 1px;
+  color: var(--fg);
+  font: 600 13px/1.35 var(--font-ui);
+  overflow-wrap: anywhere;
+  user-select: text;
 }
 
 .terminal-block-input-command {
@@ -446,7 +520,7 @@ $block-output-indent: 28px;
   align-items: center;
   justify-content: center;
   gap: 5px;
-  min-height: 100%;
+  flex: 1 0 auto;
   box-sizing: border-box;
   padding: 24px 10px;
   color: var(--fg-muted);
@@ -697,11 +771,6 @@ $block-output-indent: 28px;
   background: var(--success);
 }
 
-/* Docked prompt: the aperture's clip animates with the reserved space. */
-.xterm-shell.is-block-mode.is-block-input .xterm-host {
-  transition: clip-path $block-transition;
-}
-
 /* The dock never scrolls (the stream above is the history): no scrollbar. */
 .xterm-shell.is-block-mode.is-block-input
   .xterm-host
@@ -766,9 +835,7 @@ $block-output-indent: 28px;
     opacity: 0.6;
   }
 
-  .terminal-block-main,
-  .terminal-block-details-pane,
-  .xterm-shell.is-block-mode.is-block-input .xterm-host {
+  .terminal-block-details-pane {
     transition: none;
   }
 }

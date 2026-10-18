@@ -39,6 +39,11 @@ import {
 } from "./terminalBlockModel";
 import { useBlockStreamFollow } from "./useBlockStreamFollow";
 import { useTerminalBlockRevision } from "./useTerminalBlockRevision";
+import type { TerminalDockSource } from "./useTerminalBlockDock";
+import {
+  EMPTY_TERMINAL_DOCK_STATE,
+  resolveListedBlockEnd,
+} from "./terminalDockModel";
 import "./terminalBlock.scss";
 
 /**
@@ -77,8 +82,9 @@ interface Props {
   sessionState?: "connecting" | "disconnected";
   sessionTitleLookup?: (sessionId: string) => string | undefined;
   commandSessionTitleLookup?: (sessionId: string) => string | undefined;
-  /** Height in px of the docked prompt aperture above the footer. */
-  dockHeight?: number;
+  /** The docked prompt (real xterm) below the stream: its height, first line
+   *  and wheel. Absent: no dock. */
+  dock?: TerminalDockSource;
   onRevealInTerminal?: (activityId: string) => void;
   onSelectActivity?: (activityId: string) => void;
 }
@@ -93,6 +99,9 @@ const prefersReducedMotion = (): boolean =>
 /** Delay until a layout transition has finished (0 with reduced motion). */
 const transitionDelay = (extra: number): number =>
   prefersReducedMotion() ? 0 : TERMINAL_VIEW_TRANSITION_MS + extra;
+
+const subscribeToNothing = () => () => undefined;
+const getEmptyDockState = () => EMPTY_TERMINAL_DOCK_STATE;
 
 const isEditableTarget = (target: EventTarget | null): boolean =>
   target instanceof HTMLElement &&
@@ -141,7 +150,7 @@ export const TerminalBlockView: React.FC<Props> = ({
   onViewModeChange,
   sessionTitleLookup,
   commandSessionTitleLookup,
-  dockHeight = 0,
+  dock,
   onRevealInTerminal,
   onSelectActivity,
   footerStatus,
@@ -180,12 +189,29 @@ export const TerminalBlockView: React.FC<Props> = ({
     noteScrollUpIntent,
     setPointerHeld,
     handleStreamScroll,
+    scrollByWheel,
   } = useBlockStreamFollow({
     terminal,
     streamRef,
     enabled: listening,
     visible,
+    rowHeight,
   });
+  // Same frame as the aperture moves, so the stream/dock seam never lags.
+  const dockState = React.useSyncExternalStore(
+    dock?.subscribe ?? subscribeToNothing,
+    dock?.getSnapshot ?? getEmptyDockState,
+  );
+  const dockHeight = Math.max(0, dockState.height);
+
+  // A wheel over the dock scrolls the stream: one scroll surface.
+  const scrollByWheelRef = React.useRef(scrollByWheel);
+  scrollByWheelRef.current = scrollByWheel;
+  React.useEffect(() => {
+    if (!dock || !listening) return undefined;
+    dock.setWheelHandler((event) => scrollByWheelRef.current(event));
+    return () => dock.setWheelHandler(undefined);
+  }, [dock, listening]);
 
   React.useEffect(
     () => onNativeModeChange(native),
@@ -588,9 +614,9 @@ export const TerminalBlockView: React.FC<Props> = ({
             {blocks.length > 0 ? (
               <ol ref={listRef} className="terminal-block-list">
                 {blocks.map((annotation) => {
-                  const live =
-                    annotation.id === latestId ||
-                    annotation.activity.status === "running";
+                  const range = ranges.get(annotation.id)!;
+                  const running = annotation.activity.status === "running";
+                  const live = annotation.id === latestId || running;
                   const sessionTitle =
                     annotation.activity.sessionId && commandSessionTitleLookup
                       ? cleanTerminalSessionTitle(
@@ -604,12 +630,18 @@ export const TerminalBlockView: React.FC<Props> = ({
                       key={annotation.id}
                       terminal={terminal}
                       annotation={annotation}
-                      range={ranges.get(annotation.id)!}
+                      range={range}
                       theme={theme}
                       labels={labels}
                       sessionTitle={sessionTitle}
                       roving={annotation.id === rovingId}
                       live={live}
+                      listedEnd={resolveListedBlockEnd({
+                        outputStart: range.outputStart,
+                        end: range.end,
+                        running,
+                        dockTopLine: dockState.topLine,
+                      })}
                       version={live ? revision : 0}
                       expanded={annotation.id === focus.expandedId}
                       inspected={annotation.id === focus.inspectedId}

@@ -9,6 +9,10 @@
  * more); while a command runs, the dock shows from its start marker down to
  * the cursor, up to ~40% of the height / 12 rows. Content below the cursor
  * (completion menus) is revealed within the cap.
+ *
+ * The dock is the running command's live tail, not a copy of it: the running
+ * block lists its rows only down to the dock's first line, so the stream and
+ * the dock read as one block with nothing shown twice.
  */
 
 export const TERMINAL_DOCK_MAX_ROWS = 12;
@@ -22,6 +26,33 @@ export interface TerminalDockAnchor {
   /** Line where the latest completed command ended (where the prompt begins). */
   promptStartLine?: number;
 }
+
+/** What the Block view needs from the dock, published once per frame. */
+export interface TerminalDockState {
+  /** Aperture height in px; the Block view reserves this much at the bottom. */
+  height: number;
+  /** Absolute buffer line of the dock's first row (undefined when hidden). */
+  topLine?: number;
+}
+
+export const EMPTY_TERMINAL_DOCK_STATE: TerminalDockState = Object.freeze({
+  height: 0,
+});
+
+/**
+ * End (exclusive) of the rows a block lists in the stream. A running block
+ * stops where the dock begins: those rows are on screen live in the dock.
+ * Settled blocks list everything (the dock then shows the next prompt).
+ */
+export const resolveListedBlockEnd = (input: {
+  outputStart: number;
+  end: number;
+  running: boolean;
+  dockTopLine?: number;
+}): number =>
+  input.running && input.dockTopLine !== undefined
+    ? Math.max(input.outputStart, Math.min(input.end, input.dockTopLine))
+    : input.end;
 
 interface DockMarker {
   readonly line: number;
